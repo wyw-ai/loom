@@ -33,8 +33,8 @@ use proto::methods::{
 };
 use proto::types::trace::TraceKind;
 use proto::types::{
-    ActorKind, AudienceKind, DeliveryPolicy, Message, MessageIntent, Meta, Run, RunStatus,
-    ScopeKind, ScopeRef, TaskAssignmentStatus,
+    ActorKind, AudienceKind, DeliveryPolicy, Message, MessageIntent, MessageKind, Meta, Run,
+    RunStatus, ScopeKind, ScopeRef, TaskAssignmentStatus,
 };
 use proto::types::{Event, RefKind, RelationKind};
 use serde::{Deserialize, Serialize};
@@ -404,6 +404,54 @@ fn prepend_path_dir(env: &mut BTreeMap<String, String>, dir: &Path) {
     if let Ok(joined) = std::env::join_paths(dirs) {
         env.insert("PATH".into(), joined.to_string_lossy().into_owned());
     }
+}
+
+fn ensure_command_path_defaults(env: &mut BTreeMap<String, String>) {
+    let existing = env
+        .get("PATH")
+        .cloned()
+        .or_else(|| std::env::var("PATH").ok())
+        .unwrap_or_default();
+    let mut dirs = std::env::split_paths(&existing).collect::<Vec<_>>();
+    for dir in default_command_path_dirs() {
+        if !dirs.iter().any(|existing| existing == &dir) {
+            dirs.push(dir);
+        }
+    }
+    if let Ok(joined) = std::env::join_paths(dirs) {
+        env.insert("PATH".into(), joined.to_string_lossy().into_owned());
+    }
+}
+
+fn default_command_path_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/usr/bin"),
+        PathBuf::from("/bin"),
+        PathBuf::from("/usr/sbin"),
+        PathBuf::from("/sbin"),
+    ];
+    dirs.extend(discover_nvm_node_bin_dirs());
+    dirs
+}
+
+fn discover_nvm_node_bin_dirs() -> Vec<PathBuf> {
+    let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+        return Vec::new();
+    };
+    let versions = PathBuf::from(home).join(".nvm/versions/node");
+    let Ok(entries) = std::fs::read_dir(versions) else {
+        return Vec::new();
+    };
+    let mut dirs = entries
+        .flatten()
+        .map(|entry| entry.path().join("bin"))
+        .filter(|dir| is_executable_file(&dir.join(executable_name("node"))))
+        .collect::<Vec<_>>();
+    dirs.sort();
+    dirs.reverse();
+    dirs
 }
 
 fn find_executable_on_path(name: &str) -> Option<PathBuf> {
@@ -1146,6 +1194,7 @@ impl AgentPaths {
         let mut env = BTreeMap::new();
         env.insert("LOOM_SERVER".into(), server_url.to_string());
         inject_loom_cli_env(&mut env, resolve_loom_cli_binary().as_deref());
+        ensure_command_path_defaults(&mut env);
         if let Some(socket) = daemon_ipc::env_socket_path() {
             env.insert("LOOM_DAEMON_SOCKET".into(), socket.display().to_string());
             env.insert(
@@ -2230,6 +2279,9 @@ struct WorkerState {
     action_map: Mutex<HashMap<String, String>>,
     /// action.request message id -> metadata for Loom-owned model selection prompts.
     model_action_map: Mutex<HashMap<String, ModelActionRequest>>,
+    /// Runtime warning de-dupe by `run_id:category`. These warnings surface
+    /// system/RPC failures without blocking the active turn or flooding chat.
+    reported_runtime_warnings: Mutex<HashSet<String>>,
     /// Currently selected model id for this actor. Loaded from profile state
     /// first, then from `spec.models.default`.
     selected_model: Mutex<Option<String>>,
@@ -2431,6 +2483,7 @@ impl WorkerState {
             seen_sources: Mutex::new(HashSet::new()),
             action_map: Mutex::new(HashMap::new()),
             model_action_map: Mutex::new(HashMap::new()),
+            reported_runtime_warnings: Mutex::new(HashSet::new()),
             selected_model: Mutex::new(selected_model),
         }
     }
@@ -2511,6 +2564,13 @@ impl WorkerState {
         let turn = active.values_mut().find(|turn| turn.run_id == run_id)?;
         turn.no_reply_requested = true;
         Some(turn.clone())
+    }
+
+    fn mark_runtime_warning_reported(&self, run_id: &str, category: &str) -> bool {
+        self.reported_runtime_warnings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(format!("{run_id}:{category}"))
     }
 
     /// Drop the active turn for `scope_id` and pop the next queued trigger for
@@ -2622,6 +2682,44 @@ impl WorkerState {
             busy.remove(&turn_key);
         }
         batch
+    }
+
+    fn drop_pending_sources(&self, source_ids: &[String]) {
+        if source_ids.is_empty() {
+            return;
+        }
+        let source_ids = source_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let mut pending = self
+            .pending_triggers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pending.retain(|_, queue| {
+            queue.retain(|trigger| !source_ids.contains(trigger.id()));
+            !queue.is_empty()
+        });
+    }
+
+    fn retain_pending_sources_for_turn_key(&self, turn_key: &str, source_ids: &HashSet<String>) {
+        let mut pending = self
+            .pending_triggers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(queue) = pending.get_mut(turn_key) {
+            queue.retain(|trigger| source_ids.contains(trigger.id()));
+            if queue.is_empty() {
+                pending.remove(turn_key);
+            }
+        }
+    }
+
+    fn release_turn_key(&self, turn_key: &str) {
+        self.busy_turn_keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(turn_key);
     }
 
     /// Pop the head trigger for `turn_key` plus, when `coalesce` is set, any
@@ -3263,6 +3361,8 @@ fn build_adapter(
     let loom_binary = current_loom_binary();
     inject_loom_cli_env(&mut process_env, loom_binary.as_deref());
     inject_loom_cli_env(&mut command_env, loom_binary.as_deref());
+    ensure_command_path_defaults(&mut process_env);
+    ensure_command_path_defaults(&mut command_env);
     process_env
         .entry("LOOM_SERVER".into())
         .or_insert_with(|| server_url.to_string());
@@ -3742,8 +3842,26 @@ fn is_message_for_us(message: &Message, actor_id: &str) -> bool {
     is_message_for_us_with_delivery(message, actor_id, false)
 }
 
+#[cfg(test)]
 fn is_inbox_message_for_us(message: &Message, actor_id: &str) -> bool {
     is_message_for_us_with_delivery(message, actor_id, true)
+}
+
+fn is_durable_inbox_message_for_us(
+    message: &Message,
+    actor_id: &str,
+    delivery_actor_id: &str,
+) -> bool {
+    if delivery_actor_id != actor_id {
+        return false;
+    }
+    if message.author_actor_id == actor_id {
+        return false;
+    }
+    if is_runtime_failure_message(message) {
+        return false;
+    }
+    message.delivery_policy != DeliveryPolicy::Silent
 }
 
 fn is_message_for_us_with_delivery(
@@ -4102,8 +4220,8 @@ async fn drain_pending_inbox(
                 record_delivery_seen_by_id(client, actor_id, &message.id).await?;
                 continue;
             }
-            if !is_inbox_message_for_us(&message, actor_id) {
-                record_delivery_seen_by_id(client, actor_id, &message.id).await?;
+            if !is_durable_inbox_message_for_us(&message, actor_id, &entry.delivery.actor_id) {
+                record_delivery_seen_by_id(client, actor_id, &source_id).await?;
                 continue;
             }
             mark_actor_inbox_delivery(&mut message, actor_id);
@@ -4211,6 +4329,18 @@ fn turn_source_ids(active: &ActiveTurn) -> Vec<&str> {
         }
     }
     ids
+}
+
+fn extend_unique_source_ids(
+    target: &mut Vec<String>,
+    source_ids: impl IntoIterator<Item = String>,
+) {
+    let mut seen = target.iter().cloned().collect::<HashSet<_>>();
+    for source_id in source_ids {
+        if seen.insert(source_id.clone()) {
+            target.push(source_id);
+        }
+    }
 }
 
 async fn record_delivery_seen_by_id(
@@ -4545,6 +4675,117 @@ async fn dispatch_trigger(
     dispatch_trigger_batch(client, state, adapter, batch).await
 }
 
+struct PendingDispatchSnapshot {
+    source_ids: HashSet<String>,
+    same_scope: Vec<AgentTrigger>,
+}
+
+async fn pending_dispatch_snapshot(
+    client: &Arc<Client>,
+    state: &Arc<WorkerState>,
+    scope: &ScopeRef,
+) -> Result<PendingDispatchSnapshot> {
+    let result: InboxListResult = client
+        .call(
+            method::INBOX_LIST,
+            json!({
+                "actorId": &state.actor_id,
+                "state": "pending",
+                "limit": 200,
+            }),
+        )
+        .await
+        .with_context(|| "inbox.list pending for queued trigger rebase")?;
+    let mut source_ids = HashSet::new();
+    let mut same_scope_pending = Vec::new();
+    for entry in result.deliveries {
+        let delivery_actor_id = entry.delivery.actor_id.clone();
+        let source_id = entry.delivery.source_id.clone();
+        source_ids.insert(source_id.clone());
+        if let Some(mut message) = entry.message {
+            source_ids.insert(message.id.clone());
+            if !same_scope(&message.scope, scope)
+                || !is_durable_inbox_message_for_us(&message, &state.actor_id, &delivery_actor_id)
+                || !message_visible_to_actor_for_prompt(&message, &state.actor_id)
+            {
+                continue;
+            }
+            mark_actor_inbox_delivery(&mut message, &state.actor_id);
+            same_scope_pending.push(AgentTrigger::Message(message));
+            continue;
+        }
+        if let Some(event) = entry.event {
+            source_ids.insert(event.id.clone());
+            if same_scope(&event.scope, scope) && is_for_us(&event, &state.actor_id) {
+                same_scope_pending.push(AgentTrigger::Event(event));
+            }
+        }
+    }
+    Ok(PendingDispatchSnapshot {
+        source_ids,
+        same_scope: same_scope_pending,
+    })
+}
+
+fn trigger_observed_at(trigger: &AgentTrigger) -> chrono::DateTime<Utc> {
+    match trigger {
+        AgentTrigger::Message(message) => message.created_at,
+        AgentTrigger::Event(event) => event.occurred_at,
+    }
+}
+
+fn rebase_queued_batch_with_pending_snapshot(
+    batch: Vec<AgentTrigger>,
+    pending_source_ids: &HashSet<String>,
+    mut same_scope_pending: Vec<AgentTrigger>,
+) -> Vec<AgentTrigger> {
+    let rebased = batch
+        .into_iter()
+        .filter(|trigger| pending_source_ids.contains(trigger.id()))
+        .collect::<Vec<_>>();
+    if !rebased.is_empty() {
+        return rebased;
+    }
+    same_scope_pending.sort_by_key(trigger_observed_at);
+    same_scope_pending.pop().into_iter().collect()
+}
+
+async fn rebase_queued_batch_or_release(
+    client: &Arc<Client>,
+    state: &Arc<WorkerState>,
+    batch: Vec<AgentTrigger>,
+) -> Vec<AgentTrigger> {
+    let Some(first) = batch.first() else {
+        return batch;
+    };
+    let turn_key = turn_key_for_trigger(first);
+    let scope = first.scope().clone();
+    let snapshot = match pending_dispatch_snapshot(client, state, &scope).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            tracing::warn!(
+                actor = %state.actor_id,
+                turn_key = %turn_key,
+                %err,
+                "could not rebase queued trigger batch against pending inbox; dispatching local queue"
+            );
+            return batch;
+        }
+    };
+    state.retain_pending_sources_for_turn_key(&turn_key, &snapshot.source_ids);
+    let rebased =
+        rebase_queued_batch_with_pending_snapshot(batch, &snapshot.source_ids, snapshot.same_scope);
+    if rebased.is_empty() {
+        tracing::debug!(
+            actor = %state.actor_id,
+            turn_key = %turn_key,
+            "queued trigger batch no longer exists in pending inbox; releasing turn key"
+        );
+        state.release_turn_key(&turn_key);
+    }
+    rebased
+}
+
 /// Open a turn, mark the scope busy, send the prompt to the adapter. Used by
 /// both the initial trigger and the Finished handler when it pops the next
 /// queued batch. On `send_prompt` failure we iteratively drain the queue
@@ -4566,7 +4807,7 @@ async fn dispatch_trigger_batch(
             return Ok(());
         };
         let turn_key = turn_key_for_trigger(&primary);
-        let source_ids: Vec<String> = batch
+        let mut source_ids: Vec<String> = batch
             .iter()
             .map(|trigger| trigger.id().to_string())
             .collect();
@@ -4594,6 +4835,8 @@ async fn dispatch_trigger_batch(
         let first_turn = state.take_seed_slot(&primary.scope().id);
         let turn_input =
             render_trigger_prompt(client, state, &batch, first_turn, &run_res.run.id).await;
+        extend_unique_source_ids(&mut source_ids, turn_input.ack_source_ids.clone());
+        state.drop_pending_sources(&source_ids);
         let prompt = compose_envelope_prompt(client, state, &batch, &turn_input, first_turn).await;
         let no_reply_file =
             no_reply_file_for_turn(client, state, primary.scope(), &run_res.run.id).await;
@@ -4667,6 +4910,7 @@ async fn dispatch_trigger_batch(
                 let scope_id = primary.scope().id.clone();
                 let next =
                     state.finish_and_next_batch(&scope_id, wake_coalesce_enabled(&state.spec));
+                let next = rebase_queued_batch_or_release(client, state, next).await;
                 if next.is_empty() {
                     return Err(anyhow!("adapter send_prompt failed: {e}"));
                 }
@@ -5325,6 +5569,7 @@ struct TriggerPromptText {
     assignment_context: String,
     delivery_context: String,
     turn_input: String,
+    ack_source_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -5349,6 +5594,7 @@ impl TurnUnreadGap {
 struct DeliveryCursorContext {
     section: String,
     unread_gap: TurnUnreadGap,
+    ack_source_ids: Vec<String>,
 }
 
 async fn render_trigger_prompt(
@@ -5375,6 +5621,7 @@ async fn render_trigger_prompt(
             DeliveryCursorContext {
                 section: String::new(),
                 unread_gap: TurnUnreadGap::empty(),
+                ack_source_ids: Vec::new(),
             }
         });
     let latest_message = render_turn_input_contract_with_names(
@@ -5390,12 +5637,17 @@ async fn render_trigger_prompt(
     let assignment_context = assignment_context_for_prompt(client, primary)
         .await
         .unwrap_or_default();
-    let turn_input = join_prompt_sections([latest_message.clone(), assignment_context.clone()]);
+    let turn_input = join_prompt_sections([
+        latest_message.clone(),
+        delivery_context.section.clone(),
+        assignment_context.clone(),
+    ]);
     TriggerPromptText {
         latest_message,
         assignment_context,
         delivery_context: delivery_context.section,
         turn_input,
+        ack_source_ids: delivery_context.ack_source_ids,
     }
 }
 
@@ -5410,13 +5662,21 @@ async fn delivery_cursor_context(
         return Ok(DeliveryCursorContext {
             section: String::new(),
             unread_gap: TurnUnreadGap::empty(),
+            ack_source_ids: Vec::new(),
         });
     };
     let budget = wake_context_token_budget(&state.spec);
     let mut sections = Vec::new();
     if first_turn {
-        if let Some(section) =
-            bootstrap_conversation_context(client, primary, batch, actor_names, budget).await?
+        if let Some(section) = bootstrap_conversation_context(
+            client,
+            &state.actor_id,
+            primary,
+            batch,
+            actor_names,
+            budget,
+        )
+        .await?
         {
             sections.push(section);
         }
@@ -5436,11 +5696,13 @@ async fn delivery_cursor_context(
     Ok(DeliveryCursorContext {
         section: join_prompt_sections(sections),
         unread_gap: pending.unread_gap,
+        ack_source_ids: pending.ack_source_ids,
     })
 }
 
 async fn bootstrap_conversation_context(
     client: &Arc<Client>,
+    local_actor_id: &str,
     primary: &AgentTrigger,
     batch: &[AgentTrigger],
     actor_names: &HashMap<String, String>,
@@ -5462,8 +5724,8 @@ async fn bootstrap_conversation_context(
         .with_context(|| format!("message.list target={target}"))?;
     let exclude_ids: HashSet<&str> = batch.iter().map(|trigger| trigger.id()).collect();
     let mut body = String::from(
-        "=== Loom bootstrap context ===\n\
-         First turn in this provider scope. Limited prior visible messages follow; later resume turns use delivery cursor context instead of fixed recent-message replay.",
+        "=== Loom visible history sample ===\n\
+         First turn in this provider scope. Limited prior visible messages follow as history, not new work. Later resume turns use the delivery cursor instead of fixed recent-message replay.",
     );
     let mut included = 0usize;
     let mut omitted = 0usize;
@@ -5475,6 +5737,7 @@ async fn bootstrap_conversation_context(
         .filter(|message| {
             message.metadata.get("kind").and_then(Value::as_str) != Some("run.started_ack")
         })
+        .filter(|message| message_visible_to_actor_for_prompt(message, local_actor_id))
     {
         let block = render_context_message_block(message, actor_names);
         if block.trim().is_empty() {
@@ -5493,7 +5756,7 @@ async fn bootstrap_conversation_context(
     }
     if omitted > 0 || result.page_info.has_more {
         body.push_str(&format!(
-            "\n\nBootstrap gap: {} earlier messages omitted by context budget. Query with `loom message read --target '{}'` if needed.",
+            "\n\nHistory gap: {} earlier messages omitted by context budget. Query with `loom --json message read --target '{}'` if needed.",
             omitted + usize::from(result.page_info.has_more),
             target
         ));
@@ -5522,14 +5785,24 @@ async fn pending_delivery_context(
         .with_context(|| "inbox.list pending for delivery cursor")?;
     let exclude_ids: HashSet<&str> = batch.iter().map(|trigger| trigger.id()).collect();
     let mut body = String::from(
-        "=== New Loom deliveries since last ack ===\n\
-         These pending same-scope deliveries arrived after the last ack and were not part of wake[].",
+        "=== Loom pending inbox ===\n\
+         Pending same-scope deliveries below were not part of wake[] for this turn. They are shown newest first.\n\
+         Treat them as unread context that may change the latest state; merge or split them according to the wake intake policy in AGENTS.md.\n\
+         Delivery ack is worker-managed. For manual inspection use `loom --json inbox list --state pending --no-ack`; do not inspect pending inbox without `--no-ack`.",
     );
     let mut included = 0usize;
     let mut seen_relevant = 0usize;
+    let mut items = Vec::new();
     for entry in result.deliveries {
+        let source_id = entry.delivery.source_id.clone();
         if let Some(message) = entry.message {
-            if !same_scope(&message.scope, scope) || exclude_ids.contains(message.id.as_str()) {
+            if !same_scope(&message.scope, scope)
+                || exclude_ids.contains(message.id.as_str())
+                || exclude_ids.contains(source_id.as_str())
+            {
+                continue;
+            }
+            if !message_visible_to_actor_for_prompt(&message, &state.actor_id) {
                 continue;
             }
             if is_runtime_failure_message(&message) {
@@ -5540,32 +5813,38 @@ async fn pending_delivery_context(
             if block.trim().is_empty() {
                 continue;
             }
-            let candidate = format!("{body}\n\n{block}");
-            if usage::estimate_tokens(&candidate) > budget {
-                continue;
-            }
-            body = candidate;
-            included += 1;
+            items.push((message.created_at, block, source_id));
             continue;
         }
         if let Some(event) = entry.event {
-            if !same_scope(&event.scope, scope) || exclude_ids.contains(event.id.as_str()) {
+            if !same_scope(&event.scope, scope)
+                || exclude_ids.contains(event.id.as_str())
+                || exclude_ids.contains(source_id.as_str())
+            {
                 continue;
             }
             seen_relevant += 1;
             let block = render_context_event_block(&event, actor_names);
-            let candidate = format!("{body}\n\n{block}");
-            if usage::estimate_tokens(&candidate) > budget {
-                continue;
-            }
-            body = candidate;
-            included += 1;
+            items.push((event.occurred_at, block, source_id));
+        }
+    }
+    items.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut ack_source_ids = Vec::new();
+    for (_, block, source_id) in items {
+        let candidate = format!("{body}\n\n{block}");
+        if usage::estimate_tokens(&candidate) > budget {
+            continue;
+        }
+        body = candidate;
+        included += 1;
+        if !ack_source_ids.contains(&source_id) {
+            ack_source_ids.push(source_id);
         }
     }
     let gap_count =
         seen_relevant.saturating_sub(included) + usize::from(result.next_cursor.is_some());
     let hint = (gap_count > 0).then(|| {
-        "Pending same-scope deliveries exceeded the turn context budget; use `loom inbox list --state pending` or `loom message read --target <scope>` to inspect the rest.".to_string()
+        "Pending same-scope deliveries exceeded the turn context budget; use `loom --json inbox list --state pending --no-ack` or `loom --json message read --target <scope>` to inspect the rest.".to_string()
     });
     let section = if included == 0 { String::new() } else { body };
     Ok(DeliveryCursorContext {
@@ -5575,6 +5854,7 @@ async fn pending_delivery_context(
             included,
             hint,
         },
+        ack_source_ids,
     })
 }
 
@@ -5591,7 +5871,7 @@ fn channel_root_context_hint(trigger: &AgentTrigger) -> Option<String> {
         return None;
     }
     Some(format!(
-        "Channel timeline is not injected for a root channel wake. Use `loom message read --target '#{}'` to inspect channel mainline context.",
+        "Channel timeline is not injected for a root channel wake. Use `loom --json message read --target '#{}'` to inspect channel mainline context.",
         message.scope.id
     ))
 }
@@ -5660,6 +5940,50 @@ async fn agents_md_context_for_scope(
         workspace: String::new(),
         members,
         agent_instructions: agent_instructions_text(&state.spec),
+        wake_policy: agents_md_wake_policy(&state.spec),
+    }
+}
+
+fn agents_md_wake_policy(spec: &AgentSpec) -> agent_runtime::AgentsMdWakePolicy {
+    let wake = spec.wake.as_ref();
+    agent_runtime::AgentsMdWakePolicy {
+        coalesce: wake.and_then(|wake| wake.coalesce).unwrap_or(true),
+        debounce_ms: wake.and_then(|wake| wake.debounce_ms).unwrap_or(0),
+        reply_reminder: wake
+            .and_then(|wake| wake.reply_reminder)
+            .unwrap_or_default()
+            .into_agents_md_label()
+            .into(),
+        busy_policy: wake
+            .and_then(|wake| wake.on_human_message_while_busy)
+            .unwrap_or_default()
+            .into_agents_md_label()
+            .into(),
+        context_token_budget: wake.and_then(|wake| wake.context_token_budget),
+    }
+}
+
+trait AgentsMdPolicyLabel {
+    fn into_agents_md_label(self) -> &'static str;
+}
+
+impl AgentsMdPolicyLabel for ReplyReminderMode {
+    fn into_agents_md_label(self) -> &'static str {
+        match self {
+            ReplyReminderMode::EveryTurn => "every-turn",
+            ReplyReminderMode::FirstTurn => "first-turn",
+            ReplyReminderMode::Off => "off",
+        }
+    }
+}
+
+impl AgentsMdPolicyLabel for OnHumanMessageWhileBusy {
+    fn into_agents_md_label(self) -> &'static str {
+        match self {
+            OnHumanMessageWhileBusy::Queue => "queue",
+            OnHumanMessageWhileBusy::CancelAndRequeue => "cancel-and-requeue",
+            OnHumanMessageWhileBusy::Inject => "inject",
+        }
     }
 }
 
@@ -5862,27 +6186,144 @@ fn reminder_render_for_turn(spec: &AgentSpec, first_turn: bool) -> ReminderRende
     }
 }
 
-const RESPONSE_DELIVERY_REMINDER: &str = "\n\nResponse delivery reminder:\n\
-If this message asks you to answer, speak, choose, vote, submit a result, or take your turn, make that\n\
-answer visible by executing a Loom CLI message command before ending the turn. For a public reply use\n\
-`loom --json message send --target \"$LOOM_REPLY_TARGET\" --text \"...\"`; for a private prompt reply use\n\
-`loom --json message send $LOOM_TRIGGER_PRIVATE_TO_FLAGS --text \"...\"`. Do not put the answer only in\n\
-your assistant final text: that text is private trace and is not delivered to the thread. If no visible\n\
-reply is needed, end with `loom --json run ignore --reason \"...\"`.\n\
-Closeout checklist: if another actor must act, wake them with `message ask` or `--private-to`; if task\n\
-or assignment work is finished, update/complete that lifecycle; if a workflow is waiting on future\n\
-replies, schedule a reminder; before conflicting shared output, re-read latest and use `--if-latest`.\n";
-
 const RESPONSE_DELIVERY_POINTER: &str =
-    "\n\nReply contract: deliver any visible reply with `loom --json message send` \
-(or end with `loom --json run ignore`); full rules in AGENTS.md.\n";
+    "\n\nReply contract: follow AGENTS.md#loom-operating-rules. Deliver requested replies \
+with Loom CLI before ending. Use `$LOOM_REPLY_TARGET` by default for the current workflow; \
+use bare `#channel` only for intentional channel-level updates outside the active thread. If another actor or group must continue, including public \
+phase/broadcast prompts to discuss, review, approve, vote, or continue, use `message ask` \
+with exact actor ids or an appropriate group; plain `message send` is only for no-action \
+announcements and may be rejected for action requests inside agent runs. Use same-scope \
+`message send --private-to @actor_id --target \"$LOOM_REPLY_TARGET\"` for hidden or sensitive prompts/follow-ups. \
+Do not use `message ask` for wait/no-reply/status messages that need no recipient action. \
+For informational `notify` / `notify_only` wakes with no requested action, do not send a receipt; \
+use `loom --json run ignore --reason \"no action needed\"`. \
+Use `loom --json run ignore --reason \"...\"` when no visible action is needed.\n";
 
 fn push_reminder(out: &mut String, reminder: ReminderRender) {
     match reminder {
-        ReminderRender::Full => out.push_str(RESPONSE_DELIVERY_REMINDER),
-        ReminderRender::Pointer => out.push_str(RESPONSE_DELIVERY_POINTER),
+        ReminderRender::Full | ReminderRender::Pointer => out.push_str(RESPONSE_DELIVERY_POINTER),
         ReminderRender::Skip => {}
     }
+}
+
+fn push_private_reply_instruction(out: &mut String, local_actor_id: &str, batch: &[AgentTrigger]) {
+    let mut seen = BTreeSet::new();
+    let mut actor_ids = Vec::new();
+    for trigger in batch {
+        let AgentTrigger::Message(message) = trigger else {
+            continue;
+        };
+        for actor_id in trigger_private_reply_actor_ids(message, local_actor_id) {
+            if seen.insert(actor_id.clone()) {
+                actor_ids.push(actor_id);
+            }
+        }
+    }
+    if actor_ids.is_empty() {
+        return;
+    }
+
+    let private_to_flags = actor_ids
+        .iter()
+        .map(|id| format!("--private-to @{id}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let public_ask_mentions = actor_ids
+        .iter()
+        .map(|id| format!("@{id}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    out.push_str("\n\nPrivate route for this turn:\n");
+    out.push_str(
+        "The current wake includes a private Loom message. If it is a completed private action, \
+vote, target, approval, or other answer to your earlier request, process it and route the next \
+required actor; do not answer the submitter again unless you need clarification.\n",
+    );
+    out.push_str("If you are answering back to the private requester(s), send it with:\n");
+    out.push('`');
+    out.push_str("loom --json message send ");
+    out.push_str(&private_to_flags);
+    out.push_str(" --target \"$LOOM_REPLY_TARGET\" --text \"...\"");
+    out.push_str("`\n");
+    out.push_str(
+        "Do not use a public `message send --target \"$LOOM_REPLY_TARGET\"` for a private answer. \
+Private actions, votes, target choices, and sensitive details stay private even when the reply is one word.\n",
+    );
+    out.push_str(
+        "If the private wake requires a hidden follow-up with another actor, keep that follow-up \
+private too: use `message send --private-to @actor_id --target \"$LOOM_REPLY_TARGET\" --text \"...\"`; \
+add more `--private-to` flags only for actors allowed to see it.\n",
+    );
+    out.push_str(
+        "Only when the requested output is explicitly intended for the public thread, use this \
+public `message ask` as the visible contribution so the requester is woken:\n",
+    );
+    out.push('`');
+    out.push_str("loom --json message ask ");
+    out.push_str(&public_ask_mentions);
+    out.push_str(" --target \"$LOOM_REPLY_TARGET\" --text \"...\"");
+    out.push_str("`\n");
+    out.push_str(
+        "Do not first publish that contribution with plain `message send`; it is notify-only and \
+does not wake the requester. Keep private facts out of any public text.\n",
+    );
+    out.push_str(
+        "If the private message is informational, notify-only, explicitly asks for no reply, only \
+acknowledges, waits, or repeats known state, run `loom --json run ignore --reason \"no action needed\"` \
+instead of sending another acknowledgement.\n",
+    );
+}
+
+fn push_public_wake_back_instruction(
+    out: &mut String,
+    local_actor_id: &str,
+    batch: &[AgentTrigger],
+) {
+    let mut seen = BTreeSet::new();
+    let mut requester_ids = Vec::new();
+    for trigger in batch {
+        let AgentTrigger::Message(message) = trigger else {
+            continue;
+        };
+        if message.kind != MessageKind::Agent
+            || message.delivery_policy != DeliveryPolicy::WakeAgent
+            || message.author_actor_id == local_actor_id
+            || !trigger_private_reply_actor_ids(message, local_actor_id).is_empty()
+        {
+            continue;
+        }
+        if seen.insert(message.author_actor_id.clone()) {
+            requester_ids.push(message.author_actor_id.clone());
+        }
+    }
+    if requester_ids.is_empty() {
+        return;
+    }
+
+    let mentions = requester_ids
+        .iter()
+        .map(|id| format!("@{id}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    out.push_str("\n\nPublic wake-back route for this turn:\n");
+    out.push_str(
+        "The current public wake came from another agent. If it is a completed answer to your \
+earlier request, process it and route the next required actor; do not wake the submitter again \
+unless you need clarification.\n",
+    );
+    out.push_str(
+        "If you are answering, confirming, choosing, voting, submitting a result, or completing \
+a step for that requester/coordinator and they must continue after your reply, wake them with:\n",
+    );
+    out.push('`');
+    out.push_str("loom --json message ask ");
+    out.push_str(&mentions);
+    out.push_str(" --target \"$LOOM_REPLY_TARGET\" --text \"...\"");
+    out.push_str("`\n");
+    out.push_str(
+        "Use plain `message send --target \"$LOOM_REPLY_TARGET\"` only when your public reply \
+does not require any actor to act next.\n",
+    );
 }
 
 fn render_turn_input_contract_with_names(
@@ -5909,15 +6350,31 @@ fn render_turn_input_contract_with_names(
     actor_name_map
         .entry(local_actor_id.to_string())
         .or_insert_with(|| json!(local_display_name));
+    let wake_count = wake.len();
+    let reply_target = primary.reply_target();
+    let read_scope_command =
+        read_scope_command_for_prompt(reply_target.as_deref(), primary.scope());
     let header = json!({
         "version": "loom.turn-input.v1",
         "turn": {
             "runId": run_id,
             "firstTurnInScope": first_turn,
             "scope": scope_ref_value(primary.scope()),
-            "replyTarget": primary.reply_target(),
+            "replyTarget": reply_target,
             "replyContract": "AGENTS.md#loom-operating-rules",
             "actor": actor_ref_value(local_actor_id, local_display_name, actor_names),
+        },
+        "inbox": {
+            "wakeCount": wake_count,
+            "wake": "Messages/events delivered to this provider turn; handle these before ending.",
+            "pendingSameScope": {
+                "includedBelow": unread_gap.included,
+                "omittedByBudget": unread_gap.count,
+                "hint": unread_gap.hint,
+            },
+            "ack": "worker-managed",
+            "inspectPendingCommand": "loom --json inbox list --state pending --no-ack",
+            "readScopeCommand": read_scope_command.clone(),
         },
         "wake": wake,
         "unreadGap": unread_gap,
@@ -5927,12 +6384,60 @@ fn render_turn_input_contract_with_names(
         .unwrap_or_else(|_| "{\"version\":\"loom.turn-input.v1\"}".into());
     let mut out = String::from("=== Loom turn input v1 ===\n");
     out.push_str(&fenced_block("json", &header_text));
+    push_turn_inbox_summary(&mut out, wake_count, unread_gap, &read_scope_command);
     for trigger in batch {
         out.push_str("\n\n");
         out.push_str(&render_trigger_body_block(trigger));
     }
     push_reminder(&mut out, reminder);
+    push_private_reply_instruction(&mut out, local_actor_id, batch);
+    push_public_wake_back_instruction(&mut out, local_actor_id, batch);
     out
+}
+
+fn push_turn_inbox_summary(
+    out: &mut String,
+    wake_count: usize,
+    unread_gap: &TurnUnreadGap,
+    read_scope_command: &str,
+) {
+    out.push_str("\n\n=== Loom turn inbox summary ===\n");
+    out.push_str(&format!(
+        "- Current wake entries: {wake_count}. These are the primary messages/events delivered to this turn.\n"
+    ));
+    out.push_str(&format!(
+        "- Pending same-scope deliveries included below: {}. Omitted by budget/page: {}.\n",
+        unread_gap.included, unread_gap.count
+    ));
+    out.push_str(
+        "- The worker acknowledges delivered items; do not manually mark pending deliveries read while only inspecting context.\n",
+    );
+    out.push_str(
+        "- To inspect pending deliveries without consuming them: `loom --json inbox list --state pending --no-ack`.\n",
+    );
+    out.push_str(&format!(
+        "- To inspect the current conversation: `{}`.\n",
+        read_scope_command
+    ));
+    out.push_str(
+        "- If this turn asks for a decision, vote, review, tally, next speaker, or other stateful \
+choice, inspect enough current conversation before answering so the choice reflects prior context.\n",
+    );
+    if let Some(hint) = unread_gap.hint.as_deref().filter(|hint| !hint.is_empty()) {
+        out.push_str("- Gap hint: ");
+        out.push_str(hint);
+        out.push('\n');
+    }
+}
+
+fn read_scope_command_for_prompt(reply_target: Option<&str>, scope: &ScopeRef) -> String {
+    if let Some(target) = reply_target.filter(|target| !target.trim().is_empty()) {
+        return format!("loom --json message read --target '{}'", target);
+    }
+    match scope.kind {
+        ScopeKind::Thread => format!("loom --json message read --thread {}", scope.id),
+        ScopeKind::Channel => format!("loom --json message read --target '#{}'", scope.id),
+    }
 }
 
 fn wake_header_value(
@@ -6287,6 +6792,30 @@ fn message_visibility_label(
     private.then_some("private".into())
 }
 
+fn message_visible_to_actor_for_prompt(message: &Message, local_actor_id: &str) -> bool {
+    let private_actor_ids = private_actor_ids_for_prompt(&message.metadata);
+    let private = !private_actor_ids.is_empty()
+        || message
+            .metadata
+            .get("private")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        || message
+            .metadata
+            .get("visibility")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.eq_ignore_ascii_case("private"));
+    if !private {
+        return true;
+    }
+    message.author_actor_id == local_actor_id
+        || private_actor_ids.iter().any(|id| id == local_actor_id)
+        || message
+            .audience
+            .iter()
+            .any(|audience| audience.kind == AudienceKind::Actor && audience.id == local_actor_id)
+}
+
 fn private_actor_ids_for_prompt(metadata: &Meta) -> Vec<String> {
     let mut out = BTreeSet::new();
     for key in ["privateTo", "privateActorIds"] {
@@ -6600,8 +7129,7 @@ async fn compose_envelope_prompt(
     };
     let scope = trigger.scope();
     let conversation_context = trigger_prompt.delivery_context.clone();
-    let runtime_context =
-        join_prompt_sections([local_time_manifest(), conversation_context.clone()]);
+    let runtime_context = local_time_manifest();
     let profile_prompt_files = load_profile_prompt_files_section(&state.profile_dir);
     let channel_id = resolve_channel_for_scope(client, state, scope).await;
     let template_vars = channel_id
@@ -7183,8 +7711,11 @@ async fn translate_one(
             } else {
                 let _ = state.take_text(&active.id);
             }
-            append_trace(
+            append_trace_or_report(
                 client,
+                state,
+                &active,
+                actor_id,
                 &active.run_id,
                 TraceKind::TextDelta,
                 json!({ "text": content }),
@@ -7203,8 +7734,11 @@ async fn translate_one(
             if active.cancel_requested {
                 return Ok(());
             }
-            append_trace(
+            append_trace_or_report(
                 client,
+                state,
+                &active,
+                actor_id,
                 &active.run_id,
                 TraceKind::ToolStart,
                 json!({ "toolName": tool_name, "input": input }),
@@ -7267,8 +7801,11 @@ async fn translate_one(
                 if active.cancel_requested {
                     return Ok(());
                 }
-                append_trace(
+                append_trace_or_report(
                     client,
+                    state,
+                    &active,
+                    actor_id,
                     &active.run_id,
                     TraceKind::Status,
                     json!({ "status": status }),
@@ -7296,8 +7833,11 @@ async fn translate_one(
                 if active.cancel_requested {
                     return Ok(());
                 }
-                append_trace(
+                append_trace_or_report(
                     client,
+                    state,
+                    &active,
+                    actor_id,
                     &active.run_id,
                     TraceKind::Status,
                     json!({
@@ -7354,8 +7894,11 @@ async fn translate_one(
             }
             if !success {
                 if let Some(text) = failed_turn_text(&summary) {
-                    append_trace(
+                    append_trace_or_report(
                         client,
+                        state,
+                        &active,
+                        actor_id,
                         &active.run_id,
                         TraceKind::Error,
                         json!({ "message": text }),
@@ -7369,8 +7912,11 @@ async fn translate_one(
             // mirroring the dual-write into the message metadata. Skip when
             // the adapter did not report any usage for this turn.
             if let Some(final_usage) = usage.as_ref() {
-                append_trace(
+                append_trace_or_report(
                     client,
+                    state,
+                    &active,
+                    actor_id,
                     &active.run_id,
                     TraceKind::Status,
                     json!({
@@ -7396,6 +7942,16 @@ async fn translate_one(
                     %e,
                     "run.close RPC failed; clearing slot anyway so the queue can drain"
                 );
+                publish_runtime_warning_once(
+                    client,
+                    state,
+                    &active,
+                    actor_id,
+                    "run.close",
+                    "failed to close run; queue will continue",
+                    &e,
+                )
+                .await;
             }
             if active.ack_on_finish {
                 for source_id in turn_source_ids(&active) {
@@ -7426,6 +7982,7 @@ async fn translate_one(
                 .unwrap_or_else(|| active.scope.id.clone());
             let next_batch =
                 state.finish_and_next_batch(&scope_id, wake_coalesce_enabled(&state.spec));
+            let next_batch = rebase_queued_batch_or_release(client, state, next_batch).await;
             if !next_batch.is_empty() {
                 match dispatch_trigger_batch(client, state, adapter, next_batch).await {
                     Ok(_) => {}
@@ -7437,13 +7994,27 @@ async fn translate_one(
         }
         AdapterEvent::Error { scope: _, message } => {
             if let Some(active) = active {
-                append_trace(
+                let warning = anyhow!(message.clone());
+                append_trace_or_report(
                     client,
+                    state,
+                    &active,
+                    actor_id,
                     &active.run_id,
                     TraceKind::Error,
                     json!({ "message": message }),
                 )
                 .await?;
+                publish_runtime_warning_once(
+                    client,
+                    state,
+                    &active,
+                    actor_id,
+                    "adapter.error",
+                    "provider adapter reported an error",
+                    &warning,
+                )
+                .await;
             } else {
                 tracing::error!("[{actor_id}] adapter error (agent-wide): {message}");
             }
@@ -7487,6 +8058,99 @@ async fn publish_failed_turn_notice(
             "failed to publish agent runtime failure"
         );
     }
+}
+
+async fn publish_runtime_warning_once(
+    client: &Arc<Client>,
+    state: &WorkerState,
+    active: &ActiveTurn,
+    actor_id: &str,
+    category: &str,
+    summary: &str,
+    err: &anyhow::Error,
+) {
+    if active.cancel_requested || !state.mark_runtime_warning_reported(&active.run_id, category) {
+        return;
+    }
+    let error = truncate_runtime_warning_error(&format!("{err:#}"));
+    let body = format!(
+        "Agent runtime warning: {summary}.\n\nRun `{}` will continue, but this system error was surfaced instead of hidden.\n\nError: {error}",
+        active.run_id
+    );
+    let mut meta = build_turn_base_meta(active);
+    meta.insert("kind".into(), json!("agent.runtime_warning"));
+    meta.insert("runtimeWarning".into(), json!(true));
+    meta.insert("category".into(), json!(category));
+
+    if let Err(e) = flush_runtime_warning_text(client, actor_id, active, body, meta).await {
+        tracing::warn!(
+            actor = %actor_id,
+            turn = %active.id,
+            scope = %active.scope.id,
+            category = %category,
+            %e,
+            "failed to publish agent runtime warning"
+        );
+    }
+}
+
+fn truncate_runtime_warning_error(error: &str) -> String {
+    const MAX_CHARS: usize = 2000;
+    let trimmed = error.trim();
+    if trimmed.chars().count() <= MAX_CHARS {
+        return trimmed.to_string();
+    }
+    let mut out = trimmed.chars().take(MAX_CHARS).collect::<String>();
+    out.push_str("\n... truncated ...");
+    out
+}
+
+async fn flush_runtime_warning_text(
+    client: &Arc<Client>,
+    actor_id: &str,
+    active: &ActiveTurn,
+    body: String,
+    meta: Meta,
+) -> Result<()> {
+    let trigger_actor = active.trigger_actor.trim();
+    let audience_actor_id = if trigger_actor.is_empty() || trigger_actor == actor_id {
+        None
+    } else {
+        Some(trigger_actor.to_string())
+    };
+    if let Some(target) = active.reply_target.as_deref() {
+        let parent_message_id = parent_message_id_for_reply_target(
+            &active.trigger_source_id,
+            target,
+            active.trigger_is_message,
+        );
+        return send_agent_message(
+            client,
+            target,
+            body,
+            parent_message_id,
+            audience_actor_id,
+            MessageIntent::StatusUpdate,
+            DeliveryPolicy::NotifyOnly,
+            meta,
+        )
+        .await
+        .map(|_| ());
+    }
+    send_scope_message(
+        client,
+        &active.scope,
+        body,
+        active
+            .trigger_is_message
+            .then(|| active.trigger_source_id.clone()),
+        audience_actor_id,
+        MessageIntent::StatusUpdate,
+        DeliveryPolicy::NotifyOnly,
+        meta,
+    )
+    .await
+    .map(|_| ())
 }
 
 struct FailureNotice {
@@ -7704,18 +8368,51 @@ async fn append_trace(
     kind: TraceKind,
     payload: Value,
 ) -> Result<()> {
+    let frame_kind = trace_frame_kind(kind);
     let _: RunAppendResult = client
         .call(
             method::RUN_APPEND,
             json!({
                 "runId": run_id,
                 "status": "running",
-                "frameKind": trace_frame_kind(kind),
+                "frameKind": frame_kind,
                 "payload": payload,
             }),
         )
         .await
-        .with_context(|| format!("run.append run={run_id}"))?;
+        .with_context(|| format!("run.append run={run_id} frame={frame_kind}"))?;
+    Ok(())
+}
+
+async fn append_trace_or_report(
+    client: &Arc<Client>,
+    state: &Arc<WorkerState>,
+    active: &ActiveTurn,
+    actor_id: &str,
+    run_id: &str,
+    kind: TraceKind,
+    payload: Value,
+) -> Result<()> {
+    if let Err(err) = append_trace(client, run_id, kind, payload).await {
+        let frame_kind = trace_frame_kind(kind);
+        tracing::warn!(
+            actor = %actor_id,
+            run = %run_id,
+            frame_kind = %frame_kind,
+            %err,
+            "run.append failed; exposing runtime warning and continuing so the active turn can drain"
+        );
+        publish_runtime_warning_once(
+            client,
+            state,
+            active,
+            actor_id,
+            "run.append",
+            &format!("failed to persist {frame_kind} trace frame; workflow will continue"),
+            &err,
+        )
+        .await;
+    }
     Ok(())
 }
 
@@ -8451,6 +9148,7 @@ mod tests {
             workspace: String::new(),
             members: Vec::new(),
             agent_instructions: None,
+            wake_policy: agent_runtime::AgentsMdWakePolicy::default(),
         };
         let scope_paths = paths
             .ensure_scope("actor_demo", "chan_demo", &scope, None, &agents_md_context)
@@ -8561,6 +9259,7 @@ mod tests {
             workspace: String::new(),
             members: Vec::new(),
             agent_instructions: None,
+            wake_policy: agent_runtime::AgentsMdWakePolicy::default(),
         };
 
         let scope_paths = paths
@@ -8926,6 +9625,23 @@ mod tests {
         assert!(paths.contains(&PathBuf::from("/opt/loom/bin")));
         assert!(paths.contains(&PathBuf::from("/usr/bin")));
         assert!(paths.contains(&PathBuf::from("/bin")));
+    }
+
+    #[test]
+    fn command_path_defaults_include_common_macos_tool_dirs() {
+        let mut env = BTreeMap::new();
+        let path_list =
+            std::env::join_paths(&[PathBuf::from("/usr/bin"), PathBuf::from("/bin")]).unwrap();
+        env.insert("PATH".into(), path_list.into_string().unwrap());
+
+        ensure_command_path_defaults(&mut env);
+
+        let path_val = env.get("PATH").expect("PATH");
+        let paths = std::env::split_paths(path_val).collect::<Vec<_>>();
+        assert!(paths.contains(&PathBuf::from("/usr/bin")));
+        assert!(paths.contains(&PathBuf::from("/bin")));
+        assert!(paths.contains(&PathBuf::from("/opt/homebrew/bin")));
+        assert!(paths.contains(&PathBuf::from("/usr/local/bin")));
     }
 
     #[test]
@@ -9305,6 +10021,47 @@ mod tests {
     }
 
     #[test]
+    fn durable_channel_root_delivery_row_wakes_agent_worker() {
+        let message = sample_message(
+            "msg_channel_root",
+            ScopeRef {
+                kind: ScopeKind::Channel,
+                id: "chan_demo".into(),
+            },
+            "#chan_demo",
+            None,
+            None,
+        );
+
+        assert!(!is_inbox_message_for_us(&message, "actor_agent_echo"));
+        assert!(is_durable_inbox_message_for_us(
+            &message,
+            "actor_agent_echo",
+            "actor_agent_echo"
+        ));
+    }
+
+    #[test]
+    fn durable_delivery_row_for_other_actor_does_not_wake_agent_worker() {
+        let message = sample_message(
+            "msg_other_actor",
+            ScopeRef {
+                kind: ScopeKind::Channel,
+                id: "chan_demo".into(),
+            },
+            "#chan_demo",
+            None,
+            None,
+        );
+
+        assert!(!is_durable_inbox_message_for_us(
+            &message,
+            "actor_agent_echo",
+            "actor_agent_other"
+        ));
+    }
+
+    #[test]
     fn explicit_notify_only_actor_inbox_delivery_wakes_agent_worker() {
         let mut message = sample_message(
             "msg_notify",
@@ -9348,6 +10105,11 @@ mod tests {
         message.delivery_policy = DeliveryPolicy::Silent;
 
         assert!(!is_inbox_message_for_us(&message, "actor_agent_echo"));
+        assert!(!is_durable_inbox_message_for_us(
+            &message,
+            "actor_agent_echo",
+            "actor_agent_echo"
+        ));
     }
 
     #[test]
@@ -10140,6 +10902,7 @@ mod tests {
             assignment_context: "assignment".into(),
             delivery_context: String::new(),
             turn_input: "latest\n\nassignment".into(),
+            ack_source_ids: Vec::new(),
         };
 
         add_turn_input_prompt_parts(&mut prompt, &trigger_prompt, &trigger_prompt.turn_input);
@@ -10397,6 +11160,7 @@ mod tests {
             assignment_context: String::new(),
             delivery_context: String::new(),
             turn_input: "latest".into(),
+            ack_source_ids: Vec::new(),
         };
         add_turn_input_prompt_parts(&mut prompt, &trigger_prompt, &trigger_prompt.turn_input);
 
@@ -11190,6 +11954,141 @@ mod tests {
     }
 
     #[test]
+    fn pending_sources_folded_into_turn_are_removed_from_local_queue() {
+        let root = temp_path("drop-folded-pending-sources");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        let state = WorkerState::new(
+            "actor_demo".into(),
+            sample_spec(None),
+            paths.profile.clone(),
+            paths,
+            "ws://127.0.0.1:0".into(),
+        );
+        let scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: "thread_folded".into(),
+        };
+        let mk = |id: &str| {
+            let mut message = sample_message(
+                id,
+                scope.clone(),
+                "#chan_demo:msg_root",
+                Some("msg_root"),
+                Some("msg_root"),
+            );
+            message.author_actor_id = "actor_human".into();
+            AgentTrigger::Message(message)
+        };
+        let turn_key = turn_key_for_scope(&scope);
+        let active_trigger = mk("msg_wake");
+        assert!(state.begin_or_enqueue(&turn_key, active_trigger.clone()));
+        state.set_turn(ActiveTurn {
+            id: "turn_wake".into(),
+            run_id: "run_wake".into(),
+            turn_key: turn_key.clone(),
+            scope: scope.clone(),
+            trigger_source_id: "msg_wake".into(),
+            trigger_source_ids: vec!["msg_wake".into(), "msg_folded".into()],
+            trigger_batch: vec![active_trigger],
+            ack_on_finish: true,
+            trigger_is_message: true,
+            assignment_id: None,
+            reply_target: Some("#chan_demo:msg_root".into()),
+            prompt_stats: empty_prompt_stats(),
+            prompt_breakdown: empty_prompt_breakdown(),
+            trigger_actor: "actor_human".into(),
+            trigger_private_to: Vec::new(),
+            no_reply_file: None,
+            no_reply_requested: false,
+            cancel_requested: false,
+        });
+
+        assert!(!state.begin_or_enqueue(&turn_key, mk("msg_folded")));
+        assert!(!state.begin_or_enqueue(&turn_key, mk("msg_later")));
+
+        state.drop_pending_sources(&["msg_wake".into(), "msg_folded".into()]);
+
+        let batch = state.finish_and_next_batch(&scope.id, true);
+        assert_eq!(
+            batch.iter().map(|t| t.id().to_string()).collect::<Vec<_>>(),
+            vec!["msg_later"]
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn queued_batch_rebase_replaces_stale_local_trigger_with_latest_pending() {
+        let scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: "thread_rebase".into(),
+        };
+        let mk = |id: &str, seconds: i64| {
+            let mut message = sample_message(
+                id,
+                scope.clone(),
+                "#chan_demo:msg_root",
+                Some("msg_root"),
+                Some("msg_root"),
+            );
+            message.created_at = Utc::now() + chrono::Duration::seconds(seconds);
+            AgentTrigger::Message(message)
+        };
+        let batch = vec![mk("msg_stale_local", 0)];
+        let mut pending_source_ids = HashSet::new();
+        pending_source_ids.insert("msg_latest_pending".to_string());
+        pending_source_ids.insert("msg_older_pending".to_string());
+
+        let rebased = rebase_queued_batch_with_pending_snapshot(
+            batch,
+            &pending_source_ids,
+            vec![mk("msg_older_pending", 1), mk("msg_latest_pending", 2)],
+        );
+
+        assert_eq!(
+            rebased
+                .iter()
+                .map(|trigger| trigger.id().to_string())
+                .collect::<Vec<_>>(),
+            vec!["msg_latest_pending"]
+        );
+    }
+
+    #[test]
+    fn queued_batch_rebase_keeps_local_trigger_still_pending() {
+        let scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: "thread_rebase_keep".into(),
+        };
+        let mk = |id: &str| {
+            AgentTrigger::Message(sample_message(
+                id,
+                scope.clone(),
+                "#chan_demo:msg_root",
+                Some("msg_root"),
+                Some("msg_root"),
+            ))
+        };
+        let batch = vec![mk("msg_still_pending")];
+        let mut pending_source_ids = HashSet::new();
+        pending_source_ids.insert("msg_still_pending".to_string());
+        pending_source_ids.insert("msg_latest_pending".to_string());
+
+        let rebased = rebase_queued_batch_with_pending_snapshot(
+            batch,
+            &pending_source_ids,
+            vec![mk("msg_latest_pending")],
+        );
+
+        assert_eq!(
+            rebased
+                .iter()
+                .map(|trigger| trigger.id().to_string())
+                .collect::<Vec<_>>(),
+            vec!["msg_still_pending"]
+        );
+    }
+
+    #[test]
     fn cancel_and_requeue_puts_active_batch_before_new_human_message() {
         let root = temp_path("cancel-requeue");
         let paths = AgentPaths::new(&root, "actor_demo");
@@ -11505,7 +12404,13 @@ mod tests {
             true,
             &TurnUnreadGap::empty(),
         );
-        assert!(full.contains("Response delivery reminder:"));
+        assert!(!full.contains("Response delivery reminder:"));
+        assert!(full.contains("Reply contract:"));
+        assert!(full.contains("AGENTS.md#loom-operating-rules"));
+        assert!(full.contains("If another actor or group must continue"));
+        assert!(full.contains("public phase/broadcast prompts"));
+        assert!(full.contains("plain `message send` is only for no-action announcements"));
+        assert!(full.contains("loom --json run ignore --reason"));
 
         let pointer = render_turn_input_contract_with_names(
             "actor_self",
@@ -11519,7 +12424,11 @@ mod tests {
         );
         assert!(!pointer.contains("Response delivery reminder:"));
         assert!(pointer.contains("Reply contract:"));
-        assert!(pointer.contains("AGENTS.md"));
+        assert!(pointer.contains("AGENTS.md#loom-operating-rules"));
+        assert!(pointer.contains("If another actor or group must continue"));
+        assert!(pointer.contains("public phase/broadcast prompts"));
+        assert!(pointer.contains("plain `message send` is only for no-action announcements"));
+        assert!(pointer.contains("loom --json run ignore --reason"));
 
         let skip = render_turn_input_contract_with_names(
             "actor_self",
@@ -11585,6 +12494,268 @@ mod tests {
     }
 
     #[test]
+    fn turn_input_inbox_summary_exposes_safe_read_commands() {
+        let actor_names = HashMap::new();
+        let message = sample_message(
+            "msg_inbox",
+            ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_demo".into(),
+            },
+            "#chan_demo:msg_root",
+            Some("msg_root"),
+            Some("msg_root"),
+        );
+        let gap = TurnUnreadGap {
+            count: 2,
+            included: 1,
+            hint: Some("read more with --no-ack".into()),
+        };
+
+        let prompt = render_turn_input_contract_with_names(
+            "actor_self",
+            "Self",
+            &[AgentTrigger::Message(message)],
+            &actor_names,
+            ReminderRender::Skip,
+            "run_inbox",
+            false,
+            &gap,
+        );
+        let header = turn_header_value(&prompt);
+
+        assert_eq!(header["inbox"]["wakeCount"], 1);
+        assert_eq!(header["inbox"]["pendingSameScope"]["includedBelow"], 1);
+        assert_eq!(header["inbox"]["pendingSameScope"]["omittedByBudget"], 2);
+        assert_eq!(header["inbox"]["ack"], "worker-managed");
+        assert!(prompt.contains("=== Loom turn inbox summary ==="));
+        assert!(prompt.contains("worker acknowledges delivered items"));
+        assert!(prompt.contains("loom --json inbox list --state pending --no-ack"));
+        assert!(prompt.contains("loom --json message read --target '#chan_demo:msg_root'"));
+        assert!(prompt.contains("decision, vote, review, tally, next speaker"));
+    }
+
+    #[test]
+    fn pending_context_ack_sources_extend_turn_sources_once() {
+        let mut source_ids = vec!["msg_wake".to_string(), "msg_coalesced".to_string()];
+
+        extend_unique_source_ids(
+            &mut source_ids,
+            vec![
+                "msg_pending_new".to_string(),
+                "msg_wake".to_string(),
+                "msg_pending_new".to_string(),
+                "evt_pending".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            source_ids,
+            vec![
+                "msg_wake",
+                "msg_coalesced",
+                "msg_pending_new",
+                "evt_pending"
+            ]
+        );
+    }
+
+    #[test]
+    fn private_prompt_renders_exact_private_reply_command() {
+        let mut actor_names = HashMap::new();
+        actor_names.insert("actor_agent_dm".into(), "DM".into());
+        actor_names.insert("actor_player".into(), "Player".into());
+        let mut message = sample_message(
+            "msg_private",
+            ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_demo".into(),
+            },
+            "#chan_demo:msg_root",
+            Some("msg_root"),
+            Some("msg_root"),
+        );
+        message.author_actor_id = "actor_agent_dm".into();
+        message.audience = vec![proto::types::AudienceRef {
+            kind: AudienceKind::Actor,
+            id: "actor_player".into(),
+            display: Some("Player".into()),
+        }];
+        message.metadata.insert("private".into(), json!(true));
+        message
+            .metadata
+            .insert("privateTo".into(), json!(["actor_player"]));
+
+        let prompt = render_turn_input_contract_with_names(
+            "actor_player",
+            "Player",
+            &[AgentTrigger::Message(message)],
+            &actor_names,
+            ReminderRender::Skip,
+            "run_private",
+            false,
+            &TurnUnreadGap::empty(),
+        );
+
+        assert!(prompt.contains("Private route for this turn:"));
+        assert!(prompt.contains("completed private action"));
+        assert!(prompt.contains("route the next required actor"));
+        assert!(prompt.contains(
+            "loom --json message send --private-to @actor_agent_dm --target \"$LOOM_REPLY_TARGET\" --text \"...\""
+        ));
+        assert!(prompt.contains(
+            "Private actions, votes, target choices, and sensitive details stay private"
+        ));
+        assert!(prompt.contains("requires a hidden follow-up with another actor"));
+        assert!(prompt.contains("add more `--private-to` flags only for actors allowed"));
+        assert!(prompt.contains(
+            "loom --json message ask @actor_agent_dm --target \"$LOOM_REPLY_TARGET\" --text \"...\""
+        ));
+        assert!(prompt.contains("explicitly intended for the public thread"));
+        assert!(prompt.contains("plain `message send`; it is notify-only"));
+        assert!(prompt.contains("Keep private facts out of any public text"));
+        assert!(prompt.contains("only acknowledges, waits, or repeats known state"));
+        assert!(prompt.contains("loom --json run ignore --reason \"no action needed\""));
+    }
+
+    #[test]
+    fn public_agent_ask_renders_wake_back_command_to_requester() {
+        let mut actor_names = HashMap::new();
+        actor_names.insert("actor_agent_dm".into(), "DM".into());
+        actor_names.insert("actor_player".into(), "Player".into());
+        let mut message = sample_message(
+            "msg_public_ask",
+            ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_demo".into(),
+            },
+            "#chan_demo:msg_root",
+            Some("msg_root"),
+            Some("msg_root"),
+        );
+        message.author_actor_id = "actor_agent_dm".into();
+        message.kind = MessageKind::Agent;
+        message.intent = MessageIntent::Ask;
+        message.delivery_policy = DeliveryPolicy::WakeAgent;
+        message.audience = vec![proto::types::AudienceRef {
+            kind: AudienceKind::Actor,
+            id: "actor_player".into(),
+            display: Some("Player".into()),
+        }];
+
+        let prompt = render_turn_input_contract_with_names(
+            "actor_player",
+            "Player",
+            &[AgentTrigger::Message(message)],
+            &actor_names,
+            ReminderRender::Skip,
+            "run_public",
+            false,
+            &TurnUnreadGap::empty(),
+        );
+
+        assert!(prompt.contains("Public wake-back route for this turn:"));
+        assert!(prompt.contains("came from another agent"));
+        assert!(prompt.contains("completed answer to your earlier request"));
+        assert!(prompt.contains("route the next required actor"));
+        assert!(prompt.contains(
+            "loom --json message ask @actor_agent_dm --target \"$LOOM_REPLY_TARGET\" --text \"...\""
+        ));
+        assert!(prompt.contains("does not require any actor to act next"));
+    }
+
+    #[test]
+    fn runtime_warning_errors_are_trimmed_and_truncated() {
+        assert_eq!(
+            truncate_runtime_warning_error("  short error  "),
+            "short error"
+        );
+
+        let long = "x".repeat(2_100);
+        let truncated = truncate_runtime_warning_error(&long);
+        assert!(truncated.ends_with("\n... truncated ..."));
+        assert_eq!(
+            truncated.chars().count(),
+            2000 + "\n... truncated ...".chars().count()
+        );
+    }
+
+    #[test]
+    fn human_public_ask_does_not_render_wake_back_command() {
+        let mut actor_names = HashMap::new();
+        actor_names.insert("actor_human_local".into(), "Human".into());
+        let mut message = sample_message(
+            "msg_human_ask",
+            ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_demo".into(),
+            },
+            "#chan_demo:msg_root",
+            Some("msg_root"),
+            Some("msg_root"),
+        );
+        message.author_actor_id = "actor_human_local".into();
+        message.intent = MessageIntent::Ask;
+        message.delivery_policy = DeliveryPolicy::WakeAgent;
+
+        let prompt = render_turn_input_contract_with_names(
+            "actor_agent_dm",
+            "DM",
+            &[AgentTrigger::Message(message)],
+            &actor_names,
+            ReminderRender::Skip,
+            "run_human",
+            true,
+            &TurnUnreadGap::empty(),
+        );
+
+        assert!(!prompt.contains("Public wake-back route for this turn:"));
+        assert!(!prompt.contains("message ask @actor_human_local"));
+    }
+
+    #[test]
+    fn prompt_history_filters_private_messages_by_actor() {
+        let mut message = sample_message(
+            "msg_private_filter",
+            ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_demo".into(),
+            },
+            "#chan_demo:msg_root",
+            Some("msg_root"),
+            Some("msg_root"),
+        );
+        message.author_actor_id = "actor_sender".into();
+        assert!(message_visible_to_actor_for_prompt(
+            &message,
+            "actor_observer"
+        ));
+
+        message.metadata.insert("private".into(), json!(true));
+        message
+            .metadata
+            .insert("privateTo".into(), json!(["actor_allowed"]));
+        message.audience = vec![proto::types::AudienceRef {
+            kind: AudienceKind::Actor,
+            id: "actor_allowed".into(),
+            display: Some("Allowed".into()),
+        }];
+
+        assert!(message_visible_to_actor_for_prompt(
+            &message,
+            "actor_sender"
+        ));
+        assert!(message_visible_to_actor_for_prompt(
+            &message,
+            "actor_allowed"
+        ));
+        assert!(!message_visible_to_actor_for_prompt(
+            &message,
+            "actor_observer"
+        ));
+    }
+
+    #[test]
     fn turn_input_contract_fences_raw_body_without_mention_rewrite() {
         let mut actor_names = HashMap::new();
         actor_names.insert("actor_agent_echo".into(), "Echo".into());
@@ -11635,7 +12806,7 @@ mod tests {
         let hint = channel_root_context_hint(&AgentTrigger::Message(message)).expect("hint");
 
         assert!(hint.contains("Channel timeline is not injected"));
-        assert!(hint.contains("loom message read --target '#chan_demo'"));
+        assert!(hint.contains("loom --json message read --target '#chan_demo'"));
     }
 
     #[test]
@@ -11701,7 +12872,8 @@ mod tests {
         assert_eq!(wake[1]["intent"], "ask");
         assert!(prompt.contains("先看这个"));
         assert!(prompt.contains("补充一点"));
-        assert_eq!(prompt.matches("Response delivery reminder:").count(), 1);
+        assert_eq!(prompt.matches("Reply contract:").count(), 1);
+        assert!(!prompt.contains("Response delivery reminder:"));
     }
 
     #[test]

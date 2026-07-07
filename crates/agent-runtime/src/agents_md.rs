@@ -196,6 +196,11 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
 - In ordered workflows, when the latest message completes a step or names the\n\
   next participant, wake the next required actor immediately; stale waiting or\n\
   acknowledgement messages do not override that handoff.\n\
+- If the next actor depends on dynamic eligibility, permissions, lifecycle,\n\
+  membership, or other state that can change during the workflow, participants\n\
+  should wake the requester/coordinator with their completion instead of\n\
+  directly routing to another participant. The coordinator should read the\n\
+  latest state and route the next eligible actor.\n\
 - If you are the requester/coordinator receiving a completed public answer,\n\
   process it and wake the next required actor; do not ask the submitter again\n\
   unless you need clarification.\n\
@@ -388,6 +393,8 @@ mod tests {
         assert!(out.contains("identify your role for this wake"));
         assert!(out.contains("participant/contributor"));
         assert!(out.contains("ordered workflows"));
+        assert!(out.contains("dynamic eligibility"));
+        assert!(out.contains("route the next eligible actor"));
         assert!(out.contains("acknowledgement-only"));
         assert!(out.contains("plain public `message send`"));
         assert!(out.contains("private wake asks for a public contribution"));

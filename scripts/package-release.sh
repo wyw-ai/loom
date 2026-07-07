@@ -84,6 +84,7 @@ RUNTIME_TARGETS=(
   "aarch64-apple-darwin"
   "x86_64-apple-darwin"
   "universal-apple-darwin"
+  "x86_64-unknown-linux-gnu"
   "aarch64-unknown-linux-musl"
   "x86_64-unknown-linux-musl"
   "x86_64-pc-windows-msvc"
@@ -366,16 +367,19 @@ archive_sha_if_exists() {
 write_installer() {
   local installer="$PACKAGE_OUT_DIR/install.sh"
   local runtime_mac="loom-runtime-$VERSION-universal-apple-darwin.tar.gz"
+  local runtime_linux_x86_gnu="loom-runtime-$VERSION-x86_64-unknown-linux-gnu.tar.gz"
   local runtime_linux_x86="loom-runtime-$VERSION-x86_64-unknown-linux-musl.tar.gz"
   local runtime_linux_arm="loom-runtime-$VERSION-aarch64-unknown-linux-musl.tar.gz"
   local runtime_windows_x86="loom-runtime-$VERSION-x86_64-pc-windows-msvc.zip"
-  local sha_mac sha_linux_x86 sha_linux_arm sha_windows_x86
+  local sha_mac sha_linux_x86_gnu sha_linux_x86 sha_linux_arm sha_windows_x86
 
   runtime_mac="$(archive_name_if_exists "$runtime_mac")"
+  runtime_linux_x86_gnu="$(archive_name_if_exists "$runtime_linux_x86_gnu")"
   runtime_linux_x86="$(archive_name_if_exists "$runtime_linux_x86")"
   runtime_linux_arm="$(archive_name_if_exists "$runtime_linux_arm")"
   runtime_windows_x86="$(archive_name_if_exists "$runtime_windows_x86")"
   sha_mac="$(archive_sha_if_exists "$runtime_mac")"
+  sha_linux_x86_gnu="$(archive_sha_if_exists "$runtime_linux_x86_gnu")"
   sha_linux_x86="$(archive_sha_if_exists "$runtime_linux_x86")"
   sha_linux_arm="$(archive_sha_if_exists "$runtime_linux_arm")"
   sha_windows_x86="$(archive_sha_if_exists "$runtime_windows_x86")"
@@ -392,6 +396,8 @@ DEFAULT_PACKAGE_DIR="\$(CDPATH= cd "\$(dirname "\$0")" && pwd)"
 
 PKG_UNIVERSAL_APPLE_DARWIN='$runtime_mac'
 SHA_UNIVERSAL_APPLE_DARWIN='$sha_mac'
+PKG_X86_64_UNKNOWN_LINUX_GNU='$runtime_linux_x86_gnu'
+SHA_X86_64_UNKNOWN_LINUX_GNU='$sha_linux_x86_gnu'
 PKG_X86_64_UNKNOWN_LINUX_MUSL='$runtime_linux_x86'
 SHA_X86_64_UNKNOWN_LINUX_MUSL='$sha_linux_x86'
 PKG_AARCH64_UNKNOWN_LINUX_MUSL='$runtime_linux_arm'
@@ -410,6 +416,7 @@ Options:
                         Can be repeated or comma-separated. Default: all.
   -t, --target TARGET   Override target package:
                         universal-apple-darwin,
+                        x86_64-unknown-linux-gnu,
                         x86_64-unknown-linux-musl,
                         aarch64-unknown-linux-musl,
                         x86_64-pc-windows-msvc.
@@ -438,7 +445,14 @@ detect_target() {
   arch="\$(uname -m 2>/dev/null || true)"
   case "\$os:\$arch" in
     Darwin:*) printf '%s\n' universal-apple-darwin ;;
-    Linux:x86_64|Linux:amd64) printf '%s\n' x86_64-unknown-linux-musl ;;
+    Linux:x86_64|Linux:amd64)
+      # Prefer glibc on x86_64 Linux when present; static musl remains a portable fallback.
+      if [ -n "\$PKG_X86_64_UNKNOWN_LINUX_GNU" ]; then
+        printf '%s\n' x86_64-unknown-linux-gnu
+      else
+        printf '%s\n' x86_64-unknown-linux-musl
+      fi
+      ;;
     Linux:aarch64|Linux:arm64) printf '%s\n' aarch64-unknown-linux-musl ;;
     MINGW64_NT:*|MSYS_NT:*|CYGWIN_NT:*) printf '%s\n' x86_64-pc-windows-msvc ;;
     *) die "unsupported platform: \$os \$arch; pass --target explicitly" ;;
@@ -448,6 +462,7 @@ detect_target() {
 runtime_package_name() {
   case "\$1" in
     universal-apple-darwin) printf '%s\n' "\$PKG_UNIVERSAL_APPLE_DARWIN" ;;
+    x86_64-unknown-linux-gnu) printf '%s\n' "\$PKG_X86_64_UNKNOWN_LINUX_GNU" ;;
     x86_64-unknown-linux-musl) printf '%s\n' "\$PKG_X86_64_UNKNOWN_LINUX_MUSL" ;;
     aarch64-unknown-linux-musl) printf '%s\n' "\$PKG_AARCH64_UNKNOWN_LINUX_MUSL" ;;
     x86_64-pc-windows-msvc) printf '%s\n' "\$PKG_X86_64_PC_WINDOWS_MSVC" ;;
@@ -458,6 +473,7 @@ runtime_package_name() {
 runtime_sha256() {
   case "\$1" in
     universal-apple-darwin) printf '%s\n' "\$SHA_UNIVERSAL_APPLE_DARWIN" ;;
+    x86_64-unknown-linux-gnu) printf '%s\n' "\$SHA_X86_64_UNKNOWN_LINUX_GNU" ;;
     x86_64-unknown-linux-musl) printf '%s\n' "\$SHA_X86_64_UNKNOWN_LINUX_MUSL" ;;
     aarch64-unknown-linux-musl) printf '%s\n' "\$SHA_AARCH64_UNKNOWN_LINUX_MUSL" ;;
     x86_64-pc-windows-msvc) printf '%s\n' "\$SHA_X86_64_PC_WINDOWS_MSVC" ;;

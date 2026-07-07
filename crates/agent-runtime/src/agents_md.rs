@@ -20,6 +20,7 @@ pub struct AgentsMdContext {
     pub workspace: String,
     pub members: Vec<AgentsMdMember>,
     pub agent_instructions: Option<String>,
+    pub wake_policy: AgentsMdWakePolicy,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -27,6 +28,27 @@ pub struct AgentsMdMember {
     pub actor_id: String,
     pub display_name: String,
     pub kind: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentsMdWakePolicy {
+    pub coalesce: bool,
+    pub debounce_ms: u64,
+    pub reply_reminder: String,
+    pub busy_policy: String,
+    pub context_token_budget: Option<u64>,
+}
+
+impl Default for AgentsMdWakePolicy {
+    fn default() -> Self {
+        Self {
+            coalesce: true,
+            debounce_ms: 0,
+            reply_reminder: "first-turn".into(),
+            busy_policy: "queue".into(),
+            context_token_budget: None,
+        }
+    }
 }
 
 /// Create or refresh the Loom block inside `{workspace}/AGENTS.md`.
@@ -87,6 +109,7 @@ fn loom_block(context: &AgentsMdContext) -> String {
     let channel_title = optional_field(&context.channel_title);
     let channel_topic = optional_field(&context.channel_topic);
     let members = render_members(&context.members);
+    let wake_policy = render_wake_policy(&context.wake_policy);
     let mut block = format!(
         "{BEGIN_MARKER}\n\
 # Loom runtime bootstrap\n\
@@ -110,19 +133,87 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
 \n\
 {members}\n\
 \n\
+## Wake intake policy\n\
+\n\
+{wake_policy}\n\
+\n\
 ## Loom operating rules\n\
 \n\
 - This file contains stable actor/channel facts. Thread, turn, trigger, task,\n\
   assignment, and inbox facts are dynamic and belong to the current turn input.\n\
 - Current runtime values are available in environment variables such as\n\
   `LOOM_ACTOR`, `LOOM_CHANNEL_ID`, `LOOM_SCOPE_ID`, `LOOM_REPLY_TARGET`,\n\
-  `LOOM_TRIGGER_MESSAGE_ID`, and `LOOM_TRIGGER_ACTOR`.\n\
-- Assistant text is an internal run transcript. Publish visible collaboration\n\
-  messages with `loom --json message send` or `loom --json message ask`.\n\
+  `LOOM_TRIGGER_MESSAGE_ID`, `LOOM_TRIGGER_ACTOR`, `LOOM_TRIGGER_PRIVATE`,\n\
+  and `LOOM_TRIGGER_PRIVATE_TO_FLAGS`.\n\
+- Before acting, identify your role for this wake: requester/coordinator,\n\
+  participant/contributor, assignee/reviewer, observer, or no-action recipient.\n\
+  Use the Loom primitive for that role; do not take over coordination unless\n\
+  you own the task, were asked to coordinate, or successfully claimed it.\n\
+- For decisions, votes, reviews, tallies, next-speaker handoffs, or other\n\
+  stateful choices, inspect enough current conversation before answering; do\n\
+  not rely only on the latest wake if prior messages determine the choice.\n\
+- Assistant text is an internal run transcript. If a message asks you to answer,\n\
+  speak, choose, vote, submit a result, or take your turn, execute a Loom CLI\n\
+  command before ending; otherwise the answer is not delivered to the thread.\n\
+- Use `$LOOM_REPLY_TARGET` as the default target for the current workflow. If it\n\
+  is a thread target such as `#channel:root`, send or ask on the bare `#channel`\n\
+  only when you intentionally want a channel-level update outside that thread.\n\
+- Public replies that only inform the thread may use\n\
+  `loom --json message send --target \"$LOOM_REPLY_TARGET\" --text \"...\"`.\n\
+  If you answer a public ask and the requester/coordinator must collect it or\n\
+  continue after your reply, use\n\
+  `loom --json message ask @actor_id --target \"$LOOM_REPLY_TARGET\" --text \"...\"`\n\
+  so that actor is woken; plain public `message send` is notify-only.\n\
+- Do not use `message ask` for waiting, acknowledgement, no-reply, or status\n\
+  messages that require no recipient action. Send them as notify-only with\n\
+  `message send` when they are useful, or omit them.\n\
+- A public phase transition, broadcast, or handoff that asks participants to\n\
+  discuss, vote, review, approve, continue, or otherwise act is not complete\n\
+  unless it is routed with `message ask` to the exact actor(s) or appropriate\n\
+  group. Natural language such as \"everyone please start\" does not wake agents;\n\
+  agent CLI may reject notify-only messages that look like action requests.\n\
+- If `LOOM_TRIGGER_PRIVATE=1`, private answers use\n\
+  `loom --json message send $LOOM_TRIGGER_PRIVATE_TO_FLAGS --text \"...\"`;\n\
+  never send a private answer to `$LOOM_REPLY_TARGET`.\n\
+- If the current turn input says `Private route for this turn`, use its exact\n\
+  dynamic command when answering the private requester(s).\n\
+- If you are the requester/coordinator receiving a completed private action,\n\
+  vote, target, approval, or other answer, process it and route the next\n\
+  required actor; do not answer the submitter again unless you need\n\
+  clarification.\n\
+- If a private wake requires a hidden follow-up with another actor, keep that\n\
+  follow-up private too: use same-scope\n\
+  `loom --json message send --private-to @actor_id --target \"$LOOM_REPLY_TARGET\" --text \"...\"`.\n\
+- Use public `message ask` from private context only when the requested output\n\
+  is explicitly intended for the public thread; keep private facts out.\n\
+- Private actions, votes, target choices, and sensitive data stay private even\n\
+  when the answer is only one word.\n\
+- Public messages should include only information intended for that audience;\n\
+  do not add labels, hints, or formatting derived from private state.\n\
+- In ordered workflows, when the latest message completes a step or names the\n\
+  next participant, wake the next required actor immediately; stale waiting or\n\
+  acknowledgement messages do not override that handoff.\n\
+- If you are the requester/coordinator receiving a completed public answer,\n\
+  process it and wake the next required actor; do not ask the submitter again\n\
+  unless you need clarification.\n\
+- In multi-party decisions, rebuild the latest effective decision for each\n\
+  required participant before declaring agreement; crossed or stale replies do\n\
+  not count as consensus.\n\
+- If a private wake asks for a public contribution, publish the contribution\n\
+  publicly with `message ask` to the coordinator or next actor, and keep private\n\
+  facts out of the public text.\n\
+- If a wake is only informational, has `notify` / `notify_only` delivery, or\n\
+  explicitly asks for no reply, do not send a receipt; run\n\
+  `loom --json run ignore --reason \"no action needed\"`.\n\
+- Do not answer acknowledgement-only or waiting messages that do not change\n\
+  state; run `loom --json run ignore --reason \"no action needed\"`.\n\
 - Use `loom --json message ask @actor_id ...` when another actor must act next;\n\
   plain `message send` is notify-only and does not wake agents.\n\
-- Use `loom --json message send --private-to @actor_id --target \"$LOOM_REPLY_TARGET\" ...`\n\
-  for same-scope private information that must wake exactly one actor.\n\
+- Prefer same-scope private delivery for hidden prompts that require action in\n\
+  an active workflow:\n\
+  `loom --json message send --private-to @actor_id --target \"$LOOM_REPLY_TARGET\" --text \"...\"`.\n\
+  Global `dm:@actor_id` starts a separate private channel; use it deliberately\n\
+  only when leaving the current workflow scope is intended.\n\
 - Query fresh state with `loom --json ...` commands before relying on channel,\n\
   thread, task, assignment, or actor state.\n\
 - Before ending, make the next required step explicit: send the required reply,\n\
@@ -139,6 +230,7 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
         channel_title = channel_title,
         channel_topic = channel_topic,
         members = members,
+        wake_policy = wake_policy,
     );
 
     if let Some(instructions) = context
@@ -154,6 +246,49 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
 
     block.push_str(&format!("\n{END_MARKER}"));
     block
+}
+
+fn render_wake_policy(policy: &AgentsMdWakePolicy) -> String {
+    let mut lines = vec![
+        format!(
+            "- Coalesce queued same-scope triggers: `{}`",
+            policy.coalesce
+        ),
+        format!("- Dispatch debounce: `{}` ms", policy.debounce_ms),
+        format!(
+            "- Reply reminder: `{}`",
+            inline_value(&policy.reply_reminder)
+        ),
+        format!(
+            "- Human message while busy: `{}`",
+            inline_value(&policy.busy_policy)
+        ),
+    ];
+    if let Some(budget) = policy.context_token_budget {
+        lines.push(format!("- Context token budget: `{budget}`"));
+    }
+
+    if policy.coalesce || policy.debounce_ms > 0 {
+        lines.extend([
+            "- Strategy: this actor may receive several same-scope inputs in one turn.".to_string(),
+            "  Treat the current USER message as a Loom turn inbox: handle wake[],".to_string(),
+            "  fold in any pending same-scope inbox items shown there, merge related".to_string(),
+            "  state changes for the same workflow, handle independent requests".to_string(),
+            "  separately, and use the latest effective state instead of stale".to_string(),
+            "  messages blindly. If extra inspection is needed, use".to_string(),
+            "  `loom --json inbox list --state pending --no-ack`.".to_string(),
+        ]);
+    } else {
+        lines.extend([
+            "- Strategy: this actor is expected to process one focused wake at a time.".to_string(),
+            "  Do not proactively drain unrelated unread inbox or channel messages.".to_string(),
+            "  Read more history only when needed to validate state or avoid conflict;".to_string(),
+            "  if you inspect pending inbox, use `loom --json inbox list --state pending --no-ack`.".to_string(),
+            "  This keeps inspection from consuming delivery state.".to_string(),
+        ]);
+    }
+
+    lines.join("\n")
 }
 
 fn render_members(members: &[AgentsMdMember]) -> String {
@@ -226,6 +361,7 @@ mod tests {
                 },
             ],
             agent_instructions: Some("Prefer concise answers.".into()),
+            wake_policy: AgentsMdWakePolicy::default(),
         }
     }
 
@@ -238,9 +374,19 @@ mod tests {
         assert!(out.contains("Channel id: `chan_demo`"));
         assert!(out.contains("Demo Channel"));
         assert!(out.contains("actor_human_owner"));
+        assert!(out.contains("Wake intake policy"));
+        assert!(out.contains("Coalesce queued same-scope triggers: `true`"));
+        assert!(out.contains("Strategy: this actor may receive several same-scope inputs"));
         assert!(out.contains("Stable agent instructions"));
         assert!(out.contains("Prefer concise answers."));
         assert!(out.contains("Assistant text is an internal run transcript"));
+        assert!(out.contains("identify your role for this wake"));
+        assert!(out.contains("participant/contributor"));
+        assert!(out.contains("ordered workflows"));
+        assert!(out.contains("acknowledgement-only"));
+        assert!(out.contains("plain public `message send`"));
+        assert!(out.contains("private wake asks for a public contribution"));
+        assert!(out.contains("latest effective decision"));
         assert!(out.contains("loom guide show <topic>"));
         assert!(!out.contains("### Read-only CLI"));
         assert!(!out.contains("### Write CLI"));

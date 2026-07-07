@@ -31,6 +31,7 @@ import type {
   Task,
   TaskAssignmentType,
   Thread,
+  WakeSpec,
   Workspace,
 } from "./types";
 
@@ -444,6 +445,7 @@ export async function machineAgentCreate(args: {
   description?: string;
   instructions?: string;
   promptAssembly?: Record<string, unknown>;
+  wake?: WakeSpec | null;
   model?: string;
   reasoningEffort?: string;
   autostart?: boolean;
@@ -460,6 +462,7 @@ export async function agentUpdate(args: {
   description?: string;
   instructions?: string;
   promptAssembly?: Record<string, unknown> | null;
+  wake?: WakeSpec | null;
   providerId?: string;
   model?: string;
   reasoningEffort?: string;

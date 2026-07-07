@@ -34,6 +34,13 @@ provider manifest，再让 agent 的 `providerRef.id` 指向它。
     "mode": "print",
     "model": "sonnet"
   },
+  "wake": {
+    "coalesce": true,
+    "debounceMs": 750,
+    "replyReminder": "first-turn",
+    "onHumanMessageWhileBusy": "queue",
+    "contextTokenBudget": 900
+  },
   "autostart": false
 }
 ```
@@ -48,6 +55,15 @@ provider manifest，再让 agent 的 `providerRef.id` 指向它。
 
 `providerRef.model` 和 `providerRef.reasoningEffort` 是具体 agent 的偏好。provider
 manifest 负责声明这些值如何映射成 CLI 参数，例如 `--model {model}`。
+
+`wake` 控制 turn intake 行为：
+
+- `coalesce` 合并忙碌期间积压的兼容消息；
+- `debounceMs` 在 dispatch 前等待短窗口，吸收连续分段输入；
+- `replyReminder` 控制每回合 reply contract 的重复频率；
+- `onHumanMessageWhileBusy` 可选 `queue`、`cancel_and_requeue`、`inject`；
+- `contextTokenBudget` 限制 bootstrap / pending delivery 上下文预算，超出时转为
+  `unreadGap` 提示。
 
 如果 agent 配置了 `bundle.source`，Loom 会把 bundle 安装到该 agent home 下，并把当前
 scope 可见的 agent bundles 以 symlink 方式挂到该 agent 自己的

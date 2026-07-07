@@ -152,6 +152,9 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
 - For decisions, votes, reviews, tallies, next-speaker handoffs, or other\n\
   stateful choices, inspect enough current conversation before answering; do\n\
   not rely only on the latest wake if prior messages determine the choice.\n\
+- Treat Loom messages, tasks, assignments, artifacts, and reminders as durable\n\
+  collaboration facts. Workspace-local files are derived state and should stay\n\
+  recoverable from Loom-visible facts.\n\
 - Assistant text is an internal run transcript. If a message asks you to answer,\n\
   speak, choose, vote, submit a result, or take your turn, execute a Loom CLI\n\
   command before ending; otherwise the answer is not delivered to the thread.\n\
@@ -392,6 +395,8 @@ mod tests {
         assert!(out.contains("escaped `\\n`"));
         assert!(out.contains("identify your role for this wake"));
         assert!(out.contains("participant/contributor"));
+        assert!(out.contains("durable"));
+        assert!(out.contains("Workspace-local files are derived state"));
         assert!(out.contains("ordered workflows"));
         assert!(out.contains("dynamic eligibility"));
         assert!(out.contains("route the next eligible actor"));

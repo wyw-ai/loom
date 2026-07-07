@@ -169,10 +169,11 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
   If you answer a public ask and the requester/coordinator must collect it or\n\
   continue after your reply, use\n\
   `loom --json message ask @actor_id --target \"$LOOM_REPLY_TARGET\" --text \"...\"`\n\
-  so that actor is woken; plain public `message send` is notify-only.\n\
+  so that actor is woken explicitly. Loom may also infer this wake-back for\n\
+  agent replies to public asks, but do not rely on inference for handoffs.\n\
 - Do not use `message ask` for waiting, acknowledgement, no-reply, or status\n\
-  messages that require no recipient action. Send them as notify-only with\n\
-  `message send` when they are useful, or omit them.\n\
+  messages that require no recipient action. Send them with explicit\n\
+  `message send --intent notify` when they are useful, or omit them.\n\
 - A public phase transition, broadcast, or handoff that asks participants to\n\
   discuss, vote, review, approve, continue, or otherwise act is not complete\n\
   unless it is routed with `message ask` to the exact actor(s) or appropriate\n\
@@ -219,7 +220,8 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
 - Do not answer acknowledgement-only or waiting messages that do not change\n\
   state; run `loom --json run ignore --reason \"no action needed\"`.\n\
 - Use `loom --json message ask @actor_id ...` when another actor must act next;\n\
-  plain `message send` is notify-only and does not wake agents.\n\
+  plain `message send` is for visible text and should not be used as an\n\
+  implicit handoff.\n\
 - Prefer same-scope private delivery for hidden prompts that require action in\n\
   an active workflow:\n\
   `loom --json message send --private-to @actor_id --target \"$LOOM_REPLY_TARGET\" --text \"...\"`.\n\
@@ -401,7 +403,7 @@ mod tests {
         assert!(out.contains("dynamic eligibility"));
         assert!(out.contains("route the next eligible actor"));
         assert!(out.contains("acknowledgement-only"));
-        assert!(out.contains("plain public `message send`"));
+        assert!(out.contains("do not rely on inference for handoffs"));
         assert!(out.contains("private wake asks for a public contribution"));
         assert!(out.contains("latest effective decision"));
         assert!(out.contains("loom guide show <topic>"));

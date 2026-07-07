@@ -258,6 +258,9 @@ pub fn loom_config_dir() -> PathBuf {
     if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
         return PathBuf::from(home).join(".loom");
     }
+    if let Some(home) = dirs::home_dir() {
+        return home.join(".loom");
+    }
     PathBuf::from(".loom")
 }
 

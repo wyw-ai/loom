@@ -18,7 +18,7 @@ use agent_runtime::provider::{
 use anyhow::{anyhow, Context, Result};
 use proto::methods::{
     AgentBundleSkillSpec, AgentBundleSpec, AgentModelSpec, AgentPromptAssemblySpec,
-    AgentProviderRef, AgentSpec, ProviderManifest, ServiceSpec,
+    AgentProviderRef, AgentSpec, ProviderManifest, ServiceSpec, WakeSpec,
 };
 use proto::types::{Actor, ActorKind};
 use serde::{Deserialize, Serialize};
@@ -599,6 +599,11 @@ fn agent_spec_from_command(
                 .context("parse promptAssembly")
         })
         .transpose()?;
+    let wake = command
+        .get("wake")
+        .filter(|value| !value.is_null())
+        .map(|value| serde_json::from_value::<WakeSpec>(value.clone()).context("parse wake"))
+        .transpose()?;
 
     let env: BTreeMap<String, String> = command
         .get("env")
@@ -656,7 +661,7 @@ fn agent_spec_from_command(
         memory: None,
         announcement: None,
         trigger: None,
-        wake: None,
+        wake,
         prompt_assembly,
         prompt_template: None,
     })
@@ -767,6 +772,13 @@ fn update_agent_spec_from_command(
                 serde_json::from_value::<AgentPromptAssemblySpec>(value.clone())
                     .context("parse promptAssembly")?,
             )
+        };
+    }
+    if let Some(value) = command.get("wake") {
+        spec.wake = if value.is_null() {
+            None
+        } else {
+            Some(serde_json::from_value::<WakeSpec>(value.clone()).context("parse wake")?)
         };
     }
     if let Some(env_value) = command.get("env") {

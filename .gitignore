@@ -23,6 +23,7 @@ __pycache__/
 !/docs/ISSUES.md
 !/docs/protocol/
 !/docs/protocol/agent-coordination-workflow.md
+!/docs/protocol/turn-input-contract-v1.md
 !/docs/superpowers/
 !/docs/windows-build-guide.md
 !/docs/ci/

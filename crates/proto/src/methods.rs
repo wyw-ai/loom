@@ -2850,6 +2850,14 @@ pub struct WakeSpec {
     /// this only controls the per-turn repetition. Default: `first-turn`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_reminder: Option<ReplyReminderMode>,
+    /// What to do when a human message arrives while the same scope already
+    /// has an in-flight provider turn. Default: `queue`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_human_message_while_busy: Option<OnHumanMessageWhileBusy>,
+    /// Approximate token budget for bootstrap / pending-delivery context
+    /// injected outside the structured wake body. Default is runtime-defined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_token_budget: Option<u64>,
 }
 
 /// Reply-reminder frequency. See `WakeSpec.reply_reminder`.
@@ -2864,6 +2872,22 @@ pub enum ReplyReminderMode {
     FirstTurn,
     /// Never append reminder text; rely on `AGENTS.md` / skills only.
     Off,
+}
+
+/// Busy-scope policy for newly arriving human messages. See `WakeSpec`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OnHumanMessageWhileBusy {
+    /// Preserve current behavior: enqueue the new trigger behind the active
+    /// turn, subject to wake coalescing when it eventually dispatches.
+    #[default]
+    Queue,
+    /// Cancel the active provider turn, requeue its trigger batch, and let the
+    /// cancelled batch coalesce with the new human message.
+    CancelAndRequeue,
+    /// Reserved for transports that can append input to an existing provider
+    /// process. Unsupported transports treat this as `queue`.
+    Inject,
 }
 
 /// Per-actor prompt template (design §5). All three lists are joined with

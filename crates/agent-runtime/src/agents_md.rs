@@ -160,7 +160,8 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
   command before ending; otherwise the answer is not delivered to the thread.\n\
 - Loom stores message text literally. For multiline visible messages, pass real\n\
   newline characters to `--text`; do not write escaped `\\n` unless the backslash\n\
-  and letter `n` should be shown to readers.\n\
+  and letter `n` should be shown to readers. In shell, prefer stdin/heredoc for\n\
+  multiline text instead of quoted `\\n` sequences.\n\
 - Use `$LOOM_REPLY_TARGET` as the default target for the current workflow. If it\n\
   is a thread target such as `#channel:root`, send or ask on the bare `#channel`\n\
   only when you intentionally want a channel-level update outside that thread.\n\
@@ -392,6 +393,7 @@ mod tests {
         assert!(out.contains("Assistant text is an internal run transcript"));
         assert!(out.contains("pass real"));
         assert!(out.contains("escaped `\\n`"));
+        assert!(out.contains("stdin/heredoc"));
         assert!(out.contains("identify your role for this wake"));
         assert!(out.contains("participant/contributor"));
         assert!(out.contains("durable"));

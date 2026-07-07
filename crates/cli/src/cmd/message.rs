@@ -42,6 +42,7 @@ pub async fn send(
     if body.trim().is_empty() && attachment_ids.is_empty() {
         bail!("message body is empty");
     }
+    warn_if_escaped_newlines(&body);
     let is_private = !private_to.is_empty();
     let mut intent = parse_message_intent(intent)?;
     let mut delivery_policy = parse_delivery_policy(delivery_policy)?;
@@ -141,6 +142,7 @@ pub async fn ask(
     if body.trim().is_empty() && attachment_ids.is_empty() {
         bail!("message body is empty");
     }
+    warn_if_escaped_newlines(&body);
     let params = build_ask_params(target.clone(), recipients, body, if_latest, attachment_ids)?;
     if let Some(warning) = channel_fragmentation_warning(&target, false) {
         eprintln!("{warning}");
@@ -197,6 +199,20 @@ fn notify_only_call_for_action_warning() -> &'static str {
      response, send it with `loom message ask @actor_id ...` (or `--private-to @actor_id` \
      for a hidden prompt). A notify_only call-for-action wakes no one and is the #1 cause \
      of stalled multi-actor flows."
+}
+
+fn warn_if_escaped_newlines(body: &str) {
+    if let Some(warning) = escaped_newline_warning(body) {
+        eprintln!("{warning}");
+    }
+}
+
+fn escaped_newline_warning(body: &str) -> Option<&'static str> {
+    body.contains("\\n").then_some(
+        "loom: warning: message text contains literal `\\n`. Loom stores text literally; \
+         for multiline messages, omit `--text` and pipe stdin/heredoc so real newline \
+         characters are sent.",
+    )
 }
 
 fn agent_turn_is_active() -> bool {
@@ -560,6 +576,15 @@ mod tests {
         assert!(!should_reject_notify_only_call_for_action(
             true, false, true
         ));
+    }
+
+    #[test]
+    fn escaped_newline_warning_flags_literal_backslash_n() {
+        let warning =
+            escaped_newline_warning("line one\\nline two").expect("literal newline warning");
+        assert!(warning.contains("literal `\\n`"));
+        assert!(warning.contains("stdin/heredoc"));
+        assert!(escaped_newline_warning("line one\nline two").is_none());
     }
 
     #[test]

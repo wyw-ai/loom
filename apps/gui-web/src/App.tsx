@@ -4,14 +4,11 @@ import {
   useRef,
   useState,
 } from "react";
-import type { CSSProperties, PointerEvent } from "react";
 import { Loader2 } from "lucide-react";
 
 import * as ipc from "@/ipc/bridge";
 import {
-  channelTarget,
   scopeKey,
-  threadTarget,
   type Channel,
   type ChannelMemberConfig,
   type DesktopConfig,
@@ -31,15 +28,12 @@ import type {
   AgentFormState,
   AgentUpdatePatch,
   ChannelGroup,
-  PanelResizeDrag,
-  PanelResizeKind,
 } from "@/lib/types";
 import {
   defaultAgentPromptAssembly,
   detailPanelBreakpoint,
   localServerCommand,
   machineStatusPollIntervalMs,
-  mainMinWidth,
   ungroupedChannelGroupId
 } from "@/lib/constants";
 import {
@@ -49,14 +43,11 @@ import {
 import { defaultWakeSpec } from "@/lib/wake-utils";
 
 import {
-  channelGroupStorageKey,
   channelMentionActors,
   channelMentionAgentActors,
   directChannelPeerId,
   directMessageTarget,
   directPeerForMessage,
-  directScopeForActor,
-  flattenThreads,
   isChannelMentionActor,
   isDirectChannel,
   loadChannelGroups,
@@ -88,8 +79,6 @@ import {
   displayName,
   errorText,
   filterEmptyEnvKeys,
-  findAgentMemberEntry,
-  fitPanelSizes,
   initialViewportWidth,
   machineCanCreateAgent,
   mentionAudience,
@@ -101,7 +90,6 @@ import {
   sortTasks,
   sortThreads,
   uniqueAudience,
-  uniqueActorsById,
   upsert,
 } from "@/lib/format-utils";
 
@@ -137,6 +125,28 @@ import { AccountView } from "@/components/views/AccountView";
 import { SettingsView } from "@/components/views/SettingsView";
 import { OnboardingView } from "@/components/views/OnboardingView";
 import { ChannelPanel } from "@/components/panels/ChannelPanels";
+
+import {
+  deriveActiveChannel,
+  deriveActiveDirectActor,
+  deriveActiveDirectScope,
+  deriveActiveDirectTarget,
+  deriveActiveScope,
+  deriveActiveThread,
+  deriveActiveThreadScope,
+  deriveAgentActors,
+  deriveAllThreads,
+  deriveActorList,
+  deriveChannelGroupsKey,
+  deriveChannelTasks,
+  deriveChannelThreads,
+  deriveMemberCandidates,
+  deriveTarget,
+  deriveTasksBySourceMessageId,
+  deriveThreadMessageTarget,
+  deriveVisibleChannels,
+} from "@/lib/derived";
+import { usePanelResize } from "@/hooks/usePanelResize";
 
 
 export function App() {
@@ -248,65 +258,36 @@ export function App() {
   const hasOpenedConnectionRef = useRef(false);
   const reconnectTimerRef = useRef<number | null>(null);
   const reconnectAttemptRef = useRef(0);
-  const panelResizeDragRef = useRef<PanelResizeDrag | null>(null);
-  const panelResizeCleanupRef = useRef<(() => void) | null>(null);
 
   const account = config.account ?? null;
   const workspaces = config.workspaces ?? [];
   const activeWorkspaceId = workspace?.id ?? null;
-  const visibleChannels = channels.filter((channel) => !isDirectChannel(channel));
-  const activeChannel =
-    visibleChannels.find((channel) => channel.id === activeChannelId) ?? null;
-  const channelGroupsKey = channelGroupStorageKey(workspace);
-  const channelThreads = activeChannel
-    ? threadsByChannel[activeChannel.id] ?? []
-    : [];
+  const visibleChannels = deriveVisibleChannels(channels);
+  const activeChannel = deriveActiveChannel(visibleChannels, activeChannelId);
+  const channelGroupsKey = deriveChannelGroupsKey(workspace);
+  const channelThreads = deriveChannelThreads(activeChannel, threadsByChannel);
   const activeChannelMemberConfigs = activeChannel
     ? channelMemberConfigsByChannel[activeChannel.id] ?? {}
     : {};
-  const activeThread =
-    channelThreads.find((thread) => thread.id === activeThreadId) ?? null;
-  const target = activeChannel ? channelTarget(activeChannel.id) : null;
-  const threadMessageTarget = activeThread ? threadTarget(activeThread) : null;
-  const activeScope: ScopeRef | null = activeChannel
-    ? { kind: "channel", id: activeChannel.id }
-    : null;
-  const activeThreadScope: ScopeRef | null = activeThread
-    ? { kind: "thread", id: activeThread.id }
-    : null;
-  const allThreads = flattenThreads(threadsByChannel, visibleChannels);
+  const activeThread = deriveActiveThread(channelThreads, activeThreadId);
+  const target = deriveTarget(activeChannel);
+  const threadMessageTarget = deriveThreadMessageTarget(activeThread);
+  const activeScope = deriveActiveScope(activeChannel);
+  const activeThreadScope = deriveActiveThreadScope(activeThread);
+  const allThreads = deriveAllThreads(threadsByChannel, visibleChannels);
   const channelIdsKey = visibleChannels.map((channel) => channel.id).join("|");
-  const actorList = Object.values(actors).sort((a, b) =>
-    displayName(a).localeCompare(displayName(b)),
-  );
-  const agentActors = actorList.filter((actor) => actor.kind === "agent");
+  const actorList = deriveActorList(actors);
+  const agentActors = deriveAgentActors(actorList);
   const agentActorIdsKey = agentActors.map((actor) => actor.id).join("|");
-  const activeDirectActor =
-    agentActors.find((actor) => actor.id === activeDirectActorId) ??
-    (activeDirectActorId
-      ? findAgentMemberEntry(machines, activeDirectActorId)?.agent.spec.actor ?? null
-      : null);
-  const activeDirectTarget = activeDirectActor
-    ? directMessageTarget(activeDirectActor.id)
-    : null;
-  const activeDirectScope =
-    activeDirectActor && workspace
-      ? directScopeForActor(channels, workspace.actorId, activeDirectActor.id) ??
-        directScopesByActorId[activeDirectActor.id] ??
-        null
-      : null;
-  const memberCandidates = uniqueActorsById(
-    actorList.filter((actor) => actor.kind !== "service"),
-  );
+  const activeDirectActor = deriveActiveDirectActor(agentActors, activeDirectActorId, machines);
+  const activeDirectTarget = deriveActiveDirectTarget(activeDirectActor);
+  const activeDirectScope = deriveActiveDirectScope(activeDirectActor, workspace, channels, directScopesByActorId);
+  const memberCandidates = deriveMemberCandidates(actorList);
   const channelAgentActors = activeChannel
     ? channelMentionAgentActors(activeChannel, actors)
     : [];
-  const channelTasks = activeChannel
-    ? tasks.filter((task) => task.channelId === activeChannel.id)
-    : tasks;
-  const tasksBySourceMessageId: Record<string, Task> = Object.fromEntries(
-    tasks.map((task) => [task.sourceMessageId, task]),
-  );
+  const channelTasks = deriveChannelTasks(activeChannel, tasks);
+  const tasksBySourceMessageId = deriveTasksBySourceMessageId(tasks);
   const activeThreadTask = activeThread
     ? tasksBySourceMessageId[activeThread.rootMessageId] ?? null
     : null;
@@ -562,13 +543,6 @@ export function App() {
     updateViewport();
     window.addEventListener("resize", updateViewport);
     return () => window.removeEventListener("resize", updateViewport);
-  }, []);
-
-  useEffect(() => {
-    return () => {
-      panelResizeCleanupRef.current?.();
-      document.body.classList.remove("is-resizing-panels");
-    };
   }, []);
 
   useEffect(() => {
@@ -1932,80 +1906,27 @@ export function App() {
     (Boolean(activeThread) || (Boolean(channelPanelTab) && Boolean(activeChannel)));
   const detailVisibleInGrid =
     showChatDetail && viewportWidth >= detailPanelBreakpoint;
-  const fittedPanelSizes = fitPanelSizes(
+
+  const {
+    shellStyle,
+    cleanupPanelResize,
+    startPanelResize,
+    resizePanelByKeyboard,
+  } = usePanelResize({
     panelSizes,
+    setPanelSizes,
     viewportWidth,
     detailVisibleInGrid,
-  );
-  const shellStyle = {
-    "--sidebar-width": `${fittedPanelSizes.sidebar}px`,
-    "--detail-width": `${fittedPanelSizes.detail}px`,
-    "--main-min-width": `${mainMinWidth}px`,
-  } as CSSProperties;
-  const cleanupPanelResize = () => {
-    panelResizeCleanupRef.current?.();
-    panelResizeCleanupRef.current = null;
-    panelResizeDragRef.current = null;
-    setResizingPanel(null);
-    document.body.classList.remove("is-resizing-panels");
-  };
-  const applyPanelResize = (
-    drag: PanelResizeDrag,
-    clientX: number,
-    width = initialViewportWidth(),
-  ) => {
-    const delta = clientX - drag.startX;
-    const next =
-      drag.kind === "sidebar"
-        ? { sidebar: drag.sidebar + delta, detail: drag.detail }
-        : { sidebar: drag.sidebar, detail: drag.detail - delta };
-    setPanelSizes(fitPanelSizes(next, width, width >= detailPanelBreakpoint && showChatDetail));
-  };
-  const startPanelResize = (
-    event: PointerEvent<HTMLButtonElement>,
-    kind: PanelResizeKind,
-  ) => {
-    if (event.button !== 0) return;
-    event.preventDefault();
-    cleanupPanelResize();
-    const drag: PanelResizeDrag = {
-      kind,
-      startX: event.clientX,
-      sidebar: panelSizes.sidebar,
-      detail: panelSizes.detail,
-    };
-    panelResizeDragRef.current = drag;
-    setResizingPanel(kind);
-    document.body.classList.add("is-resizing-panels");
-    const handlePointerMove = (moveEvent: globalThis.PointerEvent) => {
-      const current = panelResizeDragRef.current;
-      if (!current) return;
-      moveEvent.preventDefault();
-      applyPanelResize(current, moveEvent.clientX);
-    };
-    const handlePointerUp = (upEvent: globalThis.PointerEvent) => {
-      const current = panelResizeDragRef.current;
-      if (current) applyPanelResize(current, upEvent.clientX);
+    showChatDetail,
+    setResizingPanel,
+  });
+
+  useEffect(() => {
+    return () => {
       cleanupPanelResize();
+      document.body.classList.remove("is-resizing-panels");
     };
-    window.addEventListener("pointermove", handlePointerMove, { passive: false });
-    window.addEventListener("pointerup", handlePointerUp);
-    window.addEventListener("pointercancel", cleanupPanelResize);
-    panelResizeCleanupRef.current = () => {
-      window.removeEventListener("pointermove", handlePointerMove);
-      window.removeEventListener("pointerup", handlePointerUp);
-      window.removeEventListener("pointercancel", cleanupPanelResize);
-    };
-  };
-  const resizePanelByKeyboard = (kind: PanelResizeKind, delta: number) => {
-    setPanelSizes((current) => {
-      const next =
-        kind === "sidebar"
-          ? { ...current, sidebar: current.sidebar + delta }
-          : { ...current, detail: current.detail - delta };
-      return fitPanelSizes(next, viewportWidth, detailVisibleInGrid);
-    });
-  };
+  }, [cleanupPanelResize]);
   const selectWorkspace = async (workspaceId: string): Promise<Workspace | null> => {
     setView("chat");
     setChannelPanelTab(null);

@@ -56,12 +56,12 @@ export function ComposerResizeHandle({
       onKeyDown={handleKeyDown}
       onDoubleClick={onReset}
       className={cn(
-        "group/handle absolute -top-1 left-0 right-0 z-10 flex h-2 cursor-ns-resize items-start justify-center outline-none",
+        "group/handle flex h-2 cursor-ns-resize items-center justify-center outline-none",
         "focus-visible:ring-2 focus-visible:ring-[#503ed4] focus-visible:ring-offset-1",
         className,
       )}
     >
-      <div className="mt-px h-1 w-10 rounded-full bg-[#d0d4de] transition-colors group-hover/handle:bg-[#503ed4]" />
+      <div className="h-1 w-10 rounded-full bg-[#d0d4de] transition-colors group-hover/handle:bg-[#503ed4]" />
     </div>
   );
 }

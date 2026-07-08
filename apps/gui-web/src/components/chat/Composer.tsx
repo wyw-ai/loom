@@ -121,11 +121,7 @@ export function Composer({
   }
 
   return (
-    <footer className="relative border-t border-[#e2e6ef] bg-white px-5 py-4">
-      <ComposerResizeHandle
-        onKeyboardResize={handleKeyboardResize}
-        onReset={handleReset}
-      />
+    <footer className="border-t border-[#e2e6ef] bg-white px-5 py-4">
       <Resizable
         className="mx-auto max-w-4xl"
         enable={{ top: true, right: false, bottom: false, left: false, topRight: false, bottomRight: false, bottomLeft: false, topLeft: false }}
@@ -133,13 +129,13 @@ export function Composer({
         minHeight={COMPOSER_MIN_HEIGHT}
         maxHeight={maxHeightPx}
         onResizeStop={handleResizeStop}
-        handleStyles={{
-          top: {
-            cursor: "ns-resize",
-            height: "8px",
-            top: "-4px",
-            width: "100%",
-          },
+        handleComponent={{
+          top: (
+            <ComposerResizeHandle
+              onKeyboardResize={handleKeyboardResize}
+              onReset={handleReset}
+            />
+          ),
         }}
       >
         <div className="flex h-full flex-col">

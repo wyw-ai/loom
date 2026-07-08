@@ -868,6 +868,53 @@
     display: none;
   }
 
+  .code-block-wrapper {
+    position: relative;
+    margin: 0 0 0.45rem;
+  }
+
+  .code-block-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 4px 12px;
+    border: 1px solid #dfe3ec;
+    border-bottom: none;
+    border-radius: 10px 10px 0 0;
+    background: #edeff5;
+    font-size: 0.75rem;
+  }
+
+  .code-block-header + pre {
+    border-radius: 0 0 10px 10px;
+    border-top: 1px solid #dfe3ec;
+  }
+
+  .code-lang-label {
+    font-family: monospace;
+    text-transform: lowercase;
+    color: #667085;
+    font-weight: 500;
+  }
+
+  .code-copy-btn {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 6px;
+    border-radius: 4px;
+    color: #667085;
+    transition: color 0.15s, background 0.15s;
+  }
+
+  .code-copy-btn:hover {
+    color: #111827;
+    background: rgba(0, 0, 0, 0.05);
+  }
+
+  .code-copy-btn.copied {
+    color: #16a34a;
+  }
+
   /* GFM elements (remark-gfm): tables, strikethrough, task lists, headings,
      lists, blockquotes, hr. Scoped under .message-markdown so they never leak
      into the wider app. Loom-native palette (see ARCH Part A §2.2). */

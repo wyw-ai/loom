@@ -1,4 +1,4 @@
-import { useMemo, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { Actor, MachineInfo, Message, Run, Task, Thread } from "@/ipc/types";
 import type { ThreadActivityStats } from "@/lib/types";
 import {
@@ -7,8 +7,9 @@ import {
   canUseAsThreadRoot,
   groupMessagesByDate,
 } from "@/lib/message-utils";
-import { Virtuoso } from "react-virtuoso";
+import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { MessageRow } from "@/components/chat/MessageRow";
+import { ScrollJumpButtons } from "@/components/chat/ScrollJumpButtons";
 
 type FeedItem =
   | { kind: "date-divider"; key: string; label: string }
@@ -85,6 +86,27 @@ export function MessageFeed({
     return items;
   }, [visibleMessages]);
 
+  const virtuosoRef = useRef<VirtuosoHandle>(null);
+  const [firstVisibleIndex, setFirstVisibleIndex] = useState(0);
+  const [lastVisibleIndex, setLastVisibleIndex] = useState(0);
+
+  const showJumpToTop = firstVisibleIndex > 5;
+  const showJumpToBottom = lastVisibleIndex < feedItems.length - 5;
+
+  // Auto-scroll to latest on thread/channel entry (Item 4)
+  useEffect(() => {
+    if (feedItems.length === 0) return;
+    const threshold = 200;
+    const timer = setTimeout(() => {
+      virtuosoRef.current?.scrollToIndex({
+        index: feedItems.length - 1,
+        behavior: feedItems.length > threshold ? "auto" : "smooth",
+      });
+    }, 50);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [feedKey]);
+
   if (visibleMessages.length === 0) {
     return (
       <div className="flex min-h-0 flex-1 items-center justify-center bg-white px-8 text-sm text-muted-foreground">
@@ -97,12 +119,17 @@ export function MessageFeed({
   }
 
   return (
-    <div className="min-h-0 flex-1 bg-white soft-scrollbar">
+    <div className="relative min-h-0 flex-1 bg-white soft-scrollbar">
       <Virtuoso
         key={feedKey}
+        ref={virtuosoRef}
         className="h-full"
         totalCount={feedItems.length}
         followOutput="smooth"
+        rangeChanged={(range) => {
+          setFirstVisibleIndex(range.startIndex);
+          setLastVisibleIndex(range.endIndex);
+        }}
         itemContent={(index) => {
           const item = feedItems[index];
           if (item.kind === "date-divider") {
@@ -143,6 +170,17 @@ export function MessageFeed({
             />
           );
         }}
+      />
+      <ScrollJumpButtons
+        showJumpToTop={showJumpToTop}
+        showJumpToBottom={showJumpToBottom}
+        onJumpToTop={() => virtuosoRef.current?.scrollToIndex({ index: 0, behavior: "smooth" })}
+        onJumpToBottom={() =>
+          virtuosoRef.current?.scrollToIndex({
+            index: feedItems.length - 1,
+            behavior: "smooth",
+          })
+        }
       />
     </div>
   );

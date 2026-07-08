@@ -155,6 +155,11 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
 - Treat Loom messages, tasks, assignments, artifacts, and reminders as durable\n\
   collaboration facts. Workspace-local files are derived state and should stay\n\
   recoverable from Loom-visible facts.\n\
+- When you accept owner/coordinator responsibility for a multi-step workflow,\n\
+  create or claim the message-anchored task when possible. Use message routing\n\
+  for short handoffs, task/assignment for lifecycle ownership, coordination for\n\
+  explicit baton or slot flows, reminders for rechecks, and facts, projections,\n\
+  or artifacts for recoverable non-private state.\n\
 - Assistant text is an internal run transcript. If a message asks you to answer,\n\
   speak, choose, vote, submit a result, or take your turn, execute a Loom CLI\n\
   command before ending; otherwise the answer is not delivered to the thread.\n\
@@ -172,9 +177,13 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
   `loom --json message ask @actor_id --target \"$LOOM_REPLY_TARGET\" --text \"...\"`\n\
   so that actor is woken explicitly. Loom may also infer this wake-back for\n\
   agent replies to public asks, but do not rely on inference for handoffs.\n\
+  Do not send the same answer once with `message send` and again with\n\
+  `message ask`; choose the routed form when a wake-back is needed.\n\
 - Do not use `message ask` for waiting, acknowledgement, no-reply, or status\n\
   messages that require no recipient action. Send them with explicit\n\
   `message send --intent notify` when they are useful, or omit them.\n\
+- Final summaries, wrap-ups, and phase results that require no further action\n\
+  should use `message send` or `message send --intent notify`, not `message ask`.\n\
 - A public phase transition, broadcast, or handoff that asks participants to\n\
   discuss, vote, review, approve, continue, or otherwise act is not complete\n\
   unless it is routed with `message ask` to the exact actor(s) or appropriate\n\
@@ -223,6 +232,9 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
 - Prefer same-scope private delivery for hidden prompts that require action in\n\
   an active workflow:\n\
   `loom --json message send --private-to @actor_id --target \"$LOOM_REPLY_TARGET\" --text \"...\"`.\n\
+  If you assign hidden or actor-specific information, actually send it this\n\
+  way before announcing it as done; if the recipient must act, that private\n\
+  message is the wake.\n\
   Global `dm:@actor_id` starts a separate private channel; use it deliberately\n\
   only when leaving the current workflow scope is intended.\n\
 - Query fresh state with `loom --json ...` commands before relying on channel,\n\
@@ -398,12 +410,18 @@ mod tests {
         assert!(out.contains("participant/contributor"));
         assert!(out.contains("durable"));
         assert!(out.contains("Workspace-local files are derived state"));
+        assert!(out.contains("message-anchored task"));
+        assert!(out.contains("coordination for"));
+        assert!(out.contains("recoverable non-private state"));
         assert!(out.contains("ordered workflows"));
         assert!(out.contains("dynamic eligibility"));
         assert!(out.contains("route the next eligible actor"));
         assert!(out.contains("acknowledgement-only"));
+        assert!(out.contains("Final summaries"));
         assert!(out.contains("do not rely on inference for handoffs"));
+        assert!(out.contains("Do not send the same answer"));
         assert!(out.contains("private wake asks for a public contribution"));
+        assert!(out.contains("actually send it this"));
         assert!(out.contains("latest effective decision"));
         assert!(out.contains("loom guide show <topic>"));
         assert!(!out.contains("### Read-only CLI"));

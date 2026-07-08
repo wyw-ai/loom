@@ -111,12 +111,7 @@ export function ThreadComposer({
   }
 
   return (
-    <footer className="relative shrink-0 border-t border-[#edf0f5] bg-white p-4">
-      <ComposerResizeHandle
-        onKeyboardResize={handleKeyboardResize}
-        onReset={handleReset}
-        ariaLabel="Resize thread reply input. Use arrow keys to adjust height, Enter to reset."
-      />
+    <footer className="shrink-0 border-t border-[#edf0f5] bg-white p-4">
       <Resizable
         className="w-full"
         enable={{ top: true, right: false, bottom: false, left: false, topRight: false, bottomRight: false, bottomLeft: false, topLeft: false }}
@@ -124,16 +119,17 @@ export function ThreadComposer({
         minHeight={THREAD_COMPOSER_MIN_HEIGHT}
         maxHeight={maxHeightPx}
         onResizeStop={handleResizeStop}
-        handleStyles={{
-          top: {
-            cursor: "ns-resize",
-            height: "8px",
-            top: "-4px",
-            width: "100%",
-          },
+        handleComponent={{
+          top: (
+            <ComposerResizeHandle
+              onKeyboardResize={handleKeyboardResize}
+              onReset={handleReset}
+              ariaLabel="Resize thread reply input. Use arrow keys to adjust height, Enter to reset."
+            />
+          ),
         }}
       >
-        <div className="composer-box composer-box-compact relative flex h-full flex-col">
+        <div className="composer-box composer-box-compact relative flex h-full items-end gap-2">
           {showMentions && (
             <MentionMenu
               options={mentionOptions}

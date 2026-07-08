@@ -89,6 +89,7 @@ export function MessageFeed({
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const [firstVisibleIndex, setFirstVisibleIndex] = useState(0);
   const [lastVisibleIndex, setLastVisibleIndex] = useState(0);
+  const [isHovered, setIsHovered] = useState(false);
 
   const showJumpToTop = firstVisibleIndex > 5;
   const showJumpToBottom = lastVisibleIndex < feedItems.length - 5;
@@ -119,7 +120,11 @@ export function MessageFeed({
   }
 
   return (
-    <div className="relative min-h-0 flex-1 bg-white soft-scrollbar">
+    <div
+      className="relative min-h-0 flex-1 bg-white soft-scrollbar"
+      onMouseEnter={() => setIsHovered(true)}
+      onMouseLeave={() => setIsHovered(false)}
+    >
       <Virtuoso
         key={feedKey}
         ref={virtuosoRef}
@@ -134,7 +139,7 @@ export function MessageFeed({
           const item = feedItems[index];
           if (item.kind === "date-divider") {
             return (
-              <div className="date-divider">
+              <div className={`date-divider ${index === 0 ? "date-divider-first" : ""}`}>
                 <span />
                 <div>{item.label}</div>
                 <span />
@@ -174,6 +179,7 @@ export function MessageFeed({
       <ScrollJumpButtons
         showJumpToTop={showJumpToTop}
         showJumpToBottom={showJumpToBottom}
+        isHovered={isHovered}
         onJumpToTop={() => virtuosoRef.current?.scrollToIndex({ index: 0, behavior: "smooth" })}
         onJumpToBottom={() =>
           virtuosoRef.current?.scrollToIndex({

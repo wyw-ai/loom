@@ -343,6 +343,10 @@
     background: #e6e8ef;
   }
 
+  .date-divider-first {
+    padding-top: 4px;
+  }
+
   .reaction-chip {
     display: inline-flex;
     height: 28px;

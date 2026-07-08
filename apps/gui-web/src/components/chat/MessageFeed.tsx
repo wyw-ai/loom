@@ -89,10 +89,9 @@ export function MessageFeed({
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const [firstVisibleIndex, setFirstVisibleIndex] = useState(0);
   const [lastVisibleIndex, setLastVisibleIndex] = useState(0);
-  const [isHovered, setIsHovered] = useState(false);
 
-  const showJumpToTop = firstVisibleIndex > 5;
-  const showJumpToBottom = lastVisibleIndex < feedItems.length - 5;
+  const showJumpToTop = firstVisibleIndex > 2;
+  const showJumpToBottom = lastVisibleIndex < feedItems.length - 3;
 
   // Auto-scroll to latest on thread/channel entry (Item 4)
   useEffect(() => {
@@ -120,17 +119,14 @@ export function MessageFeed({
   }
 
   return (
-    <div
-      className="relative min-h-0 flex-1 bg-white soft-scrollbar"
-      onMouseEnter={() => setIsHovered(true)}
-      onMouseLeave={() => setIsHovered(false)}
-    >
+    <div className="relative min-h-0 flex-1 bg-white">
       <Virtuoso
         key={feedKey}
         ref={virtuosoRef}
-        className="h-full"
+        className="h-full soft-scrollbar"
         totalCount={feedItems.length}
         followOutput="smooth"
+        increaseViewportBy={{ top: 200, bottom: 200 }}
         rangeChanged={(range) => {
           setFirstVisibleIndex(range.startIndex);
           setLastVisibleIndex(range.endIndex);
@@ -179,7 +175,6 @@ export function MessageFeed({
       <ScrollJumpButtons
         showJumpToTop={showJumpToTop}
         showJumpToBottom={showJumpToBottom}
-        isHovered={isHovered}
         onJumpToTop={() => virtuosoRef.current?.scrollToIndex({ index: 0, behavior: "smooth" })}
         onJumpToBottom={() =>
           virtuosoRef.current?.scrollToIndex({

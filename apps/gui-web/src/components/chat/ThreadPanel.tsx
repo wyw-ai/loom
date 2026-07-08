@@ -137,6 +137,7 @@ export function ThreadPanel({
             className="h-full soft-scrollbar"
             totalCount={replyItems.length} // +1 for root message slot
             followOutput="smooth"
+            increaseViewportBy={{ top: 200, bottom: 200 }}
             components={{
               Header: () => (
                 <section className="border-b border-[#edf0f5] bg-white px-5 py-4">

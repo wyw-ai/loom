@@ -843,6 +843,7 @@
 
   .message-markdown pre {
     overflow-x: auto;
+    overflow-y: hidden;
     border: 1px solid #dfe3ec;
     border-radius: 10px;
     background: #f7f8fb;

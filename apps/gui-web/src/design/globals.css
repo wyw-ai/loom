@@ -671,6 +671,11 @@
     min-height: 44px;
   }
 
+  .composer-box-manual textarea {
+    height: 100% !important;
+    max-height: none !important;
+  }
+
   .composer-icon {
     display: inline-flex;
     height: 28px;

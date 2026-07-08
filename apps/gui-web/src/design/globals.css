@@ -856,16 +856,16 @@
     border: 1px solid #dfe3ec;
     border-radius: 10px;
     background: #f7f8fb;
-    padding: 12px 12px 20px 12px;
+    padding: 12px;
   }
 
   .message-markdown pre::-webkit-scrollbar {
     height: 6px;
+    -webkit-appearance: none;
   }
 
   .message-markdown pre::-webkit-scrollbar-track {
     background: transparent;
-    border-radius: 0 0 10px 10px;
   }
 
   .message-markdown pre::-webkit-scrollbar-thumb {

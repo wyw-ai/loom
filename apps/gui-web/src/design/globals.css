@@ -812,10 +812,6 @@
     color: #ffffff;
   }
 
-  .message-markdown {
-    contain: content;
-  }
-
   .message-markdown p {
     margin: 0 0 0.45rem;
   }

@@ -56,7 +56,7 @@ export function ComposerResizeHandle({
       onKeyDown={handleKeyDown}
       onDoubleClick={onReset}
       className={cn(
-        "group/handle flex h-[10px] cursor-ns-resize items-end justify-center outline-none",
+        "group/handle flex h-full w-full cursor-ns-resize items-center justify-center outline-none",
         "focus-visible:ring-2 focus-visible:ring-[#503ed4] focus-visible:ring-offset-1",
         className,
       )}

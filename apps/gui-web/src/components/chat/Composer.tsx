@@ -121,7 +121,7 @@ export function Composer({
   }
 
   return (
-    <footer className="border-t border-[#e2e6ef] bg-white px-5 py-4">
+    <footer className="border-t border-[#e2e6ef] bg-white px-5 pt-1 pb-3">
       <Resizable
         className="mx-auto max-w-4xl"
         enable={{ top: true, right: false, bottom: false, left: false, topRight: false, bottomRight: false, bottomLeft: false, topLeft: false }}

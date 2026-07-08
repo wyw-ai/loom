@@ -1,3 +1,5 @@
+import { useEffect, useState } from "react";
+import { createPortal } from "react-dom";
 import { ChevronUp, ChevronDown } from "lucide-react";
 
 type ScrollJumpButtonsProps = {
@@ -13,33 +15,94 @@ export function ScrollJumpButtons({
   onJumpToTop,
   onJumpToBottom,
 }: ScrollJumpButtonsProps) {
-  if (!showJumpToTop && !showJumpToBottom) return null;
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
 
-  return (
+  if (!mounted || (!showJumpToTop && !showJumpToBottom)) return null;
+
+  return createPortal(
     <div
-      className="fixed bottom-20 right-8 z-50 flex flex-col gap-2 opacity-80 transition-opacity hover:opacity-100"
-      style={{ position: "fixed" }}
+      style={{
+        position: "fixed",
+        bottom: "80px",
+        right: "32px",
+        zIndex: 9999,
+        display: "flex",
+        flexDirection: "column",
+        gap: "8px",
+        opacity: 0.8,
+        transition: "opacity 200ms ease",
+      }}
+      onMouseEnter={(e) => {
+        e.currentTarget.style.opacity = "1";
+      }}
+      onMouseLeave={(e) => {
+        e.currentTarget.style.opacity = "0.8";
+      }}
     >
       {showJumpToTop && (
         <button
           type="button"
           onClick={onJumpToTop}
-          className="flex h-9 w-9 items-center justify-center rounded-full border border-[#dfe3ec] bg-white text-[#667085] shadow-md transition-colors hover:bg-[#f3f4f6] hover:text-[#1f2937]"
           aria-label="Jump to top"
+          style={{
+            width: "36px",
+            height: "36px",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            borderRadius: "9999px",
+            border: "1px solid #dfe3ec",
+            background: "#ffffff",
+            color: "#667085",
+            boxShadow: "0 2px 8px rgba(0,0,0,0.12)",
+            cursor: "pointer",
+            transition: "background 150ms ease, color 150ms ease",
+          }}
+          onMouseEnter={(e) => {
+            e.currentTarget.style.background = "#f3f4f6";
+            e.currentTarget.style.color = "#1f2937";
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.background = "#ffffff";
+            e.currentTarget.style.color = "#667085";
+          }}
         >
-          <ChevronUp className="h-5 w-5" />
+          <ChevronUp size={20} />
         </button>
       )}
       {showJumpToBottom && (
         <button
           type="button"
           onClick={onJumpToBottom}
-          className="flex h-9 w-9 items-center justify-center rounded-full border border-[#dfe3ec] bg-white text-[#667085] shadow-md transition-colors hover:bg-[#f3f4f6] hover:text-[#1f2937]"
           aria-label="Jump to bottom"
+          style={{
+            width: "36px",
+            height: "36px",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            borderRadius: "9999px",
+            border: "1px solid #dfe3ec",
+            background: "#ffffff",
+            color: "#667085",
+            boxShadow: "0 2px 8px rgba(0,0,0,0.12)",
+            cursor: "pointer",
+            transition: "background 150ms ease, color 150ms ease",
+          }}
+          onMouseEnter={(e) => {
+            e.currentTarget.style.background = "#f3f4f6";
+            e.currentTarget.style.color = "#1f2937";
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.background = "#ffffff";
+            e.currentTarget.style.color = "#667085";
+          }}
         >
-          <ChevronDown className="h-5 w-5" />
+          <ChevronDown size={20} />
         </button>
       )}
-    </div>
+    </div>,
+    document.body,
   );
 }

@@ -657,18 +657,18 @@
 
   .composer-box {
     display: flex;
-    min-height: 78px;
-    align-items: center;
+    min-height: 48px;
+    align-items: flex-end;
     gap: 12px;
     border: 1px solid #dfe3ec;
     border-radius: 12px;
     background: #ffffff;
-    padding: 10px 12px;
+    padding: 8px 12px;
     box-shadow: 0 1px 2px rgb(16 24 40 / 0.02);
   }
 
   .composer-box-compact {
-    min-height: 72px;
+    min-height: 44px;
   }
 
   .composer-icon {
@@ -807,6 +807,10 @@
     color: #ffffff;
   }
 
+  .message-markdown {
+    contain: content;
+  }
+
   .message-markdown p {
     margin: 0 0 0.45rem;
   }
@@ -847,7 +851,21 @@
     border: 1px solid #dfe3ec;
     border-radius: 10px;
     background: #f7f8fb;
-    padding: 12px;
+    padding: 12px 12px 8px 12px;
+  }
+
+  .message-markdown pre::-webkit-scrollbar {
+    height: 6px;
+  }
+
+  .message-markdown pre::-webkit-scrollbar-track {
+    background: transparent;
+    border-radius: 0 0 10px 10px;
+  }
+
+  .message-markdown pre::-webkit-scrollbar-thumb {
+    background: #c5c9d3;
+    border-radius: 3px;
   }
 
   .message-markdown pre code {

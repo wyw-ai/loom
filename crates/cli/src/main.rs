@@ -1059,6 +1059,9 @@ enum MessageCmd {
         private_to: Vec<String>,
         #[arg(long)]
         text: Option<String>,
+        /// Allow literal backslash-n sequences in --text from an agent run.
+        #[arg(long = "allow-escaped-newlines")]
+        allow_escaped_newlines: bool,
         /// Message intent: chat, ask, request_action, assign_task, status_update, review, notify.
         #[arg(long)]
         intent: Option<String>,
@@ -1084,6 +1087,9 @@ enum MessageCmd {
         thread: Option<String>,
         #[arg(long)]
         text: Option<String>,
+        /// Allow literal backslash-n sequences in --text from an agent run.
+        #[arg(long = "allow-escaped-newlines")]
+        allow_escaped_newlines: bool,
         /// Only send if this is still the latest message in the target scope.
         #[arg(long = "if-latest")]
         if_latest: Option<String>,
@@ -2069,6 +2075,7 @@ async fn async_main() -> Result<()> {
                 delivery_policy,
                 if_latest,
                 attachment_ids,
+                allow_escaped_newlines,
             } => {
                 cmd::message::send(
                     client,
@@ -2082,6 +2089,7 @@ async fn async_main() -> Result<()> {
                     delivery_policy,
                     if_latest,
                     attachment_ids,
+                    allow_escaped_newlines,
                 )
                 .await?
             }
@@ -2092,6 +2100,7 @@ async fn async_main() -> Result<()> {
                 text,
                 if_latest,
                 attachment_ids,
+                allow_escaped_newlines,
             } => {
                 cmd::message::ask(
                     client,
@@ -2102,6 +2111,7 @@ async fn async_main() -> Result<()> {
                     text,
                     if_latest,
                     attachment_ids,
+                    allow_escaped_newlines,
                 )
                 .await?
             }

@@ -111,7 +111,7 @@ export function ThreadComposer({
   }
 
   return (
-    <footer className="shrink-0 border-t border-[#edf0f5] bg-white pt-1 pb-3">
+    <footer className="shrink-0 border-t border-[#edf0f5] bg-white p-4">
       <Resizable
         className="w-full"
         enable={{ top: true, right: false, bottom: false, left: false, topRight: false, bottomRight: false, bottomLeft: false, topLeft: false }}

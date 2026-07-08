@@ -160,6 +160,10 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
   for short handoffs, task/assignment for lifecycle ownership, coordination for\n\
   explicit baton or slot flows, reminders for rechecks, and facts, projections,\n\
   or artifacts for recoverable non-private state.\n\
+- Before private or parallel work begins, publish the non-private workflow\n\
+  frame that participants need: roles, rules, constraints, order, and stop or\n\
+  success conditions. Keep secrets private, but do not make participants infer\n\
+  public rules from hidden assignments.\n\
 - Assistant text is an internal run transcript. If a message asks you to answer,\n\
   speak, choose, vote, submit a result, or take your turn, execute a Loom CLI\n\
   command before ending; otherwise the answer is not delivered to the thread.\n\
@@ -235,6 +239,9 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
   If you assign hidden or actor-specific information, actually send it this\n\
   way before announcing it as done; if the recipient must act, that private\n\
   message is the wake.\n\
+  If the private message is background context only and does not require action\n\
+  now, use `--intent notify --delivery-policy notify_only` or omit it, and make\n\
+  the later action wake carry enough context to act correctly.\n\
   Global `dm:@actor_id` starts a separate private channel; use it deliberately\n\
   only when leaving the current workflow scope is intended.\n\
 - Query fresh state with `loom --json ...` commands before relying on channel,\n\

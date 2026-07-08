@@ -129,7 +129,7 @@ export function ThreadComposer({
           ),
         }}
       >
-        <div className="composer-box composer-box-compact relative flex h-full items-start gap-2">
+        <div className={`composer-box composer-box-compact relative flex h-full items-start gap-2${isManual ? " composer-box-manual" : ""}`}>
           {showMentions && (
             <MentionMenu
               options={mentionOptions}
@@ -141,7 +141,7 @@ export function ThreadComposer({
             ref={textareaRef}
             value={draft}
             maxRows={COMPOSER_AUTO_MAX_ROWS}
-            fixedHeight={isManual ? resolvedHeight - 32 : null}
+            fixedHeight={isManual ? resolvedHeight - 20 : null}
             onChange={(event) => {
               setDraft(event.target.value);
               syncCaret(event.currentTarget);

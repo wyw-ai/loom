@@ -1,12 +1,21 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Resizable } from "re-resizable";
 import type { Actor, Message } from "@/ipc/types";
 import type { MentionOption } from "@/lib/format-utils";
 import { activeMentionQuery, mentionCandidates } from "@/lib/format-utils";
 import { isComposingKeyEvent, shouldSendOnEnter } from "@/lib/format-utils";
-import { Textarea } from "@/components/ui/textarea";
+import {
+  COMPOSER_AUTO_MAX_ROWS,
+  COMPOSER_DEFAULT_CAP,
+  COMPOSER_MIN_HEIGHT,
+  composerMaxHeightPx,
+} from "@/lib/composer-utils";
+import { useComposerStore } from "@/store/composerStore";
+import { AutoGrowTextarea } from "@/components/ui/AutoGrowTextarea";
 import { Button } from "@/components/ui/button";
 import { Send, Loader2, X } from "lucide-react";
 import { MentionMenu } from "@/components/chat/MentionMenu";
+import { ComposerResizeHandle } from "@/components/chat/ComposerResizeHandle";
 
 export function Composer({
   draft,
@@ -37,6 +46,40 @@ export function Composer({
   const [caretIndex, setCaretIndex] = useState(draft.length);
   const [selectedMentionIndex, setSelectedMentionIndex] = useState(0);
   const [dismissedMentionKey, setDismissedMentionKey] = useState<string | null>(null);
+
+  // --- Resize state ---
+  const entry = useComposerStore((s) => s.entries.channel);
+  const setManualHeight = useComposerStore((s) => s.setManualHeight);
+  const resetToAuto = useComposerStore((s) => s.resetToAuto);
+  const isManual = entry.mode === "manual" && entry.manualHeight !== null;
+  const resolvedHeight = isManual ? entry.manualHeight! : COMPOSER_DEFAULT_CAP;
+  const maxHeightPx = composerMaxHeightPx();
+
+  const handleResizeStop = useCallback(
+    (_e: MouseEvent | TouchEvent, _dir: string, _ref: HTMLElement, delta: { height: number }) => {
+      const newHeight = Math.max(
+        COMPOSER_MIN_HEIGHT,
+        Math.min(resolvedHeight + delta.height, maxHeightPx),
+      );
+      setManualHeight("channel", newHeight);
+    },
+    [resolvedHeight, maxHeightPx, setManualHeight],
+  );
+
+  const handleKeyboardResize = useCallback(
+    (deltaPx: number) => {
+      const newHeight = Math.max(
+        COMPOSER_MIN_HEIGHT,
+        Math.min(resolvedHeight + deltaPx, maxHeightPx),
+      );
+      setManualHeight("channel", newHeight);
+    },
+    [resolvedHeight, maxHeightPx, setManualHeight],
+  );
+
+  const handleReset = useCallback(() => {
+    resetToAuto("channel");
+  }, [resetToAuto]);
   const activeMention = activeMentionQuery(draft, caretIndex);
   const mentionKey = activeMention
     ? `${activeMention.start}:${activeMention.end}:${activeMention.query}`
@@ -78,81 +121,104 @@ export function Composer({
   }
 
   return (
-    <footer className="border-t border-[#e2e6ef] bg-white px-5 py-4">
-      <div className="mx-auto max-w-4xl">
-        {replyTo && (
-          <div className="mb-2 flex items-center gap-2 rounded-lg border border-[#dfe3ec] bg-[#f7f8fb] px-3 py-2 text-xs text-[#667085]">
-            <span className="min-w-0 flex-1 truncate">Replying to {actorName}</span>
-            <button onClick={onClearReply}>
-              <X size={14} />
-            </button>
-          </div>
-        )}
-        <div className="composer-box relative">
-          {showMentions && (
-            <MentionMenu
-              options={mentionOptions}
-              selectedIndex={effectiveMentionIndex}
-              onSelect={chooseMention}
-            />
+    <footer className="relative border-t border-[#e2e6ef] bg-white px-5 py-4">
+      <ComposerResizeHandle
+        onKeyboardResize={handleKeyboardResize}
+        onReset={handleReset}
+      />
+      <Resizable
+        className="mx-auto max-w-4xl"
+        enable={{ top: true, right: false, bottom: false, left: false, topRight: false, bottomRight: false, bottomLeft: false, topLeft: false }}
+        size={{ width: "100%", height: resolvedHeight }}
+        minHeight={COMPOSER_MIN_HEIGHT}
+        maxHeight={maxHeightPx}
+        onResizeStop={handleResizeStop}
+        handleStyles={{
+          top: {
+            cursor: "ns-resize",
+            height: "8px",
+            top: "-4px",
+            width: "100%",
+          },
+        }}
+      >
+        <div className="flex h-full flex-col">
+          {replyTo && (
+            <div className="mb-2 flex shrink-0 items-center gap-2 rounded-lg border border-[#dfe3ec] bg-[#f7f8fb] px-3 py-2 text-xs text-[#667085]">
+              <span className="min-w-0 flex-1 truncate">Replying to {actorName}</span>
+              <button onClick={onClearReply}>
+                <X size={14} />
+              </button>
+            </div>
           )}
-          <Textarea
-            ref={textareaRef}
-            value={draft}
-            onChange={(event) => {
-              setDraft(event.target.value);
-              syncCaret(event.currentTarget);
-              setDismissedMentionKey(null);
-            }}
-            onClick={(event) => syncCaret(event.currentTarget)}
-            onKeyUp={(event) => syncCaret(event.currentTarget)}
-            onKeyDown={(event) => {
-              if (isComposingKeyEvent(event)) return;
-              if (showMentions) {
-                if (event.key === "ArrowDown") {
-                  event.preventDefault();
-                  setSelectedMentionIndex((index) =>
-                    (index + 1) % mentionOptions.length,
-                  );
-                  return;
+          <div className="composer-box relative flex-1">
+            {showMentions && (
+              <MentionMenu
+                options={mentionOptions}
+                selectedIndex={effectiveMentionIndex}
+                onSelect={chooseMention}
+              />
+            )}
+            <AutoGrowTextarea
+              ref={textareaRef}
+              value={draft}
+              maxRows={COMPOSER_AUTO_MAX_ROWS}
+              fixedHeight={isManual ? resolvedHeight - 44 : null}
+              onChange={(event) => {
+                setDraft(event.target.value);
+                syncCaret(event.currentTarget);
+                setDismissedMentionKey(null);
+              }}
+              onClick={(event) => syncCaret(event.currentTarget)}
+              onKeyUp={(event) => syncCaret(event.currentTarget)}
+              onKeyDown={(event) => {
+                if (isComposingKeyEvent(event)) return;
+                if (showMentions) {
+                  if (event.key === "ArrowDown") {
+                    event.preventDefault();
+                    setSelectedMentionIndex((index) =>
+                      (index + 1) % mentionOptions.length,
+                    );
+                    return;
+                  }
+                  if (event.key === "ArrowUp") {
+                    event.preventDefault();
+                    setSelectedMentionIndex((index) =>
+                      (index - 1 + mentionOptions.length) % mentionOptions.length,
+                    );
+                    return;
+                  }
+                  if ((event.key === "Enter" || event.key === "Tab") && selectedMention) {
+                    event.preventDefault();
+                    chooseMention(selectedMention);
+                    return;
+                  }
+                  if (event.key === "Escape") {
+                    event.preventDefault();
+                    setDismissedMentionKey(mentionKey);
+                    return;
+                  }
                 }
-                if (event.key === "ArrowUp") {
+                if (shouldSendOnEnter(event)) {
                   event.preventDefault();
-                  setSelectedMentionIndex((index) =>
-                    (index - 1 + mentionOptions.length) % mentionOptions.length,
-                  );
-                  return;
+                  onSend();
                 }
-                if ((event.key === "Enter" || event.key === "Tab") && selectedMention) {
-                  event.preventDefault();
-                  chooseMention(selectedMention);
-                  return;
-                }
-                if (event.key === "Escape") {
-                  event.preventDefault();
-                  setDismissedMentionKey(mentionKey);
-                  return;
-                }
-              }
-              if (shouldSendOnEnter(event)) {
-                event.preventDefault();
-                onSend();
-              }
-            }}
-            disabled={disabled}
-            placeholder={disabled ? disabledPlaceholder : placeholder}
-            className="max-h-48 min-h-[44px] flex-1 border-0 bg-transparent px-0 py-1 shadow-none focus-visible:ring-0"
-          />
-          <Button
-            size="icon"
-            onClick={onSend}
-            disabled={disabled || !draft.trim() || busy}
-            className="h-9 w-9 rounded-lg"
-          >
-            {busy ? <Loader2 className="animate-spin" size={17} /> : <Send size={17} />}
-          </Button>
+              }}
+              disabled={disabled}
+              placeholder={disabled ? disabledPlaceholder : placeholder}
+              className="max-h-full min-h-[44px] flex-1 px-0"
+            />
+            <Button
+              size="icon"
+              onClick={onSend}
+              disabled={disabled || !draft.trim() || busy}
+              className="h-9 w-9 shrink-0 rounded-lg"
+            >
+              {busy ? <Loader2 className="animate-spin" size={17} /> : <Send size={17} />}
+            </Button>
+          </div>
         </div>
-      </div>
+      </Resizable>
     </footer>
   );
 }

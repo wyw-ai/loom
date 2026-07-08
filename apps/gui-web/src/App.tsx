@@ -8,7 +8,6 @@ import { Loader2 } from "lucide-react";
 
 import * as ipc from "@/ipc/bridge";
 import {
-  scopeKey,
   type Channel,
   type ChannelMemberConfig,
   type DesktopConfig,
@@ -28,7 +27,6 @@ import {
   defaultAgentPromptAssembly,
   detailPanelBreakpoint,
   localServerCommand,
-  machineStatusPollIntervalMs,
 } from "@/lib/constants";
 import {
   defaultWorkspaceForm,
@@ -54,7 +52,6 @@ import {
   normalizeMessage,
   sortMessages,
   threadIdForMessage,
-  threadStatsFromMessages,
   threadTitle,
   upsertMessage,
   upsertThreadStatsMessage,
@@ -72,7 +69,6 @@ import {
   machineCanCreateAgent,
   mentionAudience,
   normalizeAgentForm,
-  reconnectDelayMs,
   resolveAgentMachine,
   resolveAgentProvider,
   savePanelSizes,
@@ -137,6 +133,8 @@ import {
 import { usePanelResize } from "@/hooks/usePanelResize";
 import { useStreamHandler } from "@/hooks/useStreamHandler";
 import { useChannelGroups } from "@/hooks/useChannelGroups";
+import { useConnectionLifecycle } from "@/hooks/useConnectionLifecycle";
+import { useChannelScope } from "@/hooks/useChannelScope";
 
 
 export function App() {
@@ -242,7 +240,6 @@ export function App() {
   const activeDirectScopeRef = useRef<ScopeRef | null>(null);
   const activeDirectActorIdRef = useRef<string | null>(null);
   const actorIdRef = useRef<string | null>(null);
-  const targetRef = useRef<string | null>(null);
   const workspaceRef = useRef<Workspace | null>(null);
   const autoReconnectRef = useRef(false);
   const hasOpenedConnectionRef = useRef(false);
@@ -251,7 +248,6 @@ export function App() {
 
   const account = config.account ?? null;
   const workspaces = config.workspaces ?? [];
-  const activeWorkspaceId = workspace?.id ?? null;
   const visibleChannels = deriveVisibleChannels(channels);
   const activeChannel = deriveActiveChannel(visibleChannels, activeChannelId);
   const channelGroupsKey = deriveChannelGroupsKey(workspace);
@@ -468,302 +464,6 @@ export function App() {
     [clearReconnectTimer, connection, loadWorkspaceData, pushNotice],
   );
 
-  useEffect(() => {
-    let unlistenStream: (() => void) | null = null;
-    let unlistenConnection: (() => void) | null = null;
-
-    void loadConfig();
-    void ipc.onStream((update) => handleStream(update)).then((off) => {
-      unlistenStream = off;
-    });
-    void ipc.onConnection((event) => {
-      if (event.state === "closed") {
-        setConnection("closed");
-        if (
-          hasOpenedConnectionRef.current &&
-          autoReconnectRef.current &&
-          workspaceRef.current
-        ) {
-          setError("Connection lost. Reconnecting...");
-        } else {
-          autoReconnectRef.current = false;
-          setError(null);
-        }
-        void loadMachines(true).catch(() => {});
-      } else {
-        hasOpenedConnectionRef.current = true;
-        if (workspaceRef.current) autoReconnectRef.current = true;
-        reconnectAttemptRef.current = 0;
-        setConnection("open");
-        setError(null);
-        void loadMachines(true).catch(() => {});
-      }
-    }).then((off) => {
-      unlistenConnection = off;
-    });
-
-    return () => {
-      unlistenStream?.();
-      unlistenConnection?.();
-    };
-  }, [loadConfig, loadMachines]);
-
-  useEffect(() => {
-    workspaceRef.current = workspace;
-  }, [workspace]);
-
-  useEffect(() => {
-    if (!account || !activeWorkspaceId || connection !== "idle") return;
-    autoReconnectRef.current = false;
-    hasOpenedConnectionRef.current = false;
-    reconnectAttemptRef.current = 0;
-    void connectWorkspace(activeWorkspaceId, { automatic: true, quiet: true });
-  }, [account, activeWorkspaceId, connectWorkspace, connection]);
-
-  useEffect(() => {
-    activeDirectActorIdRef.current = activeDirectActor?.id ?? null;
-  }, [activeDirectActor?.id]);
-
-  useEffect(() => {
-    savePanelSizes(panelSizes);
-  }, [panelSizes]);
-
-  useEffect(() => {
-    const updateViewport = () => setViewportWidth(initialViewportWidth());
-    updateViewport();
-    window.addEventListener("resize", updateViewport);
-    return () => window.removeEventListener("resize", updateViewport);
-  }, []);
-
-  useEffect(() => {
-    setChannelGroups(loadChannelGroups(channelGroupsKey));
-  }, [channelGroupsKey]);
-
-  useEffect(() => {
-    setActiveDirectActorId(null);
-    setDirectMessages([]);
-    setDirectDraft("");
-    setDirectScopesByActorId({});
-  }, [workspace?.id]);
-
-  useEffect(() => {
-    if (view !== "direct") return;
-    setActiveDirectActorId((current) => current ?? agentActors[0]?.id ?? null);
-  }, [agentActorIdsKey, view]);
-
-  useEffect(() => {
-    if (
-      !account ||
-      !autoReconnectRef.current ||
-      !hasOpenedConnectionRef.current ||
-      !workspace ||
-      (connection !== "closed" && connection !== "error")
-    ) {
-      return;
-    }
-
-    const attempt = reconnectAttemptRef.current + 1;
-    reconnectAttemptRef.current = attempt;
-    const delay = reconnectDelayMs(attempt);
-    const timer = window.setTimeout(() => {
-      reconnectTimerRef.current = null;
-      void connectWorkspace(workspace.id, { automatic: true, reconnect: true });
-    }, delay);
-    reconnectTimerRef.current = timer;
-
-    return () => {
-      if (reconnectTimerRef.current === timer) {
-        window.clearTimeout(timer);
-        reconnectTimerRef.current = null;
-      }
-    };
-  }, [account, connectWorkspace, connection, workspace]);
-
-  useEffect(() => {
-    if (connection !== "open") return;
-
-    const refreshMachines = () => {
-      void loadMachines(true).catch(() => {});
-    };
-    refreshMachines();
-
-    const interval = window.setInterval(refreshMachines, machineStatusPollIntervalMs);
-    const refreshWhenVisible = () => {
-      if (document.visibilityState === "visible") refreshMachines();
-    };
-    document.addEventListener("visibilitychange", refreshWhenVisible);
-
-    return () => {
-      window.clearInterval(interval);
-      document.removeEventListener("visibilitychange", refreshWhenVisible);
-    };
-  }, [connection, loadMachines]);
-
-  useEffect(() => {
-    if (!activeChannel || connection !== "open") return;
-    let alive = true;
-    void ipc
-      .channelMembers(activeChannel.id)
-      .then((result) => {
-        if (!alive) return;
-        setActors((current) => {
-          const next = { ...current };
-          for (const actor of result.members) next[actor.id] = actor;
-          return next;
-        });
-      })
-      .catch(() => {});
-    void ipc
-      .channelMemberConfigList(activeChannel.id)
-      .then((result) => {
-        if (!alive) return;
-        setChannelMemberConfigsByChannel((current) => ({
-          ...current,
-          [activeChannel.id]: Object.fromEntries(
-            result.configs.map((config) => [config.actorId, config]),
-          ),
-        }));
-      })
-      .catch(() => {});
-    void ipc
-      .threadList(activeChannel.id)
-      .then((result) => {
-        if (!alive) return;
-        setThreadsByChannel((current) => ({
-          ...current,
-          [activeChannel.id]: sortThreads(result.threads),
-        }));
-      })
-      .catch((err) => setError(errorText(err)));
-    return () => {
-      alive = false;
-    };
-  }, [activeChannel?.id, activeChannel?.members.join("|"), connection]);
-
-  useEffect(() => {
-    if (connection !== "open" || visibleChannels.length === 0) return;
-    let alive = true;
-    void Promise.allSettled(
-      visibleChannels.map((channel) =>
-        ipc.threadList(channel.id).then((result) => ({
-          channelId: channel.id,
-          threads: result.threads,
-        })),
-      ),
-    ).then((results) => {
-      if (!alive) return;
-      setThreadsByChannel((current) => {
-        const next = { ...current };
-        for (const result of results) {
-          if (result.status === "fulfilled") {
-            next[result.value.channelId] = sortThreads(result.value.threads);
-          }
-        }
-        return next;
-      });
-    });
-    return () => {
-      alive = false;
-    };
-  }, [channelIdsKey, connection]);
-
-  useEffect(() => {
-    activeScopeRef.current = activeScope;
-    targetRef.current = target;
-    if (!activeScope || !target || connection !== "open") {
-      setMessages([]);
-      return;
-    }
-
-    let alive = true;
-    setMessages([]);
-    void ipc.scopeSubscribe(activeScope).catch(() => {});
-    void ipc
-      .messageList({ target, limit: 150 })
-      .then((result) => {
-        if (!alive) return;
-        setError(null);
-        setMessages(sortMessages(result.messages.map(normalizeMessage)));
-      })
-      .catch((err) => setError(errorText(err)));
-
-    return () => {
-      alive = false;
-      void ipc.scopeUnsubscribe(activeScope).catch(() => {});
-    };
-  }, [activeScope ? scopeKey(activeScope) : null, connection, target]);
-
-  useEffect(() => {
-    activeThreadScopeRef.current = activeThreadScope;
-    if (!activeThreadScope || !threadMessageTarget || connection !== "open") {
-      setThreadMessages([]);
-      return;
-    }
-
-    let alive = true;
-    setThreadMessages([]);
-    void ipc.scopeSubscribe(activeThreadScope).catch(() => {});
-    void ipc
-      .messageList({ target: threadMessageTarget, limit: 100 })
-      .then((result) => {
-        if (!alive) return;
-        setError(null);
-        const sorted = sortMessages(result.messages.map(normalizeMessage));
-        setThreadMessages(sorted);
-        setThreadStatsById((current) => ({
-          ...current,
-          [activeThreadScope.id]: threadStatsFromMessages(
-            sorted,
-            result.pageInfo?.hasMore ?? false,
-          ),
-        }));
-      })
-      .catch((err) => setError(errorText(err)));
-
-    return () => {
-      alive = false;
-      void ipc.scopeUnsubscribe(activeThreadScope).catch(() => {});
-    };
-  }, [
-    activeThreadScope ? scopeKey(activeThreadScope) : null,
-    connection,
-    threadMessageTarget,
-  ]);
-
-  useEffect(() => {
-    activeDirectScopeRef.current = activeDirectScope;
-    if (!activeDirectActor || !activeDirectTarget || connection !== "open") {
-      setDirectMessages([]);
-      return;
-    }
-    if (!activeDirectScope) {
-      setDirectMessages([]);
-      return;
-    }
-
-    let alive = true;
-    setDirectMessages([]);
-    void ipc.scopeSubscribe(activeDirectScope).catch(() => {});
-    void ipc
-      .messageList({ target: activeDirectTarget, limit: 150 })
-      .then((result) => {
-        if (!alive) return;
-        setError(null);
-        setDirectMessages(sortMessages(result.messages.map(normalizeMessage)));
-      })
-      .catch((err) => setError(errorText(err)));
-
-    return () => {
-      alive = false;
-      void ipc.scopeUnsubscribe(activeDirectScope).catch(() => {});
-    };
-  }, [
-    activeDirectActor?.id,
-    activeDirectScope ? scopeKey(activeDirectScope) : null,
-    activeDirectTarget,
-    connection,
-  ]);
-
   const {
     updateChannelGroups,
     addChannelGroup,
@@ -803,6 +503,80 @@ export function App() {
     setActiveThreadId,
     updateChannelGroups,
     refreshInbox,
+  });
+
+  useConnectionLifecycle({
+    loadConfig,
+    loadMachines,
+    handleStream,
+    connectWorkspace,
+    setConnection,
+    setError,
+    connection,
+    account,
+    workspace,
+    workspaceRef,
+    autoReconnectRef,
+    hasOpenedConnectionRef,
+    reconnectTimerRef,
+    reconnectAttemptRef,
+    clearReconnectTimer,
+  });
+
+  useEffect(() => {
+    activeDirectActorIdRef.current = activeDirectActor?.id ?? null;
+  }, [activeDirectActor?.id]);
+
+  useEffect(() => {
+    savePanelSizes(panelSizes);
+  }, [panelSizes]);
+
+  useEffect(() => {
+    const updateViewport = () => setViewportWidth(initialViewportWidth());
+    updateViewport();
+    window.addEventListener("resize", updateViewport);
+    return () => window.removeEventListener("resize", updateViewport);
+  }, []);
+
+  useEffect(() => {
+    setChannelGroups(loadChannelGroups(channelGroupsKey));
+  }, [channelGroupsKey]);
+
+  useEffect(() => {
+    setActiveDirectActorId(null);
+    setDirectMessages([]);
+    setDirectDraft("");
+    setDirectScopesByActorId({});
+  }, [workspace?.id]);
+
+  useEffect(() => {
+    if (view !== "direct") return;
+    setActiveDirectActorId((current) => current ?? agentActors[0]?.id ?? null);
+  }, [agentActorIdsKey, view]);
+
+  useChannelScope({
+    connection,
+    activeChannel,
+    visibleChannels,
+    channelIdsKey,
+    activeScope,
+    target,
+    activeThreadScope,
+    threadMessageTarget,
+    activeDirectActor,
+    activeDirectScope,
+    activeDirectTarget,
+    activeScopeRef,
+    activeThreadScopeRef,
+    activeDirectScopeRef,
+    setActors,
+    setChannelMemberConfigsByChannel,
+    setThreadsByChannel,
+    setMessages,
+    setThreadMessages,
+    setDirectMessages,
+    setThreadStatsById,
+    setError,
   });
 
   async function setLocalIdentity(args: {

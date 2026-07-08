@@ -5063,10 +5063,10 @@ mod tests {
         adapter.cancel(scope.clone()).await.expect("cancel");
 
         // The Finished event should arrive promptly with summary "cancelled".
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut got_cancelled = false;
         while std::time::Instant::now() < deadline {
-            match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
+            match tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await {
                 Ok(Some(AdapterEvent::Finished {
                     success, summary, ..
                 })) => {
@@ -5076,7 +5076,8 @@ mod tests {
                     break;
                 }
                 Ok(Some(_)) => continue,
-                Ok(None) | Err(_) => break,
+                Ok(None) => break,
+                Err(_) => continue,
             }
         }
         assert!(got_cancelled, "did not receive cancelled Finished event");

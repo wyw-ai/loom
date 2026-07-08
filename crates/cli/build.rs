@@ -2,8 +2,7 @@ use std::env;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
-
-use loom_platform::process::Command;
+use std::process::Command;
 
 const GUIDE_REPO_URL: &str = "https://github.com/wyw-ai/loom-guide.git";
 const SKILLS_REPO_URL: &str = "https://github.com/wyw-ai/loom-skills.git";

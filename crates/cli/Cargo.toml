@@ -46,7 +46,6 @@ thiserror = { workspace = true }
 tempfile = { workspace = true }
 
 [build-dependencies]
-loom-platform = { workspace = true }
 
 [lints]
 workspace = true

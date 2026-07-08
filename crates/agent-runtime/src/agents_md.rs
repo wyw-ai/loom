@@ -183,6 +183,9 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
   agent replies to public asks, but do not rely on inference for handoffs.\n\
   Do not send the same answer once with `message send` and again with\n\
   `message ask`; choose the routed form when a wake-back is needed.\n\
+- Requested answers such as joining, voting, choosing, approving, reviewing,\n\
+  or completing a step are actionable even when they are short; wake the\n\
+  requester/coordinator instead of sending them notify-only.\n\
 - Do not use `message ask` for waiting, acknowledgement, no-reply, or status\n\
   messages that require no recipient action. Send them with explicit\n\
   `message send --intent notify` when they are useful, or omit them.\n\
@@ -222,6 +225,11 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
 - In multi-party decisions, rebuild the latest effective decision for each\n\
   required participant before declaring agreement; crossed or stale replies do\n\
   not count as consensus.\n\
+- If same-phase replies conflict or include corrections, use the latest\n\
+  explicit final/correction visible to the allowed audience, or ask for\n\
+  clarification. After consuming answers, do not end silently: record the\n\
+  accepted result, wake the next actor, schedule a reminder, or surface the\n\
+  blocker.\n\
 - If a private wake asks for a public contribution, publish it with\n\
   `message ask` to the requester/coordinator unless you own or were delegated\n\
   the next handoff; keep private facts out of the public text.\n\

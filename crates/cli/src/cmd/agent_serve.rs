@@ -6200,6 +6200,7 @@ announcements and may be rejected for action requests inside agent runs. Do not 
 `message send` and `message ask`. Use same-scope \
 `message send --private-to @actor_id --target \"$LOOM_REPLY_TARGET\"` for hidden or sensitive prompts/follow-ups. \
 If you assign hidden or actor-specific information, actually send it privately before announcing it as done. \
+If private context requires no action yet, prefer `--intent notify --delivery-policy notify_only` and put required context in the later action wake. \
 Do not use `message ask` for wait/no-reply/status messages that need no recipient action. \
 For final summaries or wrap-ups that require no further action, use `message send`, not `message ask`. \
 For informational `notify` / `notify_only` wakes with no requested action, do not send a receipt; \

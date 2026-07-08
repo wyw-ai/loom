@@ -29,6 +29,9 @@ use serde_json::{json, Map, Value};
 
 use crate::adapter::{PromptPart, PromptRoleHint};
 
+const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 30 * 60 * 1000;
+const DEFAULT_COMMAND_IDLE_TIMEOUT_MS: u64 = 5 * 60 * 1000;
+
 #[derive(Debug, Clone)]
 pub struct DetectedProvider {
     pub id: String,
@@ -2145,8 +2148,8 @@ fn mode(
         },
         stderr: None,
         session,
-        timeout_ms: None,
-        idle_timeout_ms: None,
+        timeout_ms: Some(DEFAULT_COMMAND_TIMEOUT_MS),
+        idle_timeout_ms: Some(DEFAULT_COMMAND_IDLE_TIMEOUT_MS),
         interactive: None,
         provider: None,
     }
@@ -3871,6 +3874,29 @@ mod tests {
                 !rendered.contains("{loom.configDir}"),
                 "{provider_id} should not expose the daemon config dir by default"
             );
+        }
+    }
+
+    #[test]
+    fn builtin_command_print_modes_have_bounded_turn_timeouts() {
+        for provider_id in ["claude", "qoder", "copilot", "codex", "opencode"] {
+            let manifest = builtin_provider_manifests()
+                .into_iter()
+                .find(|manifest| manifest.id == provider_id)
+                .expect("provider");
+            let mode = manifest.modes.get("print").expect("print mode");
+            if mode.transport == "command" {
+                assert_eq!(
+                    mode.timeout_ms,
+                    Some(DEFAULT_COMMAND_TIMEOUT_MS),
+                    "{provider_id} should bound total command turn runtime"
+                );
+                assert_eq!(
+                    mode.idle_timeout_ms,
+                    Some(DEFAULT_COMMAND_IDLE_TIMEOUT_MS),
+                    "{provider_id} should surface quiet hung command turns"
+                );
+            }
         }
     }
 

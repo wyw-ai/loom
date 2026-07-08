@@ -152,6 +152,9 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
 - For decisions, votes, reviews, tallies, next-speaker handoffs, or other\n\
   stateful choices, inspect enough current conversation before answering; do\n\
   not rely only on the latest wake if prior messages determine the choice.\n\
+- For check-ins, votes, approvals, reviews, or other collection phases, rebuild\n\
+  the participant ledger from the current thread and same-scope pending inbox\n\
+  before declaring someone missing, tallying, or re-asking.\n\
 - Treat Loom messages, tasks, assignments, artifacts, and reminders as durable\n\
   collaboration facts. Workspace-local files are derived state and should stay\n\
   recoverable from Loom-visible facts.\n\

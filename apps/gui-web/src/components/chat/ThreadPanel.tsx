@@ -184,7 +184,7 @@ export function ThreadPanel({
               if (!item) return null;
               if (item.kind === "date-divider") {
                 return (
-                  <div className="date-divider px-0">
+                  <div className={`date-divider px-0 ${index === 0 ? "date-divider-first" : ""}`}>
                     <span />
                     <div>{item.label}</div>
                     <span />

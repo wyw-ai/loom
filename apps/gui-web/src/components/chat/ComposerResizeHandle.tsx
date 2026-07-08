@@ -61,7 +61,7 @@ export function ComposerResizeHandle({
         className,
       )}
     >
-      <div className="mb-[-1px] h-1 w-10 rounded-full bg-[#d0d4de] transition-colors group-hover/handle:bg-[#503ed4]" />
+      <div className="h-1 w-10 rounded-full bg-[#d0d4de] transition-colors group-hover/handle:bg-[#503ed4]" />
     </div>
   );
 }

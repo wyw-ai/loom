@@ -852,7 +852,7 @@
     border: 1px solid #dfe3ec;
     border-radius: 10px;
     background: #f7f8fb;
-    padding: 12px;
+    padding: 12px 12px 18px;
   }
 
   .message-markdown pre::-webkit-scrollbar {

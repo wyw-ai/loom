@@ -6196,9 +6196,12 @@ For multiline messages, omit `--text` and pipe stdin/heredoc; quoted `\\n` is st
 In coordinated workflows, wake the requester/coordinator with your result unless you own or were delegated the next handoff. \
 When you own the handoff, or no coordinator exists and another actor or group must continue, use `message ask` \
 with exact actor ids or an appropriate group; plain `message send` is only for no-action \
-announcements and may be rejected for action requests inside agent runs. Use same-scope \
+announcements and may be rejected for action requests inside agent runs. Do not send the same answer twice with both \
+`message send` and `message ask`. Use same-scope \
 `message send --private-to @actor_id --target \"$LOOM_REPLY_TARGET\"` for hidden or sensitive prompts/follow-ups. \
+If you assign hidden or actor-specific information, actually send it privately before announcing it as done. \
 Do not use `message ask` for wait/no-reply/status messages that need no recipient action. \
+For final summaries or wrap-ups that require no further action, use `message send`, not `message ask`. \
 For informational `notify` / `notify_only` wakes with no requested action, do not send a receipt; \
 use `loom --json run ignore --reason \"no action needed\"`. \
 Use `loom --json run ignore --reason \"...\"` when no visible action is needed.\n";
@@ -12624,6 +12627,9 @@ mod tests {
         assert!(full.contains("unless you own or were delegated the next handoff"));
         assert!(full.contains("When you own the handoff"));
         assert!(full.contains("plain `message send` is only for no-action announcements"));
+        assert!(full.contains("Do not send the same answer twice"));
+        assert!(full.contains("actually send it privately before announcing it as done"));
+        assert!(full.contains("For final summaries or wrap-ups"));
         assert!(full.contains("loom --json run ignore --reason"));
 
         let pointer = render_turn_input_contract_with_names(
@@ -12643,6 +12649,9 @@ mod tests {
         assert!(pointer.contains("unless you own or were delegated the next handoff"));
         assert!(pointer.contains("When you own the handoff"));
         assert!(pointer.contains("plain `message send` is only for no-action announcements"));
+        assert!(pointer.contains("Do not send the same answer twice"));
+        assert!(pointer.contains("actually send it privately before announcing it as done"));
+        assert!(pointer.contains("For final summaries or wrap-ups"));
         assert!(pointer.contains("loom --json run ignore --reason"));
 
         let skip = render_turn_input_contract_with_names(

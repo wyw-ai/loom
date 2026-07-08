@@ -658,7 +658,7 @@
   .composer-box {
     display: flex;
     min-height: 78px;
-    align-items: flex-end;
+    align-items: center;
     gap: 12px;
     border: 1px solid #dfe3ec;
     border-radius: 12px;

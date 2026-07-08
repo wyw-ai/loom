@@ -16,7 +16,10 @@ export function ScrollJumpButtons({
   if (!showJumpToTop && !showJumpToBottom) return null;
 
   return (
-    <div className="absolute bottom-4 right-4 z-10 flex flex-col gap-2 opacity-80 transition-opacity hover:opacity-100">
+    <div
+      className="fixed bottom-20 right-8 z-50 flex flex-col gap-2 opacity-80 transition-opacity hover:opacity-100"
+      style={{ position: "fixed" }}
+    >
       {showJumpToTop && (
         <button
           type="button"

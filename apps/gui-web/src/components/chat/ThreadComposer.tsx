@@ -130,6 +130,15 @@ export function ThreadComposer({
         maxHeight={maxHeightPx}
         onResizeStop={handleResizeStop}
         onResize={handleResize}
+        handleStyles={{
+          top: {
+            top: "-2px",
+            height: "6px",
+            width: "100%",
+            position: "absolute",
+            cursor: "row-resize",
+          },
+        }}
         handleComponent={{
           top: (
             <ComposerResizeHandle

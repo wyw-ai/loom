@@ -14,11 +14,7 @@ import {
   type DesktopConfig,
   type MachineInfo,
   type Message,
-  type Run,
   type ScopeRef,
-  type StreamUpdate,
-  type Task,
-  type Thread,
   type Workspace
 } from "@/ipc/types";
 
@@ -27,14 +23,12 @@ import { cn } from "@/lib/utils";
 import type {
   AgentFormState,
   AgentUpdatePatch,
-  ChannelGroup,
 } from "@/lib/types";
 import {
   defaultAgentPromptAssembly,
   detailPanelBreakpoint,
   localServerCommand,
   machineStatusPollIntervalMs,
-  ungroupedChannelGroupId
 } from "@/lib/constants";
 import {
   defaultWorkspaceForm,
@@ -45,23 +39,18 @@ import { defaultWakeSpec } from "@/lib/wake-utils";
 import {
   channelMentionActors,
   channelMentionAgentActors,
-  directChannelPeerId,
   directMessageTarget,
   directPeerForMessage,
   isChannelMentionActor,
   isDirectChannel,
   loadChannelGroups,
-  messageBelongsToDirectActor,
-  normalizeChannelGroups,
   sameScope,
-  saveChannelGroups,
   sortChannels,
 } from "@/lib/channel-utils";
 
 import {
   channelFromMessage,
   emptyThreadStats,
-  messageIsActionRequestFor,
   normalizeMessage,
   sortMessages,
   threadIdForMessage,
@@ -100,7 +89,6 @@ import { useChannelStore } from "@/store/channelStore";
 import { useMessageStore } from "@/store/messageStore";
 import { useActorStore } from "@/store/actorStore";
 import { useTaskStore } from "@/store/taskStore";
-import { applyMessageToUsageStore } from "@/store/usageStore";
 
 // P3 — Extracted layout / shared components
 import { Rail } from "@/components/layout/Rail";
@@ -147,6 +135,8 @@ import {
   deriveVisibleChannels,
 } from "@/lib/derived";
 import { usePanelResize } from "@/hooks/usePanelResize";
+import { useStreamHandler } from "@/hooks/useStreamHandler";
+import { useChannelGroups } from "@/hooks/useChannelGroups";
 
 
 export function App() {
@@ -774,207 +764,46 @@ export function App() {
     connection,
   ]);
 
-  function handleStream(update: StreamUpdate) {
-    switch (update.kind) {
-      case "channel.created":
-      case "channel.updated":
-      case "channel.invited": {
-        const channel = update.data.channel as Channel | undefined;
-        if (channel) {
-          setChannels((current) => sortChannels(upsert(current, channel)));
-          const peerActorId = directChannelPeerId(channel, actorIdRef.current);
-          if (peerActorId) {
-            setDirectScopesByActorId((current) => ({
-              ...current,
-              [peerActorId]: { kind: "channel", id: channel.id },
-            }));
-          }
-        }
-        return;
-      }
-      case "channel.deleted": {
-        const channelId = update.data.channelId as string | undefined;
-        if (!channelId) return;
-        applyChannelDeleted(channelId);
-        return;
-      }
-      case "channel.revoked": {
-        const channelId = update.data.channelId as string | undefined;
-        if (!channelId) return;
-        applyChannelDeleted(channelId);
-        return;
-      }
-      case "thread.created":
-      case "thread.updated": {
-        const thread = update.data.thread as Thread | undefined;
-        if (!thread) return;
-        setThreadsByChannel((current) => ({
-          ...current,
-          [thread.channelId]: sortThreads(
-            upsert(current[thread.channelId] ?? [], thread).filter(
-              (item) => !item.archivedAt,
-            ),
-          ),
-        }));
-        return;
-      }
-      case "message.created": {
-        const message = update.data.message as Message | undefined;
-        if (!message) return;
-              applyMessageToUsageStore(message);
-              if (messageIsActionRequestFor(message, actorIdRef.current)) {
-          setInbox((current) =>
-            current.some((item) => item.delivery.sourceId === message.id)
-              ? current
-              : [
-                  {
-                    delivery: {
-                      sourceId: message.id,
-                      actorId: actorIdRef.current ?? "",
-                      state: "pending",
-                      updatedAt: message.createdAt,
-                    },
-                    message: normalizeMessage(message),
-                  },
-                  ...current,
-                ],
-          );
-        }
-        if (update.scope && activeScopeRef.current && sameScope(update.scope, activeScopeRef.current)) {
-          setMessages((current) => sortMessages(upsertMessage(current, message)));
-        }
-        if (message.scope.kind === "thread") {
-          setThreadStatsById((current) => upsertThreadStatsMessage(current, message));
-        }
-        if (
-          update.scope &&
-          activeThreadScopeRef.current &&
-          sameScope(update.scope, activeThreadScopeRef.current)
-        ) {
-          setThreadMessages((current) => sortMessages(upsertMessage(current, message)));
-        }
-        if (
-          (update.scope &&
-            activeDirectScopeRef.current &&
-            sameScope(update.scope, activeDirectScopeRef.current)) ||
-          messageBelongsToDirectActor(
-            message,
-            activeDirectActorIdRef.current,
-            actorIdRef.current,
-          )
-        ) {
-          setDirectMessages((current) => sortMessages(upsertMessage(current, message)));
-        }
-        return;
-      }
-      case "message.updated": {
-        const message = update.data.message as Message | undefined;
-        if (!message) return;
-              applyMessageToUsageStore(message);
-              if (update.scope && activeScopeRef.current && sameScope(update.scope, activeScopeRef.current)) {
-          setMessages((current) => sortMessages(upsertMessage(current, message)));
-        }
-        if (message.scope.kind === "thread") {
-          setThreadStatsById((current) => upsertThreadStatsMessage(current, message));
-        }
-        if (
-          update.scope &&
-          activeThreadScopeRef.current &&
-          sameScope(update.scope, activeThreadScopeRef.current)
-        ) {
-          setThreadMessages((current) => sortMessages(upsertMessage(current, message)));
-        }
-        if (
-          (update.scope &&
-            activeDirectScopeRef.current &&
-            sameScope(update.scope, activeDirectScopeRef.current)) ||
-          messageBelongsToDirectActor(
-            message,
-            activeDirectActorIdRef.current,
-            actorIdRef.current,
-          )
-        ) {
-          setDirectMessages((current) => sortMessages(upsertMessage(current, message)));
-        }
-        setInbox((current) =>
-          current.map((item) =>
-            item.delivery.sourceId === message.id
-              ? { ...item, message: normalizeMessage(message) }
-              : item,
-          ),
-        );
-        return;
-      }
-      case "run.updated": {
-        const run = update.data.run as Run | undefined;
-        if (run) setRuns((current) => ({ ...current, [run.id]: run }));
-        return;
-      }
-      case "task.changed": {
-        const task = update.data.task as Task | undefined;
-        if (task) setTasks((current) => sortTasks(upsert(current, task)));
-        return;
-      }
-      case "task_assignment.changed": {
-        const task = update.data.task as Task | undefined;
-        if (task) setTasks((current) => sortTasks(upsert(current, task)));
-        return;
-      }
-      case "delivery.updated": {
-        const actorId = actorIdRef.current;
-        if (actorId) void refreshInbox(actorId).catch(() => {});
-        return;
-      }
-    }
-  }
+  const {
+    updateChannelGroups,
+    addChannelGroup,
+    renameChannelGroup,
+    removeChannelGroup,
+    toggleChannelGroup,
+    moveChannelToGroup,
+  } = useChannelGroups({
+    channelGroups,
+    setChannelGroups,
+    channelGroupsKey,
+  });
 
-  function applyChannelDeleted(channelId: string) {
-    const deletedThreads = threadsByChannel[channelId] ?? [];
-    const deletedChannel = channels.find((channel) => channel.id === channelId) ?? null;
-    const fallbackChannelId =
-      channels.find((channel) => channel.id !== channelId && !isDirectChannel(channel))
-        ?.id ?? null;
-    setChannels((current) => current.filter((channel) => channel.id !== channelId));
-    const deletedDirectPeerId = directChannelPeerId(deletedChannel, actorIdRef.current);
-    if (deletedDirectPeerId) {
-      setDirectScopesByActorId((current) => {
-        const next = { ...current };
-        delete next[deletedDirectPeerId];
-        return next;
-      });
-    }
-    setThreadsByChannel((current) => {
-      const next = { ...current };
-      delete next[channelId];
-      return next;
-    });
-    setTasks((current) => current.filter((task) => task.channelId !== channelId));
-    setThreadStatsById((current) => {
-      const next = { ...current };
-      for (const thread of deletedThreads) delete next[thread.id];
-      return next;
-    });
-    updateChannelGroups((current) =>
-      current.map((group) => ({
-        ...group,
-        channelIds: group.channelIds.filter((id) => id !== channelId),
-      })),
-    );
-    setActiveChannelId((current) =>
-      current === channelId ? fallbackChannelId : current,
-    );
-    setActiveThreadId((current) =>
-      current && deletedThreads.some((thread) => thread.id === current)
-        ? null
-        : current,
-    );
-    if (activeChannelId === channelId) {
-      setChannelPanelTab(null);
-      setReplyTo(null);
-      setMessages([]);
-      setThreadMessages([]);
-    }
-  }
+  const { handleStream, applyChannelDeleted } = useStreamHandler({
+    setChannels,
+    setDirectScopesByActorId,
+    setThreadsByChannel,
+    setMessages,
+    setThreadMessages,
+    setDirectMessages,
+    setThreadStatsById,
+    setRuns,
+    setTasks,
+    setInbox,
+    setError,
+    activeScopeRef,
+    activeThreadScopeRef,
+    activeDirectScopeRef,
+    activeDirectActorIdRef,
+    actorIdRef,
+    threadsByChannel,
+    channels,
+    activeChannelId,
+    setChannelPanelTab,
+    setReplyTo,
+    setActiveChannelId,
+    setActiveThreadId,
+    updateChannelGroups,
+    refreshInbox,
+  });
 
   async function setLocalIdentity(args: {
     userId: string;
@@ -1813,78 +1642,6 @@ export function App() {
       setBusy(null);
     }
   }
-
-  const updateChannelGroups = useCallback(
-    (updater: (current: ChannelGroup[]) => ChannelGroup[]) => {
-      setChannelGroups((current) => {
-        const next = normalizeChannelGroups(updater(current));
-        saveChannelGroups(channelGroupsKey, next);
-        return next;
-      });
-    },
-    [channelGroupsKey],
-  );
-
-  const addChannelGroup = useCallback((title: string) => {
-    const trimmed = title.trim();
-    if (!trimmed) return;
-    updateChannelGroups((current) => [
-      ...current,
-      {
-        id: `local-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
-        title: trimmed,
-        channelIds: [],
-        collapsed: false,
-      },
-    ]);
-  }, [updateChannelGroups]);
-
-  const renameChannelGroup = useCallback(
-    (groupId: string, title: string) => {
-      const trimmed = title.trim();
-      if (!trimmed) return;
-      updateChannelGroups((current) =>
-        current.map((item) =>
-          item.id === groupId ? { ...item, title: trimmed } : item,
-        ),
-      );
-    },
-    [updateChannelGroups],
-  );
-
-  const removeChannelGroup = useCallback(
-    (groupId: string) => {
-      updateChannelGroups((current) => current.filter((item) => item.id !== groupId));
-    },
-    [updateChannelGroups],
-  );
-
-  const toggleChannelGroup = useCallback(
-    (groupId: string) => {
-      updateChannelGroups((current) =>
-        current.map((item) =>
-          item.id === groupId ? { ...item, collapsed: !item.collapsed } : item,
-        ),
-      );
-    },
-    [updateChannelGroups],
-  );
-
-  const moveChannelToGroup = useCallback(
-    (channelId: string, groupId: string) => {
-      updateChannelGroups((current) =>
-        current.map((group) => {
-          const channelIds = group.channelIds.filter((id) => id !== channelId);
-          if (group.id === groupId && groupId !== ungroupedChannelGroupId) {
-            channelIds.push(channelId);
-            return { ...group, channelIds, collapsed: false };
-          }
-          return { ...group, channelIds };
-        }),
-      );
-    },
-    [updateChannelGroups],
-  );
 
   const chatEmpty =
     connection === "open"

@@ -3,7 +3,6 @@ import { ChevronUp, ChevronDown } from "lucide-react";
 type ScrollJumpButtonsProps = {
   showJumpToTop: boolean;
   showJumpToBottom: boolean;
-  isHovered: boolean;
   onJumpToTop: () => void;
   onJumpToBottom: () => void;
 };
@@ -11,20 +10,13 @@ type ScrollJumpButtonsProps = {
 export function ScrollJumpButtons({
   showJumpToTop,
   showJumpToBottom,
-  isHovered,
   onJumpToTop,
   onJumpToBottom,
 }: ScrollJumpButtonsProps) {
   if (!showJumpToTop && !showJumpToBottom) return null;
 
-  const visible = isHovered;
-
   return (
-    <div
-      className={`absolute bottom-4 right-4 z-10 flex flex-col gap-2 transition-opacity duration-200 ${
-        visible ? "opacity-100" : "opacity-0"
-      }`}
-    >
+    <div className="absolute bottom-4 right-4 z-10 flex flex-col gap-2 opacity-80 transition-opacity hover:opacity-100">
       {showJumpToTop && (
         <button
           type="button"

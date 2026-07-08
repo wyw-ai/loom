@@ -138,7 +138,7 @@ export function Composer({
           ),
         }}
       >
-        <div className="flex h-full flex-col">
+        <div className="flex h-full flex-col pt-1">
           {replyTo && (
             <div className="mb-2 flex shrink-0 items-center gap-2 rounded-lg border border-[#dfe3ec] bg-[#f7f8fb] px-3 py-2 text-xs text-[#667085]">
               <span className="min-w-0 flex-1 truncate">Replying to {actorName}</span>
@@ -208,7 +208,7 @@ export function Composer({
               size="icon"
               onClick={onSend}
               disabled={disabled || !draft.trim() || busy}
-              className="h-9 w-9 shrink-0 rounded-lg"
+              className="h-9 w-9 shrink-0 self-end rounded-lg"
             >
               {busy ? <Loader2 className="animate-spin" size={17} /> : <Send size={17} />}
             </Button>

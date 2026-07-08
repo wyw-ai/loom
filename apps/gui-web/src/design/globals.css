@@ -847,23 +847,25 @@
   }
 
   .message-markdown pre {
-    overflow-x: auto;
-    overflow-y: hidden;
-    scrollbar-width: none;
-    -ms-overflow-style: none;
+    overflow: visible;
+    position: relative;
     border: 1px solid #dfe3ec;
     border-radius: 10px;
     background: #f7f8fb;
     padding: 12px;
   }
 
-  .message-markdown pre::-webkit-scrollbar {
-    display: none;
-  }
-
   .message-markdown pre code {
+    display: block;
+    overflow-x: auto;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
     background: transparent;
     padding: 0;
+  }
+
+  .message-markdown pre code::-webkit-scrollbar {
+    display: none;
   }
 
   /* GFM elements (remark-gfm): tables, strikethrough, task lists, headings,

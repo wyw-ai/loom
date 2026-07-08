@@ -129,7 +129,7 @@ export function ThreadComposer({
           ),
         }}
       >
-        <div className="composer-box composer-box-compact relative flex h-full items-end gap-2">
+        <div className="composer-box composer-box-compact relative flex h-full items-start gap-2">
           {showMentions && (
             <MentionMenu
               options={mentionOptions}
@@ -190,7 +190,7 @@ export function ThreadComposer({
             size="icon"
             onClick={onSend}
             disabled={disabled || !draft.trim() || busy}
-            className="h-9 w-9 shrink-0 rounded-lg bg-[#503ed4] text-white hover:bg-[#4635c5]"
+            className="h-9 w-9 shrink-0 self-end rounded-lg bg-[#503ed4] text-white hover:bg-[#4635c5]"
           >
             {busy ? <Loader2 className="animate-spin" size={17} /> : <Send size={17} />}
           </Button>

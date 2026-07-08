@@ -7,7 +7,7 @@ export const COMPOSER_MIN_HEIGHT = 44;
 export const COMPOSER_MAX_HEIGHT_RATIO = 0.5;
 
 /** Default height cap in pixels for auto-grow before switching to scroll. */
-export const COMPOSER_DEFAULT_CAP = 120;
+export const COMPOSER_DEFAULT_CAP = 52;
 
 /** Maximum rows the textarea grows to in auto mode before scrolling. */
 export const COMPOSER_AUTO_MAX_ROWS = 5;

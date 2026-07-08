@@ -147,7 +147,7 @@ export function Composer({
               </button>
             </div>
           )}
-          <div className="composer-box relative flex-1">
+          <div className={`composer-box relative flex-1${isManual ? " composer-box-manual" : ""}`}>
             {showMentions && (
               <MentionMenu
                 options={mentionOptions}
@@ -159,7 +159,7 @@ export function Composer({
               ref={textareaRef}
               value={draft}
               maxRows={COMPOSER_AUTO_MAX_ROWS}
-              fixedHeight={isManual ? resolvedHeight - 44 : null}
+              fixedHeight={isManual ? resolvedHeight - 20 : null}
               onChange={(event) => {
                 setDraft(event.target.value);
                 syncCaret(event.currentTarget);

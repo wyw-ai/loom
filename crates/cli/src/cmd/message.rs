@@ -31,6 +31,7 @@ pub async fn send(
     delivery_policy: Option<String>,
     if_latest: Option<String>,
     attachment_ids: Vec<String>,
+    allow_escaped_newlines: bool,
 ) -> Result<()> {
     let private_to = normalize_actor_ids(private_to)?;
     if to.is_some() && !private_to.is_empty() {
@@ -38,11 +39,20 @@ pub async fn send(
     }
     let target =
         resolve_send_target(client.as_ref(), target, thread, to, !private_to.is_empty()).await?;
+    let text_contains_escaped_newline = text
+        .as_deref()
+        .map(|value| value.contains("\\n"))
+        .unwrap_or(false);
     let body = read_message_body(text)?;
     if body.trim().is_empty() && attachment_ids.is_empty() {
         bail!("message body is empty");
     }
-    warn_if_escaped_newlines(&body);
+    check_escaped_newlines(
+        &body,
+        text_contains_escaped_newline,
+        allow_escaped_newlines,
+        agent_turn_is_active(),
+    )?;
     let is_private = !private_to.is_empty();
     let mut intent = parse_message_intent(intent)?;
     let mut delivery_policy = parse_delivery_policy(delivery_policy)?;
@@ -136,13 +146,23 @@ pub async fn ask(
     text: Option<String>,
     if_latest: Option<String>,
     attachment_ids: Vec<String>,
+    allow_escaped_newlines: bool,
 ) -> Result<()> {
     let target = resolve_send_target(client.as_ref(), target, thread, None, false).await?;
+    let text_contains_escaped_newline = text
+        .as_deref()
+        .map(|value| value.contains("\\n"))
+        .unwrap_or(false);
     let body = read_message_body(text)?;
     if body.trim().is_empty() && attachment_ids.is_empty() {
         bail!("message body is empty");
     }
-    warn_if_escaped_newlines(&body);
+    check_escaped_newlines(
+        &body,
+        text_contains_escaped_newline,
+        allow_escaped_newlines,
+        agent_turn_is_active(),
+    )?;
     let params = build_ask_params(target.clone(), recipients, body, if_latest, attachment_ids)?;
     if let Some(warning) = channel_fragmentation_warning(&target, false) {
         eprintln!("{warning}");
@@ -201,10 +221,24 @@ fn notify_only_call_for_action_warning() -> &'static str {
      of stalled multi-actor flows."
 }
 
-fn warn_if_escaped_newlines(body: &str) {
+fn check_escaped_newlines(
+    body: &str,
+    text_contains_escaped_newline: bool,
+    allow_escaped_newlines: bool,
+    agent_turn_active: bool,
+) -> Result<()> {
     if let Some(warning) = escaped_newline_warning(body) {
+        if agent_turn_active && text_contains_escaped_newline && !allow_escaped_newlines {
+            bail!(
+                "{warning} This is blocked inside an agent run because `--text` preserves \
+                 backslash-n literally. For multiline messages, omit `--text` and pipe \
+                 stdin/heredoc with real newline characters. If the literal `\\n` text is \
+                 intentional, pass `--allow-escaped-newlines`."
+            );
+        }
         eprintln!("{warning}");
     }
+    Ok(())
 }
 
 fn escaped_newline_warning(body: &str) -> Option<&'static str> {
@@ -585,6 +619,23 @@ mod tests {
         assert!(warning.contains("literal `\\n`"));
         assert!(warning.contains("stdin/heredoc"));
         assert!(escaped_newline_warning("line one\nline two").is_none());
+    }
+
+    #[test]
+    fn agent_turn_rejects_escaped_newline_text_unless_allowed() {
+        let error = check_escaped_newlines("line one\\nline two", true, false, true)
+            .expect_err("agent --text literal newline escape should be rejected");
+        assert!(error.to_string().contains("blocked inside an agent run"));
+        assert!(error.to_string().contains("--allow-escaped-newlines"));
+
+        check_escaped_newlines("line one\\nline two", true, true, true)
+            .expect("explicit allow should pass");
+        check_escaped_newlines("line one\\nline two", true, false, false)
+            .expect("manual CLI use should only warn");
+        check_escaped_newlines("line one\nline two", true, false, true)
+            .expect("real newline should pass");
+        check_escaped_newlines("line one\\nline two", false, false, true)
+            .expect("stdin body with literal sequence should only warn");
     }
 
     #[test]

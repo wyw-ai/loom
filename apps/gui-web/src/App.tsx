@@ -8,11 +8,9 @@ import { Loader2 } from "lucide-react";
 
 import * as ipc from "@/ipc/bridge";
 import {
-  type Channel,
   type ChannelMemberConfig,
   type DesktopConfig,
   type MachineInfo,
-  type Message,
   type ScopeRef,
   type Workspace
 } from "@/ipc/types";
@@ -21,61 +19,37 @@ import { cn } from "@/lib/utils";
 
 import type {
   AgentFormState,
-  AgentUpdatePatch,
 } from "@/lib/types";
 import {
-  defaultAgentPromptAssembly,
   detailPanelBreakpoint,
   localServerCommand,
 } from "@/lib/constants";
 import {
   defaultWorkspaceForm,
-  normalizeWorkspaceFormServerUrl,
 } from "@/lib/server-url";
 import { defaultWakeSpec } from "@/lib/wake-utils";
 
 import {
-  channelMentionActors,
   channelMentionAgentActors,
-  directMessageTarget,
   directPeerForMessage,
-  isChannelMentionActor,
   isDirectChannel,
   loadChannelGroups,
-  sameScope,
   sortChannels,
 } from "@/lib/channel-utils";
 
 import {
   channelFromMessage,
-  emptyThreadStats,
-  normalizeMessage,
-  sortMessages,
   threadIdForMessage,
-  threadTitle,
-  upsertMessage,
-  upsertThreadStatsMessage,
 } from "@/lib/message-utils";
 
 import {
-  accountName,
   accountToActor,
   actorName,
-  audienceWakesAgent,
-  displayName,
   errorText,
-  filterEmptyEnvKeys,
   initialViewportWidth,
-  machineCanCreateAgent,
-  mentionAudience,
   normalizeAgentForm,
-  resolveAgentMachine,
-  resolveAgentProvider,
   savePanelSizes,
   sortTasks,
-  sortThreads,
-  uniqueAudience,
-  upsert,
 } from "@/lib/format-utils";
 
 // Zustand stores (P2)
@@ -135,6 +109,7 @@ import { useStreamHandler } from "@/hooks/useStreamHandler";
 import { useChannelGroups } from "@/hooks/useChannelGroups";
 import { useConnectionLifecycle } from "@/hooks/useConnectionLifecycle";
 import { useChannelScope } from "@/hooks/useChannelScope";
+import { useActions } from "@/hooks/useActions";
 
 
 export function App() {
@@ -579,843 +554,99 @@ export function App() {
     setError,
   });
 
-  async function setLocalIdentity(args: {
-    userId: string;
-    nickname: string;
-    actorId: string;
-  }): Promise<boolean> {
-    setBusy("account:set-local");
-    setError(null);
-    try {
-      const result = await ipc.accountSetLocal(args);
-      autoReconnectRef.current = false;
-      hasOpenedConnectionRef.current = false;
-      reconnectAttemptRef.current = 0;
-      clearReconnectTimer();
-      applyConfig(result.config);
-      workspaceRef.current = null;
-      actorIdRef.current = null;
-      setConnection("idle");
-      setChannels([]);
-      setActors({});
-      setRuns({});
-      setInbox([]);
-      setTasks([]);
-      setMessages([]);
-      setThreadMessages([]);
-      setDirectMessages([]);
-      setDirectDraft("");
-      setActiveDirectActorId(null);
-      setDirectScopesByActorId({});
-      pushNotice(`Signed in as ${accountName(result.account)}`);
-      return true;
-    } catch (err) {
-      setError(errorText(err));
-      return false;
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function logout() {
-    setBusy("logout");
-    try {
-      autoReconnectRef.current = false;
-      hasOpenedConnectionRef.current = false;
-      reconnectAttemptRef.current = 0;
-      clearReconnectTimer();
-      applyConfig(await ipc.accountLogout());
-      workspaceRef.current = null;
-      setWorkspace(null);
-      setConnection("idle");
-      setChannels([]);
-      setActors({});
-      setRuns({});
-      setInbox([]);
-      setTasks([]);
-      setMessages([]);
-      setThreadMessages([]);
-      setDirectMessages([]);
-      setDirectDraft("");
-      setActiveDirectActorId(null);
-      setDirectScopesByActorId({});
-      setOnboardingActive(true);
-    } catch (err) {
-      setError(errorText(err));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function updateAccountAvatar(avatarUrl: string) {
-    setBusy("account:avatar");
-    setError(null);
-    try {
-      const next = await ipc.accountUpdateAvatar(avatarUrl);
-      applyConfig(next);
-      const updatedAccount = next.account ?? null;
-      if (updatedAccount) {
-        setActors((current) => ({
-          ...current,
-          [updatedAccount.actorId]: accountToActor(updatedAccount),
-        }));
-      }
-      pushNotice("Account avatar updated");
-    } catch (err) {
-      setError(errorText(err));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function addWorkspace(): Promise<Workspace | null> {
-    const hasTarget = workspaceForm.advanced
-      ? workspaceForm.serverUrl.trim()
-      : workspaceForm.host.trim();
-    if (!workspaceForm.name.trim() || !hasTarget) return null;
-    setBusy("workspace:add");
-    setError(null);
-    try {
-      const serverUrl = normalizeWorkspaceFormServerUrl(workspaceForm);
-      const next = await ipc.workspaceAdd({
-        name: workspaceForm.name.trim(),
-        serverUrl,
-        activate: true,
-      });
-      applyConfig(next);
-      await loadMachines();
-      setWorkspaceForm(defaultWorkspaceForm());
-      const saved =
-        next.workspaces.find((item) => item.serverUrl === serverUrl) ??
-        next.workspaces.find((item) => item.id === next.active) ??
-        null;
-      if (saved) {
-        await connectWorkspace(saved.id, { quiet: true });
-        pushNotice(`Connected to ${saved.name}`);
-      } else {
-        pushNotice(`Server ${workspaceForm.name.trim()} added`);
-      }
-      return saved;
-    } catch (err) {
-      setError(errorText(err));
-      return null;
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function removeWorkspace(id: string) {
-    setBusy(`workspace:remove:${id}`);
-    setError(null);
-    try {
-      const next = await ipc.workspaceRemove(id);
-      applyConfig(next);
-      await loadMachines();
-      if (workspace?.id === id) {
-        try {
-          await ipc.disconnect();
-        } catch {
-          /* local state still closes */
-        }
-        autoReconnectRef.current = false;
-        hasOpenedConnectionRef.current = false;
-        reconnectAttemptRef.current = 0;
-        clearReconnectTimer();
-        workspaceRef.current = null;
-        setWorkspace(null);
-        setConnection("idle");
-      }
-    } catch (err) {
-      setError(errorText(err));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function checkMachines() {
-    setBusy("machine:check");
-    setError(null);
-    try {
-      await loadMachines(true);
-      pushNotice("Registered hosts refreshed");
-    } catch (err) {
-      setError(errorText(err));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function createMachine(args: {
-    name: string;
-    dataRoot?: string;
-  }): Promise<MachineInfo | null> {
-    const name = args.name.trim();
-    if (!name) {
-      setError("Host name is required.");
-      return null;
-    }
-    setBusy("machine:create");
-    setError(null);
-    try {
-      const result = await ipc.machineCreate({
-        name,
-        dataRoot: args.dataRoot?.trim() || undefined,
-      });
-      applyMachines(result.machines);
-      pushNotice(`Host ${name} registration prepared`);
-      return (
-        result.machines.find(
-          (machine) => machine.source === "local_registration" && machine.name === name,
-        ) ??
-        result.machines.find((machine) => machine.name === name) ??
-        null
-      );
-    } catch (err) {
-      setError(errorText(err));
-      return null;
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function startLocalHost(): Promise<boolean> {
-    if (connection !== "open" || !workspaceRef.current) {
-      setError("Connect to a server before starting a local host.");
-      return false;
-    }
-    const liveHost = machines.find(
-      (machine) =>
-        machine.source === "server_inventory" && machine.connectionStatus === "online",
-    );
-    if (liveHost) {
-      pushNotice(`${liveHost.name} is already online`);
-      return true;
-    }
-
-    let machine =
-      machines.find((item) => item.source === "local_registration") ?? null;
-    if (!machine) {
-      machine = await createMachine({ name: "Local Host" });
-      if (!machine) return false;
-    }
-
-    setBusy("machine:start");
-    setError(null);
-    try {
-      const result = await ipc.machineStart(machine.id);
-      applyMachines(result.machines);
-      pushNotice(`Local host started (pid ${result.pid})`);
-      window.setTimeout(() => {
-        void loadMachines(true).catch(() => {});
-      }, 1200);
-      return true;
-    } catch (err) {
-      setError(errorText(err));
-      return false;
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function removeMachine(machineId: string) {
-    setBusy(`machine:remove:${machineId}`);
-    setError(null);
-    try {
-      const result = await ipc.machineRemove(machineId);
-      applyMachines(result.machines);
-      pushNotice("Registered host removed");
-    } catch (err) {
-      setError(errorText(err));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function createAgent(form: AgentFormState = agentForm): Promise<boolean> {
-    const name = form.name.trim();
-    const machine = resolveAgentMachine(form, machines);
-    const provider = resolveAgentProvider(form, machine);
-    if (!machine) {
-      setError("Register a host before creating an agent.");
-      return false;
-    }
-    if (!machineCanCreateAgent(machine)) {
-      setError(`Host ${machine.name} is read-only or does not support agent creation.`);
-      return false;
-    }
-    if (!provider) {
-      setError(`No agent runtime is available for ${machine.name}.`);
-      return false;
-    }
-    if (!name) {
-      setError("Agent name is required.");
-      return false;
-    }
-    setBusy("agent:create");
-    setError(null);
-    try {
-      const result = await ipc.machineAgentCreate({
-        machineId: machine.id,
-        providerId: provider.id,
-        actorId: form.actorId.trim() || undefined,
-        name,
-        description: form.description.trim(),
-        instructions: form.instructions.trim(),
-        promptAssembly: defaultAgentPromptAssembly,
-        wake: form.wake,
-        model: form.model.trim() || provider.defaultModel || "",
-        autostart: form.autostart,
-        env: filterEmptyEnvKeys(form.env),
-      });
-      applyMachines(result.machines);
-      setAgentForm((current) =>
-        normalizeAgentForm({ ...current, actorId: "", name: "Echo" }, result.machines),
-      );
-      if (workspace && connection === "open") {
-        await loadWorkspaceData(workspace);
-      }
-      pushNotice(`Agent ${name} added`);
-      return true;
-    } catch (err) {
-      setError(errorText(err));
-      return false;
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function removeAgent(machineId: string, actorId: string) {
-    setBusy(`agent:remove:${actorId}`);
-    setError(null);
-    try {
-      const result = await ipc.machineAgentRemove({ machineId, actorId });
-      applyMachines(result.machines);
-      if (workspace && connection === "open") {
-        await loadWorkspaceData(workspace);
-      }
-      pushNotice("Agent removed");
-    } catch (err) {
-      setError(errorText(err));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function updateAgent(patch: AgentUpdatePatch) {
-    setBusy(`agent:update:${patch.actorId}`);
-    setError(null);
-    try {
-      await ipc.agentUpdate({
-        machineId: patch.machineId,
-        actorId: patch.actorId,
-        displayName: patch.displayName.trim(),
-        description: patch.description.trim(),
-        instructions: patch.instructions.trim(),
-        providerId: patch.providerId,
-        model: patch.model.trim(),
-        reasoningEffort: patch.reasoningEffort.trim(),
-        autostart: patch.autostart,
-        avatarUrl: patch.avatarUrl.trim(),
-        env: filterEmptyEnvKeys(patch.env),
-        bundleSkills: patch.bundleSkills,
-        wake: patch.wake,
-      });
-      await loadMachines();
-      if (workspace && connection === "open") {
-        await loadWorkspaceData(workspace);
-      }
-      pushNotice("Agent settings saved");
-    } catch (err) {
-      setError(errorText(err));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function addAgentSkill(machineId: string, actorId: string, source: string) {
-    setBusy(`agent:skill:add:${actorId}`);
-    setError(null);
-    try {
-      await ipc.agentSkillAdd({
-        machineId,
-        actorId,
-        source: source.trim(),
-      });
-      await loadMachines();
-      if (workspace && connection === "open") {
-        await loadWorkspaceData(workspace);
-      }
-      pushNotice("Skill added");
-      return true;
-    } catch (err) {
-      setError(errorText(err));
-      return false;
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function inviteMemberToChannel(channelId: string, actorId: string) {
-    const actor = actors[actorId];
-    setBusy(`channel:invite:${channelId}:${actorId}`);
-    setError(null);
-    try {
-      const result = await ipc.channelInvite({ channelId, actorId });
-      setChannels((current) => sortChannels(upsert(current, result.channel)));
-      pushNotice(`${actor ? displayName(actor) : actorId} added to channel`);
-    } catch (err) {
-      setError(errorText(err));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function removeMemberFromChannel(channelId: string, actorId: string) {
-    const actor = actors[actorId];
-    setBusy(`channel:revoke:${channelId}:${actorId}`);
-    setError(null);
-    try {
-      const result = await ipc.channelRevoke({ channelId, actorId });
-      setChannels((current) => sortChannels(upsert(current, result.channel)));
-      setChannelMemberConfigsByChannel((current) => {
-        const channelConfigs = current[channelId];
-        if (!channelConfigs) return current;
-        const nextChannelConfigs = { ...channelConfigs };
-        delete nextChannelConfigs[actorId];
-        return { ...current, [channelId]: nextChannelConfigs };
-      });
-      pushNotice(`${actor ? displayName(actor) : actorId} removed from channel`);
-    } catch (err) {
-      setError(errorText(err));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function saveMemberWorkspace(
-    channelId: string,
-    actorId: string,
-    workspaceDir: string,
-  ): Promise<boolean> {
-    const value = workspaceDir.trim();
-    if (!value) {
-      setError("Workspace path is required.");
-      return false;
-    }
-    setBusy(`channel:member-workspace:${channelId}:${actorId}`);
-    setError(null);
-    try {
-      const result = await ipc.channelMemberConfigSet({
-        channelId,
-        actorId,
-        workspaceDir: value,
-      });
-      setChannelMemberConfigsByChannel((current) => ({
-        ...current,
-        [channelId]: {
-          ...(current[channelId] ?? {}),
-          [actorId]: result.config,
-        },
-      }));
-      pushNotice("Workspace saved");
-      return true;
-    } catch (err) {
-      setError(errorText(err));
-      return false;
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function clearMemberWorkspace(channelId: string, actorId: string): Promise<boolean> {
-    setBusy(`channel:member-workspace:${channelId}:${actorId}`);
-    setError(null);
-    try {
-      await ipc.channelMemberConfigClear({ channelId, actorId });
-      setChannelMemberConfigsByChannel((current) => {
-        const channelConfigs = current[channelId];
-        if (!channelConfigs) return current;
-        const nextChannelConfigs = { ...channelConfigs };
-        delete nextChannelConfigs[actorId];
-        return { ...current, [channelId]: nextChannelConfigs };
-      });
-      pushNotice("Workspace reset");
-      return true;
-    } catch (err) {
-      setError(errorText(err));
-      return false;
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function openLocalPath(path: string) {
-    setError(null);
-    try {
-      await ipc.openLocalPath(path);
-    } catch (err) {
-      setError(errorText(err));
-    }
-  }
-
-  async function createChannelWithTitle(rawTitle: string) {
-    const title = rawTitle.trim();
-    const currentWorkspace = workspaceRef.current ?? workspace;
-    if (!title) return;
-    if (!currentWorkspace) {
-      setError("Add or select a space before creating a channel.");
-      return;
-    }
-    setBusy("channel:create");
-    try {
-      let channelWorkspace = currentWorkspace;
-      if (connection !== "open") {
-        const connected = await connectWorkspace(currentWorkspace.id, { quiet: true });
-        if (!connected) return;
-        channelWorkspace = connected;
-      }
-      const result = await ipc.channelCreate({
-        title,
-        actorId: channelWorkspace.actorId,
-      });
-      setChannels((current) => sortChannels(upsert(current, result.channel)));
-      setActiveChannelId(result.channel.id);
-      setActiveThreadId(null);
-      setChannelPanelTab(null);
-    } catch (err) {
-      setError(errorText(err));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function renameChannel(channel: Channel, rawTitle: string) {
-    const title = rawTitle.trim();
-    if (!title || title === channel.title) return;
-    setBusy(`channel:rename:${channel.id}`);
-    setError(null);
-    try {
-      const result = await ipc.channelUpdate({
-        channelId: channel.id,
-        title,
-        topic: channel.topic,
-      });
-      setChannels((current) => sortChannels(upsert(current, result.channel)));
-      pushNotice(`Renamed #${channel.title} to #${result.channel.title}`);
-    } catch (err) {
-      setError(errorText(err));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function deleteChannel(channel: Channel) {
-    setBusy(`channel:delete:${channel.id}`);
-    setError(null);
-    try {
-      const result = await ipc.channelDelete({
-        channelId: channel.id,
-        cascade: true,
-      });
-      if (result.deleted) {
-        applyChannelDeleted(channel.id);
-        const deletedThreads = result.deletedThreads ?? 0;
-        pushNotice(
-          deletedThreads > 0
-            ? `Deleted #${channel.title} and ${deletedThreads} threads`
-            : `Deleted #${channel.title}`,
-        );
-      }
-    } catch (err) {
-      setError(errorText(err));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function sendMessage() {
-    const body = draft.trim();
-    if (!body || !target) return;
-    setBusy("message:send");
-    try {
-      const parentMessageId = replyTo?.id;
-      const repliedActor = replyTo ? actors[replyTo.authorActorId] : undefined;
-      const mentionableActors = activeChannel
-        ? channelMentionActors(activeChannel, actors)
-        : [];
-      const mentionedAudience = mentionAudience(
-        body,
-        mentionableActors,
-        workspace?.actorId,
-      );
-      const replyAudience =
-        repliedActor && repliedActor.id !== workspace?.actorId
-          ? [{ kind: "actor" as const, id: repliedActor.id }]
-          : [];
-      const directedTo = uniqueAudience([...replyAudience, ...mentionedAudience]);
-      const unavailableAgents = activeChannel
-        ? directedTo.filter(
-            (audience) =>
-              audience.kind === "actor" &&
-              !isChannelMentionActor(activeChannel, audience.id),
-          )
-        : [];
-      if (unavailableAgents.length > 0) {
-        setError(
-          `Add ${unavailableAgents
-            .map((audience) => actorName(actors, audience.id))
-            .join(", ")} to this channel before mentioning them.`,
-        );
-        return;
-      }
-      const wakesAgent = directedTo.some((audience) =>
-        audienceWakesAgent(audience, actors),
-      );
-      const result = await ipc.messageSend({
-        target,
-        body,
-        parentMessageId,
-        audience: directedTo,
-        deliveryPolicy: wakesAgent ? "wake_agent" : "notify_only",
-        intent: wakesAgent ? "request_action" : "chat",
-      });
-      setMessages((current) => sortMessages(upsertMessage(current, result.message)));
-      setDraft("");
-      setReplyTo(null);
-    } catch (err) {
-      setError(errorText(err));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function sendThreadMessage() {
-    const body = threadDraft.trim();
-    if (!body || !threadMessageTarget) return;
-    setBusy("thread:message:send");
-    try {
-      const mentionableActors = activeChannel
-        ? channelMentionActors(activeChannel, actors)
-        : [];
-      const mentionedAudience = mentionAudience(
-        body,
-        mentionableActors,
-        workspace?.actorId,
-      );
-      const unavailableAgents = activeChannel
-        ? mentionedAudience.filter(
-            (audience) =>
-              audience.kind === "actor" &&
-              !isChannelMentionActor(activeChannel, audience.id),
-          )
-        : [];
-      if (unavailableAgents.length > 0) {
-        setError(
-          `Add ${unavailableAgents
-            .map((audience) => actorName(actors, audience.id))
-            .join(", ")} to this channel before mentioning them.`,
-        );
-        return;
-      }
-      const wakesAgent = mentionedAudience.some((audience) =>
-        audienceWakesAgent(audience, actors),
-      );
-      const result = await ipc.messageSend({
-        target: threadMessageTarget,
-        body,
-        audience: mentionedAudience,
-        deliveryPolicy: wakesAgent ? "wake_agent" : "notify_only",
-        intent: wakesAgent ? "request_action" : "chat",
-      });
-      setThreadMessages((current) => sortMessages(upsertMessage(current, result.message)));
-      setThreadStatsById((current) => upsertThreadStatsMessage(current, result.message));
-      setThreadDraft("");
-    } catch (err) {
-      setError(errorText(err));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function sendDirectMessage() {
-    const body = directDraft.trim();
-    if (!body || !activeDirectActor || !activeDirectTarget) return;
-    const directMentions = mentionAudience(
-      body,
-      Object.values(actors),
-      workspace?.actorId,
-    );
-    if (directMentions.length > 0) {
-      setError("Direct messages do not support @ mentions.");
-      return;
-    }
-    setBusy(`direct:message:send:${activeDirectActor.id}`);
-    setError(null);
-    try {
-      const result = await ipc.messageSend({
-        target: activeDirectTarget,
-        body,
-        deliveryPolicy: "wake_agent",
-        intent: "request_action",
-      });
-      const message = normalizeMessage(result.message);
-      activeDirectScopeRef.current = message.scope;
-      setDirectScopesByActorId((current) => ({
-        ...current,
-        [activeDirectActor.id]: message.scope,
-      }));
-      setDirectMessages((current) => sortMessages(upsertMessage(current, message)));
-      setDirectDraft("");
-    } catch (err) {
-      setError(errorText(err));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function startThread(message: Message) {
-    if (!activeChannel) return;
-    const existing = channelThreads.find(
-      (thread) => thread.rootMessageId === message.id,
-    );
-    if (existing) {
-      setActiveThreadId(existing.id);
-      setChannelPanelTab(null);
-      return;
-    }
-    setBusy(`thread:create:${message.id}`);
-    try {
-      const result = await ipc.threadCreate({
-        channelId: activeChannel.id,
-        rootMessageId: message.id,
-        title: threadTitle(message),
-      });
-      setThreadsByChannel((current) => ({
-        ...current,
-        [activeChannel.id]: sortThreads(
-          upsert(current[activeChannel.id] ?? [], result.thread),
-        ),
-      }));
-      setActiveThreadId(result.thread.id);
-      setChannelPanelTab(null);
-      setThreadStatsById((current) => ({
-        ...current,
-        [result.thread.id]: emptyThreadStats(),
-      }));
-    } catch (err) {
-      setError(errorText(err));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function toggleMessageReaction(message: Message, emoji: string) {
-    setBusy(`message:reaction:${message.id}:${emoji}`);
-    setError(null);
-    try {
-      const result = await ipc.messageReactionToggle({
-        messageId: message.id,
-        emoji,
-      });
-      const updatedMessage = normalizeMessage(result.message);
-      if (
-        activeScopeRef.current &&
-        sameScope(updatedMessage.scope, activeScopeRef.current)
-      ) {
-        setMessages((current) => sortMessages(upsertMessage(current, updatedMessage)));
-      }
-      if (
-        activeThreadScopeRef.current &&
-        sameScope(updatedMessage.scope, activeThreadScopeRef.current)
-      ) {
-        setThreadMessages((current) => sortMessages(upsertMessage(current, updatedMessage)));
-      }
-      if (
-        activeDirectScopeRef.current &&
-        sameScope(updatedMessage.scope, activeDirectScopeRef.current)
-      ) {
-        setDirectMessages((current) => sortMessages(upsertMessage(current, updatedMessage)));
-      }
-    } catch (err) {
-      setError(errorText(err));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function answerAction(message: Message, optionId: string, accepted: boolean) {
-    const responseTarget = message.target || target;
-    if (!responseTarget || !workspace) return;
-    const responseKind = accepted ? "accepted" : "declined";
-    setBusy(`action:${message.id}:${optionId}`);
-    try {
-      await ipc.messageSend({
-        target: responseTarget,
-        body: `${responseKind}: ${optionId}`,
-        parentMessageId: message.id,
-        audience: [{ kind: "actor", id: message.authorActorId }],
-        intent: "notify",
-        deliveryPolicy: "wake_agent",
-        metadata: {
-          kind: "action.response",
-          optionId,
-          responseKind,
-          requestMessageId: message.id,
-        },
-      });
-      await ipc.deliveryAck({
-        actorId: workspace.actorId,
-        sourceId: message.id,
-      });
-      setInbox((current) =>
-        current.filter((item) => item.delivery.sourceId !== message.id),
-      );
-      pushNotice(`Action ${responseKind}`);
-    } catch (err) {
-      setError(errorText(err));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function answerDirectAction(message: Message, optionId: string, accepted: boolean) {
-    if (!workspace) return;
-    const peerActorId =
-      directPeerForMessage(message, workspace.actorId) ?? activeDirectActor?.id ?? null;
-    const responseTarget = peerActorId
-      ? directMessageTarget(peerActorId)
-      : message.target;
-    const responseKind = accepted ? "accepted" : "declined";
-    setBusy(`action:${message.id}:${optionId}`);
-    try {
-      await ipc.messageSend({
-        target: responseTarget,
-        body: `${responseKind}: ${optionId}`,
-        parentMessageId: message.id,
-        audience: [{ kind: "actor", id: message.authorActorId }],
-        intent: "notify",
-        deliveryPolicy: "wake_agent",
-        metadata: {
-          kind: "action.response",
-          optionId,
-          responseKind,
-          requestMessageId: message.id,
-        },
-      });
-      await ipc.deliveryAck({
-        actorId: workspace.actorId,
-        sourceId: message.id,
-      });
-      setInbox((current) =>
-        current.filter((item) => item.delivery.sourceId !== message.id),
-      );
-      pushNotice(`Action ${responseKind}`);
-    } catch (err) {
-      setError(errorText(err));
-    } finally {
-      setBusy(null);
-    }
-  }
+  const {
+    setLocalIdentity,
+    logout,
+    updateAccountAvatar,
+    addWorkspace,
+    removeWorkspace,
+    checkMachines,
+    createMachine,
+    startLocalHost,
+    removeMachine,
+    createAgent,
+    removeAgent,
+    updateAgent,
+    addAgentSkill,
+    inviteMemberToChannel,
+    removeMemberFromChannel,
+    saveMemberWorkspace,
+    clearMemberWorkspace,
+    openLocalPath,
+    createChannelWithTitle,
+    renameChannel,
+    deleteChannel,
+    sendMessage,
+    sendThreadMessage,
+    sendDirectMessage,
+    startThread,
+    toggleMessageReaction,
+    answerAction,
+    answerDirectAction,
+    selectWorkspace,
+    finishOnboarding,
+  } = useActions({
+    setBusy,
+    setError,
+    setConnection,
+    setChannels,
+    setActors,
+    setRuns,
+    setInbox,
+    setTasks,
+    setMessages,
+    setThreadMessages,
+    setDirectMessages,
+    setThreadStatsById,
+    setDraft,
+    setThreadDraft,
+    setDirectDraft,
+    setReplyTo,
+    setActiveChannelId,
+    setActiveThreadId,
+    setActiveDirectActorId,
+    setDirectScopesByActorId,
+    setWorkspace,
+    setWorkspaceForm,
+    setChannelPanelTab,
+    setOnboardingActive,
+    setAgentForm,
+    setChannelMemberConfigsByChannel,
+    setThreadsByChannel,
+    setView,
+    draft,
+    threadDraft,
+    directDraft,
+    replyTo,
+    target,
+    threadMessageTarget,
+    activeDirectTarget,
+    activeDirectActor,
+    activeChannel,
+    channelThreads,
+    actors,
+    machines,
+    workspace,
+    connection,
+    workspaceForm,
+    agentForm,
+    workspaceRef,
+    autoReconnectRef,
+    hasOpenedConnectionRef,
+    reconnectAttemptRef,
+    activeScopeRef,
+    activeThreadScopeRef,
+    activeDirectScopeRef,
+    actorIdRef,
+    applyConfig,
+    applyMachines,
+    loadMachines,
+    loadWorkspaceData,
+    connectWorkspace,
+    clearReconnectTimer,
+    pushNotice,
+    applyChannelDeleted,
+  });
 
   const chatEmpty =
     connection === "open"
@@ -1458,22 +689,6 @@ export function App() {
       document.body.classList.remove("is-resizing-panels");
     };
   }, [cleanupPanelResize]);
-  const selectWorkspace = async (workspaceId: string): Promise<Workspace | null> => {
-    setView("chat");
-    setChannelPanelTab(null);
-    if (workspace?.id !== workspaceId || connection !== "open") {
-      return connectWorkspace(workspaceId);
-    }
-    return workspaceRef.current ?? workspace ?? null;
-  };
-
-  const finishOnboarding = () => {
-    setOnboardingActive(false);
-    setView("chat");
-    if (connection === "open") {
-      void loadMachines(true).catch(() => {});
-    }
-  };
 
   if (!configLoaded) {
     return (

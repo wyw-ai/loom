@@ -142,7 +142,7 @@ export function Composer({
         onResize={handleResize}
         handleStyles={{
           top: {
-            top: "-2px",
+            top: "-4px",
             height: "6px",
             width: "100%",
             position: "absolute",

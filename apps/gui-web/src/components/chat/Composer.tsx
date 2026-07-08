@@ -46,6 +46,7 @@ export function Composer({
   const [caretIndex, setCaretIndex] = useState(draft.length);
   const [selectedMentionIndex, setSelectedMentionIndex] = useState(0);
   const [dismissedMentionKey, setDismissedMentionKey] = useState<string | null>(null);
+  const [liveHeight, setLiveHeight] = useState<number | null>(null);
 
   // --- Resize state ---
   const entry = useComposerStore((s) => s.entries.channel);
@@ -53,7 +54,15 @@ export function Composer({
   const resetToAuto = useComposerStore((s) => s.resetToAuto);
   const isManual = entry.mode === "manual" && entry.manualHeight !== null;
   const resolvedHeight = isManual ? entry.manualHeight! : COMPOSER_DEFAULT_CAP;
+  const effectiveHeight = liveHeight ?? resolvedHeight;
   const maxHeightPx = composerMaxHeightPx();
+
+  const handleResize = useCallback(
+    (_e: unknown, _dir: unknown, _ref: unknown, delta: { height: number }) => {
+      setLiveHeight(resolvedHeight + delta.height);
+    },
+    [resolvedHeight],
+  );
 
   const handleResizeStop = useCallback(
     (_e: MouseEvent | TouchEvent, _dir: string, _ref: HTMLElement, delta: { height: number }) => {
@@ -62,6 +71,7 @@ export function Composer({
         Math.min(resolvedHeight + delta.height, maxHeightPx),
       );
       setManualHeight("channel", newHeight);
+      setLiveHeight(null);
     },
     [resolvedHeight, maxHeightPx, setManualHeight],
   );
@@ -125,10 +135,11 @@ export function Composer({
       <Resizable
         className="mx-auto max-w-4xl"
         enable={{ top: true, right: false, bottom: false, left: false, topRight: false, bottomRight: false, bottomLeft: false, topLeft: false }}
-        size={{ width: "100%", height: resolvedHeight }}
+        size={{ width: "100%", height: effectiveHeight }}
         minHeight={COMPOSER_MIN_HEIGHT}
         maxHeight={maxHeightPx}
         onResizeStop={handleResizeStop}
+        onResize={handleResize}
         handleComponent={{
           top: (
             <ComposerResizeHandle
@@ -159,7 +170,7 @@ export function Composer({
               ref={textareaRef}
               value={draft}
               maxRows={COMPOSER_AUTO_MAX_ROWS}
-              fixedHeight={isManual ? resolvedHeight - 20 : null}
+              fixedHeight={(isManual || liveHeight !== null) ? effectiveHeight - 20 : null}
               onChange={(event) => {
                 setDraft(event.target.value);
                 syncCaret(event.currentTarget);
@@ -202,13 +213,13 @@ export function Composer({
               }}
               disabled={disabled}
               placeholder={disabled ? disabledPlaceholder : placeholder}
-              className="max-h-full min-h-[44px] flex-1 px-0"
+              className="max-h-full min-h-[44px] flex-1 px-0 pr-12"
             />
             <Button
               size="icon"
               onClick={onSend}
               disabled={disabled || !draft.trim() || busy}
-              className="h-9 w-9 shrink-0 self-end rounded-lg"
+              className="absolute bottom-2 right-3 h-9 w-9 shrink-0 rounded-lg"
             >
               {busy ? <Loader2 className="animate-spin" size={17} /> : <Send size={17} />}
             </Button>

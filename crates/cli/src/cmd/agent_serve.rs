@@ -6194,6 +6194,7 @@ with Loom CLI before ending. Use `$LOOM_REPLY_TARGET` by default for the current
 use bare `#channel` only for intentional channel-level updates outside the active thread. \
 For multiline messages, omit `--text` and pipe stdin/heredoc; quoted `\\n` is stored literally. \
 In coordinated workflows, wake the requester/coordinator with your result unless you own or were delegated the next handoff. \
+Short requested answers like joining, choosing, voting, approving, or completing a step are actionable; wake the collector instead of notify-only. \
 When you own the handoff, or no coordinator exists and another actor or group must continue, use `message ask` \
 with exact actor ids or an appropriate group; plain `message send` is only for no-action \
 announcements and may be rejected for action requests inside agent runs. Do not send the same answer twice with both \
@@ -6203,6 +6204,7 @@ If you assign hidden or actor-specific information, actually send it privately b
 If private context requires no action yet, prefer `--intent notify --delivery-policy notify_only` and put required context in the later action wake. \
 Do not use `message ask` for wait/no-reply/status messages that need no recipient action. \
 For final summaries or wrap-ups that require no further action, use `message send`, not `message ask`. \
+If collected replies conflict or corrections arrive, use the latest explicit final/correction or ask clarification, then route the next step; never end silently. \
 For informational `notify` / `notify_only` wakes with no requested action, do not send a receipt; \
 use `loom --json run ignore --reason \"no action needed\"`. \
 Use `loom --json run ignore --reason \"...\"` when no visible action is needed.\n";

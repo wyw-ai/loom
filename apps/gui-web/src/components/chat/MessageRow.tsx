@@ -35,6 +35,7 @@ export const MessageRow = memo(function MessageRow({
   sourceTask,
   currentActorId,
   busy,
+  isScrolling = false,
 }: {
   actor?: Actor;
   actors: Record<string, Actor>;
@@ -54,6 +55,7 @@ export const MessageRow = memo(function MessageRow({
   sourceTask: Task | null;
   currentActorId: string | null;
   busy: string | null;
+  isScrolling?: boolean;
 }) {
   const actionRequest = messageKind(message) === "action.request";
   const bodyPoll = actionRequest ? null : bodyPollFromMessage(message);
@@ -65,6 +67,31 @@ export const MessageRow = memo(function MessageRow({
   );
   const reactions = message.reactions ?? [];
   const attachments = message.attachments ?? [];
+
+  // During fast scroll, skip markdown parsing + heavy rendering.
+  // Render a lightweight plain-text row to keep scroll smooth.
+  if (isScrolling && !actionRequest) {
+    return (
+      <article className="rounded-xl px-4 py-3">
+        <div className="flex items-start gap-4">
+          <div className="mt-0.5 h-8 w-8 shrink-0 rounded-full bg-[#edeff5]" />
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-semibold text-[#111827]">
+                {actor ? displayName(actor) : message.authorActorId}
+              </span>
+              <span className="text-xs font-medium text-[#667085]">
+                {formatTime(message.createdAt)}
+              </span>
+            </div>
+            <div className="mt-1 max-w-none break-words text-[15px] leading-6 text-[#485063]">
+              {displayBody}
+            </div>
+          </div>
+        </div>
+      </article>
+    );
+  }
 
   if (isWorkflowMessage(message)) {
     return <WorkflowEventRow actor={actor} actors={actors} message={message} />;
@@ -215,6 +242,7 @@ export const MessageRow = memo(function MessageRow({
     prev.sourceTask === next.sourceTask &&
     prev.canReply === next.canReply &&
     prev.canStartThread === next.canStartThread &&
-    prev.workflowSourceIds === next.workflowSourceIds
+    prev.workflowSourceIds === next.workflowSourceIds &&
+    prev.isScrolling === next.isScrolling
   );
 });

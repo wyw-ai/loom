@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { ScrollJumpButtons } from "@/components/chat/ScrollJumpButtons";
 import type { FeedItem } from "@/components/chat/MessageFeed";
@@ -15,10 +15,12 @@ export const FeedScrollManager = memo(function FeedScrollManager({
   feedKey,
   feedItems,
   renderItem,
+  headerRenderer,
 }: {
   feedKey: string;
   feedItems: FeedItem[];
   renderItem: (index: number) => ReactNode;
+  headerRenderer?: () => ReactNode;
 }) {
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const [firstVisibleIndex, setFirstVisibleIndex] = useState(0);
@@ -27,6 +29,11 @@ export const FeedScrollManager = memo(function FeedScrollManager({
 
   const showJumpToTop = firstVisibleIndex > 2;
   const showJumpToBottom = lastVisibleIndex < feedItems.length - 3;
+
+  const components = useMemo(() => {
+    if (!headerRenderer) return undefined;
+    return { Header: headerRenderer };
+  }, [headerRenderer]);
 
   // Auto-scroll to latest on thread/channel entry
   useEffect(() => {
@@ -65,6 +72,7 @@ export const FeedScrollManager = memo(function FeedScrollManager({
         followOutput={isAtBottom ? "smooth" : false}
         increaseViewportBy={{ top: 200, bottom: 200 }}
         atBottomStateChange={(atBottom: boolean) => setIsAtBottom(atBottom)}
+        components={components}
         computeItemKey={(index) => {
           const item = feedItems[index];
           if (!item) return `item-${index}`;

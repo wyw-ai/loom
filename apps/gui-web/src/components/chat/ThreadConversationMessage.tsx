@@ -1,3 +1,4 @@
+import { memo } from "react";
 import type { Actor, MachineInfo, Message, Run } from "@/ipc/types";
 import { bodyPollFromMessage, actionChoices, metadataText } from "@/lib/message-utils";
 import { displayName, actorName } from "@/lib/format-utils";
@@ -9,7 +10,7 @@ import { AttachmentStack } from "@/components/chat/AttachmentStack";
 import { PollCard } from "@/components/chat/PollCard";
 import { ReactionPicker } from "@/components/chat/ReactionPicker";
 
-export function ThreadConversationMessage({
+export const ThreadConversationMessage = memo(function ThreadConversationMessage({
   actor,
   actors,
   currentActorId,
@@ -123,4 +124,11 @@ export function ThreadConversationMessage({
       </div>
     </article>
   );
-}
+}, (prev, next) => {
+  return (
+    prev.message === next.message &&
+    prev.actor === next.actor &&
+    prev.busy === next.busy &&
+    prev.root === next.root
+  );
+});

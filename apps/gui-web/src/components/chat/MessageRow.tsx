@@ -1,3 +1,4 @@
+import { memo, useMemo } from "react";
 import { cn, shortId, formatTime } from "@/lib/utils";
 import { displayName, actorName } from "@/lib/format-utils";
 import { messageKind, bodyPollFromMessage, actionChoices, metadataText } from "@/lib/message-utils";
@@ -15,7 +16,7 @@ import { ReactionPicker } from "@/components/chat/ReactionPicker";
 import { ThreadSummaryRow } from "@/components/chat/ThreadSummaryRow";
 import { WorkflowEventRow, WorkflowResultRow } from "@/components/chat/WorkflowRows";
 
-export function MessageRow({
+export const MessageRow = memo(function MessageRow({
   actor,
   actors,
   machines,
@@ -58,7 +59,10 @@ export function MessageRow({
   const bodyPoll = actionRequest ? null : bodyPollFromMessage(message);
   const choices = actionChoices(message);
   const pollChoices = choices.length > 0 ? choices : bodyPoll?.choices ?? [];
-  const displayBody = bodyPoll?.question || message.body || metadataText(message);
+  const displayBody = useMemo(
+    () => bodyPoll?.question || message.body || metadataText(message),
+    [bodyPoll, message],
+  );
   const reactions = message.reactions ?? [];
   const attachments = message.attachments ?? [];
 
@@ -201,4 +205,16 @@ export function MessageRow({
       </div>
     </article>
   );
-}
+}, (prev, next) => {
+  return (
+    prev.message === next.message &&
+    prev.actor === next.actor &&
+    prev.busy === next.busy &&
+    prev.threadSummary === next.threadSummary &&
+    prev.threadStats === next.threadStats &&
+    prev.sourceTask === next.sourceTask &&
+    prev.canReply === next.canReply &&
+    prev.canStartThread === next.canStartThread &&
+    prev.workflowSourceIds === next.workflowSourceIds
+  );
+});

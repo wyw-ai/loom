@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { Actor, MachineInfo, Message, Run, Task, Thread } from "@/ipc/types";
 import type { ThreadActivityStats } from "@/lib/types";
 import {
@@ -107,6 +107,68 @@ export function MessageFeed({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [feedKey]);
 
+  const renderItem = useCallback(
+    (index: number) => {
+      const item = feedItems[index];
+      if (item.kind === "date-divider") {
+        return (
+          <div className={`date-divider ${index === 0 ? "date-divider-first" : ""}`}>
+            <span />
+            <div>{item.label}</div>
+            <span />
+          </div>
+        );
+      }
+      const message = item.message;
+      const threadSummary = threadByRoot.get(message.id) ?? null;
+      const sourceTask =
+        message.scope.kind === "channel"
+          ? tasksBySourceMessageId[message.id] ?? null
+          : null;
+      return (
+        <MessageRow
+          actor={actors[message.authorActorId]}
+          actors={actors}
+          machines={machines}
+          runs={runs}
+          message={message}
+          workflowSourceIds={workflowSourceIds}
+          onReply={onReply}
+          onStartThread={onStartThread}
+          onToggleReaction={onToggleReaction}
+          onAnswerAction={onAnswerAction}
+          onOpenAgentSettings={onOpenAgentSettings}
+          canReply={allowReply}
+          canStartThread={allowThreads && canUseAsThreadRoot(message)}
+          threadSummary={threadSummary}
+          threadStats={threadSummary ? threadStatsById[threadSummary.id] : undefined}
+          sourceTask={sourceTask}
+          currentActorId={currentActorId}
+          busy={busy}
+        />
+      );
+    },
+    [
+      feedItems,
+      threadByRoot,
+      tasksBySourceMessageId,
+      actors,
+      machines,
+      runs,
+      workflowSourceIds,
+      onReply,
+      onStartThread,
+      onToggleReaction,
+      onAnswerAction,
+      onOpenAgentSettings,
+      allowReply,
+      allowThreads,
+      currentActorId,
+      busy,
+      threadStatsById,
+    ],
+  );
+
   if (visibleMessages.length === 0) {
     return (
       <div className="flex min-h-0 flex-1 items-center justify-center bg-white px-8 text-sm text-muted-foreground">
@@ -127,50 +189,17 @@ export function MessageFeed({
         totalCount={feedItems.length}
         followOutput="smooth"
         increaseViewportBy={{ top: 200, bottom: 200 }}
+        defaultItemHeight={88}
+        computeItemKey={(index) => {
+          const item = feedItems[index];
+          if (!item) return `item-${index}`;
+          return item.kind === "date-divider" ? item.key : item.message.id;
+        }}
         rangeChanged={(range) => {
           setFirstVisibleIndex(range.startIndex);
           setLastVisibleIndex(range.endIndex);
         }}
-        itemContent={(index) => {
-          const item = feedItems[index];
-          if (item.kind === "date-divider") {
-            return (
-              <div className={`date-divider ${index === 0 ? "date-divider-first" : ""}`}>
-                <span />
-                <div>{item.label}</div>
-                <span />
-              </div>
-            );
-          }
-          const message = item.message;
-          const threadSummary = threadByRoot.get(message.id) ?? null;
-          const sourceTask =
-            message.scope.kind === "channel"
-              ? tasksBySourceMessageId[message.id] ?? null
-              : null;
-          return (
-            <MessageRow
-              actor={actors[message.authorActorId]}
-              actors={actors}
-              machines={machines}
-              runs={runs}
-              message={message}
-              workflowSourceIds={workflowSourceIds}
-              onReply={onReply}
-              onStartThread={onStartThread}
-              onToggleReaction={onToggleReaction}
-              onAnswerAction={onAnswerAction}
-              onOpenAgentSettings={onOpenAgentSettings}
-              canReply={allowReply}
-              canStartThread={allowThreads && canUseAsThreadRoot(message)}
-              threadSummary={threadSummary}
-              threadStats={threadSummary ? threadStatsById[threadSummary.id] : undefined}
-              sourceTask={sourceTask}
-              currentActorId={currentActorId}
-              busy={busy}
-            />
-          );
-        }}
+        itemContent={renderItem}
       />
       <ScrollJumpButtons
         showJumpToTop={showJumpToTop}

@@ -1,5 +1,11 @@
 # Provider 扩展设计
 
+> 状态：历史设计。关于 Loom runtime guidance、`AGENTS.md`、默认 `loom` skill、
+> `loom guide`、以及移除 Loom-owned system prompt 的最新协议，以
+> [Agent 运行规则感知协议](./agent-runtime-awareness.md) 为准。本文中关于
+> `actor_context`、`agent_instructions`、`scope_bootstrap` 进入默认 system prompt
+> 或通过 `--append-system-prompt` 注入的描述已经过期。
+
 本文描述 Loom agent runtime 的下一版 Provider 模型。目标是让新增 Provider
 尽量数据驱动，而不是继续把 provider id、启动参数和输出解析逻辑硬编码在
 Rust 里。

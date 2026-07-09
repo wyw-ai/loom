@@ -1,4 +1,4 @@
-import type { Actor, AgentBundleSkillSpec, Channel, MachineAgentProviderInfo, MachineInfo, Thread } from "@/ipc/types";
+import type { Actor, AgentBundleSkillSpec, Channel, MachineAgentProviderInfo, MachineInfo, Thread, WakeSpec } from "@/ipc/types";
 
 export type ConnectionState = "idle" | "connecting" | "open" | "closed" | "error";
 export type View = "chat" | "threads" | "channels" | "direct" | "inbox" | "tasks" | "spaces" | "account" | "settings";
@@ -69,6 +69,7 @@ export type AgentFormState = {
   model: string;
   autostart: boolean;
   env: Record<string, string>;
+  wake: WakeSpec;
 };
 export type WorkspaceFormState = {
   name: string;
@@ -89,6 +90,7 @@ export type AgentUpdatePatch = {
   avatarUrl: string;
   env: Record<string, string>;
   bundleSkills: AgentBundleSkillSpec[];
+  wake: WakeSpec;
 };
 export type AgentSettingsDraft = {
   displayName: string;
@@ -101,6 +103,7 @@ export type AgentSettingsDraft = {
   avatarUrl: string;
   env: Record<string, string>;
   bundleSkills: AgentBundleSkillSpec[];
+  wake: WakeSpec;
 };
 export type AgentMemberEntry = {
   machine: MachineInfo;

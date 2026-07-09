@@ -3,6 +3,11 @@
 > 本文档追踪 Loom 项目中已发现的问题、Bug 与待改进项。
 > 关联 Obsidian 笔记：[[Loom 文档索引 (Loom Index)]]
 
+> 注：2026-07-06 后，Copilot instructions 注入策略已被
+> `docs/protocol/agent-runtime-awareness.md` 中的方案取代：Loom 不再通过默认
+> system prompt 注入 runtime guidance，而是使用 workspace `AGENTS.md`、默认
+> `loom` skill 和 `loom guide`。
+
 ## 活跃问题
 
 ### #1 Copilot CLI 首次运行 `--resume` 参数错误 ✅ 已修复 (2026-06-14)
@@ -85,6 +90,19 @@
 - **测试**: 699/699 测试通过
 - **关联**: [[2026-06-18 HANSIONSTATION 删除与 ANSI 显示修复]]
 
+### #7 同频道并发根消息触发 ActiveTurn 覆盖与 session 冲突 ✅ 已修复 (2026-07-07)
+
+- **严重程度**: 🔴 Critical — 同频道两条并发根消息会互相覆盖运行状态，并可能让该会话永久失活
+- **影响范围**: 所有 agent worker 的唤醒调度
+- **根因**: 调度键（`turn_key`，按 thread-root 族）与执行串行键（`scope.id`）粒度不一致。同一 channel 的两条根消息生成两个 turn_key，`begin_or_enqueue` 允许并发 dispatch，但 `active_turns`、adapter in-flight 槽和 provider session 都以 `scope.id` 为键：第二个 turn 的 `set_turn` 覆盖第一个 turn 的记录；command transport 直接报 "session already in flight" 失败；且失败路径的 `finish_and_next` 会误删仍在运行的第一个 turn 的 active 记录，导致其 Finished 事件匹配不到 turn、run 永不关闭、busy 键永久泄漏——该会话族此后所有触发只入队不派发
+- **修复**:
+  1. `turn_key_for_trigger` 统一为 `scope:{kind}:{id}`，与执行粒度一一对应（同频道根消息串行排队，不同 thread / DM 对话保持并行；DM 由此从"全部 DM 串行"修正为按对端并行）
+  2. 顺带引入唤醒合并（wake coalescing，见 `docs/agent-turn-input-analysis.md` §6.2）：`finish_and_next_batch` 把排队期间积压的同目标、同可见性普通消息合并为一个 turn，一次性回应并逐条 ack delivery；`AgentSpec.wake`（`coalesce`/`debounceMs`/`replyReminder`）可调
+  3. Response delivery reminder 按 `replyReminder` 降频（默认首回合全文、后续单行指针），prompt 头新增 `Intent:` 行
+- **文件**: `crates/cli/src/cmd/agent_serve.rs`, `crates/proto/src/methods.rs`, `crates/cli/src/cmd/daemon.rs`
+- **测试**: loom-cli 391/391、loom-server 123/123、proto 19/19 通过
+- **关联**: [[agent-turn-input-analysis]]（docs/agent-turn-input-analysis.md §5.8、§6.2、§6.4-6.6）
+
 ## 已关闭
 
 _（暂无）_
@@ -93,6 +111,7 @@ _（暂无）_
 
 | 日期 | 描述 |
 |------|------|
+| 2026-07-07 | 统一唤醒调度键为 scope 粒度、新增唤醒合并与 `AgentSpec.wake` 策略、reminder 降频、prompt 增加 Intent 行（loom-cli 391 测试通过） |
 | 2026-06-18 | 修复 HANSIONSTATION 无法删除、loom-shell ANSI 乱码、实现 machine_remove（699 测试通过） |
 | 2026-06-14 | 修复 Copilot CLI Session 上下文膨胀（instructions_via 注入策略，677 测试通过） |
 | 2026-06-14 | 修复频道删除后 Agent 继续执行导致错误循环（新增 CHANNEL_DELETED 处理） |

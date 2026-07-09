@@ -47,8 +47,7 @@ export const FeedScrollManager = memo(function FeedScrollManager({
   }, [isAtBottom]);
 
   const components = useMemo(() => {
-    if (!headerRenderer) return undefined;
-    return { Header: headerRenderer };
+    return headerRenderer ? { Header: headerRenderer } : {};
   }, [headerRenderer]);
 
   // Auto-scroll to latest on thread/channel entry

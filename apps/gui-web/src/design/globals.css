@@ -920,10 +920,19 @@
      into the wider app. Loom-native palette (see ARCH Part A §2.2). */
   .message-markdown table {
     border-collapse: collapse;
-    width: 100%;
-    display: block;
-    overflow-x: auto;
+    width: max-content;
     margin: 0 0 0.45rem;
+  }
+
+  .message-markdown .table-wrapper {
+    overflow-x: auto;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+    margin: 0 0 0.45rem;
+  }
+
+  .message-markdown .table-wrapper::-webkit-scrollbar {
+    display: none;
   }
 
   .message-markdown thead th {
@@ -999,15 +1008,28 @@
 
   .message-markdown blockquote {
     margin: 0 0 0.45rem;
-    padding: 0.2rem 0 0.2rem 0.9rem;
+    padding: 0.5rem 0 0.5rem 0.9rem;
     border-left: 3px solid #5843d7;
+    background: #f7f8fb;
+    border-radius: 0 6px 6px 0;
     color: #485063;
+  }
+
+  .message-markdown blockquote blockquote {
+    border-left-color: #b1b5c5;
+    background: #fbfbfd;
   }
 
   .message-markdown hr {
     border: none;
     border-top: 1px solid #dfe3ec;
     margin: 0.8rem 0;
+  }
+
+  .message-markdown img {
+    max-width: 100%;
+    border-radius: 8px;
+    margin: 0.25rem 0;
   }
 }
 

@@ -1061,3 +1061,83 @@
   animation: chat-header-pulse 2s ease-in-out infinite;
 }
 
+
+  /* highlight.js github theme — scoped under .message-markdown pre code
+     so it only applies to code blocks inside messages. */
+  .message-markdown pre code.hljs {
+    color: #24292e;
+    background: transparent;
+  }
+  .message-markdown .hljs-doctag,
+  .message-markdown .hljs-keyword,
+  .message-markdown .hljs-meta .hljs-keyword,
+  .message-markdown .hljs-template-tag,
+  .message-markdown .hljs-template-variable,
+  .message-markdown .hljs-type,
+  .message-markdown .hljs-variable.language_ {
+    color: #d73a49;
+  }
+  .message-markdown .hljs-title,
+  .message-markdown .hljs-title.class_,
+  .message-markdown .hljs-title.class_.inherited__,
+  .message-markdown .hljs-title.function_ {
+    color: #6f42c1;
+  }
+  .message-markdown .hljs-attr,
+  .message-markdown .hljs-attribute,
+  .message-markdown .hljs-literal,
+  .message-markdown .hljs-meta,
+  .message-markdown .hljs-number,
+  .message-markdown .hljs-operator,
+  .message-markdown .hljs-variable,
+  .message-markdown .hljs-selector-attr,
+  .message-markdown .hljs-selector-class,
+  .message-markdown .hljs-selector-id {
+    color: #005cc5;
+  }
+  .message-markdown .hljs-regexp,
+  .message-markdown .hljs-string,
+  .message-markdown .hljs-meta .hljs-string {
+    color: #032f62;
+  }
+  .message-markdown .hljs-built_in,
+  .message-markdown .hljs-symbol {
+    color: #e36209;
+  }
+  .message-markdown .hljs-comment,
+  .message-markdown .hljs-code,
+  .message-markdown .hljs-formula {
+    color: #6a737d;
+  }
+  .message-markdown .hljs-name,
+  .message-markdown .hljs-quote,
+  .message-markdown .hljs-selector-tag,
+  .message-markdown .hljs-selector-pseudo {
+    color: #22863a;
+  }
+  .message-markdown .hljs-subst {
+    color: #24292e;
+  }
+  .message-markdown .hljs-section {
+    color: #005cc5;
+    font-weight: bold;
+  }
+  .message-markdown .hljs-bullet {
+    color: #735c0f;
+  }
+  .message-markdown .hljs-emphasis {
+    color: #24292e;
+    font-style: italic;
+  }
+  .message-markdown .hljs-strong {
+    color: #24292e;
+    font-weight: bold;
+  }
+  .message-markdown .hljs-addition {
+    color: #22863a;
+    background-color: #f0fff4;
+  }
+  .message-markdown .hljs-deletion {
+    color: #b31d28;
+    background-color: #ffeef0;
+  }

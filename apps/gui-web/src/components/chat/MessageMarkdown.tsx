@@ -1,11 +1,38 @@
 import { memo } from "react";
 import remarkGfm from "remark-gfm";
+import rehypeHighlight from "rehype-highlight";
+import hljs from "highlight.js/lib/core";
+import javascript from "highlight.js/lib/languages/javascript";
+import typescript from "highlight.js/lib/languages/typescript";
+import python from "highlight.js/lib/languages/python";
+import rust from "highlight.js/lib/languages/rust";
+import go from "highlight.js/lib/languages/go";
+import java from "highlight.js/lib/languages/java";
+import bash from "highlight.js/lib/languages/bash";
+import json from "highlight.js/lib/languages/json";
+import yaml from "highlight.js/lib/languages/yaml";
+import sql from "highlight.js/lib/languages/sql";
+import xml from "highlight.js/lib/languages/xml";
+import css from "highlight.js/lib/languages/css";
 import { actorName } from "@/lib/format-utils";
 import type { Actor, MessageMention } from "@/ipc/types";
 import type { Components } from "react-markdown";
 import ReactMarkdown from "react-markdown";
 import { actorMentionRemarkPlugin, actorMentionActorId } from "@/lib/format-utils";
 import { CodeBlockWithCopy } from "@/components/chat/CodeBlockWithCopy";
+
+hljs.registerLanguage("javascript", javascript);
+hljs.registerLanguage("typescript", typescript);
+hljs.registerLanguage("python", python);
+hljs.registerLanguage("rust", rust);
+hljs.registerLanguage("go", go);
+hljs.registerLanguage("java", java);
+hljs.registerLanguage("bash", bash);
+hljs.registerLanguage("json", json);
+hljs.registerLanguage("yaml", yaml);
+hljs.registerLanguage("sql", sql);
+hljs.registerLanguage("xml", xml);
+hljs.registerLanguage("css", css);
 
 // remark-gfm must run BEFORE actorMentionRemarkPlugin so GFM syntax (tables,
 // strikethrough, autolinks) is parsed into mdast nodes first; actorMention then
@@ -32,7 +59,7 @@ export const MessageMarkdown = memo(function MessageMarkdown({
         );
       }
       return (
-        <CodeBlockWithCopy language={match?.[1] ?? ""}>
+        <CodeBlockWithCopy language={match?.[1] ?? ""} codeClassName={className}>
           {children}
         </CodeBlockWithCopy>
       );
@@ -61,6 +88,7 @@ export const MessageMarkdown = memo(function MessageMarkdown({
   return (
     <ReactMarkdown
       remarkPlugins={[remarkGfm, actorMentionRemarkPlugin(actors, mentions)]}
+      rehypePlugins={[[rehypeHighlight, { detect: true, ignoreMissing: true }]]}
       components={components}
     >
       {body}

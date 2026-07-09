@@ -1,4 +1,4 @@
-import { memo, useMemo } from "react";
+import { lazy, memo, Suspense, useMemo } from "react";
 import { cn, shortId, formatTime } from "@/lib/utils";
 import { displayName, actorName } from "@/lib/format-utils";
 import { messageKind, bodyPollFromMessage, actionChoices, metadataText } from "@/lib/message-utils";
@@ -9,12 +9,19 @@ import { Button } from "@/components/ui/button";
 import { Reply, Split } from "lucide-react";
 import { AgentMessageAvatar } from "@/components/agent/AgentMessageAvatar";
 import { TaskStateBadge } from "@/components/chat/TaskStateBadge";
-import { MessageMarkdown } from "@/components/chat/MessageMarkdown";
 import { AttachmentStack } from "@/components/chat/AttachmentStack";
 import { PollCard } from "@/components/chat/PollCard";
 import { ReactionPicker } from "@/components/chat/ReactionPicker";
 import { ThreadSummaryRow } from "@/components/chat/ThreadSummaryRow";
 import { WorkflowEventRow, WorkflowResultRow } from "@/components/chat/WorkflowRows";
+
+const MessageMarkdown = lazy(() =>
+  import("@/components/chat/MessageMarkdown").then((m) => ({ default: m.MessageMarkdown })),
+);
+
+function MarkdownFallback() {
+  return <div className="min-h-[1em]" />;
+}
 
 export const MessageRow = memo(function MessageRow({
   actor,
@@ -108,11 +115,13 @@ export const MessageRow = memo(function MessageRow({
             )}
           </div>
           <div className="message-markdown mt-1 max-w-none break-words text-[15px] leading-6 text-[#111827]">
-            <MessageMarkdown
-              actors={actors}
-              body={displayBody}
-              mentions={displayBody === message.body ? message.mentions : []}
-            />
+            <Suspense fallback={<MarkdownFallback />}>
+              <MessageMarkdown
+                actors={actors}
+                body={displayBody}
+                mentions={displayBody === message.body ? message.mentions : []}
+              />
+            </Suspense>
           </div>
           {attachments.length > 0 && (
             <AttachmentStack attachments={attachments} />

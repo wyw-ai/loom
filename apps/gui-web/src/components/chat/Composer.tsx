@@ -1,16 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Resizable } from "re-resizable";
 import type { Actor, Message } from "@/ipc/types";
 import type { MentionOption } from "@/lib/format-utils";
 import { activeMentionQuery, mentionCandidates } from "@/lib/format-utils";
 import { isComposingKeyEvent, shouldSendOnEnter } from "@/lib/format-utils";
-import {
-  COMPOSER_AUTO_MAX_ROWS,
-  COMPOSER_DEFAULT_CAP,
-  COMPOSER_MIN_HEIGHT,
-  composerMaxHeightPx,
-} from "@/lib/composer-utils";
-import { useComposerStore } from "@/store/composerStore";
+import { COMPOSER_AUTO_MAX_ROWS, COMPOSER_MIN_HEIGHT } from "@/lib/composer-utils";
+import { useComposerResize } from "@/hooks/useComposerResize";
 import { AutoGrowTextarea } from "@/components/ui/AutoGrowTextarea";
 import { Button } from "@/components/ui/button";
 import { Send, Loader2, X } from "lucide-react";
@@ -46,50 +41,18 @@ export function Composer({
   const [caretIndex, setCaretIndex] = useState(draft.length);
   const [selectedMentionIndex, setSelectedMentionIndex] = useState(0);
   const [dismissedMentionKey, setDismissedMentionKey] = useState<string | null>(null);
-  const [liveHeight, setLiveHeight] = useState<number | null>(null);
 
   // --- Resize state ---
-  const entry = useComposerStore((s) => s.entries.channel);
-  const setManualHeight = useComposerStore((s) => s.setManualHeight);
-  const resetToAuto = useComposerStore((s) => s.resetToAuto);
-  const isManual = entry.mode === "manual" && entry.manualHeight !== null;
-  const resolvedHeight = isManual ? entry.manualHeight! : COMPOSER_DEFAULT_CAP;
-  const effectiveHeight = liveHeight ?? resolvedHeight;
-  const maxHeightPx = composerMaxHeightPx();
-
-  const handleResize = useCallback(
-    (_e: unknown, _dir: unknown, _ref: unknown, delta: { height: number }) => {
-      setLiveHeight(resolvedHeight + delta.height);
-    },
-    [resolvedHeight],
-  );
-
-  const handleResizeStop = useCallback(
-    (_e: MouseEvent | TouchEvent, _dir: string, _ref: HTMLElement, delta: { height: number }) => {
-      const newHeight = Math.max(
-        COMPOSER_MIN_HEIGHT,
-        Math.min(resolvedHeight + delta.height, maxHeightPx),
-      );
-      setManualHeight("channel", newHeight);
-      setLiveHeight(null);
-    },
-    [resolvedHeight, maxHeightPx, setManualHeight],
-  );
-
-  const handleKeyboardResize = useCallback(
-    (deltaPx: number) => {
-      const newHeight = Math.max(
-        COMPOSER_MIN_HEIGHT,
-        Math.min(resolvedHeight + deltaPx, maxHeightPx),
-      );
-      setManualHeight("channel", newHeight);
-    },
-    [resolvedHeight, maxHeightPx, setManualHeight],
-  );
-
-  const handleReset = useCallback(() => {
-    resetToAuto("channel");
-  }, [resetToAuto]);
+  const {
+    effectiveHeight,
+    isManual,
+    liveHeight,
+    maxHeightPx,
+    handleResize,
+    handleResizeStop,
+    handleKeyboardResize,
+    handleReset,
+  } = useComposerResize({ type: "channel" });
   const activeMention = activeMentionQuery(draft, caretIndex);
   const mentionKey = activeMention
     ? `${activeMention.start}:${activeMention.end}:${activeMention.query}`

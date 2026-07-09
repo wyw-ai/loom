@@ -1,4 +1,4 @@
-import { useCallback } from "react";
+import { useCallback, useRef } from "react";
 import * as ipc from "@/ipc/bridge";
 import type {
   Channel,
@@ -121,13 +121,15 @@ export interface ActionDeps {
 }
 
 export function useActions(deps: ActionDeps) {
-  const d = deps;
+  const depsRef = useRef(deps);
+  depsRef.current = deps;
 
   const setLocalIdentity = useCallback(async (args: {
     userId: string;
     nickname: string;
     actorId: string;
   }): Promise<boolean> => {
+    const d = depsRef.current;
     d.setBusy("account:set-local");
     d.setError(null);
     try {
@@ -159,9 +161,10 @@ export function useActions(deps: ActionDeps) {
     } finally {
       d.setBusy(null);
     }
-  }, [d]);
+  }, []);
 
   const logout = useCallback(async () => {
+    const d = depsRef.current;
     d.setBusy("logout");
     try {
       d.autoReconnectRef.current = false;
@@ -189,9 +192,10 @@ export function useActions(deps: ActionDeps) {
     } finally {
       d.setBusy(null);
     }
-  }, [d]);
+  }, []);
 
   const updateAccountAvatar = useCallback(async (avatarUrl: string) => {
+    const d = depsRef.current;
     d.setBusy("account:avatar");
     d.setError(null);
     try {
@@ -210,9 +214,10 @@ export function useActions(deps: ActionDeps) {
     } finally {
       d.setBusy(null);
     }
-  }, [d]);
+  }, []);
 
   const addWorkspace = useCallback(async (): Promise<Workspace | null> => {
+    const d = depsRef.current;
     const hasTarget = d.workspaceForm.advanced
       ? d.workspaceForm.serverUrl.trim()
       : d.workspaceForm.host.trim();
@@ -246,9 +251,10 @@ export function useActions(deps: ActionDeps) {
     } finally {
       d.setBusy(null);
     }
-  }, [d]);
+  }, []);
 
   const removeWorkspace = useCallback(async (id: string) => {
+    const d = depsRef.current;
     d.setBusy(`workspace:remove:${id}`);
     d.setError(null);
     try {
@@ -274,9 +280,10 @@ export function useActions(deps: ActionDeps) {
     } finally {
       d.setBusy(null);
     }
-  }, [d]);
+  }, []);
 
   const checkMachines = useCallback(async () => {
+    const d = depsRef.current;
     d.setBusy("machine:check");
     d.setError(null);
     try {
@@ -287,12 +294,13 @@ export function useActions(deps: ActionDeps) {
     } finally {
       d.setBusy(null);
     }
-  }, [d]);
+  }, []);
 
   const createMachine = useCallback(async (args: {
     name: string;
     dataRoot?: string;
   }): Promise<MachineInfo | null> => {
+    const d = depsRef.current;
     const name = args.name.trim();
     if (!name) {
       d.setError("Host name is required.");
@@ -320,9 +328,10 @@ export function useActions(deps: ActionDeps) {
     } finally {
       d.setBusy(null);
     }
-  }, [d]);
+  }, []);
 
   const startLocalHost = useCallback(async (): Promise<boolean> => {
+    const d = depsRef.current;
     if (d.connection !== "open" || !d.workspaceRef.current) {
       d.setError("Connect to a server before starting a local host.");
       return false;
@@ -359,9 +368,10 @@ export function useActions(deps: ActionDeps) {
     } finally {
       d.setBusy(null);
     }
-  }, [d, createMachine]);
+  }, [createMachine]);
 
   const removeMachine = useCallback(async (machineId: string) => {
+    const d = depsRef.current;
     d.setBusy(`machine:remove:${machineId}`);
     d.setError(null);
     try {
@@ -373,9 +383,10 @@ export function useActions(deps: ActionDeps) {
     } finally {
       d.setBusy(null);
     }
-  }, [d]);
+  }, []);
 
-  const createAgent = useCallback(async (form: AgentFormState = d.agentForm): Promise<boolean> => {
+  const createAgent = useCallback(async (form: AgentFormState = depsRef.current.agentForm): Promise<boolean> => {
+    const d = depsRef.current;
     const name = form.name.trim();
     const machine = resolveAgentMachine(form, d.machines);
     const provider = resolveAgentProvider(form, machine);
@@ -425,9 +436,10 @@ export function useActions(deps: ActionDeps) {
     } finally {
       d.setBusy(null);
     }
-  }, [d]);
+  }, []);
 
   const removeAgent = useCallback(async (machineId: string, actorId: string) => {
+    const d = depsRef.current;
     d.setBusy(`agent:remove:${actorId}`);
     d.setError(null);
     try {
@@ -442,9 +454,10 @@ export function useActions(deps: ActionDeps) {
     } finally {
       d.setBusy(null);
     }
-  }, [d]);
+  }, []);
 
   const updateAgent = useCallback(async (patch: AgentUpdatePatch) => {
+    const d = depsRef.current;
     d.setBusy(`agent:update:${patch.actorId}`);
     d.setError(null);
     try {
@@ -472,9 +485,10 @@ export function useActions(deps: ActionDeps) {
     } finally {
       d.setBusy(null);
     }
-  }, [d]);
+  }, []);
 
   const addAgentSkill = useCallback(async (machineId: string, actorId: string, source: string) => {
+    const d = depsRef.current;
     d.setBusy(`agent:skill:add:${actorId}`);
     d.setError(null);
     try {
@@ -495,9 +509,10 @@ export function useActions(deps: ActionDeps) {
     } finally {
       d.setBusy(null);
     }
-  }, [d]);
+  }, []);
 
   const inviteMemberToChannel = useCallback(async (channelId: string, actorId: string) => {
+    const d = depsRef.current;
     const actor = d.actors[actorId];
     d.setBusy(`channel:invite:${channelId}:${actorId}`);
     d.setError(null);
@@ -510,9 +525,10 @@ export function useActions(deps: ActionDeps) {
     } finally {
       d.setBusy(null);
     }
-  }, [d]);
+  }, []);
 
   const removeMemberFromChannel = useCallback(async (channelId: string, actorId: string) => {
+    const d = depsRef.current;
     const actor = d.actors[actorId];
     d.setBusy(`channel:revoke:${channelId}:${actorId}`);
     d.setError(null);
@@ -532,13 +548,14 @@ export function useActions(deps: ActionDeps) {
     } finally {
       d.setBusy(null);
     }
-  }, [d]);
+  }, []);
 
   const saveMemberWorkspace = useCallback(async (
     channelId: string,
     actorId: string,
     workspaceDir: string,
   ): Promise<boolean> => {
+    const d = depsRef.current;
     const value = workspaceDir.trim();
     if (!value) {
       d.setError("Workspace path is required.");
@@ -567,9 +584,10 @@ export function useActions(deps: ActionDeps) {
     } finally {
       d.setBusy(null);
     }
-  }, [d]);
+  }, []);
 
   const clearMemberWorkspace = useCallback(async (channelId: string, actorId: string): Promise<boolean> => {
+    const d = depsRef.current;
     d.setBusy(`channel:member-workspace:${channelId}:${actorId}`);
     d.setError(null);
     try {
@@ -589,18 +607,20 @@ export function useActions(deps: ActionDeps) {
     } finally {
       d.setBusy(null);
     }
-  }, [d]);
+  }, []);
 
   const openLocalPath = useCallback(async (path: string) => {
+    const d = depsRef.current;
     d.setError(null);
     try {
       await ipc.openLocalPath(path);
     } catch (err) {
       d.setError(errorText(err));
     }
-  }, [d]);
+  }, []);
 
   const createChannelWithTitle = useCallback(async (rawTitle: string) => {
+    const d = depsRef.current;
     const title = rawTitle.trim();
     const currentWorkspace = d.workspaceRef.current ?? d.workspace;
     if (!title) return;
@@ -629,9 +649,10 @@ export function useActions(deps: ActionDeps) {
     } finally {
       d.setBusy(null);
     }
-  }, [d]);
+  }, []);
 
   const renameChannel = useCallback(async (channel: Channel, rawTitle: string) => {
+    const d = depsRef.current;
     const title = rawTitle.trim();
     if (!title || title === channel.title) return;
     d.setBusy(`channel:rename:${channel.id}`);
@@ -649,9 +670,10 @@ export function useActions(deps: ActionDeps) {
     } finally {
       d.setBusy(null);
     }
-  }, [d]);
+  }, []);
 
   const deleteChannel = useCallback(async (channel: Channel) => {
+    const d = depsRef.current;
     d.setBusy(`channel:delete:${channel.id}`);
     d.setError(null);
     try {
@@ -673,9 +695,10 @@ export function useActions(deps: ActionDeps) {
     } finally {
       d.setBusy(null);
     }
-  }, [d]);
+  }, []);
 
   const sendMessage = useCallback(async () => {
+    const d = depsRef.current;
     const body = d.draft.trim();
     if (!body || !d.target) return;
     d.setBusy("message:send");
@@ -729,9 +752,10 @@ export function useActions(deps: ActionDeps) {
     } finally {
       d.setBusy(null);
     }
-  }, [d]);
+  }, []);
 
   const sendThreadMessage = useCallback(async () => {
+    const d = depsRef.current;
     const body = d.threadDraft.trim();
     if (!body || !d.threadMessageTarget) return;
     d.setBusy("thread:message:send");
@@ -777,9 +801,10 @@ export function useActions(deps: ActionDeps) {
     } finally {
       d.setBusy(null);
     }
-  }, [d]);
+  }, []);
 
   const sendDirectMessage = useCallback(async () => {
+    const d = depsRef.current;
     const body = d.directDraft.trim();
     if (!body || !d.activeDirectActor || !d.activeDirectTarget) return;
     const directMentions = mentionAudience(
@@ -813,9 +838,10 @@ export function useActions(deps: ActionDeps) {
     } finally {
       d.setBusy(null);
     }
-  }, [d]);
+  }, []);
 
   const startThread = useCallback(async (message: Message) => {
+    const d = depsRef.current;
     if (!d.activeChannel) return;
     const existing = d.channelThreads.find(
       (thread) => thread.rootMessageId === message.id,
@@ -849,9 +875,10 @@ export function useActions(deps: ActionDeps) {
     } finally {
       d.setBusy(null);
     }
-  }, [d]);
+  }, []);
 
   const toggleMessageReaction = useCallback(async (message: Message, emoji: string) => {
+    const d = depsRef.current;
     d.setBusy(`message:reaction:${message.id}:${emoji}`);
     d.setError(null);
     try {
@@ -883,9 +910,10 @@ export function useActions(deps: ActionDeps) {
     } finally {
       d.setBusy(null);
     }
-  }, [d]);
+  }, []);
 
   const answerAction = useCallback(async (message: Message, optionId: string, accepted: boolean) => {
+    const d = depsRef.current;
     const responseTarget = message.target || d.target;
     if (!responseTarget || !d.workspace) return;
     const responseKind = accepted ? "accepted" : "declined";
@@ -918,9 +946,10 @@ export function useActions(deps: ActionDeps) {
     } finally {
       d.setBusy(null);
     }
-  }, [d]);
+  }, []);
 
   const answerDirectAction = useCallback(async (message: Message, optionId: string, accepted: boolean) => {
+    const d = depsRef.current;
     if (!d.workspace) return;
     const peerActorId =
       directPeerForMessage(message, d.workspace.actorId) ?? d.activeDirectActor?.id ?? null;
@@ -957,24 +986,26 @@ export function useActions(deps: ActionDeps) {
     } finally {
       d.setBusy(null);
     }
-  }, [d]);
+  }, []);
 
   const selectWorkspace = useCallback(async (workspaceId: string): Promise<Workspace | null> => {
+    const d = depsRef.current;
     d.setView("chat");
     d.setChannelPanelTab(null);
     if (d.workspace?.id !== workspaceId || d.connection !== "open") {
       return d.connectWorkspace(workspaceId);
     }
     return d.workspaceRef.current ?? d.workspace ?? null;
-  }, [d]);
+  }, []);
 
   const finishOnboarding = useCallback(() => {
+    const d = depsRef.current;
     d.setOnboardingActive(false);
     d.setView("chat");
     if (d.connection === "open") {
       void d.loadMachines(true).catch(() => {});
     }
-  }, [d]);
+  }, []);
 
   return {
     setLocalIdentity,

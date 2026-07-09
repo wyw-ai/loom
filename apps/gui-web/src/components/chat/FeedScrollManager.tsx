@@ -26,9 +26,25 @@ export const FeedScrollManager = memo(function FeedScrollManager({
   const [firstVisibleIndex, setFirstVisibleIndex] = useState(0);
   const [lastVisibleIndex, setLastVisibleIndex] = useState(0);
   const [isAtBottom, setIsAtBottom] = useState(true);
+  const [newMessageCount, setNewMessageCount] = useState(0);
+  const prevCountRef = useRef(feedItems.length);
 
   const showJumpToTop = firstVisibleIndex > 2;
   const showJumpToBottom = lastVisibleIndex < feedItems.length - 3;
+
+  // Track new messages arriving while scrolled up
+  useEffect(() => {
+    const prev = prevCountRef.current;
+    prevCountRef.current = feedItems.length;
+    if (feedItems.length > prev && !isAtBottom) {
+      setNewMessageCount((c) => c + (feedItems.length - prev));
+    }
+  }, [feedItems.length, isAtBottom]);
+
+  // Reset count when user returns to bottom
+  useEffect(() => {
+    if (isAtBottom) setNewMessageCount(0);
+  }, [isAtBottom]);
 
   const components = useMemo(() => {
     if (!headerRenderer) return undefined;
@@ -54,11 +70,13 @@ export const FeedScrollManager = memo(function FeedScrollManager({
     [],
   );
   const onJumpToBottom = useCallback(
-    () =>
+    () => {
+      setNewMessageCount(0);
       virtuosoRef.current?.scrollToIndex({
         index: feedItems.length - 1,
         behavior: "smooth",
-      }),
+      });
+    },
     [feedItems.length],
   );
 
@@ -87,6 +105,7 @@ export const FeedScrollManager = memo(function FeedScrollManager({
       <ScrollJumpButtons
         showJumpToTop={showJumpToTop}
         showJumpToBottom={showJumpToBottom}
+        newMessageCount={newMessageCount}
         onJumpToTop={onJumpToTop}
         onJumpToBottom={onJumpToBottom}
       />

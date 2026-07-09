@@ -20,8 +20,12 @@ env:
 
 jobs:
   rust:
-    name: Rust
-    runs-on: ubuntu-latest
+    name: Rust (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6.0.3
@@ -33,6 +37,8 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
 
       - name: Format
         run: cargo fmt --all --check
@@ -44,6 +50,9 @@ jobs:
         run: cargo build
 
       - name: E2E smoke
+        # E2E scripts use bash + /tmp + python3 idioms that are Linux-only.
+        # Windows/macOS runners don't reliably provide all three.
+        if: runner.os == 'Linux'
         run: bash scripts/e2e/run-all.sh
 
   frontend:

@@ -13,9 +13,11 @@ function extractText(node: ReactNode): string {
 
 export function CodeBlockWithCopy({
   language,
+  codeClassName,
   children,
 }: {
   language: string;
+  codeClassName?: string;
   children: ReactNode;
 }) {
   const [copied, setCopied] = useState(false);
@@ -61,7 +63,7 @@ export function CodeBlockWithCopy({
         </button>
       </div>
       <pre>
-        <code className={language ? `language-${language}` : undefined}>{children}</code>
+        <code className={codeClassName ?? (language ? `language-${language}` : undefined)}>{children}</code>
       </pre>
     </div>
   );

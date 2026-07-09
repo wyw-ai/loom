@@ -86,6 +86,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6.0.3
 
+      - name: Checkout official Loom guide content
+        uses: actions/checkout@v6.0.3
+        with:
+          repository: wyw-ai/loom-guide
+          token: ${{ secrets.LOOM_CONTENT_TOKEN || github.token }}
+          path: loom-guide
+
+      - name: Checkout official Loom skills content
+        uses: actions/checkout@v6.0.3
+        with:
+          repository: wyw-ai/loom-skills
+          token: ${{ secrets.LOOM_CONTENT_TOKEN || github.token }}
+          path: loom-skills
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -118,6 +132,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6.0.3
 
+      - name: Checkout official Loom guide content
+        uses: actions/checkout@v6.0.3
+        with:
+          repository: wyw-ai/loom-guide
+          token: ${{ secrets.LOOM_CONTENT_TOKEN || github.token }}
+          path: loom-guide
+
+      - name: Checkout official Loom skills content
+        uses: actions/checkout@v6.0.3
+        with:
+          repository: wyw-ai/loom-skills
+          token: ${{ secrets.LOOM_CONTENT_TOKEN || github.token }}
+          path: loom-skills
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -146,6 +174,20 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6.0.3
+
+      - name: Checkout official Loom guide content
+        uses: actions/checkout@v6.0.3
+        with:
+          repository: wyw-ai/loom-guide
+          token: ${{ secrets.LOOM_CONTENT_TOKEN || github.token }}
+          path: loom-guide
+
+      - name: Checkout official Loom skills content
+        uses: actions/checkout@v6.0.3
+        with:
+          repository: wyw-ai/loom-skills
+          token: ${{ secrets.LOOM_CONTENT_TOKEN || github.token }}
+          path: loom-skills
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

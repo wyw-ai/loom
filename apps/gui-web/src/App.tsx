@@ -46,6 +46,7 @@ import {
   defaultWorkspaceForm,
   normalizeWorkspaceFormServerUrl,
 } from "@/lib/server-url";
+import { defaultWakeSpec } from "@/lib/wake-utils";
 
 import {
   channelGroupStorageKey,
@@ -228,6 +229,7 @@ export function App() {
     model: "",
     autostart: true,
     env: {},
+    wake: defaultWakeSpec(),
   });
   const [configLoaded, setConfigLoaded] = useState(false);
   const [onboardingActive, setOnboardingActive] = useState(false);
@@ -1283,6 +1285,7 @@ export function App() {
         description: form.description.trim(),
         instructions: form.instructions.trim(),
         promptAssembly: defaultAgentPromptAssembly,
+        wake: form.wake,
         model: form.model.trim() || provider.defaultModel || "",
         autostart: form.autostart,
         env: filterEmptyEnvKeys(form.env),
@@ -1338,6 +1341,7 @@ export function App() {
         avatarUrl: patch.avatarUrl.trim(),
         env: filterEmptyEnvKeys(patch.env),
         bundleSkills: patch.bundleSkills,
+        wake: patch.wake,
       });
       await loadMachines();
       if (workspace && connection === "open") {

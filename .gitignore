@@ -11,6 +11,7 @@
 __pycache__/
 /docs/*
 !/docs/README.md
+!/docs/agent-turn-input-analysis.md
 !/docs/gui-actor-provider-management-design.md
 !/docs/loom-refactor-plan.md
 !/docs/loop-engineering.md
@@ -22,6 +23,7 @@ __pycache__/
 !/docs/ISSUES.md
 !/docs/protocol/
 !/docs/protocol/agent-coordination-workflow.md
+!/docs/protocol/turn-input-contract-v1.md
 !/docs/superpowers/
 !/docs/windows-build-guide.md
 !/docs/ci/
@@ -38,3 +40,6 @@ data
 /crates/gui/target/
 /logs/
 /tmp/
+# In-repo checkouts of official runtime content (CI checks these out here)
+/loom-guide/
+/loom-skills/

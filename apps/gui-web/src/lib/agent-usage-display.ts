@@ -65,10 +65,7 @@ const SEGMENT_META: Record<SegmentKind, { label: string; detail: string; color: 
 };
 
 const SYSTEM_PROMPT_KEYS = new Set([
-  "agent_instructions",
-  "actor_context",
   "runtime_context",
-  "scope_bootstrap",
   "bootstrap_memory",
   "profile_prompt_files",
   "trigger_prefix",

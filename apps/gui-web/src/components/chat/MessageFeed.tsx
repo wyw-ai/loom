@@ -88,6 +88,7 @@ export function MessageFeed({
   const renderItem = useCallback(
     (index: number) => {
       const item = feedItems[index];
+      if (!item) return null;
       if (item.kind === "date-divider") {
         return (
           <div className={`date-divider ${index === 0 ? "date-divider-first" : ""}`}>

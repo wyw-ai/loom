@@ -86,7 +86,7 @@ export function MessageFeed({
   }, [visibleMessages]);
 
   const renderItem = useCallback(
-    (index: number) => {
+    (index: number, isScrolling: boolean) => {
       const item = feedItems[index];
       if (item.kind === "date-divider") {
         return (
@@ -123,6 +123,7 @@ export function MessageFeed({
           sourceTask={sourceTask}
           currentActorId={currentActorId}
           busy={busy}
+          isScrolling={isScrolling}
         />
       );
     },

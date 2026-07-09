@@ -22,9 +22,17 @@ jobs:
   rust:
     name: Rust
     runs-on: ubuntu-latest
+    env:
+      LOOM_GUIDE_DIR: ${{ github.workspace }}/crates/cli/fixtures/ci-runtime-content/loom-guide
+      LOOM_SKILLS_DIR: ${{ github.workspace }}/crates/cli/fixtures/ci-runtime-content/loom-skills
     steps:
       - name: Checkout
         uses: actions/checkout@v6.0.3
+
+      - name: Validate CI runtime content fixture
+        run: |
+          test -f "$LOOM_GUIDE_DIR/guides/runtime-awareness.md"
+          test -f "$LOOM_SKILLS_DIR/skills/loom/SKILL.md"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

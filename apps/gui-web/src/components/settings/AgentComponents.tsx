@@ -826,6 +826,13 @@ export function AgentMemberDetail({
     setDraft((current) => ({ ...current, ...patch }));
   }
 
+  function updateWake(patch: Partial<AgentSettingsDraft["wake"]>) {
+    setDraft((current) => ({
+      ...current,
+      wake: { ...current.wake, ...patch },
+    }));
+  }
+
   function addEnvEntry() {
     setDraft((current) => ({
       ...current,
@@ -867,6 +874,7 @@ export function AgentMemberDetail({
       avatarUrl: nextDraft.avatarUrl,
       env: nextDraft.env,
       bundleSkills: nextDraft.bundleSkills,
+      wake: nextDraft.wake,
     };
   }
 
@@ -1118,6 +1126,75 @@ export function AgentMemberDetail({
                 />
                 Autostart
               </label>
+            </div>
+          </HostDetailSection>
+          <HostDetailSection title="Wake Policy">
+            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
+              <label className="flex h-10 items-center gap-2 rounded-lg border border-[#dfe3ec] bg-white px-3 text-sm text-[#303849]">
+                <input
+                  type="checkbox"
+                  checked={draft.wake.coalesce !== false}
+                  onChange={(event) => updateWake({ coalesce: event.target.checked })}
+                  disabled={!canEdit}
+                />
+                Coalesce
+              </label>
+              <Input
+                type="number"
+                min={0}
+                max={10000}
+                value={draft.wake.debounceMs ?? 0}
+                onChange={(event) =>
+                  updateWake({ debounceMs: Math.max(0, Number(event.target.value) || 0) })
+                }
+                placeholder="Debounce ms"
+                className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
+                disabled={!canEdit}
+              />
+              <StyledSelect
+                value={draft.wake.replyReminder ?? "first-turn"}
+                onChange={(event) =>
+                  updateWake({
+                    replyReminder: event.target.value as NonNullable<
+                      AgentSettingsDraft["wake"]["replyReminder"]
+                    >,
+                  })
+                }
+                disabled={!canEdit}
+              >
+                <option value="first-turn">Reminder first turn</option>
+                <option value="every-turn">Reminder every turn</option>
+                <option value="off">Reminder off</option>
+              </StyledSelect>
+              <StyledSelect
+                value={draft.wake.onHumanMessageWhileBusy ?? "queue"}
+                onChange={(event) =>
+                  updateWake({
+                    onHumanMessageWhileBusy: event.target.value as NonNullable<
+                      AgentSettingsDraft["wake"]["onHumanMessageWhileBusy"]
+                    >,
+                  })
+                }
+                disabled={!canEdit}
+              >
+                <option value="queue">Busy: queue</option>
+                <option value="cancel_and_requeue">Busy: cancel + requeue</option>
+                <option value="inject">Busy: inject</option>
+              </StyledSelect>
+              <Input
+                type="number"
+                min={1}
+                max={8000}
+                value={draft.wake.contextTokenBudget ?? 900}
+                onChange={(event) =>
+                  updateWake({
+                    contextTokenBudget: Math.max(1, Number(event.target.value) || 900),
+                  })
+                }
+                placeholder="Context tokens"
+                className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
+                disabled={!canEdit}
+              />
             </div>
           </HostDetailSection>
           <HostDetailSection title="Environment Variables">

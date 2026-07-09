@@ -145,6 +145,11 @@ enum Cmd {
         #[command(subcommand)]
         sub: ProviderCmd,
     },
+    /// Read or update the official Loom operating guide.
+    Guide {
+        #[command(subcommand)]
+        sub: GuideCmd,
+    },
     /// Manage daemon machines through server-routed machine commands.
     Machine {
         #[command(subcommand)]
@@ -1054,6 +1059,9 @@ enum MessageCmd {
         private_to: Vec<String>,
         #[arg(long)]
         text: Option<String>,
+        /// Allow literal backslash-n sequences in --text from an agent run.
+        #[arg(long = "allow-escaped-newlines")]
+        allow_escaped_newlines: bool,
         /// Message intent: chat, ask, request_action, assign_task, status_update, review, notify.
         #[arg(long)]
         intent: Option<String>,
@@ -1079,6 +1087,9 @@ enum MessageCmd {
         thread: Option<String>,
         #[arg(long)]
         text: Option<String>,
+        /// Allow literal backslash-n sequences in --text from an agent run.
+        #[arg(long = "allow-escaped-newlines")]
+        allow_escaped_newlines: bool,
         /// Only send if this is still the latest message in the target scope.
         #[arg(long = "if-latest")]
         if_latest: Option<String>,
@@ -1520,6 +1531,18 @@ enum ProviderCmd {
 }
 
 #[derive(Subcommand, Debug)]
+enum GuideCmd {
+    /// List available guide topics.
+    List,
+    /// Show one guide topic.
+    Show { topic: String },
+    /// Search guide topics.
+    Search { query: String },
+    /// Refresh the local guide cache from the official repository.
+    Update,
+}
+
+#[derive(Subcommand, Debug)]
 enum MachineCmd {
     /// List daemon machines visible from the current server.
     List,
@@ -1772,6 +1795,16 @@ async fn async_main() -> Result<()> {
             ProviderCmd::Show { provider_id } => cmd::provider::show(provider_id)?,
             ProviderCmd::Remove { provider_id } => cmd::provider::remove(provider_id)?,
             ProviderCmd::Doctor { provider_id } => cmd::provider::doctor(provider_id)?,
+        }
+        return Ok(());
+    }
+
+    if let Cmd::Guide { sub } = &args.cmd {
+        match sub {
+            GuideCmd::List => cmd::guide::list()?,
+            GuideCmd::Show { topic } => cmd::guide::show(topic)?,
+            GuideCmd::Search { query } => cmd::guide::search(query)?,
+            GuideCmd::Update => cmd::guide::update()?,
         }
         return Ok(());
     }
@@ -2042,6 +2075,7 @@ async fn async_main() -> Result<()> {
                 delivery_policy,
                 if_latest,
                 attachment_ids,
+                allow_escaped_newlines,
             } => {
                 cmd::message::send(
                     client,
@@ -2055,6 +2089,7 @@ async fn async_main() -> Result<()> {
                     delivery_policy,
                     if_latest,
                     attachment_ids,
+                    allow_escaped_newlines,
                 )
                 .await?
             }
@@ -2065,6 +2100,7 @@ async fn async_main() -> Result<()> {
                 text,
                 if_latest,
                 attachment_ids,
+                allow_escaped_newlines,
             } => {
                 cmd::message::ask(
                     client,
@@ -2075,6 +2111,7 @@ async fn async_main() -> Result<()> {
                     text,
                     if_latest,
                     attachment_ids,
+                    allow_escaped_newlines,
                 )
                 .await?
             }
@@ -2622,6 +2659,7 @@ async fn async_main() -> Result<()> {
         }
         Cmd::Agent { .. } => unreachable!("handled before client setup"),
         Cmd::Provider { .. } => unreachable!("handled before client setup"),
+        Cmd::Guide { .. } => unreachable!("handled before client setup"),
         Cmd::Mcp { .. } => unreachable!("handled before client setup"),
         Cmd::Memory { .. } => unreachable!("handled before client setup"),
         Cmd::Machine { sub } => match sub {

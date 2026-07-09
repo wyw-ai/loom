@@ -1,5 +1,10 @@
 标题：Copilot CLI 指令注入方式改造设计 ✅ 已实施 (2026-06-14)
 
+> 状态：历史设计。最新方案不再使用 `instructions_via` 在 prompt 和 AGENTS.md 之间
+> 分流 Loom runtime guidance；Loom 默认把稳定 actor/channel 信息写入 workspace
+> `AGENTS.md`，投影默认 `loom` skill，并通过 `loom guide` 提供详细规则。最新边界
+> 见 `docs/protocol/agent-runtime-awareness.md`。
+
 ## 背景
 
 Copilot CLI 不支持 `--system-prompt` 参数（与 Codex/CC 不同），LOOM 通过 `-p "{prompt.full}"` 将所有内容传入。每次 `--resume`，copilot 的 events.jsonl 都会新增一条 user.message（~47KB），其中 40KB 为固定不变的 `agent_instructions`。52 轮对话后 session 膨胀至 10MB/1769 条事件，传递给模型 API 时超时。

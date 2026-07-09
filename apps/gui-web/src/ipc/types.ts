@@ -284,8 +284,17 @@ export interface AgentSpec {
   models?: AgentModelSpec | null;
   autostart?: boolean | null;
   bundle?: AgentBundleSpec | null;
+  wake?: WakeSpec | null;
   promptAssembly?: Record<string, unknown> | null;
   _meta?: Record<string, unknown>;
+}
+
+export interface WakeSpec {
+  coalesce?: boolean | null;
+  debounceMs?: number | null;
+  replyReminder?: "every-turn" | "first-turn" | "off" | null;
+  onHumanMessageWhileBusy?: "queue" | "cancel_and_requeue" | "inject" | null;
+  contextTokenBudget?: number | null;
 }
 
 export interface AgentInfo {
@@ -462,6 +471,8 @@ export interface PromptBreakdownSection {
 
 export interface PromptBreakdown {
   sections: PromptBreakdownSection[];
+  duplicate_byte_count?: number;
+  duplicate_ratio?: number;
 }
 
 export function readMessageTokenUsage(
@@ -489,7 +500,16 @@ export function readMessagePromptBreakdown(
   if (!raw || typeof raw !== "object") return null;
   const sections = (raw as Record<string, unknown>)["sections"];
   if (!Array.isArray(sections)) return null;
-  return { sections: sections as PromptBreakdownSection[] };
+  const obj = raw as Record<string, unknown>;
+  return {
+    sections: sections as PromptBreakdownSection[],
+    duplicate_byte_count: typeof obj["duplicate_byte_count"] === "number"
+      ? obj["duplicate_byte_count"] as number
+      : undefined,
+    duplicate_ratio: typeof obj["duplicate_ratio"] === "number"
+      ? obj["duplicate_ratio"] as number
+      : undefined,
+  };
 }
 
 export function scopeKey(scope: ScopeRef): string {

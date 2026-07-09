@@ -18,10 +18,7 @@ export const machineStatusPollIntervalMs = 5_000;
 export const reasoningEffortChoices = ["", "minimal", "low", "medium", "high", "xhigh"] as const;
 export const defaultNewPromptFilePath = "prompts/new.md";
 export const defaultSystemPromptTemplate = [
-  "{actor_context}",
-  "{agent_instructions}",
   "{bootstrap_memory}",
-  "{scope_bootstrap}",
   "{profile_prompt_files}",
 ].join("\n\n");
 export const defaultUserPromptTemplate = [
@@ -31,19 +28,10 @@ export const defaultUserPromptTemplate = [
   "{user_message}",
 ].join("\n\n");
 export const promptPresetParts: Record<string, string[]> = {
-  loom_system: [
-    "actor_context",
-    "agent_instructions",
-    "bootstrap_memory",
-    "scope_bootstrap",
-    "profile_prompt_files",
-  ],
+  loom_system: ["bootstrap_memory", "profile_prompt_files"],
   loom_turn: ["turn_memory", "runtime_context", "assignment_context", "user_message"],
   loom_full: [
-    "actor_context",
-    "agent_instructions",
     "bootstrap_memory",
-    "scope_bootstrap",
     "profile_prompt_files",
     "turn_memory",
     "runtime_context",
@@ -52,10 +40,7 @@ export const promptPresetParts: Record<string, string[]> = {
   ],
 };
 export const promptVariableOptions = [
-  { key: "actor_context", label: "Actor" },
-  { key: "agent_instructions", label: "Instructions" },
   { key: "bootstrap_memory", label: "Long memory" },
-  { key: "scope_bootstrap", label: "Scope" },
   { key: "profile_prompt_files", label: "Profile prompt files" },
   { key: "turn_memory", label: "Turn memory" },
   { key: "runtime_context", label: "Runtime" },

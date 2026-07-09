@@ -15,6 +15,7 @@ import type {
 } from "@/lib/types";
 import { agentAvatarIndexes, avatarCount } from "@/lib/constants";
 import { metadataString, metadataNumber } from "@/lib/message-utils";
+import { normalizeWakeSpec } from "@/lib/wake-utils";
 import {
   displayName,
   isOnlinePresenceStatus,
@@ -145,6 +146,7 @@ export function agentSettingsDraft(
     avatarUrl: agentAvatarValue(agent),
     env: { ...(agent.spec.providerRef.env ?? {}) },
     bundleSkills: [...(agent.spec.bundle?.skills ?? [])],
+    wake: normalizeWakeSpec(agent.spec.wake),
   };
 }
 

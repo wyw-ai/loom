@@ -10,5 +10,12 @@
     "mode": "print",
     "model": "gpt-5.5"
   },
+  "wake": {
+    "coalesce": true,
+    "debounceMs": 750,
+    "replyReminder": "first-turn",
+    "onHumanMessageWhileBusy": "queue",
+    "contextTokenBudget": 900
+  },
   "autostart": false
 }

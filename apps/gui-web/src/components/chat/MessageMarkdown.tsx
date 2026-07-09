@@ -64,6 +64,16 @@ export const MessageMarkdown = memo(function MessageMarkdown({
         </CodeBlockWithCopy>
       );
     },
+    table({ children }) {
+      return (
+        <div className="table-wrapper">
+          <table>{children}</table>
+        </div>
+      );
+    },
+    img({ src, alt, ...props }) {
+      return <img src={src} alt={alt} loading="lazy" {...props} />;
+    },
     a({ href, children, node: _node, ...props }) {
       const actorId = href ? actorMentionActorId(href) : null;
       if (actorId) {

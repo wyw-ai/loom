@@ -18,11 +18,12 @@ export const FeedScrollManager = memo(function FeedScrollManager({
 }: {
   feedKey: string;
   feedItems: FeedItem[];
-  renderItem: (index: number) => ReactNode;
+  renderItem: (index: number, isScrolling: boolean) => ReactNode;
 }) {
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const [firstVisibleIndex, setFirstVisibleIndex] = useState(0);
   const [lastVisibleIndex, setLastVisibleIndex] = useState(0);
+  const [isScrolling, setIsScrolling] = useState(false);
 
   const showJumpToTop = firstVisibleIndex > 2;
   const showJumpToBottom = lastVisibleIndex < feedItems.length - 3;
@@ -64,6 +65,8 @@ export const FeedScrollManager = memo(function FeedScrollManager({
         followOutput="smooth"
         increaseViewportBy={{ top: 200, bottom: 200 }}
         defaultItemHeight={88}
+        isScrolling={setIsScrolling}
+        context={isScrolling}
         computeItemKey={(index) => {
           const item = feedItems[index];
           if (!item) return `item-${index}`;
@@ -73,7 +76,7 @@ export const FeedScrollManager = memo(function FeedScrollManager({
           setFirstVisibleIndex(range.startIndex);
           setLastVisibleIndex(range.endIndex);
         }}
-        itemContent={renderItem}
+        itemContent={(index, _data, ctx) => renderItem(index, Boolean(ctx))}
       />
       <ScrollJumpButtons
         showJumpToTop={showJumpToTop}

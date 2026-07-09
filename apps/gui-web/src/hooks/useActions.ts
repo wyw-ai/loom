@@ -420,6 +420,7 @@ export function useActions(deps: ActionDeps) {
         model: form.model.trim() || provider.defaultModel || "",
         autostart: form.autostart,
         env: filterEmptyEnvKeys(form.env),
+        wake: form.wake,
       });
       d.applyMachines(result.machines);
       d.setAgentForm((current) =>
@@ -474,6 +475,7 @@ export function useActions(deps: ActionDeps) {
         avatarUrl: patch.avatarUrl.trim(),
         env: filterEmptyEnvKeys(patch.env),
         bundleSkills: patch.bundleSkills,
+        wake: patch.wake,
       });
       await d.loadMachines();
       if (d.workspace && d.connection === "open") {

@@ -61,6 +61,9 @@ export function CodeBlockWithCopy({
         >
           {copied ? <Check size={14} /> : <Copy size={14} />}
         </button>
+        <span role="status" aria-live="polite" className="sr-only">
+          {copied ? "Copied!" : ""}
+        </span>
       </div>
       <pre>
         <code className={codeClassName ?? (language ? `language-${language}` : undefined)}>{children}</code>

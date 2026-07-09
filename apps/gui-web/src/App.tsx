@@ -7,6 +7,7 @@ import { defaultWakeSpec } from "@/lib/wake-utils";
 import { channelMentionAgentActors } from "@/lib/channel-utils";
 import { WorkspaceShell } from "@/containers/WorkspaceShell";
 import { OnboardingView } from "@/components/views/OnboardingView";
+import { ErrorBoundary } from "@/components/shared/ErrorBoundary";
 import * as D from "@/lib/derived";
 import { usePanelResize } from "@/hooks/usePanelResize";
 import { useStreamHandler } from "@/hooks/useStreamHandler";
@@ -393,7 +394,8 @@ export function App() {
 
   if (onboardingActive) {
     return (
-      <OnboardingView
+      <ErrorBoundary>
+        <OnboardingView
         account={account}
         busy={busy}
         connection={connection}
@@ -411,6 +413,7 @@ export function App() {
         onStartLocalHost={startLocalHost}
         onFinish={finishOnboarding}
       />
+      </ErrorBoundary>
     );
   }
 
@@ -439,5 +442,9 @@ export function App() {
     removeMemberFromChannel, saveMemberWorkspace, clearMemberWorkspace,
   };
 
-  return <WorkspaceShell {...shellProps} />;
+  return (
+    <ErrorBoundary>
+      <WorkspaceShell {...shellProps} />
+    </ErrorBoundary>
+  );
 }

@@ -1,4 +1,4 @@
-import { useCallback } from "react";
+import { useCallback, useRef } from "react";
 import type {
   Channel,
   Message,
@@ -64,73 +64,77 @@ export interface StreamHandlerDeps {
 }
 
 export function useStreamHandler(deps: StreamHandlerDeps) {
+  const depsRef = useRef(deps);
+  depsRef.current = deps;
   const applyChannelDeleted = useCallback(
     (channelId: string) => {
-      const deletedThreads = deps.threadsByChannel[channelId] ?? [];
+      const d = depsRef.current;
+      const deletedThreads = d.threadsByChannel[channelId] ?? [];
       const deletedChannel =
-        deps.channels.find((channel) => channel.id === channelId) ?? null;
+        d.channels.find((channel) => channel.id === channelId) ?? null;
       const fallbackChannelId =
-        deps.channels.find(
+        d.channels.find(
           (channel) => channel.id !== channelId && !isDirectChannel(channel),
         )?.id ?? null;
-      deps.setChannels((current) =>
+      d.setChannels((current) =>
         current.filter((channel) => channel.id !== channelId),
       );
-      const deletedDirectPeerId = directChannelPeerId(deletedChannel, deps.actorIdRef.current);
+      const deletedDirectPeerId = directChannelPeerId(deletedChannel, d.actorIdRef.current);
       if (deletedDirectPeerId) {
-        deps.setDirectScopesByActorId((current) => {
+        d.setDirectScopesByActorId((current) => {
           const next = { ...current };
           delete next[deletedDirectPeerId];
           return next;
         });
       }
-      deps.setThreadsByChannel((current) => {
+      d.setThreadsByChannel((current) => {
         const next = { ...current };
         delete next[channelId];
         return next;
       });
-      deps.setTasks((current) => current.filter((task) => task.channelId !== channelId));
-      deps.setThreadStatsById((current) => {
+      d.setTasks((current) => current.filter((task) => task.channelId !== channelId));
+      d.setThreadStatsById((current) => {
         const next = { ...current };
         for (const thread of deletedThreads) delete next[thread.id];
         return next;
       });
-      deps.updateChannelGroups((current) =>
+      d.updateChannelGroups((current) =>
         current.map((group) => ({
           ...group,
           channelIds: group.channelIds.filter((id) => id !== channelId),
         })),
       );
-      deps.setActiveChannelId((current) =>
+      d.setActiveChannelId((current) =>
         current === channelId ? fallbackChannelId : current,
       );
-      deps.setActiveThreadId((current) =>
+      d.setActiveThreadId((current) =>
         current && deletedThreads.some((thread) => thread.id === current)
           ? null
           : current,
       );
-      if (deps.activeChannelId === channelId) {
-        deps.setChannelPanelTab(null);
-        deps.setReplyTo(null);
-        deps.setMessages(() => []);
-        deps.setThreadMessages(() => []);
+      if (d.activeChannelId === channelId) {
+        d.setChannelPanelTab(null);
+        d.setReplyTo(null);
+        d.setMessages(() => []);
+        d.setThreadMessages(() => []);
       }
     },
-    [deps],
+    [],
   );
 
   const handleStream = useCallback(
     (update: StreamUpdate) => {
+      const d = depsRef.current;
       switch (update.kind) {
         case "channel.created":
         case "channel.updated":
         case "channel.invited": {
           const channel = update.data.channel as Channel | undefined;
           if (channel) {
-            deps.setChannels((current) => sortChannels(upsert(current, channel)));
-            const peerActorId = directChannelPeerId(channel, deps.actorIdRef.current);
+            d.setChannels((current) => sortChannels(upsert(current, channel)));
+            const peerActorId = directChannelPeerId(channel, d.actorIdRef.current);
             if (peerActorId) {
-              deps.setDirectScopesByActorId((current) => ({
+              d.setDirectScopesByActorId((current) => ({
                 ...current,
                 [peerActorId]: { kind: "channel", id: channel.id },
               }));
@@ -154,7 +158,7 @@ export function useStreamHandler(deps: StreamHandlerDeps) {
         case "thread.updated": {
           const thread = update.data.thread as Thread | undefined;
           if (!thread) return;
-          deps.setThreadsByChannel((current) => ({
+          d.setThreadsByChannel((current) => ({
             ...current,
             [thread.channelId]: sortThreads(
               upsert(current[thread.channelId] ?? [], thread).filter(
@@ -168,15 +172,15 @@ export function useStreamHandler(deps: StreamHandlerDeps) {
           const message = update.data.message as Message | undefined;
           if (!message) return;
           applyMessageToUsageStore(message);
-          if (messageIsActionRequestFor(message, deps.actorIdRef.current)) {
-            deps.setInbox((current) =>
+          if (messageIsActionRequestFor(message, d.actorIdRef.current)) {
+            d.setInbox((current) =>
               current.some((item) => item.delivery.sourceId === message.id)
                 ? current
                 : [
                     {
                       delivery: {
                         sourceId: message.id,
-                        actorId: deps.actorIdRef.current ?? "",
+                        actorId: d.actorIdRef.current ?? "",
                         state: "pending",
                         updatedAt: message.createdAt,
                       },
@@ -188,32 +192,32 @@ export function useStreamHandler(deps: StreamHandlerDeps) {
           }
           if (
             update.scope &&
-            deps.activeScopeRef.current &&
-            sameScope(update.scope, deps.activeScopeRef.current)
+            d.activeScopeRef.current &&
+            sameScope(update.scope, d.activeScopeRef.current)
           ) {
-            deps.setMessages((current) => sortMessages(upsertMessage(current, message)));
+            d.setMessages((current) => sortMessages(upsertMessage(current, message)));
           }
           if (message.scope.kind === "thread") {
-            deps.setThreadStatsById((current) => upsertThreadStatsMessage(current, message));
+            d.setThreadStatsById((current) => upsertThreadStatsMessage(current, message));
           }
           if (
             update.scope &&
-            deps.activeThreadScopeRef.current &&
-            sameScope(update.scope, deps.activeThreadScopeRef.current)
+            d.activeThreadScopeRef.current &&
+            sameScope(update.scope, d.activeThreadScopeRef.current)
           ) {
-            deps.setThreadMessages((current) => sortMessages(upsertMessage(current, message)));
+            d.setThreadMessages((current) => sortMessages(upsertMessage(current, message)));
           }
           if (
             (update.scope &&
-              deps.activeDirectScopeRef.current &&
-              sameScope(update.scope, deps.activeDirectScopeRef.current)) ||
+              d.activeDirectScopeRef.current &&
+              sameScope(update.scope, d.activeDirectScopeRef.current)) ||
             messageBelongsToDirectActor(
               message,
-              deps.activeDirectActorIdRef.current,
-              deps.actorIdRef.current,
+              d.activeDirectActorIdRef.current,
+              d.actorIdRef.current,
             )
           ) {
-            deps.setDirectMessages((current) => sortMessages(upsertMessage(current, message)));
+            d.setDirectMessages((current) => sortMessages(upsertMessage(current, message)));
           }
           return;
         }
@@ -223,34 +227,34 @@ export function useStreamHandler(deps: StreamHandlerDeps) {
           applyMessageToUsageStore(message);
           if (
             update.scope &&
-            deps.activeScopeRef.current &&
-            sameScope(update.scope, deps.activeScopeRef.current)
+            d.activeScopeRef.current &&
+            sameScope(update.scope, d.activeScopeRef.current)
           ) {
-            deps.setMessages((current) => sortMessages(upsertMessage(current, message)));
+            d.setMessages((current) => sortMessages(upsertMessage(current, message)));
           }
           if (message.scope.kind === "thread") {
-            deps.setThreadStatsById((current) => upsertThreadStatsMessage(current, message));
+            d.setThreadStatsById((current) => upsertThreadStatsMessage(current, message));
           }
           if (
             update.scope &&
-            deps.activeThreadScopeRef.current &&
-            sameScope(update.scope, deps.activeThreadScopeRef.current)
+            d.activeThreadScopeRef.current &&
+            sameScope(update.scope, d.activeThreadScopeRef.current)
           ) {
-            deps.setThreadMessages((current) => sortMessages(upsertMessage(current, message)));
+            d.setThreadMessages((current) => sortMessages(upsertMessage(current, message)));
           }
           if (
             (update.scope &&
-              deps.activeDirectScopeRef.current &&
-              sameScope(update.scope, deps.activeDirectScopeRef.current)) ||
+              d.activeDirectScopeRef.current &&
+              sameScope(update.scope, d.activeDirectScopeRef.current)) ||
             messageBelongsToDirectActor(
               message,
-              deps.activeDirectActorIdRef.current,
-              deps.actorIdRef.current,
+              d.activeDirectActorIdRef.current,
+              d.actorIdRef.current,
             )
           ) {
-            deps.setDirectMessages((current) => sortMessages(upsertMessage(current, message)));
+            d.setDirectMessages((current) => sortMessages(upsertMessage(current, message)));
           }
-          deps.setInbox((current) =>
+          d.setInbox((current) =>
             current.map((item) =>
               item.delivery.sourceId === message.id
                 ? { ...item, message: normalizeMessage(message) }
@@ -261,27 +265,27 @@ export function useStreamHandler(deps: StreamHandlerDeps) {
         }
         case "run.updated": {
           const run = update.data.run as Run | undefined;
-          if (run) deps.setRuns((current) => ({ ...current, [run.id]: run }));
+          if (run) d.setRuns((current) => ({ ...current, [run.id]: run }));
           return;
         }
         case "task.changed": {
           const task = update.data.task as Task | undefined;
-          if (task) deps.setTasks((current) => sortTasks(upsert(current, task)));
+          if (task) d.setTasks((current) => sortTasks(upsert(current, task)));
           return;
         }
         case "task_assignment.changed": {
           const task = update.data.task as Task | undefined;
-          if (task) deps.setTasks((current) => sortTasks(upsert(current, task)));
+          if (task) d.setTasks((current) => sortTasks(upsert(current, task)));
           return;
         }
         case "delivery.updated": {
-          const actorId = deps.actorIdRef.current;
-          if (actorId) void deps.refreshInbox(actorId).catch(() => {});
+          const actorId = d.actorIdRef.current;
+          if (actorId) void d.refreshInbox(actorId).catch(() => {});
           return;
         }
       }
     },
-    [deps, applyChannelDeleted],
+    [applyChannelDeleted],
   );
 
   return { handleStream, applyChannelDeleted };

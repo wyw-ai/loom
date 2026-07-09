@@ -1,4 +1,4 @@
-import { useCallback, useMemo, type ReactNode } from "react";
+import { useCallback, useMemo, type ReactNode, Component } from "react";
 import type { Actor, MachineInfo, Message, Run, Task, Thread } from "@/ipc/types";
 import type { ThreadActivityStats } from "@/lib/types";
 import {
@@ -9,6 +9,38 @@ import {
 } from "@/lib/message-utils";
 import { MessageRow } from "@/components/chat/MessageRow";
 import { FeedScrollManager } from "@/components/chat/FeedScrollManager";
+
+/** Per-message error boundary: catches single-message render crashes and logs the message id. */
+class MessageItemErrorBoundary extends Component<
+  { messageId: string; children: ReactNode },
+  { hasError: boolean; error: Error | null }
+> {
+  constructor(props: { messageId: string; children: ReactNode }) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error };
+  }
+  componentDidCatch(error: Error) {
+    console.error(
+      `[MessageItemErrorBoundary] Crash rendering message ${this.props.messageId}:`,
+      error,
+    );
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="mx-4 my-1 rounded border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+          ⚠️ Error rendering message {this.props.messageId.slice(0, 10)}…
+          <br />
+          <span className="opacity-70">{this.state.error?.message}</span>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 export type FeedItem =
   | { kind: "date-divider"; key: string; label: string }
@@ -105,26 +137,28 @@ export function MessageFeed({
           ? tasksBySourceMessageId[message.id] ?? null
           : null;
       return (
-        <MessageRow
-          actor={actors[message.authorActorId]}
-          actors={actors}
-          machines={machines}
-          runs={runs}
-          message={message}
-          workflowSourceIds={workflowSourceIds}
-          onReply={onReply}
-          onStartThread={onStartThread}
-          onToggleReaction={onToggleReaction}
-          onAnswerAction={onAnswerAction}
-          onOpenAgentSettings={onOpenAgentSettings}
-          canReply={allowReply}
-          canStartThread={allowThreads && canUseAsThreadRoot(message)}
-          threadSummary={threadSummary}
-          threadStats={threadSummary ? threadStatsById[threadSummary.id] : undefined}
-          sourceTask={sourceTask}
-          currentActorId={currentActorId}
-          busy={busy}
-        />
+        <MessageItemErrorBoundary messageId={message.id}>
+          <MessageRow
+            actor={actors[message.authorActorId]}
+            actors={actors}
+            machines={machines}
+            runs={runs}
+            message={message}
+            workflowSourceIds={workflowSourceIds}
+            onReply={onReply}
+            onStartThread={onStartThread}
+            onToggleReaction={onToggleReaction}
+            onAnswerAction={onAnswerAction}
+            onOpenAgentSettings={onOpenAgentSettings}
+            canReply={allowReply}
+            canStartThread={allowThreads && canUseAsThreadRoot(message)}
+            threadSummary={threadSummary}
+            threadStats={threadSummary ? threadStatsById[threadSummary.id] : undefined}
+            sourceTask={sourceTask}
+            currentActorId={currentActorId}
+            busy={busy}
+          />
+        </MessageItemErrorBoundary>
       );
     },
     [

@@ -1,10 +1,9 @@
-import { useMemo } from "react";
+import { useCallback, useMemo } from "react";
 import type { Actor, Channel, MachineInfo, Message, Run, Task, Thread } from "@/ipc/types";
 import { isHiddenProtocolMessage } from "@/lib/message-utils";
 import { groupMessagesByDate } from "@/lib/message-utils";
 import { displayName } from "@/lib/format-utils";
 import { cn } from "@/lib/utils";
-import { Virtuoso } from "react-virtuoso";
 import { X, Split, MessageSquare } from "lucide-react";
 import { EmptyState } from "@/components/shared/EmptyState";
 import { MutedLine } from "@/components/shared/MutedLine";
@@ -12,10 +11,10 @@ import { TaskStateBadge } from "@/components/chat/TaskStateBadge";
 import { ThreadConversationMessage } from "@/components/chat/ThreadConversationMessage";
 import { ThreadComposer } from "@/components/chat/ThreadComposer";
 import { ScopeTokenSummary } from "@/components/layout/ScopeTokenSummary";
+import { FeedScrollManager } from "@/components/chat/FeedScrollManager";
+import type { FeedItem } from "@/components/chat/MessageFeed";
 
-type ReplyItem =
-  | { kind: "date-divider"; key: string; label: string }
-  | { kind: "message"; message: Message };
+type ReplyItem = FeedItem;
 
 export function ThreadPanel({
   actors,
@@ -88,6 +87,68 @@ export function ThreadPanel({
     return items;
   }, [replyMessages]);
 
+  const feedKey = thread ? `thread-${thread.id}` : "thread-empty";
+
+  const renderItem = useCallback(
+    (index: number) => {
+      const item = replyItems[index];
+      if (!item) return null;
+      if (item.kind === "date-divider") {
+        return (
+          <div className={`date-divider px-0 ${index === 0 ? "date-divider-first" : ""}`}>
+            <span />
+            <div>{item.label}</div>
+            <span />
+          </div>
+        );
+      }
+      return (
+        <ThreadConversationMessage
+          actor={actors[item.message.authorActorId]}
+          actors={actors}
+          busy={busy}
+          currentActorId={currentActorId}
+          machines={machines}
+          runs={runs}
+          message={item.message}
+          onOpenAgentSettings={onOpenAgentSettings}
+          onToggleReaction={onToggleReaction}
+        />
+      );
+    },
+    [replyItems, actors, busy, currentActorId, machines, runs, onOpenAgentSettings, onToggleReaction],
+  );
+
+  const headerRenderer = useCallback(
+    () => (
+      <section className="border-b border-[#edf0f5] bg-white px-5 py-4">
+        <div className="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-[#667085]">
+          <Split size={13} />
+          Original message
+        </div>
+        {rootMessage ? (
+          <ThreadConversationMessage
+            actor={starter}
+            actors={actors}
+            busy={busy}
+            currentActorId={currentActorId}
+            machines={machines}
+            runs={runs}
+            message={rootMessage}
+            onOpenAgentSettings={onOpenAgentSettings}
+            onToggleReaction={onToggleReaction}
+            root
+          />
+        ) : (
+          <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] px-4 py-6">
+            <MutedLine>Original message unavailable.</MutedLine>
+          </div>
+        )}
+      </section>
+    ),
+    [rootMessage, starter, actors, busy, currentActorId, machines, runs, onOpenAgentSettings, onToggleReaction],
+  );
+
   return (
     <aside
       className={cn(
@@ -125,89 +186,22 @@ export function ThreadPanel({
         </div>
       </div>
 
-      {/* Body — root message (non-virtual) + virtualized replies */}
+      {/* Body — root message header + virtualized replies via FeedScrollManager */}
       {!thread ? (
         <div className="flex min-h-0 flex-1 items-center justify-center p-4">
           <EmptyState icon={Split} text="Select a thread." />
         </div>
-      ) : (
-        <div className="min-h-0 flex-1 overflow-hidden">
-          <Virtuoso
-            key={thread.id}
-            className="h-full soft-scrollbar"
-            totalCount={replyItems.length} // +1 for root message slot
-            followOutput="smooth"
-            increaseViewportBy={{ top: 200, bottom: 200 }}
-            components={{
-              Header: () => (
-                <section className="border-b border-[#edf0f5] bg-white px-5 py-4">
-                  <div className="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-[#667085]">
-                    <Split size={13} />
-                    Original message
-                  </div>
-                  {rootMessage ? (
-                    <ThreadConversationMessage
-                      actor={starter}
-                      actors={actors}
-                      busy={busy}
-                      currentActorId={currentActorId}
-                      machines={machines}
-                      runs={runs}
-                      message={rootMessage}
-                      onOpenAgentSettings={onOpenAgentSettings}
-                      onToggleReaction={onToggleReaction}
-                      root
-                    />
-                  ) : (
-                    <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] px-4 py-6">
-                      <MutedLine>Original message unavailable.</MutedLine>
-                    </div>
-                  )}
-                </section>
-              ),
-              EmptyPlaceholder: () => (
-                <div className="py-8">
-                  <EmptyState icon={MessageSquare} text="No replies in this thread." />
-                </div>
-              ),
-            }}
-            itemContent={(index) => {
-              // index 0 is the Header slot (root message), skip
-              // Actually Virtuoso reserves index 0 for the Header. So index 0 = Header, index 1..N = itemContent
-              // But totalCount includes Header. So itemContent(0) is first item AFTER header.
-              // Wait, Virtuoso works differently: Header is rendered before items.
-              // totalCount = N means indices 0..N-1 passed to itemContent.
-              // So if totalCount = replyItems.length + 1, indices are 0..replyItems.length.
-              // Header takes index 0 via components.Header, so itemContent is called for indices 0..replyItems.length.
-              // We need to offset: itemContent(0) = replyItems[0], itemContent(1) = replyItems[1].
-              // So index maps directly to replyItems.
-              const item = replyItems[index];
-              if (!item) return null;
-              if (item.kind === "date-divider") {
-                return (
-                  <div className={`date-divider px-0 ${index === 0 ? "date-divider-first" : ""}`}>
-                    <span />
-                    <div>{item.label}</div>
-                    <span />
-                  </div>
-                );
-              }
-              return (
-                <ThreadConversationMessage
-                  actor={actors[item.message.authorActorId]}
-                  actors={actors}
-                  busy={busy}
-                  currentActorId={currentActorId}
-                  machines={machines}
-                  runs={runs}
-                  message={item.message}
-                  onOpenAgentSettings={onOpenAgentSettings}
-                  onToggleReaction={onToggleReaction}
-                />
-              );
-            }}
-          />
+      ) : replyItems.length === 0 && !rootMessage ? (
+        <div className="flex min-h-0 flex-1 items-center justify-center p-4">
+          <EmptyState icon={MessageSquare} text="No replies in this thread." />
         </div>
+      ) : (
+        <FeedScrollManager
+          feedKey={feedKey}
+          feedItems={replyItems}
+          renderItem={renderItem}
+          headerRenderer={headerRenderer}
+        />
       )}
 
       <ThreadComposer

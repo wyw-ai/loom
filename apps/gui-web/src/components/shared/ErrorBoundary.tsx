@@ -8,19 +8,21 @@ interface Props {
 interface State {
   error: Error | null;
   hasError: boolean;
+  componentStack: string | null;
 }
 
 export class ErrorBoundary extends Component<Props, State> {
   constructor(props: Props) {
     super(props);
-    this.state = { error: null, hasError: false };
+    this.state = { error: null, hasError: false, componentStack: null };
   }
 
-  static getDerivedStateFromError(error: Error): State {
+  static getDerivedStateFromError(error: Error): Partial<State> {
     return { error, hasError: true };
   }
 
   componentDidCatch(error: Error, info: ErrorInfo) {
+    this.setState({ componentStack: info.componentStack ?? null });
     console.error("[ErrorBoundary] Caught render error:", error, info.componentStack);
   }
 
@@ -39,6 +41,16 @@ export class ErrorBoundary extends Component<Props, State> {
             <pre className="mb-4 max-h-40 overflow-auto rounded-md bg-[#f7f8fb] p-3 text-left text-xs text-[#485063]">
               {this.state.error?.message ?? "Unknown error"}
             </pre>
+            {this.state.componentStack && (
+              <details className="mb-4">
+                <summary className="cursor-pointer text-xs text-[#667085] hover:text-[#1a1a2e]">
+                  Component Stack
+                </summary>
+                <pre className="mt-2 max-h-60 overflow-auto rounded-md bg-[#f7f8fb] p-3 text-left text-[10px] text-[#485063] whitespace-pre-wrap">
+                  {this.state.componentStack}
+                </pre>
+              </details>
+            )}
             <button
               type="button"
               onClick={() => window.location.reload()}

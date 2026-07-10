@@ -111,6 +111,67 @@ pub async fn agent_create(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+pub async fn agent_update(
+    client: Arc<Client>,
+    machine_id: String,
+    actor_id: String,
+    name: Option<String>,
+    instructions: Option<String>,
+    instructions_file: Option<PathBuf>,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+) -> Result<()> {
+    let machine = require_machine(&client, &machine_id).await?;
+    let command = agent_update_command(
+        actor_id,
+        name,
+        instructions,
+        instructions_file,
+        model,
+        reasoning_effort,
+    )?;
+    let output = run_machine_command(client, machine, command).await?;
+    if render::is_json() {
+        render::print_json(&output);
+    } else {
+        let actor_id = output
+            .pointer("/agentSpec/actor/id")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>");
+        let path = output.get("path").and_then(Value::as_str).unwrap_or("");
+        if path.is_empty() {
+            println!("updated agent {actor_id}");
+        } else {
+            println!("updated agent {actor_id}\t{path}");
+        }
+    }
+    Ok(())
+}
+
+fn agent_update_command(
+    actor_id: String,
+    name: Option<String>,
+    instructions: Option<String>,
+    instructions_file: Option<PathBuf>,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+) -> Result<Value> {
+    let instructions = read_instructions(instructions, instructions_file)?;
+    let mut command = json!({
+        "op": "agent.update",
+        "actorId": actor_id,
+    });
+    if let Some(name) = name.and_then(nonempty_owned) {
+        command["name"] = json!(name.clone());
+        command["displayName"] = json!(name);
+    }
+    insert_if_nonempty(&mut command, "instructions", instructions);
+    insert_if_nonempty(&mut command, "model", model);
+    insert_if_nonempty(&mut command, "reasoningEffort", reasoning_effort);
+    Ok(command)
+}
+
 pub async fn agent_remove(client: Arc<Client>, machine_id: String, actor_id: String) -> Result<()> {
     let machine = require_machine(&client, &machine_id).await?;
     let output = run_machine_command(
@@ -376,4 +437,50 @@ fn nonempty_string(value: Option<&Value>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_update_command_uses_update_operation_and_omits_unspecified_fields() {
+        let command = agent_update_command(
+            "actor_impl".into(),
+            Some("Implementation Agent".into()),
+            None,
+            None,
+            None,
+            Some("high".into()),
+        )
+        .expect("build agent update command");
+
+        assert_eq!(
+            command,
+            json!({
+                "op": "agent.update",
+                "actorId": "actor_impl",
+                "name": "Implementation Agent",
+                "displayName": "Implementation Agent",
+                "reasoningEffort": "high",
+            })
+        );
+    }
+
+    #[test]
+    fn agent_update_command_rejects_two_instruction_sources() {
+        let error = agent_update_command(
+            "actor_impl".into(),
+            None,
+            Some("inline".into()),
+            Some(PathBuf::from("AGENTS.md")),
+            None,
+            None,
+        )
+        .expect_err("two instruction sources must be rejected");
+
+        assert!(error
+            .to_string()
+            .contains("use either --instructions or --instructions-file"));
+    }
 }

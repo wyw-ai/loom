@@ -1576,6 +1576,23 @@ enum MachineAgentCmd {
         #[arg(long = "no-autostart")]
         no_autostart: bool,
     },
+    /// Update an AgentSpec on the target daemon via machine/command.
+    Update {
+        #[arg(long)]
+        machine: String,
+        #[arg(long = "actor-id")]
+        actor_id: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        instructions: Option<String>,
+        #[arg(long = "instructions-file")]
+        instructions_file: Option<PathBuf>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long = "reasoning-effort")]
+        reasoning_effort: Option<String>,
+    },
     /// Remove an AgentSpec from the target daemon via machine/command.
     Remove {
         #[arg(long)]
@@ -2690,6 +2707,27 @@ async fn async_main() -> Result<()> {
                     )
                     .await?
                 }
+                MachineAgentCmd::Update {
+                    machine,
+                    actor_id,
+                    name,
+                    instructions,
+                    instructions_file,
+                    model,
+                    reasoning_effort,
+                } => {
+                    cmd::machine::agent_update(
+                        client,
+                        machine,
+                        actor_id,
+                        name,
+                        instructions,
+                        instructions_file,
+                        model,
+                        reasoning_effort,
+                    )
+                    .await?
+                }
                 MachineAgentCmd::Remove { machine, actor_id } => {
                     cmd::machine::agent_remove(client, machine, actor_id).await?
                 }
@@ -3473,6 +3511,73 @@ mod tests {
             "cloud-dev",
         ])
         .expect("parse machine agent skill remove");
+    }
+
+    #[test]
+    fn machine_agent_update_parses_all_options() {
+        let args = Args::try_parse_from([
+            "loom",
+            "machine",
+            "agent",
+            "update",
+            "--machine",
+            "macmini",
+            "--actor-id",
+            "actor_impl",
+            "--name",
+            "Implementation Agent",
+            "--instructions-file",
+            "AGENTS.md",
+            "--model",
+            "gpt-5",
+            "--reasoning-effort",
+            "high",
+        ])
+        .expect("parse machine agent update");
+
+        match args.cmd {
+            Cmd::Machine {
+                sub:
+                    MachineCmd::Agent {
+                        sub:
+                            MachineAgentCmd::Update {
+                                machine,
+                                actor_id,
+                                name,
+                                instructions,
+                                instructions_file,
+                                model,
+                                reasoning_effort,
+                            },
+                    },
+            } => {
+                assert_eq!(machine, "macmini");
+                assert_eq!(actor_id, "actor_impl");
+                assert_eq!(name.as_deref(), Some("Implementation Agent"));
+                assert_eq!(instructions, None);
+                assert_eq!(instructions_file, Some(PathBuf::from("AGENTS.md")));
+                assert_eq!(model.as_deref(), Some("gpt-5"));
+                assert_eq!(reasoning_effort.as_deref(), Some("high"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn machine_agent_update_requires_actor_id() {
+        let error = Args::try_parse_from([
+            "loom",
+            "machine",
+            "agent",
+            "update",
+            "--machine",
+            "macmini",
+            "--name",
+            "Implementation Agent",
+        ])
+        .expect_err("machine agent update must require --actor-id");
+
+        assert!(error.to_string().contains("--actor-id"));
     }
 
     #[test]

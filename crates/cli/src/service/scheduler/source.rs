@@ -19,8 +19,10 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use loom_platform::process::TokioCommand as Command;
+use loom_platform::signal::{force_kill_pid, signal_child, Signal};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::Method;
+use tokio::io::AsyncReadExt;
 
 use super::spec::Source;
 
@@ -63,10 +65,37 @@ async fn exec_command(
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
 
-    let child = cmd.spawn().with_context(|| format!("spawn `{command}`"))?;
-    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+    let mut child = cmd.spawn().with_context(|| format!("spawn `{command}`"))?;
+    let pid = child
+        .id()
+        .ok_or_else(|| anyhow!("spawned `{command}` without a process id"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("capture stdout for `{command}`"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("capture stderr for `{command}`"))?;
+    let stdout_task = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
         Ok(r) => r.with_context(|| format!("wait `{command}`"))?,
         Err(_) => {
+            terminate_timed_out_child(&mut child, pid).await;
+            // A descendant can deliberately escape or keep an inherited pipe
+            // open even after the process group is gone. We do not need its
+            // partial output on the timeout path, so bound cleanup by dropping
+            // the readers once termination has been attempted.
+            stdout_task.abort();
+            stderr_task.abort();
             return Err(anyhow!(
                 "command `{}` timed out after {:?}",
                 command,
@@ -74,21 +103,45 @@ async fn exec_command(
             ));
         }
     };
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = stdout_task
+        .await
+        .context("join command stdout reader")?
+        .with_context(|| format!("read stdout for `{command}`"))?;
+    let stderr = stderr_task
+        .await
+        .context("join command stderr reader")?
+        .with_context(|| format!("read stderr for `{command}`"))?;
+
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr);
         return Err(anyhow!(
             "command `{} {}` exited with status {} (stderr: {})",
             command,
             args.join(" "),
-            output.status,
+            status,
             tail(&stderr, 512)
         ));
     }
-    if !output.stderr.is_empty() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.is_empty() {
+        let stderr = String::from_utf8_lossy(&stderr);
         tracing::debug!(command = %command, stderr = %tail(&stderr, 1024), "command stderr");
     }
-    Ok(output.stdout)
+    Ok(stdout)
+}
+
+async fn terminate_timed_out_child(child: &mut tokio::process::Child, pid: u32) {
+    let _ = signal_child(pid, Signal::Term);
+
+    // Do not reap the process-group leader during the grace period. If the
+    // leader exits on SIGTERM while a descendant ignores it, reaping here can
+    // free the PID before we target the original process group with SIGKILL.
+    // On Unix, keeping the leader as a zombie until after escalation prevents
+    // PID reuse and lets the process-group SIGKILL reach TERM-ignoring
+    // descendants. On other platforms, aborting the pipe readers above still
+    // bounds the scheduler cleanup even when the OS cannot kill a full tree.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let _ = force_kill_pid(pid);
+    let _ = child.wait().await;
 }
 
 async fn exec_http(
@@ -209,6 +262,36 @@ mod tests {
         let err = exec_source(&s).await.unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("timed out"), "{msg}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_timeout_terminates_the_process_group() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("late-marker");
+        // The leader keeps the default TERM behavior while its descendant
+        // ignores TERM and retains the stdout/stderr pipes. A leader-only
+        // cleanup returns early and either blocks on those readers or lets the
+        // descendant write the marker after the scheduler has timed out.
+        let script = format!(
+            "(trap '' TERM; sleep 3; printf late > '{}') & wait",
+            marker.display()
+        );
+        let s = Source::Command {
+            command: "sh".into(),
+            args: vec!["-c".into(), script],
+            env: BTreeMap::new(),
+            timeout_ms: Some(100),
+        };
+
+        let err = exec_source(&s).await.unwrap_err();
+        assert!(format!("{err:?}").contains("timed out"));
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert!(
+            !marker.exists(),
+            "timed-out command subtree kept running and wrote {}",
+            marker.display()
+        );
     }
 
     #[tokio::test]

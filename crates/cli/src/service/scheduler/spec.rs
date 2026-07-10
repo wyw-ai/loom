@@ -114,7 +114,12 @@ pub enum Source {
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         env: BTreeMap<String, String>,
         /// Default 30000.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            rename = "timeoutMs",
+            alias = "timeout_ms",
+            skip_serializing_if = "Option::is_none"
+        )]
         timeout_ms: Option<u64>,
     },
     Http {
@@ -128,7 +133,12 @@ pub enum Source {
         /// JSON in a string here.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         body: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            rename = "timeoutMs",
+            alias = "timeout_ms",
+            skip_serializing_if = "Option::is_none"
+        )]
         timeout_ms: Option<u64>,
     },
 }
@@ -486,5 +496,28 @@ mod tests {
             timeout_ms: Some(5_000),
         };
         assert_eq!(s2.effective_timeout(), Duration::from_millis(5_000));
+    }
+
+    #[test]
+    fn source_timeout_accepts_documented_camel_case_and_legacy_snake_case() {
+        let command: Source = serde_json::from_value(json!({
+            "kind": "command",
+            "command": "true",
+            "timeoutMs": 60_000
+        }))
+        .expect("parse command timeoutMs");
+        assert_eq!(command.effective_timeout(), Duration::from_secs(60));
+
+        let http: Source = serde_json::from_value(json!({
+            "kind": "http",
+            "url": "https://example.com",
+            "timeout_ms": 45_000
+        }))
+        .expect("parse legacy http timeout_ms");
+        assert_eq!(http.effective_timeout(), Duration::from_secs(45));
+
+        let serialized = serde_json::to_value(command).expect("serialize command source");
+        assert_eq!(serialized["timeoutMs"], json!(60_000));
+        assert!(serialized.get("timeout_ms").is_none());
     }
 }

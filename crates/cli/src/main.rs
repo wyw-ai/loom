@@ -150,6 +150,11 @@ enum Cmd {
         #[command(subcommand)]
         sub: GuideCmd,
     },
+    /// Materialize embedded official Loom skills for external runtimes.
+    Skill {
+        #[command(subcommand)]
+        sub: SkillCmd,
+    },
     /// Manage daemon machines through server-routed machine commands.
     Machine {
         #[command(subcommand)]
@@ -1543,6 +1548,19 @@ enum GuideCmd {
 }
 
 #[derive(Subcommand, Debug)]
+enum SkillCmd {
+    /// Write the embedded official Loom skill into a dedicated directory.
+    Materialize {
+        /// Embedded skill id. Currently only `loom` is available.
+        #[arg(value_name = "SKILL_ID", value_parser = ["loom"])]
+        id: String,
+        /// Dedicated skill directory to reconcile. Its contents are managed by Loom.
+        #[arg(long, value_name = "SKILL_DIR")]
+        output: PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum MachineCmd {
     /// List daemon machines visible from the current server.
     List,
@@ -1669,6 +1687,11 @@ async fn async_main() -> Result<()> {
     } else {
         OutputMode::Pretty
     });
+    if let Cmd::Skill { sub } = &args.cmd {
+        return match sub {
+            SkillCmd::Materialize { id, output } => cmd::skill::materialize(id, output),
+        };
+    }
     if let Cmd::Memory { sub } = &args.cmd {
         return match sub {
             MemoryCmd::Query {
@@ -2683,6 +2706,7 @@ async fn async_main() -> Result<()> {
         Cmd::Agent { .. } => unreachable!("handled before client setup"),
         Cmd::Provider { .. } => unreachable!("handled before client setup"),
         Cmd::Guide { .. } => unreachable!("handled before client setup"),
+        Cmd::Skill { .. } => unreachable!("handled before client setup"),
         Cmd::Mcp { .. } => unreachable!("handled before client setup"),
         Cmd::Memory { .. } => unreachable!("handled before client setup"),
         Cmd::Machine { sub } => match sub {
@@ -3455,6 +3479,46 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn skill_materialize_accepts_dedicated_output_directory() {
+        let args = Args::try_parse_from([
+            "loom",
+            "--json",
+            "skill",
+            "materialize",
+            "loom",
+            "--output",
+            "/tmp/loom-skill",
+        ])
+        .expect("parse skill materialize");
+
+        assert!(args.json);
+        match args.cmd {
+            Cmd::Skill {
+                sub: SkillCmd::Materialize { id, output },
+            } => {
+                assert_eq!(id, "loom");
+                assert_eq!(output, PathBuf::from("/tmp/loom-skill"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn skill_materialize_rejects_unknown_embedded_skill() {
+        let error = Args::try_parse_from([
+            "loom",
+            "skill",
+            "materialize",
+            "unknown",
+            "--output",
+            "/tmp/unknown-skill",
+        ])
+        .expect_err("unknown embedded skill should be rejected");
+
+        assert!(error.to_string().contains("possible values: loom"));
     }
 
     #[test]

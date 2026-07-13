@@ -1569,6 +1569,9 @@ enum MachineAgentCmd {
         instructions: Option<String>,
         #[arg(long = "instructions-file")]
         instructions_file: Option<PathBuf>,
+        /// Local source root whose AGENTS.md/CLAUDE.md and skill directories are daemon-managed.
+        #[arg(long = "source-root")]
+        source_root: Option<PathBuf>,
         #[arg(long)]
         model: Option<String>,
         #[arg(long = "reasoning-effort")]
@@ -1588,6 +1591,9 @@ enum MachineAgentCmd {
         instructions: Option<String>,
         #[arg(long = "instructions-file")]
         instructions_file: Option<PathBuf>,
+        /// Local source root whose AGENTS.md/CLAUDE.md and skill directories are daemon-managed.
+        #[arg(long = "source-root")]
+        source_root: Option<PathBuf>,
         #[arg(long)]
         model: Option<String>,
         #[arg(long = "reasoning-effort")]
@@ -2689,6 +2695,7 @@ async fn async_main() -> Result<()> {
                     name,
                     instructions,
                     instructions_file,
+                    source_root,
                     model,
                     reasoning_effort,
                     no_autostart,
@@ -2701,6 +2708,7 @@ async fn async_main() -> Result<()> {
                         name,
                         instructions,
                         instructions_file,
+                        source_root,
                         model,
                         reasoning_effort,
                         !no_autostart,
@@ -2713,6 +2721,7 @@ async fn async_main() -> Result<()> {
                     name,
                     instructions,
                     instructions_file,
+                    source_root,
                     model,
                     reasoning_effort,
                 } => {
@@ -2723,6 +2732,7 @@ async fn async_main() -> Result<()> {
                         name,
                         instructions,
                         instructions_file,
+                        source_root,
                         model,
                         reasoning_effort,
                     )
@@ -3528,6 +3538,8 @@ mod tests {
             "Implementation Agent",
             "--instructions-file",
             "AGENTS.md",
+            "--source-root",
+            "/repo/qca",
             "--model",
             "gpt-5",
             "--reasoning-effort",
@@ -3546,6 +3558,7 @@ mod tests {
                                 name,
                                 instructions,
                                 instructions_file,
+                                source_root,
                                 model,
                                 reasoning_effort,
                             },
@@ -3556,6 +3569,7 @@ mod tests {
                 assert_eq!(name.as_deref(), Some("Implementation Agent"));
                 assert_eq!(instructions, None);
                 assert_eq!(instructions_file, Some(PathBuf::from("AGENTS.md")));
+                assert_eq!(source_root, Some(PathBuf::from("/repo/qca")));
                 assert_eq!(model.as_deref(), Some("gpt-5"));
                 assert_eq!(reasoning_effort.as_deref(), Some("high"));
             }

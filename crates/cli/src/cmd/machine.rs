@@ -76,6 +76,7 @@ pub async fn agent_create(
     name: String,
     instructions: Option<String>,
     instructions_file: Option<PathBuf>,
+    source_root: Option<PathBuf>,
     model: Option<String>,
     reasoning_effort: Option<String>,
     autostart: bool,
@@ -90,6 +91,7 @@ pub async fn agent_create(
     });
     insert_if_nonempty(&mut command, "actorId", actor_id);
     insert_if_nonempty(&mut command, "instructions", instructions);
+    insert_source_root(&mut command, source_root)?;
     insert_if_nonempty(&mut command, "model", model);
     insert_if_nonempty(&mut command, "reasoningEffort", reasoning_effort);
 
@@ -119,6 +121,7 @@ pub async fn agent_update(
     name: Option<String>,
     instructions: Option<String>,
     instructions_file: Option<PathBuf>,
+    source_root: Option<PathBuf>,
     model: Option<String>,
     reasoning_effort: Option<String>,
 ) -> Result<()> {
@@ -128,6 +131,7 @@ pub async fn agent_update(
         name,
         instructions,
         instructions_file,
+        source_root,
         model,
         reasoning_effort,
     )?;
@@ -154,6 +158,7 @@ fn agent_update_command(
     name: Option<String>,
     instructions: Option<String>,
     instructions_file: Option<PathBuf>,
+    source_root: Option<PathBuf>,
     model: Option<String>,
     reasoning_effort: Option<String>,
 ) -> Result<Value> {
@@ -167,6 +172,7 @@ fn agent_update_command(
         command["displayName"] = json!(name);
     }
     insert_if_nonempty(&mut command, "instructions", instructions);
+    insert_source_root(&mut command, source_root)?;
     insert_if_nonempty(&mut command, "model", model);
     insert_if_nonempty(&mut command, "reasoningEffort", reasoning_effort);
     Ok(command)
@@ -422,6 +428,23 @@ fn insert_if_nonempty(target: &mut Value, key: &str, value: Option<String>) {
     target[key] = json!(value);
 }
 
+fn insert_source_root(target: &mut Value, value: Option<PathBuf>) -> Result<()> {
+    let Some(path) = value else {
+        return Ok(());
+    };
+    let canonical = std::fs::canonicalize(&path)
+        .with_context(|| format!("resolve source root {}", path.display()))?;
+    if !canonical.is_dir() {
+        bail!("source root is not a directory: {}", canonical.display());
+    }
+    insert_if_nonempty(
+        target,
+        "sourceRoot",
+        Some(canonical.to_string_lossy().to_string()),
+    );
+    Ok(())
+}
+
 fn nonempty_owned(value: String) -> Option<String> {
     let value = value.trim().to_string();
     if value.is_empty() {
@@ -445,11 +468,13 @@ mod tests {
 
     #[test]
     fn agent_update_command_uses_update_operation_and_omits_unspecified_fields() {
+        let source_root = std::env::current_dir().expect("current directory");
         let command = agent_update_command(
             "actor_impl".into(),
             Some("Implementation Agent".into()),
             None,
             None,
+            Some(PathBuf::from(".")),
             None,
             Some("high".into()),
         )
@@ -462,6 +487,7 @@ mod tests {
                 "actorId": "actor_impl",
                 "name": "Implementation Agent",
                 "displayName": "Implementation Agent",
+                "sourceRoot": source_root,
                 "reasoningEffort": "high",
             })
         );
@@ -474,6 +500,7 @@ mod tests {
             None,
             Some("inline".into()),
             Some(PathBuf::from("AGENTS.md")),
+            None,
             None,
             None,
         )

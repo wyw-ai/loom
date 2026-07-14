@@ -15,7 +15,17 @@ export const avatarLibraryUrls = Array.from(
 export const localServerCommand = "loom-server --bind 0.0.0.0:7878";
 export const localServerUrl = "ws://127.0.0.1:7878/rpc";
 export const machineStatusPollIntervalMs = 5_000;
-export const reasoningEffortChoices = ["", "minimal", "low", "medium", "high", "xhigh"] as const;
+export const reasoningEffortChoices = [
+  "",
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+  "ultra",
+] as const;
 export const defaultNewPromptFilePath = "prompts/new.md";
 export const defaultSystemPromptTemplate = [
   "{bootstrap_memory}",

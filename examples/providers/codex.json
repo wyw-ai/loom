@@ -10,6 +10,18 @@
   "models": {
     "choices": [
       {
+        "id": "gpt-5.6-sol",
+        "label": "GPT-5.6 Sol"
+      },
+      {
+        "id": "gpt-5.6-terra",
+        "label": "GPT-5.6 Terra"
+      },
+      {
+        "id": "gpt-5.6-luna",
+        "label": "GPT-5.6 Luna"
+      },
+      {
         "id": "gpt-5.5",
         "label": "GPT-5.5"
       },
@@ -22,19 +34,11 @@
         "label": "GPT-5.4 Mini"
       },
       {
-        "id": "gpt-5.3-codex",
-        "label": "GPT-5.3 Codex"
-      },
-      {
         "id": "gpt-5.3-codex-spark",
         "label": "GPT-5.3 Codex Spark"
-      },
-      {
-        "id": "gpt-5.2",
-        "label": "GPT-5.2"
       }
     ],
-    "default": "gpt-5.5"
+    "default": "gpt-5.6-sol"
   },
   "modes": {
     "print": {
@@ -56,6 +60,13 @@
             "{model}"
           ],
           "when": "model"
+        },
+        {
+          "args": [
+            "-c",
+            "model_reasoning_effort={reasoningEffort}"
+          ],
+          "when": "reasoningEffort"
         },
         "{prompt.full}"
       ],
@@ -85,6 +96,13 @@
               "{model}"
             ],
             "when": "model"
+          },
+          {
+            "args": [
+              "-c",
+              "model_reasoning_effort={reasoningEffort}"
+            ],
+            "when": "reasoningEffort"
           },
           "{prompt.full}"
         ],

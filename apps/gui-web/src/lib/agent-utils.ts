@@ -492,9 +492,9 @@ export function getChannelAgentActivity(
 // ---------------------------------------------------------------------------
 
 export function channelPanelTitle(tab: ChannelPanelTab) {
-  if (tab === "threads") return "线程";
-  if (tab === "members") return "成员";
-  return "任务";
+  if (tab === "threads") return "Threads";
+  if (tab === "members") return "Members";
+  return "Tasks";
 }
 
 export function channelPanelDetail(
@@ -509,9 +509,9 @@ export function channelPanelDetail(
 }
 
 export function actorKindLabel(actor: Actor) {
-  if (actor.kind === "agent") return "智能体";
-  if (actor.kind === "service") return "服务";
-  return "成员";
+  if (actor.kind === "agent") return "Agent";
+  if (actor.kind === "service") return "Service";
+  return "Member";
 }
 
 // ---------------------------------------------------------------------------
@@ -524,18 +524,18 @@ export function memberPresence(
   currentActorId: string | null,
 ): ChannelMemberPresence {
   if (actor.id === currentActorId) {
-    return { online: true, label: "在线", status: "online" };
+    return { online: true, label: "Online", status: "online" };
   }
   if (actor.kind === "agent") {
     const entry = findAgentMemberEntry(machines, actor.id);
-    if (!entry) return { online: false, label: "离线", status: "offline" };
+    if (!entry) return { online: false, label: "Offline", status: "offline" };
     const rawStatus = entry.agent.status || "offline";
     const online = isOnlinePresenceStatus(rawStatus, entry.agent);
     return {
       online,
-      label: online ? "在线" : "离线",
+      label: online ? "Online" : "Offline",
       status: rawStatus,
     };
   }
-  return { online: false, label: "离线", status: "offline" };
+  return { online: false, label: "Offline", status: "offline" };
 }

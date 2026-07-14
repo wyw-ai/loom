@@ -223,6 +223,21 @@ Loom 只内置并同步 `loom-skills` 仓库中的 `skills/loom` 目录。运行
 `references` 下的文档；如果内置快照删除了旧文件，运行时也应清理
 `data_root/builtin/skills/loom` 中对应的旧文件，避免 agent 读到过期 reference。
 
+不经过原生 `agent serve` workspace 构造路径的外部 runtime adapter，应从当前安装的
+Loom CLI 导出同一份编译期快照：
+
+```text
+loom skill materialize loom --output <dedicated-skill-directory>
+```
+
+该命令离线执行，`output` 本身就是 `loom` skill 目录。adapter 应把它作为内置 runtime
+skill 绑定到每个 agent，且不能让 actor bundle、项目 skill 或手工 skill 操作覆盖它。
+这样原生 provider 与外部 runtime 使用同一 Loom 版本的官方 skill，不依赖另一个 daemon
+的私有 `data_root`。
+
+为避免误删调用方数据，导出目录名必须为 loom；首次导出只接受不存在或空目录，
+后续 reconcile 只接管带有可验证 Loom managed marker 的目录。
+
 skill 应专注于场景路由：
 
 - 判断 agent 当前是否需要 channel state、thread state、wake message、

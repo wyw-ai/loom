@@ -150,6 +150,11 @@ enum Cmd {
         #[command(subcommand)]
         sub: GuideCmd,
     },
+    /// Materialize embedded official Loom skills for external runtimes.
+    Skill {
+        #[command(subcommand)]
+        sub: SkillCmd,
+    },
     /// Manage daemon machines through server-routed machine commands.
     Machine {
         #[command(subcommand)]
@@ -1543,6 +1548,19 @@ enum GuideCmd {
 }
 
 #[derive(Subcommand, Debug)]
+enum SkillCmd {
+    /// Write the embedded official Loom skill into a dedicated directory.
+    Materialize {
+        /// Embedded skill id. Currently only `loom` is available.
+        #[arg(value_name = "SKILL_ID", value_parser = ["loom"])]
+        id: String,
+        /// Dedicated skill directory to reconcile. Its contents are managed by Loom.
+        #[arg(long, value_name = "SKILL_DIR")]
+        output: PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum MachineCmd {
     /// List daemon machines visible from the current server.
     List,
@@ -1569,6 +1587,9 @@ enum MachineAgentCmd {
         instructions: Option<String>,
         #[arg(long = "instructions-file")]
         instructions_file: Option<PathBuf>,
+        /// Local source root whose AGENTS.md/CLAUDE.md and skill directories are daemon-managed.
+        #[arg(long = "source-root")]
+        source_root: Option<PathBuf>,
         #[arg(long)]
         model: Option<String>,
         #[arg(long = "reasoning-effort")]
@@ -1588,6 +1609,9 @@ enum MachineAgentCmd {
         instructions: Option<String>,
         #[arg(long = "instructions-file")]
         instructions_file: Option<PathBuf>,
+        /// Local source root whose AGENTS.md/CLAUDE.md and skill directories are daemon-managed.
+        #[arg(long = "source-root")]
+        source_root: Option<PathBuf>,
         #[arg(long)]
         model: Option<String>,
         #[arg(long = "reasoning-effort")]
@@ -1663,6 +1687,11 @@ async fn async_main() -> Result<()> {
     } else {
         OutputMode::Pretty
     });
+    if let Cmd::Skill { sub } = &args.cmd {
+        return match sub {
+            SkillCmd::Materialize { id, output } => cmd::skill::materialize(id, output),
+        };
+    }
     if let Cmd::Memory { sub } = &args.cmd {
         return match sub {
             MemoryCmd::Query {
@@ -2677,6 +2706,7 @@ async fn async_main() -> Result<()> {
         Cmd::Agent { .. } => unreachable!("handled before client setup"),
         Cmd::Provider { .. } => unreachable!("handled before client setup"),
         Cmd::Guide { .. } => unreachable!("handled before client setup"),
+        Cmd::Skill { .. } => unreachable!("handled before client setup"),
         Cmd::Mcp { .. } => unreachable!("handled before client setup"),
         Cmd::Memory { .. } => unreachable!("handled before client setup"),
         Cmd::Machine { sub } => match sub {
@@ -2689,6 +2719,7 @@ async fn async_main() -> Result<()> {
                     name,
                     instructions,
                     instructions_file,
+                    source_root,
                     model,
                     reasoning_effort,
                     no_autostart,
@@ -2701,6 +2732,7 @@ async fn async_main() -> Result<()> {
                         name,
                         instructions,
                         instructions_file,
+                        source_root,
                         model,
                         reasoning_effort,
                         !no_autostart,
@@ -2713,6 +2745,7 @@ async fn async_main() -> Result<()> {
                     name,
                     instructions,
                     instructions_file,
+                    source_root,
                     model,
                     reasoning_effort,
                 } => {
@@ -2723,6 +2756,7 @@ async fn async_main() -> Result<()> {
                         name,
                         instructions,
                         instructions_file,
+                        source_root,
                         model,
                         reasoning_effort,
                     )
@@ -3448,6 +3482,46 @@ mod tests {
     }
 
     #[test]
+    fn skill_materialize_accepts_dedicated_output_directory() {
+        let args = Args::try_parse_from([
+            "loom",
+            "--json",
+            "skill",
+            "materialize",
+            "loom",
+            "--output",
+            "/tmp/loom-skill",
+        ])
+        .expect("parse skill materialize");
+
+        assert!(args.json);
+        match args.cmd {
+            Cmd::Skill {
+                sub: SkillCmd::Materialize { id, output },
+            } => {
+                assert_eq!(id, "loom");
+                assert_eq!(output, PathBuf::from("/tmp/loom-skill"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn skill_materialize_rejects_unknown_embedded_skill() {
+        let error = Args::try_parse_from([
+            "loom",
+            "skill",
+            "materialize",
+            "unknown",
+            "--output",
+            "/tmp/unknown-skill",
+        ])
+        .expect_err("unknown embedded skill should be rejected");
+
+        assert!(error.to_string().contains("possible values: loom"));
+    }
+
+    #[test]
     fn machine_agent_skill_commands_parse() {
         let add_args = Args::try_parse_from([
             "loom",
@@ -3528,6 +3602,8 @@ mod tests {
             "Implementation Agent",
             "--instructions-file",
             "AGENTS.md",
+            "--source-root",
+            "/repo/qca",
             "--model",
             "gpt-5",
             "--reasoning-effort",
@@ -3546,6 +3622,7 @@ mod tests {
                                 name,
                                 instructions,
                                 instructions_file,
+                                source_root,
                                 model,
                                 reasoning_effort,
                             },
@@ -3556,6 +3633,7 @@ mod tests {
                 assert_eq!(name.as_deref(), Some("Implementation Agent"));
                 assert_eq!(instructions, None);
                 assert_eq!(instructions_file, Some(PathBuf::from("AGENTS.md")));
+                assert_eq!(source_root, Some(PathBuf::from("/repo/qca")));
                 assert_eq!(model.as_deref(), Some("gpt-5"));
                 assert_eq!(reasoning_effort.as_deref(), Some("high"));
             }

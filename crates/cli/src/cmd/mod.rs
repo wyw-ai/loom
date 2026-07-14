@@ -22,6 +22,7 @@ pub mod reload;
 pub mod reminder;
 pub mod run;
 pub mod service;
+pub mod skill;
 pub mod spec;
 pub mod spec_apply;
 pub mod target;

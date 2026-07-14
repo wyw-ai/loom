@@ -1,4 +1,4 @@
-import { useMemo, type ReactNode } from "react";
+import { useCallback, useMemo, type ReactNode, Component } from "react";
 import type { Actor, MachineInfo, Message, Run, Task, Thread } from "@/ipc/types";
 import type { ThreadActivityStats } from "@/lib/types";
 import {
@@ -7,10 +7,42 @@ import {
   canUseAsThreadRoot,
   groupMessagesByDate,
 } from "@/lib/message-utils";
-import { Virtuoso } from "react-virtuoso";
 import { MessageRow } from "@/components/chat/MessageRow";
+import { FeedScrollManager } from "@/components/chat/FeedScrollManager";
 
-type FeedItem =
+/** Per-message error boundary: catches single-message render crashes and logs the message id. */
+class MessageItemErrorBoundary extends Component<
+  { messageId: string; children: ReactNode },
+  { hasError: boolean; error: Error | null }
+> {
+  constructor(props: { messageId: string; children: ReactNode }) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error };
+  }
+  componentDidCatch(error: Error) {
+    console.error(
+      `[MessageItemErrorBoundary] Crash rendering message ${this.props.messageId}:`,
+      error,
+    );
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="mx-4 my-1 rounded border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+          ⚠️ Error rendering message {this.props.messageId.slice(0, 10)}…
+          <br />
+          <span className="opacity-70">{this.state.error?.message}</span>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+export type FeedItem =
   | { kind: "date-divider"; key: string; label: string }
   | { kind: "message"; message: Message };
 
@@ -85,6 +117,71 @@ export function MessageFeed({
     return items;
   }, [visibleMessages]);
 
+  const renderItem = useCallback(
+    (index: number) => {
+      const item = feedItems[index];
+      if (!item) return null;
+      if (item.kind === "date-divider") {
+        return (
+          <div className={`date-divider ${index === 0 ? "date-divider-first" : ""}`}>
+            <span />
+            <div>{item.label}</div>
+            <span />
+          </div>
+        );
+      }
+      const message = item.message;
+      const threadSummary = threadByRoot.get(message.id) ?? null;
+      const sourceTask =
+        message.scope.kind === "channel"
+          ? tasksBySourceMessageId[message.id] ?? null
+          : null;
+      return (
+        <MessageItemErrorBoundary messageId={message.id}>
+          <MessageRow
+            actor={actors[message.authorActorId]}
+            actors={actors}
+            machines={machines}
+            runs={runs}
+            message={message}
+            workflowSourceIds={workflowSourceIds}
+            onReply={onReply}
+            onStartThread={onStartThread}
+            onToggleReaction={onToggleReaction}
+            onAnswerAction={onAnswerAction}
+            onOpenAgentSettings={onOpenAgentSettings}
+            canReply={allowReply}
+            canStartThread={allowThreads && canUseAsThreadRoot(message)}
+            threadSummary={threadSummary}
+            threadStats={threadSummary ? threadStatsById[threadSummary.id] : undefined}
+            sourceTask={sourceTask}
+            currentActorId={currentActorId}
+            busy={busy}
+          />
+        </MessageItemErrorBoundary>
+      );
+    },
+    [
+      feedItems,
+      threadByRoot,
+      tasksBySourceMessageId,
+      actors,
+      machines,
+      runs,
+      workflowSourceIds,
+      onReply,
+      onStartThread,
+      onToggleReaction,
+      onAnswerAction,
+      onOpenAgentSettings,
+      allowReply,
+      allowThreads,
+      currentActorId,
+      busy,
+      threadStatsById,
+    ],
+  );
+
   if (visibleMessages.length === 0) {
     return (
       <div className="flex min-h-0 flex-1 items-center justify-center bg-white px-8 text-sm text-muted-foreground">
@@ -97,53 +194,10 @@ export function MessageFeed({
   }
 
   return (
-    <div className="min-h-0 flex-1 bg-white soft-scrollbar">
-      <Virtuoso
-        key={feedKey}
-        className="h-full"
-        totalCount={feedItems.length}
-        followOutput="smooth"
-        itemContent={(index) => {
-          const item = feedItems[index];
-          if (item.kind === "date-divider") {
-            return (
-              <div className="date-divider">
-                <span />
-                <div>{item.label}</div>
-                <span />
-              </div>
-            );
-          }
-          const message = item.message;
-          const threadSummary = threadByRoot.get(message.id) ?? null;
-          const sourceTask =
-            message.scope.kind === "channel"
-              ? tasksBySourceMessageId[message.id] ?? null
-              : null;
-          return (
-            <MessageRow
-              actor={actors[message.authorActorId]}
-              actors={actors}
-              machines={machines}
-              runs={runs}
-              message={message}
-              workflowSourceIds={workflowSourceIds}
-              onReply={onReply}
-              onStartThread={onStartThread}
-              onToggleReaction={onToggleReaction}
-              onAnswerAction={onAnswerAction}
-              onOpenAgentSettings={onOpenAgentSettings}
-              canReply={allowReply}
-              canStartThread={allowThreads && canUseAsThreadRoot(message)}
-              threadSummary={threadSummary}
-              threadStats={threadSummary ? threadStatsById[threadSummary.id] : undefined}
-              sourceTask={sourceTask}
-              currentActorId={currentActorId}
-              busy={busy}
-            />
-          );
-        }}
-      />
-    </div>
+    <FeedScrollManager
+      feedKey={feedKey}
+      feedItems={feedItems}
+      renderItem={renderItem}
+    />
   );
 }

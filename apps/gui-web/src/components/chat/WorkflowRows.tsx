@@ -1,3 +1,4 @@
+import { memo } from "react";
 import { Check } from "lucide-react";
 import type { Actor, Message, MachineInfo, Run } from "@/ipc/types";
 import { Badge } from "@/components/ui/badge";
@@ -6,7 +7,7 @@ import { formatTime } from "@/lib/utils";
 import { displayName } from "@/lib/format-utils";
 import { AgentMessageAvatar } from "@/components/agent/AgentMessageAvatar";
 
-export function WorkflowEventRow({
+export const WorkflowEventRow = memo(function WorkflowEventRow({
   actor,
   actors,
   message,
@@ -24,9 +25,9 @@ export function WorkflowEventRow({
       {actor && <Badge variant="outline">{displayName(actor)}</Badge>}
     </div>
   );
-}
+});
 
-export function WorkflowResultRow({
+export const WorkflowResultRow = memo(function WorkflowResultRow({
   actor,
   machines,
   runs,
@@ -60,4 +61,4 @@ export function WorkflowResultRow({
       </div>
     </article>
   );
-}
+});

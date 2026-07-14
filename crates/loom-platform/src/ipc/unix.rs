@@ -10,8 +10,9 @@
 //!   `libc::chmod`, applied immediately after bind so the resulting
 //!   mode is independent of the caller's umask.
 //! - [`cleanup_stale`] — best-effort `unlink` of a leftover socket
-//!   file. We check that the path *is* a socket (`S_IFSOCK`) before
-//!   unlinking so we never delete a regular file by accident.
+//!   file. We first probe the socket and refuse to unlink it when a live
+//!   listener accepts connections, then check `S_IFSOCK` before removing a
+//!   stale path so we never delete a regular file by accident.
 //!
 //! The cross-platform listener type (Unix Domain Socket vs Named Pipe
 //! abstraction) is provided by the `interprocess` crate; this module
@@ -63,9 +64,9 @@ pub(super) fn tighten_permissions(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Best-effort removal of a stale socket file. Returns `Ok(())` if
-/// the path did not exist, or if it existed and was successfully
-/// removed. Returns the underlying error otherwise.
+/// Best-effort removal of a stale socket file. Returns `Ok(())` if the path
+/// did not exist, or if it existed without a live listener and was
+/// successfully removed. A live listener is reported as `AddrInUse`.
 ///
 /// We refuse to unlink anything that is not an `S_IFSOCK` to avoid
 /// trampling a regular file that happens to share the same name.
@@ -86,6 +87,34 @@ pub(super) fn cleanup_stale(path: &Path) -> io::Result<()> {
                 meta.file_type()
             ),
         ));
+    }
+
+    // A socket pathname may outlive its listener after a crash, but it may
+    // also belong to a healthy process. Unlinking the latter allows a second
+    // server to bind the same pathname while the first keeps running on the
+    // now-unlinked inode. Probe before cleanup and conservatively preserve the
+    // path on every error except the two states that identify a stale socket.
+    match std::os::unix::net::UnixStream::connect(path) {
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!("socket {} has a live listener", path.display()),
+            ));
+        }
+        Err(err)
+            if matches!(
+                err.kind(),
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+            ) => {}
+        Err(err) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!(
+                    "refusing to remove socket {} after connection probe failed: {err}",
+                    path.display()
+                ),
+            ));
+        }
     }
 
     match std::fs::remove_file(path) {

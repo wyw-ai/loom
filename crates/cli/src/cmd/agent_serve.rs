@@ -17,10 +17,12 @@
 //!     private `run.append` trace frames back to the server.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::ffi::OsStr;
+use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::{Local, SecondsFormat, Utc};
 use proto::methods::{
     method, stream_kind, AgentConfigActivateResult, AgentConfigPublishResult, AgentModelChoice,
@@ -1353,6 +1355,9 @@ const SCOPE_SKILLS_LINKS: &[&str] = &[
     ".opencode/skills",
 ];
 const DEFAULT_LOOM_SKILL_ID: &str = "loom";
+const MATERIALIZED_LOOM_SKILL_MARKER: &str = ".loom-managed-skill.json";
+const MATERIALIZED_LOOM_SKILL_MARKER_CONTENT: &str =
+    "{\"id\":\"loom\",\"source\":\"embedded\",\"version\":\"loom.skill-materialization.v1\"}\n";
 
 #[derive(Debug, Clone, Copy)]
 struct EmbeddedSkillFile {
@@ -1444,8 +1449,165 @@ fn ensure_default_loom_skill(data_root: &Path) -> std::io::Result<PathBuf> {
     Ok(skill_dir)
 }
 
+/// Write the embedded official Loom skill into an exact, dedicated skill directory.
+///
+/// The embedded snapshot is authoritative: files that are not present in the
+/// current snapshot are removed from `output`.
+pub fn materialize_embedded_loom_skill(output: &Path) -> Result<PathBuf> {
+    let output = if output.is_absolute() {
+        output.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("resolve current directory for Loom skill output")?
+            .join(output)
+    };
+
+    if output.file_name() != Some(OsStr::new(DEFAULT_LOOM_SKILL_ID)) {
+        bail!(
+            "Loom skill output must be a dedicated directory named {DEFAULT_LOOM_SKILL_ID}: {}",
+            output.display()
+        );
+    }
+
+    prepare_materialized_loom_skill_dir(&output)?;
+    clear_materialized_loom_skill_dir(&output)?;
+    sync_embedded_skill_dir_preserving(
+        &output,
+        EMBEDDED_LOOM_SKILL_FILES,
+        &[Path::new(MATERIALIZED_LOOM_SKILL_MARKER)],
+    )
+    .with_context(|| format!("materialize embedded Loom skill into {}", output.display()))?;
+    validate_materialized_loom_skill_marker(&output)?;
+    std::fs::canonicalize(&output)
+        .with_context(|| format!("resolve Loom skill output {}", output.display()))
+}
+
+fn prepare_materialized_loom_skill_dir(output: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(output) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            bail!(
+                "refusing symlink as Loom skill output: {}",
+                output.display()
+            )
+        }
+        Ok(meta) if !meta.is_dir() => {
+            bail!("Loom skill output is not a directory: {}", output.display())
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            create_dir_all_unc(output)
+                .with_context(|| format!("create Loom skill output {}", output.display()))?;
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("inspect Loom skill output {}", output.display()))
+        }
+    }
+
+    let output_meta = std::fs::symlink_metadata(output)
+        .with_context(|| format!("inspect Loom skill output {}", output.display()))?;
+    if output_meta.file_type().is_symlink() {
+        bail!(
+            "refusing symlink as Loom skill output: {}",
+            output.display()
+        );
+    }
+    if !output_meta.is_dir() {
+        bail!("Loom skill output is not a directory: {}", output.display());
+    }
+
+    let marker = output.join(MATERIALIZED_LOOM_SKILL_MARKER);
+    match std::fs::symlink_metadata(&marker) {
+        Ok(_) => validate_materialized_loom_skill_marker(output),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let is_empty = std::fs::read_dir(output)
+                .with_context(|| format!("read Loom skill output {}", output.display()))?
+                .next()
+                .transpose()
+                .with_context(|| format!("read Loom skill output {}", output.display()))?
+                .is_none();
+            if !is_empty {
+                bail!(
+                    "refusing non-empty Loom skill output without managed marker {MATERIALIZED_LOOM_SKILL_MARKER}: {}",
+                    output.display()
+                );
+            }
+
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&marker)
+                .with_context(|| {
+                    format!("create Loom skill managed marker {}", marker.display())
+                })?;
+            file.write_all(MATERIALIZED_LOOM_SKILL_MARKER_CONTENT.as_bytes())
+                .with_context(|| format!("write Loom skill managed marker {}", marker.display()))?;
+            file.sync_all()
+                .with_context(|| format!("sync Loom skill managed marker {}", marker.display()))?;
+            validate_materialized_loom_skill_marker(output)
+        }
+        Err(err) => Err(err)
+            .with_context(|| format!("inspect Loom skill managed marker {}", marker.display())),
+    }
+}
+
+fn validate_materialized_loom_skill_marker(output: &Path) -> Result<()> {
+    let marker = output.join(MATERIALIZED_LOOM_SKILL_MARKER);
+    let meta = std::fs::symlink_metadata(&marker)
+        .with_context(|| format!("inspect Loom skill managed marker {}", marker.display()))?;
+    if meta.file_type().is_symlink() {
+        bail!(
+            "refusing symlink as Loom skill managed marker: {}",
+            marker.display()
+        );
+    }
+    if !meta.is_file() {
+        bail!(
+            "Loom skill managed marker is not a regular file: {}",
+            marker.display()
+        );
+    }
+    let content = std::fs::read_to_string(&marker)
+        .with_context(|| format!("read Loom skill managed marker {}", marker.display()))?;
+    if content != MATERIALIZED_LOOM_SKILL_MARKER_CONTENT {
+        bail!("Loom skill managed marker is invalid: {}", marker.display());
+    }
+    Ok(())
+}
+
+fn clear_materialized_loom_skill_dir(output: &Path) -> Result<()> {
+    validate_materialized_loom_skill_marker(output)?;
+    for entry in std::fs::read_dir(output)
+        .with_context(|| format!("read Loom skill output {}", output.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("read Loom skill output entry {}", output.display()))?;
+        if entry.file_name().as_os_str() == OsStr::new(MATERIALIZED_LOOM_SKILL_MARKER) {
+            continue;
+        }
+        remove_path_if_exists(&entry.path()).with_context(|| {
+            format!(
+                "remove stale Loom skill output entry {}",
+                entry.path().display()
+            )
+        })?;
+    }
+    validate_materialized_loom_skill_marker(output)
+}
+
 fn sync_embedded_skill_dir(root: &Path, files: &[EmbeddedSkillFile]) -> std::io::Result<()> {
-    let mut expected = BTreeSet::new();
+    sync_embedded_skill_dir_preserving(root, files, &[])
+}
+
+fn sync_embedded_skill_dir_preserving(
+    root: &Path,
+    files: &[EmbeddedSkillFile],
+    preserved: &[&Path],
+) -> std::io::Result<()> {
+    let mut expected = preserved
+        .iter()
+        .map(|path| (*path).to_path_buf())
+        .collect::<BTreeSet<_>>();
     for file in files {
         let rel_path = embedded_skill_relative_path(file.path)?;
         write_text_file_if_changed(&root.join(&rel_path), file.content)?;
@@ -9341,11 +9503,187 @@ mod tests {
         assert!(skill_md.contains("name: loom"));
         assert!(skill_md.contains("Loom Runtime Skill"));
         assert!(runtime_reference.contains("AGENTS.md"));
+        assert!(!skill.join(MATERIALIZED_LOOM_SKILL_MARKER).exists());
 
         let stale = skill.join("references").join("obsolete.md");
         std::fs::write(&stale, "old").expect("stale reference");
         ensure_default_loom_skill(&root).expect("resync default loom skill");
         assert!(!stale.exists());
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn embedded_loom_skill_materializes_to_exact_output_and_prunes_stale_files() {
+        let root = temp_path("materialized-loom-skill");
+        let output = root.join("exported").join("loom");
+
+        let materialized =
+            materialize_embedded_loom_skill(&output).expect("materialize embedded Loom skill");
+        assert_eq!(
+            materialized,
+            std::fs::canonicalize(&output).expect("canonical output")
+        );
+        assert!(output.join("SKILL.md").is_file());
+        assert!(output
+            .join("references")
+            .join("runtime-awareness.md")
+            .is_file());
+        assert_eq!(
+            std::fs::read_to_string(output.join(MATERIALIZED_LOOM_SKILL_MARKER))
+                .expect("managed marker"),
+            MATERIALIZED_LOOM_SKILL_MARKER_CONTENT
+        );
+
+        let stale = output.join("references").join("obsolete.md");
+        std::fs::write(&stale, "old").expect("write stale reference");
+        materialize_embedded_loom_skill(&output).expect("reconcile embedded Loom skill");
+        assert!(!stale.exists());
+        assert_eq!(
+            std::fs::read_to_string(output.join(MATERIALIZED_LOOM_SKILL_MARKER))
+                .expect("preserved managed marker"),
+            MATERIALIZED_LOOM_SKILL_MARKER_CONTENT
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn embedded_loom_skill_refuses_unmarked_non_empty_output_without_modifying_it() {
+        let root = temp_path("materialized-loom-skill-unmarked");
+        let output = root.join("loom");
+        std::fs::create_dir_all(&output).expect("output");
+        let sentinel = output.join("keep.txt");
+        std::fs::write(&sentinel, "keep me").expect("sentinel");
+
+        let error = materialize_embedded_loom_skill(&output)
+            .expect_err("unmarked non-empty output must be rejected");
+        assert!(error.to_string().contains("without managed marker"));
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).expect("preserved sentinel"),
+            "keep me"
+        );
+        assert!(!output.join("SKILL.md").exists());
+        assert!(!output.join(MATERIALIZED_LOOM_SKILL_MARKER).exists());
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn embedded_loom_skill_refuses_invalid_marker_without_modifying_output() {
+        let root = temp_path("materialized-loom-skill-invalid-marker");
+        let output = root.join("loom");
+        std::fs::create_dir_all(&output).expect("output");
+        let marker = output.join(MATERIALIZED_LOOM_SKILL_MARKER);
+        let sentinel = output.join("keep.txt");
+        std::fs::write(&marker, "not a Loom marker\n").expect("invalid marker");
+        std::fs::write(&sentinel, "keep me").expect("sentinel");
+
+        let error =
+            materialize_embedded_loom_skill(&output).expect_err("invalid marker must be rejected");
+        assert!(error.to_string().contains("managed marker is invalid"));
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("preserved marker"),
+            "not a Loom marker\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).expect("preserved sentinel"),
+            "keep me"
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn embedded_loom_skill_requires_loom_basename() {
+        let root = temp_path("materialized-loom-skill-basename");
+        let output = root.join("not-loom");
+
+        let error = materialize_embedded_loom_skill(&output)
+            .expect_err("non-loom basename must be rejected");
+        assert!(error.to_string().contains("directory named loom"));
+        assert!(!output.exists());
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn embedded_loom_skill_refuses_output_symlink() {
+        let root = temp_path("materialized-loom-skill-output-symlink");
+        let target = root.join("target");
+        let output = root.join("loom");
+        std::fs::create_dir_all(&target).expect("target");
+        symlink_path(&target, &output).expect("output symlink");
+
+        let error =
+            materialize_embedded_loom_skill(&output).expect_err("output symlink must be rejected");
+        assert!(error.to_string().contains("symlink as Loom skill output"));
+        assert!(std::fs::read_dir(&target)
+            .expect("unchanged target")
+            .next()
+            .is_none());
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn embedded_loom_skill_refuses_marker_symlink_without_modifying_output() {
+        let root = temp_path("materialized-loom-skill-marker-symlink");
+        let output = root.join("loom");
+        let external_marker = root.join("external-marker.json");
+        let sentinel = output.join("keep.txt");
+        std::fs::create_dir_all(&output).expect("output");
+        std::fs::write(&external_marker, MATERIALIZED_LOOM_SKILL_MARKER_CONTENT)
+            .expect("external marker");
+        std::fs::write(&sentinel, "keep me").expect("sentinel");
+        symlink_path(
+            &external_marker,
+            &output.join(MATERIALIZED_LOOM_SKILL_MARKER),
+        )
+        .expect("marker symlink");
+
+        let error =
+            materialize_embedded_loom_skill(&output).expect_err("marker symlink must be rejected");
+        assert!(error
+            .to_string()
+            .contains("symlink as Loom skill managed marker"));
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).expect("preserved sentinel"),
+            "keep me"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&external_marker).expect("preserved external marker"),
+            MATERIALIZED_LOOM_SKILL_MARKER_CONTENT
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn embedded_loom_skill_replaces_expected_symlink_without_overwriting_external_target() {
+        let root = temp_path("materialized-loom-skill-expected-symlink");
+        let output = root.join("loom");
+        let external = root.join("external.txt");
+        materialize_embedded_loom_skill(&output).expect("initial materialization");
+        std::fs::write(&external, "keep me").expect("external target");
+        std::fs::remove_file(output.join("SKILL.md")).expect("remove skill md");
+        symlink_path(&external, &output.join("SKILL.md")).expect("expected file symlink");
+
+        materialize_embedded_loom_skill(&output).expect("safe reconcile");
+        assert_eq!(
+            std::fs::read_to_string(&external).expect("preserved external target"),
+            "keep me"
+        );
+        let skill_meta =
+            std::fs::symlink_metadata(output.join("SKILL.md")).expect("skill md metadata");
+        assert!(skill_meta.is_file());
+        assert!(!skill_meta.file_type().is_symlink());
+        assert!(std::fs::read_to_string(output.join("SKILL.md"))
+            .expect("materialized skill md")
+            .contains("name: loom"));
 
         std::fs::remove_dir_all(root).ok();
     }

@@ -243,24 +243,24 @@ export function channelTaskGroups(tasks: Task[]) {
   const groups = [
     {
       id: "todo",
-      title: "待办",
+      title: "To Do",
       tasks: tasks.filter((task) => task.status === "todo" || task.status === "claimed"),
     },
     {
       id: "active",
-      title: "进行中",
+      title: "In Progress",
       tasks: tasks.filter(
         (task) => task.status === "in_progress" || task.status === "waiting_review",
       ),
     },
     {
       id: "done",
-      title: "已完成",
+      title: "Done",
       tasks: tasks.filter((task) => task.status === "done"),
     },
     {
       id: "other",
-      title: "其他",
+      title: "Other",
       tasks: tasks.filter(
         (task) =>
           task.status === "failed" ||

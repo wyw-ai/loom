@@ -14,17 +14,17 @@ import { ScopeTokenSummary } from "@/components/layout/ScopeTokenSummary";
 
 function formatActivityLabel(activity: ChannelAgentActivity): string {
   const { primaryAgentName, primaryStatus, activeCount, hasFailed } = activity;
-  if (hasFailed && activeCount === 0) return `⚠ ${primaryAgentName} 运行异常`;
+  if (hasFailed && activeCount === 0) return `⚠ ${primaryAgentName} encountered an error`;
   if (activeCount === 1) {
     switch (primaryStatus) {
-      case "running": return `${primaryAgentName} 正在思考…`;
-      case "waiting_tool": return `${primaryAgentName} 正在执行工具…`;
-      case "preparing_context": return `${primaryAgentName} 正在准备上下文…`;
-      case "queued": return `${primaryAgentName} 排队中…`;
-      default: return `${primaryAgentName} 工作中…`;
+      case "running": return `${primaryAgentName} is thinking…`;
+      case "waiting_tool": return `${primaryAgentName} is running a tool…`;
+      case "preparing_context": return `${primaryAgentName} is preparing context…`;
+      case "queued": return `${primaryAgentName} is queued…`;
+      default: return `${primaryAgentName} is working…`;
     }
   }
-  return `${primaryAgentName} 等 ${activeCount} 个 Agent 工作中…`;
+  return `${primaryAgentName} and ${activeCount} agents working…`;
 }
 
 export function ChatHeader({

@@ -1102,6 +1102,25 @@ mod tests {
         assert_eq!(transport.timeout_ms, Some(7_200_000));
         assert_eq!(transport.idle_timeout_ms, Some(1_200_000));
     }
+
+    #[test]
+    fn command_transport_round_trips_unlimited_turn_timeouts() {
+        let transport: AgentTransport = serde_json::from_str(
+            r#"{
+                "kind": "command",
+                "command": "codex",
+                "timeoutMs": -1,
+                "idleTimeoutMs": -1
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(transport.timeout_ms, Some(-1));
+        assert_eq!(transport.idle_timeout_ms, Some(-1));
+
+        let serialized = serde_json::to_value(transport).unwrap();
+        assert_eq!(serialized["timeoutMs"], -1);
+        assert_eq!(serialized["idleTimeoutMs"], -1);
+    }
 }
 
 // ---- run.* ----
@@ -1948,21 +1967,20 @@ pub struct AgentTransport {
     /// variable including `{prompt.full}` or `{prompt.user}`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stdin: Option<String>,
-    /// Optional hard timeout for one command-transport turn. When exceeded the
-    /// daemon cancels the subprocess and fails the turn so later triggers can
-    /// drain instead of being stranded behind a hung CLI.
+    /// Optional hard timeout for one command-transport turn. Positive values
+    /// are milliseconds; `-1` means unlimited. When a positive timeout is
+    /// exceeded, the daemon cancels the subprocess and fails the turn.
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "timeoutMs")]
-    pub timeout_ms: Option<u64>,
-    /// Optional idle timeout for one command-transport turn. The timer resets
-    /// whenever the subprocess emits stdout. This catches provider CLIs that
-    /// have already produced their last useful stream event but remain alive
-    /// because one of their tool subprocesses leaked.
+    pub timeout_ms: Option<i64>,
+    /// Optional idle timeout for one command-transport turn. Positive values
+    /// are milliseconds; `-1` means unlimited. The timer resets whenever the
+    /// subprocess emits output.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         rename = "idleTimeoutMs"
     )]
-    pub idle_timeout_ms: Option<u64>,
+    pub idle_timeout_ms: Option<i64>,
 
     // ---- interactive_command only; ignored by other transports ----
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2097,14 +2115,16 @@ pub struct ProviderModeSpec {
     pub stderr: Option<ProviderDecoderSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<ProviderSessionSpec>,
+    /// Hard turn timeout in milliseconds. `-1` means unlimited.
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "timeoutMs")]
-    pub timeout_ms: Option<u64>,
+    pub timeout_ms: Option<i64>,
+    /// Output-idle timeout in milliseconds. `-1` means unlimited.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         rename = "idleTimeoutMs"
     )]
-    pub idle_timeout_ms: Option<u64>,
+    pub idle_timeout_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interactive: Option<InteractiveCommandSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -132,6 +132,8 @@
           }
         }
       },
+      "timeoutMs": -1,
+      "idleTimeoutMs": -1,
       "transport": "command"
     }
   },

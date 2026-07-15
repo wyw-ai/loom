@@ -166,6 +166,8 @@
         "format": "builtin",
         "name": "claude_stream_json"
       },
+      "timeoutMs": -1,
+      "idleTimeoutMs": -1,
       "transport": "command"
     }
   },

@@ -29,8 +29,8 @@ use serde_json::{json, Map, Value};
 
 use crate::adapter::{PromptPart, PromptRoleHint};
 
-const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 30 * 60 * 1000;
-const DEFAULT_COMMAND_IDLE_TIMEOUT_MS: u64 = 5 * 60 * 1000;
+const DEFAULT_COMMAND_TIMEOUT_MS: i64 = -1;
+const DEFAULT_COMMAND_IDLE_TIMEOUT_MS: i64 = -1;
 
 #[derive(Debug, Clone)]
 pub struct DetectedProvider {
@@ -77,9 +77,9 @@ pub struct ProviderRuntimePlan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stdin: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout_ms: Option<u64>,
+    pub timeout_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub idle_timeout_ms: Option<u64>,
+    pub idle_timeout_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interactive: Option<InteractiveCommandSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -324,6 +324,8 @@ pub fn validate_manifest(manifest: &ProviderManifest) -> Result<(), String> {
                 manifest.id
             ));
         }
+        validate_mode_timeout(manifest, mode_name, "timeoutMs", mode.timeout_ms)?;
+        validate_mode_timeout(manifest, mode_name, "idleTimeoutMs", mode.idle_timeout_ms)?;
         validate_mode_command(manifest, mode_name, mode)?;
         validate_decoder_spec(manifest, mode_name, "stdout", &mode.stdout)?;
         if let Some(stderr) = mode.stderr.as_ref() {
@@ -331,6 +333,21 @@ pub fn validate_manifest(manifest: &ProviderManifest) -> Result<(), String> {
         }
         validate_prompt_references(manifest, mode_name, mode)?;
         validate_interactive_mode(manifest, mode_name, mode)?;
+    }
+    Ok(())
+}
+
+fn validate_mode_timeout(
+    manifest: &ProviderManifest,
+    mode_name: &str,
+    field: &str,
+    value: Option<i64>,
+) -> Result<(), String> {
+    if value.is_some_and(|ms| ms < -1) {
+        return Err(format!(
+            "provider `{}` mode `{mode_name}` {field} must be -1 (unlimited) or a non-negative millisecond value",
+            manifest.id
+        ));
     }
     Ok(())
 }
@@ -2340,9 +2357,7 @@ fn claude_manifest() -> ProviderManifest {
         resume_args,
         scope: Some("actor_scope".into()),
     };
-    let mut print_mode = mode("{bin}", first_args, "claude_stream_json", Some(session));
-    print_mode.timeout_ms = Some(30 * 60 * 1000);
-    print_mode.idle_timeout_ms = Some(5 * 60 * 1000);
+    let print_mode = mode("{bin}", first_args, "claude_stream_json", Some(session));
     let nonprint_mode = ProviderModeSpec {
         transport: "interactive_command".into(),
         command: "{bin}".into(),
@@ -3810,8 +3825,11 @@ mod tests {
             transport.session.as_ref().and_then(|s| s.scope.as_deref()),
             Some("actor_scope")
         );
-        assert_eq!(transport.timeout_ms, Some(30 * 60 * 1000));
-        assert_eq!(transport.idle_timeout_ms, Some(5 * 60 * 1000));
+        assert_eq!(transport.timeout_ms, Some(DEFAULT_COMMAND_TIMEOUT_MS));
+        assert_eq!(
+            transport.idle_timeout_ms,
+            Some(DEFAULT_COMMAND_IDLE_TIMEOUT_MS)
+        );
     }
 
     #[test]
@@ -4002,7 +4020,7 @@ mod tests {
     }
 
     #[test]
-    fn builtin_command_print_modes_have_bounded_turn_timeouts() {
+    fn builtin_command_print_modes_default_to_unlimited_turn_timeouts() {
         for provider_id in ["claude", "qoder", "copilot", "codex", "opencode"] {
             let manifest = builtin_provider_manifests()
                 .into_iter()
@@ -4013,12 +4031,12 @@ mod tests {
                 assert_eq!(
                     mode.timeout_ms,
                     Some(DEFAULT_COMMAND_TIMEOUT_MS),
-                    "{provider_id} should bound total command turn runtime"
+                    "{provider_id} should not impose a total command turn limit"
                 );
                 assert_eq!(
                     mode.idle_timeout_ms,
                     Some(DEFAULT_COMMAND_IDLE_TIMEOUT_MS),
-                    "{provider_id} should surface quiet hung command turns"
+                    "{provider_id} should not impose an idle command turn limit"
                 );
             }
         }
@@ -4352,6 +4370,28 @@ mod tests {
             Some("codex_stream_json"),
             "patch must preserve base parser"
         );
+    }
+
+    #[test]
+    fn provider_timeouts_reject_negative_values_below_unlimited_sentinel() {
+        let registry =
+            ProviderRegistry::load(&temp_dir("invalid-timeout-config")).expect("registry");
+        for field in ["timeoutMs", "idleTimeoutMs"] {
+            let mut value = json!({
+                "schemaVersion": 1,
+                "id": "codex_invalid_timeout",
+                "displayName": "Codex Invalid Timeout",
+                "extends": "codex",
+                "modes": {
+                    "print": {}
+                }
+            });
+            value["modes"]["print"][field] = json!(-2);
+            let err = registry
+                .resolve_manifest_value(value)
+                .expect_err("timeout below -1 should fail");
+            assert!(err.contains(&format!("{field} must be -1 (unlimited)")));
+        }
     }
 
     #[test]

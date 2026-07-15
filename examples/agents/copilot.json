@@ -8,7 +8,7 @@
   "providerRef": {
     "id": "copilot",
     "mode": "print",
-    "model": "gpt-5.5"
+    "model": "claude-sonnet-5"
   },
   "autostart": false
 }

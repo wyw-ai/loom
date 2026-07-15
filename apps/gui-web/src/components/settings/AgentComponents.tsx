@@ -1113,7 +1113,11 @@ export function AgentMemberDetail({
               >
                 {reasoningEffortChoices.map((choice) => (
                   <option key={choice || "default"} value={choice}>
-                    {choice ? capitalize(choice) : "Default reasoning"}
+                    {choice
+                      ? choice === "xhigh"
+                        ? "Extra high"
+                        : capitalize(choice)
+                      : "Default reasoning"}
                   </option>
                 ))}
               </StyledSelect>

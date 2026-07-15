@@ -2568,23 +2568,28 @@ fn copilot_manifest() -> ProviderManifest {
             mode
         })]),
         &[
-            ("gpt-5.5", "GPT-5.5"),
-            ("gpt-5.4", "GPT-5.4"),
-            ("gpt-5.3-codex", "GPT-5.3 Codex"),
-            ("gpt-5.2-codex", "GPT-5.2 Codex"),
-            ("gpt-5.2", "GPT-5.2"),
-            ("gpt-5.1", "GPT-5.1"),
-            ("gpt-5.4-mini", "GPT-5.4 Mini"),
-            ("gpt-5-mini", "GPT-5 Mini"),
-            ("gpt-4.1", "GPT-4.1"),
+            ("claude-sonnet-5", "Claude Sonnet 5"),
+            ("auto", "Auto"),
             ("claude-sonnet-4.6", "Claude Sonnet 4.6"),
             ("claude-sonnet-4.5", "Claude Sonnet 4.5"),
             ("claude-haiku-4.5", "Claude Haiku 4.5"),
+            ("claude-fable-5", "Claude Fable 5"),
+            ("claude-opus-4.8", "Claude Opus 4.8"),
+            ("claude-opus-4.8-fast", "Claude Opus 4.8 (fast mode)"),
             ("claude-opus-4.7", "Claude Opus 4.7"),
             ("claude-opus-4.6", "Claude Opus 4.6"),
-            ("claude-opus-4.6-fast", "Claude Opus 4.6 Fast"),
             ("claude-opus-4.5", "Claude Opus 4.5"),
-            ("claude-sonnet-4", "Claude Sonnet 4"),
+            ("gpt-5.6-sol", "GPT-5.6 Sol"),
+            ("gpt-5.6-terra", "GPT-5.6 Terra"),
+            ("gpt-5.6-luna", "GPT-5.6 Luna"),
+            ("gpt-5.5", "GPT-5.5"),
+            ("gpt-5.4", "GPT-5.4"),
+            ("gpt-5.3-codex", "GPT-5.3 Codex"),
+            ("gpt-5.4-mini", "GPT-5.4 Mini"),
+            ("gpt-5-mini", "GPT-5 Mini"),
+            ("gemini-3.1-pro-preview", "Gemini 3.1 Pro"),
+            ("gemini-3.5-flash", "Gemini 3.5 Flash"),
+            ("kimi-k2.7-code", "Kimi K2.7 Code"),
         ],
     )
 }
@@ -2603,6 +2608,10 @@ fn codex_manifest() -> ProviderManifest {
         lit("--add-dir"),
         lit("{agent.skillWorkspace}"),
         when("model", vec![lit("--model"), lit("{model}")]),
+        when(
+            "reasoningEffort",
+            vec![lit("-c"), lit("model_reasoning_effort={reasoningEffort}")],
+        ),
         lit("{prompt.full}"),
     ];
     let resume_args = vec![
@@ -2620,6 +2629,10 @@ fn codex_manifest() -> ProviderManifest {
         lit("--add-dir"),
         lit("{agent.skillWorkspace}"),
         when("model", vec![lit("--model"), lit("{model}")]),
+        when(
+            "reasoningEffort",
+            vec![lit("-c"), lit("model_reasoning_effort={reasoningEffort}")],
+        ),
         lit("{prompt.full}"),
     ];
     let mut mode = mode(
@@ -2640,12 +2653,13 @@ fn codex_manifest() -> ProviderManifest {
         &["codex", "codexcli"],
         BTreeMap::from([("print".into(), mode)]),
         &[
+            ("gpt-5.6-sol", "GPT-5.6 Sol"),
+            ("gpt-5.6-terra", "GPT-5.6 Terra"),
+            ("gpt-5.6-luna", "GPT-5.6 Luna"),
             ("gpt-5.5", "GPT-5.5"),
             ("gpt-5.4", "GPT-5.4"),
             ("gpt-5.4-mini", "GPT-5.4 Mini"),
-            ("gpt-5.3-codex", "GPT-5.3 Codex"),
             ("gpt-5.3-codex-spark", "GPT-5.3 Codex Spark"),
-            ("gpt-5.2", "GPT-5.2"),
         ],
     )
 }
@@ -3852,6 +3866,116 @@ mod tests {
                 .map(|provider| provider.kind.as_str()),
             Some("claude")
         );
+    }
+
+    #[test]
+    fn builtin_codex_and_copilot_model_catalogs_match_current_clis() {
+        let manifests = builtin_provider_manifests();
+        let codex = manifests
+            .iter()
+            .find(|manifest| manifest.id == "codex")
+            .expect("codex");
+        let codex_models = codex.models.as_ref().expect("codex models");
+        assert_eq!(codex_models.default.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(
+            codex_models
+                .choices
+                .iter()
+                .map(|choice| choice.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-5.5",
+                "gpt-5.4",
+                "gpt-5.4-mini",
+                "gpt-5.3-codex-spark",
+            ]
+        );
+
+        let copilot = manifests
+            .iter()
+            .find(|manifest| manifest.id == "copilot")
+            .expect("copilot");
+        let copilot_models = copilot.models.as_ref().expect("copilot models");
+        assert_eq!(copilot_models.default.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(
+            copilot_models
+                .choices
+                .iter()
+                .map(|choice| choice.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "claude-sonnet-5",
+                "auto",
+                "claude-sonnet-4.6",
+                "claude-sonnet-4.5",
+                "claude-haiku-4.5",
+                "claude-fable-5",
+                "claude-opus-4.8",
+                "claude-opus-4.8-fast",
+                "claude-opus-4.7",
+                "claude-opus-4.6",
+                "claude-opus-4.5",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-5.5",
+                "gpt-5.4",
+                "gpt-5.3-codex",
+                "gpt-5.4-mini",
+                "gpt-5-mini",
+                "gemini-3.1-pro-preview",
+                "gemini-3.5-flash",
+                "kimi-k2.7-code",
+            ]
+        );
+    }
+
+    #[test]
+    fn builtin_codex_forwards_reasoning_effort_on_new_and_resumed_turns() {
+        let manifest = codex_manifest();
+        let mode = manifest.modes.get("print").expect("print mode");
+        let resume_args = &mode.session.as_ref().expect("session").resume_args;
+
+        for args in [&mode.args, resume_args] {
+            assert!(args.iter().any(|arg| matches!(
+                arg,
+                ProviderArgSpec::Conditional(spec)
+                    if spec.when == "reasoningEffort"
+                        && matches!(spec.args.as_slice(), [
+                            ProviderArgSpec::Literal(flag),
+                            ProviderArgSpec::Literal(value),
+                        ] if flag == "-c" && value == "model_reasoning_effort={reasoningEffort}")
+            )));
+        }
+    }
+
+    #[test]
+    fn checked_in_codex_and_copilot_examples_match_builtin_models() {
+        for (provider_id, example) in [
+            (
+                "codex",
+                include_str!("../../../examples/providers/codex.json"),
+            ),
+            (
+                "copilot",
+                include_str!("../../../examples/providers/copilot.json"),
+            ),
+        ] {
+            let checked_in: ProviderManifest =
+                serde_json::from_str(example).expect("checked-in provider example");
+            let builtin = builtin_provider_manifests()
+                .into_iter()
+                .find(|manifest| manifest.id == provider_id)
+                .expect("builtin provider");
+            assert_eq!(
+                serde_json::to_value(checked_in.models).expect("checked-in models"),
+                serde_json::to_value(builtin.models).expect("builtin models"),
+                "{provider_id} example model list drifted from the builtin manifest"
+            );
+        }
     }
 
     #[test]

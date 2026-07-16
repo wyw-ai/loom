@@ -635,6 +635,28 @@ enum ChannelCmd {
     GetInstruction { channel_id: String },
     /// Clear the channel-level instructions.
     ClearInstruction { channel_id: String },
+    /// Manage channel-level skills mounted into every member agent's workspace.
+    #[command(subcommand)]
+    Skill(ChannelSkillCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum ChannelSkillCmd {
+    /// Add a skill to the channel registry. The skill source is a
+    /// directory path. Use `--id` to override the derived id.
+    Add {
+        channel_id: String,
+        source: String,
+        #[arg(long)]
+        id: Option<String>,
+    },
+    /// Remove a skill from the channel registry.
+    Remove {
+        channel_id: String,
+        skill_id: String,
+    },
+    /// List skills registered for the channel.
+    List { channel_id: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -723,6 +745,28 @@ enum ThreadCmd {
         #[arg(long = "bootstrap-artifact")]
         bootstrap_artifact: String,
     },
+    /// Manage thread-level skills mounted into agent workspaces in this
+    /// thread's scope. Thread skills override channel skills for the same id.
+    #[command(subcommand)]
+    Skill(ThreadSkillCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum ThreadSkillCmd {
+    /// Add a skill to the thread registry.
+    Add {
+        thread_id: String,
+        source: String,
+        #[arg(long)]
+        id: Option<String>,
+    },
+    /// Remove a skill from the thread registry.
+    Remove {
+        thread_id: String,
+        skill_id: String,
+    },
+    /// List skills registered for the thread.
+    List { thread_id: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -2133,6 +2177,20 @@ async fn async_main() -> Result<()> {
             ChannelCmd::ClearInstruction { channel_id } => {
                 cmd::channel::clear_instruction(client, channel_id).await?
             }
+            ChannelCmd::Skill(skill_cmd) => match skill_cmd {
+                ChannelSkillCmd::Add {
+                    channel_id,
+                    source,
+                    id,
+                } => cmd::channel::skill_add(channel_id, source, id).await?,
+                ChannelSkillCmd::Remove {
+                    channel_id,
+                    skill_id,
+                } => cmd::channel::skill_remove(channel_id, skill_id).await?,
+                ChannelSkillCmd::List { channel_id } => {
+                    cmd::channel::skill_list(channel_id).await?
+                }
+            },
         },
         Cmd::Thread { sub } => match sub {
             ThreadCmd::Create {
@@ -2188,6 +2246,20 @@ async fn async_main() -> Result<()> {
             ThreadCmd::ClearInstruction { thread_id } => {
                 cmd::thread::clear_instruction(client, thread_id).await?
             }
+            ThreadCmd::Skill(skill_cmd) => match skill_cmd {
+                ThreadSkillCmd::Add {
+                    thread_id,
+                    source,
+                    id,
+                } => cmd::thread::skill_add(client, thread_id, source, id).await?,
+                ThreadSkillCmd::Remove {
+                    thread_id,
+                    skill_id,
+                } => cmd::thread::skill_remove(client, thread_id, skill_id).await?,
+                ThreadSkillCmd::List { thread_id } => {
+                    cmd::thread::skill_list(client, thread_id).await?
+                }
+            },
         },
         Cmd::Message { sub } => match sub {
             MessageCmd::Send {

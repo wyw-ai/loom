@@ -5168,7 +5168,7 @@ async fn build_adapter_prompt(
         workspace_override.as_deref(),
         &agents_md_context,
     )?;
-    let skill_targets = current_scope_skill_targets(client, state, &channel_id).await;
+    let skill_targets = current_scope_skill_targets(client, state, &channel_id, thread_id).await;
     ensure_scope_skill_targets(&scope_paths.skills, &skill_targets)
         .with_context(|| format!("ensure scope skill targets for scope {}", scope.id))?;
     let mut workspace_skill_targets = scope_skill_targets_from_dir(&scope_paths.skills)
@@ -6189,6 +6189,7 @@ async fn current_scope_skill_targets(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
     channel_id: &str,
+    thread_id: Option<&str>,
 ) -> BTreeMap<String, PathBuf> {
     let result: Result<ChannelMembersResult> = client
         .call(
@@ -6229,6 +6230,49 @@ async fn current_scope_skill_targets(
             }
         }
     }
+
+    // 2. Channel skills (from file-based registry).
+    //    Channel skills override actor bundle skills for the same id.
+    match crate::cmd::skill_registry::read_channel_skills(&state.paths.data_root, channel_id) {
+        Ok(registry) => {
+            for entry in &registry.skills {
+                targets.insert(entry.id.clone(), PathBuf::from(&entry.source));
+            }
+        }
+        Err(err) => {
+            tracing::debug!(
+                actor = %state.actor_id,
+                channel = %channel_id,
+                %err,
+                "channel skill registry unavailable"
+            );
+        }
+    }
+
+    // 3. Thread skills (only in thread scope).
+    //    Thread skills override channel skills for the same id.
+    if let Some(tid) = thread_id {
+        match crate::cmd::skill_registry::read_thread_skills(
+            &state.paths.data_root,
+            channel_id,
+            tid,
+        ) {
+            Ok(registry) => {
+                for entry in &registry.skills {
+                    targets.insert(entry.id.clone(), PathBuf::from(&entry.source));
+                }
+            }
+            Err(err) => {
+                tracing::debug!(
+                    actor = %state.actor_id,
+                    thread = %tid,
+                    %err,
+                    "thread skill registry unavailable"
+                );
+            }
+        }
+    }
+
     targets
 }
 

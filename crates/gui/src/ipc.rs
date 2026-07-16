@@ -3152,6 +3152,289 @@ fn slugify(value: &str) -> String {
     }
 }
 
+// ---- channel/thread instructions (JSON-RPC server handler passthrough) ----
+
+#[tauri::command]
+pub async fn channel_set_instruction(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::CHANNEL_SET_INSTRUCTION, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn channel_get_instruction(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::CHANNEL_GET_INSTRUCTION, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn channel_clear_instruction(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::CHANNEL_CLEAR_INSTRUCTION, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn thread_set_instruction(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::THREAD_SET_INSTRUCTION, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn thread_get_instruction(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::THREAD_GET_INSTRUCTION, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn thread_clear_instruction(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::THREAD_CLEAR_INSTRUCTION, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+// ---- channel/thread skills (local file I/O, same path/format as CLI) ----
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillEntryDto {
+    pub id: String,
+    pub source: String,
+    pub added_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SkillRegistryDto {
+    pub skills: Vec<SkillEntryDto>,
+}
+
+/// Resolve the agent data root using the same logic as the CLI
+/// `default_data_root()`: honor `LOOM_AGENT_DATA_ROOT` if set, otherwise fall
+/// back to `<data_dir>/loom/agents`.
+fn agent_data_root() -> Result<PathBuf, String> {
+    if let Ok(s) = std::env::var("LOOM_AGENT_DATA_ROOT") {
+        if !s.is_empty() {
+            return Ok(PathBuf::from(s));
+        }
+    }
+    dirs::data_dir()
+        .map(|d| d.join("loom").join("agents"))
+        .ok_or_else(|| "cannot determine agent data root".to_string())
+}
+
+fn read_skill_registry(path: &Path) -> Result<SkillRegistryDto, String> {
+    match fs::read_to_string(path) {
+        Ok(text) => {
+            let reg: SkillRegistryDto = serde_json::from_str(&text)
+                .map_err(|e| format!("parse skill registry: {e}"))?;
+            Ok(reg)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(SkillRegistryDto { skills: vec![] }),
+        Err(e) => Err(format!("read skill registry: {e}")),
+    }
+}
+
+fn write_skill_registry(path: &Path, reg: &SkillRegistryDto) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create skill registry dir: {e}"))?;
+    }
+    let text =
+        serde_json::to_string_pretty(reg).map_err(|e| format!("serialize skill registry: {e}"))?;
+    fs::write(path, text).map_err(|e| format!("write skill registry: {e}"))
+}
+
+fn now_iso() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+fn derive_skill_id(source: &str) -> String {
+    Path::new(source)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("skill")
+        .to_string()
+}
+
+// --- Channel skills ---
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelSkillListArgs {
+    pub channel_id: String,
+}
+
+#[tauri::command]
+pub async fn channel_skill_list(args: ChannelSkillListArgs) -> Result<SkillRegistryDto, String> {
+    let data_root = agent_data_root()?;
+    let path = data_root
+        .join("channels")
+        .join(&args.channel_id)
+        .join("channel-skills.json");
+    read_skill_registry(&path)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelSkillAddArgs {
+    pub channel_id: String,
+    pub source: String,
+    #[serde(default)]
+    pub skill_id: Option<String>,
+}
+
+#[tauri::command]
+pub async fn channel_skill_add(args: ChannelSkillAddArgs) -> Result<SkillRegistryDto, String> {
+    let data_root = agent_data_root()?;
+    let path = data_root
+        .join("channels")
+        .join(&args.channel_id)
+        .join("channel-skills.json");
+    let id = args.skill_id.unwrap_or_else(|| derive_skill_id(&args.source));
+    let mut reg = read_skill_registry(&path)?;
+    reg.skills.retain(|s| s.id != id);
+    reg.skills.push(SkillEntryDto {
+        id: id.clone(),
+        source: args.source,
+        added_at: now_iso(),
+    });
+    write_skill_registry(&path, &reg)?;
+    Ok(reg)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelSkillRemoveArgs {
+    pub channel_id: String,
+    pub skill_id: String,
+}
+
+#[tauri::command]
+pub async fn channel_skill_remove(args: ChannelSkillRemoveArgs) -> Result<SkillRegistryDto, String> {
+    let data_root = agent_data_root()?;
+    let path = data_root
+        .join("channels")
+        .join(&args.channel_id)
+        .join("channel-skills.json");
+    let mut reg = read_skill_registry(&path)?;
+    reg.skills.retain(|s| s.id != args.skill_id);
+    write_skill_registry(&path, &reg)?;
+    Ok(reg)
+}
+
+// --- Thread skills ---
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadSkillListArgs {
+    pub channel_id: String,
+    pub thread_id: String,
+}
+
+#[tauri::command]
+pub async fn thread_skill_list(args: ThreadSkillListArgs) -> Result<SkillRegistryDto, String> {
+    let data_root = agent_data_root()?;
+    let path = data_root
+        .join("channels")
+        .join(&args.channel_id)
+        .join("threads")
+        .join(&args.thread_id)
+        .join("thread-skills.json");
+    read_skill_registry(&path)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadSkillAddArgs {
+    pub channel_id: String,
+    pub thread_id: String,
+    pub source: String,
+    #[serde(default)]
+    pub skill_id: Option<String>,
+}
+
+#[tauri::command]
+pub async fn thread_skill_add(args: ThreadSkillAddArgs) -> Result<SkillRegistryDto, String> {
+    let data_root = agent_data_root()?;
+    let path = data_root
+        .join("channels")
+        .join(&args.channel_id)
+        .join("threads")
+        .join(&args.thread_id)
+        .join("thread-skills.json");
+    let id = args.skill_id.unwrap_or_else(|| derive_skill_id(&args.source));
+    let mut reg = read_skill_registry(&path)?;
+    reg.skills.retain(|s| s.id != id);
+    reg.skills.push(SkillEntryDto {
+        id: id.clone(),
+        source: args.source,
+        added_at: now_iso(),
+    });
+    write_skill_registry(&path, &reg)?;
+    Ok(reg)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadSkillRemoveArgs {
+    pub channel_id: String,
+    pub thread_id: String,
+    pub skill_id: String,
+}
+
+#[tauri::command]
+pub async fn thread_skill_remove(args: ThreadSkillRemoveArgs) -> Result<SkillRegistryDto, String> {
+    let data_root = agent_data_root()?;
+    let path = data_root
+        .join("channels")
+        .join(&args.channel_id)
+        .join("threads")
+        .join(&args.thread_id)
+        .join("thread-skills.json");
+    let mut reg = read_skill_registry(&path)?;
+    reg.skills.retain(|s| s.id != args.skill_id);
+    write_skill_registry(&path, &reg)?;
+    Ok(reg)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

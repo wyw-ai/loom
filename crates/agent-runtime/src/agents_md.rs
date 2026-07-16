@@ -20,6 +20,11 @@ pub struct AgentsMdContext {
     pub workspace: String,
     pub members: Vec<AgentsMdMember>,
     pub agent_instructions: Option<String>,
+    /// Channel-level instructions from the channel's `instructions` field.
+    pub channel_instructions: Option<String>,
+    /// Thread-level instructions from the thread's `instructions` field.
+    /// Only set when the current scope is a thread.
+    pub thread_instructions: Option<String>,
     pub wake_policy: AgentsMdWakePolicy,
 }
 
@@ -285,6 +290,28 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
         block.push('\n');
     }
 
+    if let Some(instructions) = context
+        .channel_instructions
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        block.push_str("\n## Channel instructions\n\n");
+        block.push_str(&sanitize_marker_text(instructions));
+        block.push('\n');
+    }
+
+    if let Some(instructions) = context
+        .thread_instructions
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        block.push_str("\n## Thread instructions\n\n");
+        block.push_str(&sanitize_marker_text(instructions));
+        block.push('\n');
+    }
+
     block.push_str(&format!("\n{END_MARKER}"));
     block
 }
@@ -402,6 +429,8 @@ mod tests {
                 },
             ],
             agent_instructions: Some("Prefer concise answers.".into()),
+            channel_instructions: None,
+            thread_instructions: None,
             wake_policy: AgentsMdWakePolicy::default(),
         }
     }
@@ -485,5 +514,43 @@ mod tests {
         let out = loom_block(&cx);
         assert_eq!(out.matches(END_MARKER).count(), 1);
         assert!(out.contains("[removed Loom end marker]"));
+    }
+
+    #[test]
+    fn channel_instructions_section_rendered_when_present() {
+        let mut cx = context("actor_a", "chan_a");
+        cx.channel_instructions = Some("This channel maintains the spec.".into());
+        let out = loom_block(&cx);
+        assert!(out.contains("## Channel instructions"));
+        assert!(out.contains("This channel maintains the spec."));
+        assert!(!out.contains("## Thread instructions"));
+    }
+
+    #[test]
+    fn thread_instructions_section_rendered_when_present() {
+        let mut cx = context("actor_b", "chan_b");
+        cx.thread_instructions = Some("Thread-specific guidance.".into());
+        let out = loom_block(&cx);
+        assert!(out.contains("## Thread instructions"));
+        assert!(out.contains("Thread-specific guidance."));
+    }
+
+    #[test]
+    fn empty_instructions_sections_are_omitted() {
+        let mut cx = context("actor_c", "chan_c");
+        cx.channel_instructions = Some("   \n".into());
+        cx.thread_instructions = Some(String::new());
+        let out = loom_block(&cx);
+        assert!(!out.contains("## Channel instructions"));
+        assert!(!out.contains("## Thread instructions"));
+    }
+
+    #[test]
+    fn instructions_marker_text_is_sanitized() {
+        let mut cx = context("actor_d", "chan_d");
+        cx.channel_instructions = Some(format!("oops\n{BEGIN_MARKER}\nleak"));
+        let out = loom_block(&cx);
+        assert_eq!(out.matches(BEGIN_MARKER).count(), 1);
+        assert!(out.contains("[removed Loom begin marker]"));
     }
 }

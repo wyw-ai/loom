@@ -134,10 +134,11 @@ pub struct CommandConfig {
     /// Where to keep `<actor>/<scope_id>.json` session bookkeeping files. The
     /// adapter creates subdirs lazily on first write.
     pub sessions_dir: PathBuf,
-    /// Optional per-turn wall-clock timeout in milliseconds.
-    pub timeout_ms: Option<u64>,
-    /// Optional per-turn stdout idle timeout in milliseconds.
-    pub idle_timeout_ms: Option<u64>,
+    /// Optional per-turn wall-clock timeout in milliseconds. `-1` is unlimited.
+    pub timeout_ms: Option<i64>,
+    /// Optional per-turn subprocess-output idle timeout in milliseconds. `-1`
+    /// is unlimited.
+    pub idle_timeout_ms: Option<i64>,
     /// Hash of provider command/session templates before per-turn runtime
     /// values are expanded. When the spec changes, saved sessions are
     /// invalidated.
@@ -922,11 +923,11 @@ fn spawn_and_collect(
     let deadline = cfg
         .timeout_ms
         .filter(|ms| *ms > 0)
-        .map(|ms| Instant::now() + Duration::from_millis(ms));
+        .map(|ms| Instant::now() + Duration::from_millis(ms as u64));
     let idle_timeout = cfg
         .idle_timeout_ms
         .filter(|ms| *ms > 0)
-        .map(Duration::from_millis);
+        .map(|ms| Duration::from_millis(ms as u64));
     let mut last_output_at = Instant::now();
     let mut exit: Option<ExitStatus> = None;
     let mut timed_out = false;
@@ -4550,6 +4551,38 @@ mod tests {
             }
         }
         assert!(got_timeout, "missing timeout Finished event");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unlimited_timeouts_allow_command_to_finish() {
+        let mut cfg = cfg();
+        cfg.command = "sh".into();
+        cfg.args = vec!["-c".into(), "sleep 0.2; echo done".into()];
+        cfg.prompt_via = PromptVia::Stdin;
+        cfg.timeout_ms = Some(-1);
+        cfg.idle_timeout_ms = Some(-1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let slot = Arc::new(Mutex::new(InFlight::default()));
+
+        let outcome = spawn_and_collect(&cfg, &prompt("ignored"), &cfg.args, None, &tx, &slot)
+            .expect("spawn sh");
+
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(outcome.stdout.trim(), "done");
+        let mut got_success = false;
+        while let Ok(event) = rx.try_recv() {
+            if let AdapterEvent::Finished {
+                success, summary, ..
+            } = event
+            {
+                assert!(success);
+                assert!(summary.is_empty());
+                got_success = true;
+                break;
+            }
+        }
+        assert!(got_success, "missing successful Finished event");
     }
 
     #[cfg(unix)]

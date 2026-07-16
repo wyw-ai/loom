@@ -1,10 +1,10 @@
-import { useCallback, useMemo } from "react";
+import { useCallback, useMemo, useState } from "react";
 import type { Actor, Channel, MachineInfo, Message, Run, Task, Thread } from "@/ipc/types";
 import { isHiddenProtocolMessage } from "@/lib/message-utils";
 import { groupMessagesByDate } from "@/lib/message-utils";
 import { displayName } from "@/lib/format-utils";
 import { cn } from "@/lib/utils";
-import { X, Split, MessageSquare } from "lucide-react";
+import { X, Split, MessageSquare, Settings } from "lucide-react";
 import { EmptyState } from "@/components/shared/EmptyState";
 import { MutedLine } from "@/components/shared/MutedLine";
 import { TaskStateBadge } from "@/components/chat/TaskStateBadge";
@@ -12,6 +12,8 @@ import { ThreadConversationMessage } from "@/components/chat/ThreadConversationM
 import { ThreadComposer } from "@/components/chat/ThreadComposer";
 import { ScopeTokenSummary } from "@/components/layout/ScopeTokenSummary";
 import { FeedScrollManager } from "@/components/chat/FeedScrollManager";
+import { InstructionsSection } from "@/components/panels/InstructionsSection";
+import { SkillsSection } from "@/components/panels/SkillsSection";
 import type { FeedItem } from "@/components/chat/MessageFeed";
 
 type ReplyItem = FeedItem;
@@ -63,6 +65,7 @@ export function ThreadPanel({
     ? channelMessages.find((message) => message.id === thread.rootMessageId) ?? null
     : null;
   const starter = rootMessage ? actors[rootMessage.authorActorId] : undefined;
+  const [showConfig, setShowConfig] = useState(false);
 
   const replyMessages = useMemo(
     () =>
@@ -179,12 +182,42 @@ export function ThreadPanel({
           <div className="flex items-center gap-1">
             {/* L1/L2 thread token summary (AC-T2) — silent-hidden when null */}
             <ScopeTokenSummary scopeId={scopeId} actors={actors} />
+            {thread && (
+              <button
+                className={cn("composer-icon", showConfig && "border-[#bdb7ff] bg-[#f1efff] text-[#5843d7]")}
+                type="button"
+                title="Configure thread"
+                aria-label="Configure"
+                aria-pressed={showConfig}
+                onClick={() => setShowConfig(!showConfig)}
+              >
+                <Settings size={16} />
+              </button>
+            )}
             <button className="composer-icon" type="button" title="Close" onClick={onClose}>
               <X size={16} />
             </button>
           </div>
         </div>
       </div>
+
+      {/* Thread configure — inline collapsible area */}
+      {showConfig && thread && channel && (
+        <div className="max-h-[40vh] shrink-0 overflow-y-auto border-b border-[#edf0f5] bg-[#fbfbfd] px-5 py-4 soft-scrollbar">
+          <div className="space-y-6">
+            <InstructionsSection
+              scope="thread"
+              scopeId={thread.id}
+              channelId={channel.id}
+            />
+            <SkillsSection
+              scope="thread"
+              channelId={channel.id}
+              threadId={thread.id}
+            />
+          </div>
+        </div>
+      )}
 
       {/* Body — root message header + virtualized replies via FeedScrollManager */}
       {!thread ? (

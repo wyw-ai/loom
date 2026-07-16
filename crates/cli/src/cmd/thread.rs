@@ -243,6 +243,94 @@ pub async fn clear_instruction(client: Arc<Client>, thread_id: String) -> Result
     Ok(())
 }
 
+// -----------------------------------------------------------------
+// Thread skill management (file-based registry, agent data root)
+// -----------------------------------------------------------------
+
+/// Resolve the channel_id for a thread via THREAD_LIST.
+async fn resolve_channel_id(client: &Arc<Client>, thread_id: &str) -> Result<String> {
+    let res: ThreadListResult = client
+        .call(method::THREAD_LIST, json!({}))
+        .await
+        .context("thread.list")?;
+    let thread = res
+        .threads
+        .into_iter()
+        .find(|t| t.id == thread_id)
+        .ok_or_else(|| anyhow!("thread {thread_id} not found"))?;
+    Ok(thread.channel_id)
+}
+
+pub async fn skill_add(
+    client: Arc<Client>,
+    thread_id: String,
+    source: String,
+    skill_id: Option<String>,
+) -> Result<()> {
+    let channel_id = resolve_channel_id(&client, &thread_id).await?;
+    let data_root = crate::cmd::agent_serve::default_data_root_pub();
+    let id = skill_id.unwrap_or_else(|| {
+        std::path::Path::new(&source)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("skill")
+            .to_string()
+    });
+    let registry = super::skill_registry::add_thread_skill(
+        &data_root,
+        &channel_id,
+        &thread_id,
+        id.clone(),
+        source.clone(),
+    )
+    .map_err(|err| anyhow!("write thread skill registry: {err}"))?;
+    if render::is_json() {
+        render::print_json(&registry);
+    } else {
+        println!("skill '{id}' added to thread {thread_id}");
+    }
+    Ok(())
+}
+
+pub async fn skill_remove(client: Arc<Client>, thread_id: String, skill_id: String) -> Result<()> {
+    let channel_id = resolve_channel_id(&client, &thread_id).await?;
+    let data_root = crate::cmd::agent_serve::default_data_root_pub();
+    let (registry, removed) = super::skill_registry::remove_thread_skill(
+        &data_root,
+        &channel_id,
+        &thread_id,
+        &skill_id,
+    )
+    .map_err(|err| anyhow!("read/remove thread skill registry: {err}"))?;
+    if render::is_json() {
+        render::print_json(&registry);
+    } else if removed {
+        println!("skill '{skill_id}' removed from thread {thread_id}");
+    } else {
+        println!(
+            "skill '{skill_id}' was not registered in thread {thread_id}"
+        );
+    }
+    Ok(())
+}
+
+pub async fn skill_list(client: Arc<Client>, thread_id: String) -> Result<()> {
+    let channel_id = resolve_channel_id(&client, &thread_id).await?;
+    let data_root = crate::cmd::agent_serve::default_data_root_pub();
+    let registry = super::skill_registry::read_thread_skills(&data_root, &channel_id, &thread_id)
+        .map_err(|err| anyhow!("read thread skill registry: {err}"))?;
+    if render::is_json() {
+        render::print_json(&registry);
+    } else if registry.skills.is_empty() {
+        println!("(no skills registered for thread {thread_id})");
+    } else {
+        for entry in &registry.skills {
+            println!("{:<20} {}", entry.id, entry.source);
+        }
+    }
+    Ok(())
+}
+
 /// `loom thread bootstrap --in <thread_id> --channel <chan> --bootstrap-artifact <uri>`.
 ///
 /// Bootstrap an *existing* thread from a clone-manifest / mounts artifact.

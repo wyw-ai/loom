@@ -93,6 +93,8 @@ export const defaultProviderManifestText = JSON.stringify(
         stdout: {
           format: "text",
         },
+        timeoutMs: -1,
+        idleTimeoutMs: -1,
       },
     },
     models: {

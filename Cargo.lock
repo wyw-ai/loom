@@ -2512,6 +2512,7 @@ version = "0.1.0"
 dependencies = [
  "agent-runtime",
  "anyhow",
+ "chrono",
  "dirs 5.0.1",
  "futures-util",
  "loom-platform",

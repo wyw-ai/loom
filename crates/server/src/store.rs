@@ -249,6 +249,7 @@ impl Store {
             topic,
             visibility,
             members,
+            instructions: None,
             _meta: None,
         };
         self.journal
@@ -712,6 +713,35 @@ impl Store {
         Ok(updated)
     }
 
+    /// Set or replace the channel-level `instructions`. Pass `None` (or an
+    /// empty string, which is normalized to `None`) to clear.
+    pub fn set_channel_instructions(
+        &self,
+        id: &str,
+        instructions: Option<String>,
+    ) -> StoreResult<Channel> {
+        if self.get_channel(id).is_none() {
+            return Err(StoreError::NotFound(format!("channel {id}")));
+        }
+        let normalized = instructions
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self.journal.append(&Mutation::ChannelInstructionSet {
+            channel_id: id.to_string(),
+            instructions: normalized.clone(),
+        })?;
+        let mut inner = self.inner.write();
+        let ch = inner
+            .channels
+            .get_mut(id)
+            .ok_or_else(|| StoreError::NotFound(format!("channel {id}")))?;
+        ch.instructions = normalized;
+        let updated = ch.clone();
+        drop(inner);
+        self.emit(StoreEvent::ChannelUpdated(updated.clone()));
+        Ok(updated)
+    }
+
     /// Default (`cascade = false`) refuses when the channel still contains
     /// threads — caller must delete children first. With `cascade = true`,
     /// every child thread is deleted (via the existing `delete_thread` path
@@ -822,6 +852,7 @@ impl Store {
             channel_id,
             title,
             root_message_id,
+            instructions: None,
             archived_at: None,
             _meta: None,
         };
@@ -926,6 +957,35 @@ impl Store {
             .get_mut(id)
             .ok_or_else(|| StoreError::NotFound(format!("thread {id}")))?;
         t.archived_at = archived_at;
+        let thread = t.clone();
+        drop(inner);
+        self.emit(StoreEvent::ThreadUpdated(thread.clone()));
+        Ok(thread)
+    }
+
+    /// Set or replace the thread-level `instructions`. Pass `None` (or an
+    /// empty string, which is normalized to `None`) to clear.
+    pub fn set_thread_instructions(
+        &self,
+        id: &str,
+        instructions: Option<String>,
+    ) -> StoreResult<Thread> {
+        if self.get_thread(id).is_none() {
+            return Err(StoreError::NotFound(format!("thread {id}")));
+        }
+        let normalized = instructions
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self.journal.append(&Mutation::ThreadInstructionSet {
+            thread_id: id.to_string(),
+            instructions: normalized.clone(),
+        })?;
+        let mut inner = self.inner.write();
+        let t = inner
+            .threads
+            .get_mut(id)
+            .ok_or_else(|| StoreError::NotFound(format!("thread {id}")))?;
+        t.instructions = normalized;
         let thread = t.clone();
         drop(inner);
         self.emit(StoreEvent::ThreadUpdated(thread.clone()));
@@ -4056,6 +4116,7 @@ impl Store {
             channel_id: channel_id.to_string(),
             title: format!("thread {root_message_id}"),
             root_message_id: root_message_id.to_string(),
+            instructions: None,
             archived_at: None,
             _meta: None,
         };
@@ -4079,6 +4140,7 @@ impl Store {
             topic: String::new(),
             visibility: ChannelVisibility::Private,
             members: vec![actor_id.to_string(), peer.to_string()],
+            instructions: None,
             _meta: None,
         };
         self.journal
@@ -5255,6 +5317,14 @@ fn apply(inner: &mut Inner, m: Mutation) {
                 }
             }
         }
+        Mutation::ChannelInstructionSet {
+            channel_id,
+            instructions,
+        } => {
+            if let Some(c) = inner.channels.get_mut(&channel_id) {
+                c.instructions = instructions;
+            }
+        }
         Mutation::ChannelDelete { channel_id } => {
             inner.channels.remove(&channel_id);
             inner
@@ -5312,6 +5382,14 @@ fn apply(inner: &mut Inner, m: Mutation) {
             inner
                 .assignments
                 .retain(|_, assignment| !task_ids.contains(&assignment.task_id));
+        }
+        Mutation::ThreadInstructionSet {
+            thread_id,
+            instructions,
+        } => {
+            if let Some(t) = inner.threads.get_mut(&thread_id) {
+                t.instructions = instructions;
+            }
         }
         Mutation::ChannelGrant {
             channel_id,
@@ -7360,6 +7438,64 @@ mod tests {
         let store2 = Store::open(journal).unwrap();
         assert_eq!(store2.get_channel(&ch.id).unwrap().title, "renamed");
         assert_eq!(store2.get_channel(&ch.id).unwrap().topic, "project notes");
+    }
+
+    #[test]
+    fn channel_instructions_round_trip_and_replay() {
+        let store = fresh_store();
+        let ch = store
+            .create_channel("instr chan".into(), None)
+            .expect("create channel");
+        assert!(store.get_channel(&ch.id).unwrap().instructions.is_none());
+
+        let set = store
+            .set_channel_instructions(&ch.id, Some("channel rules".into()))
+            .expect("set instructions");
+        assert_eq!(set.instructions.as_deref(), Some("channel rules"));
+        assert_eq!(
+            store.get_channel(&ch.id).unwrap().instructions.as_deref(),
+            Some("channel rules")
+        );
+
+        // Empty string normalizes to None (clear).
+        let cleared = store
+            .set_channel_instructions(&ch.id, Some("  ".into()))
+            .expect("clear instructions");
+        assert!(cleared.instructions.is_none());
+
+        // Re-open from journal: the last (cleared) state must replay.
+        let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
+        let store2 = Store::open(journal).unwrap();
+        assert!(store2.get_channel(&ch.id).unwrap().instructions.is_none());
+
+        // Re-set on the replayed store and verify it persists again.
+        let _ = store2
+            .set_channel_instructions(&ch.id, Some("after replay".into()))
+            .expect("set after replay");
+        assert_eq!(
+            store2.get_channel(&ch.id).unwrap().instructions.as_deref(),
+            Some("after replay")
+        );
+    }
+
+    #[test]
+    fn thread_instructions_round_trip_and_replay() {
+        let store = fresh_store();
+        let ch = store.create_channel("th chan".into(), None).expect("create channel");
+        let thread = create_thread_under(&store, &ch.id, "actor_owner", "root_msg");
+        assert!(store.get_thread(&thread.id).unwrap().instructions.is_none());
+
+        let set = store
+            .set_thread_instructions(&thread.id, Some("thread guide".into()))
+            .expect("set thread instructions");
+        assert_eq!(set.instructions.as_deref(), Some("thread guide"));
+
+        let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
+        let store2 = Store::open(journal).unwrap();
+        assert_eq!(
+            store2.get_thread(&thread.id).unwrap().instructions.as_deref(),
+            Some("thread guide")
+        );
     }
 
     #[test]

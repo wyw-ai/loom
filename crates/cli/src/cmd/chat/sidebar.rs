@@ -665,6 +665,7 @@ mod tests {
             topic: String::new(),
             visibility: ChannelVisibility::Public,
             members: Vec::new(),
+            instructions: None,
             _meta: None,
         }
     }
@@ -674,6 +675,7 @@ mod tests {
             channel_id: channel_id.into(),
             title: title.into(),
             root_message_id: format!("evt_root_{id}"),
+            instructions: None,
             archived_at: None,
             _meta: None,
         }

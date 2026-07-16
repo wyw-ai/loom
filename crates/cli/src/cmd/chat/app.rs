@@ -863,6 +863,7 @@ mod tests {
                 topic: String::new(),
                 visibility: ChannelVisibility::Private,
                 members: vec!["actor_human_current".into(), "actor_agent_alpha".into()],
+                instructions: None,
                 _meta: None,
             },
             Channel {
@@ -871,6 +872,7 @@ mod tests {
                 topic: String::new(),
                 visibility: ChannelVisibility::Public,
                 members: vec!["actor_agent_gamma".into()],
+                instructions: None,
                 _meta: None,
             },
         ]);
@@ -881,6 +883,7 @@ mod tests {
                 channel_id: "ch_design".into(),
                 title: "demo".into(),
                 root_message_id: "evt_root".into(),
+                instructions: None,
                 archived_at: None,
                 _meta: None,
             }],
@@ -928,6 +931,7 @@ mod tests {
             topic: String::new(),
             visibility: ChannelVisibility::Public,
             members: vec![],
+            instructions: None,
             _meta: None,
         }]);
         sidebar.replace_threads(
@@ -937,6 +941,7 @@ mod tests {
                 channel_id: "ch_lobby".into(),
                 title: "demo".into(),
                 root_message_id: "evt_root".into(),
+                instructions: None,
                 archived_at: None,
                 _meta: None,
             }],

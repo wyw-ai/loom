@@ -217,3 +217,57 @@ pub async fn member_config_clear(
     }
     Ok(())
 }
+
+pub async fn set_instruction(
+    client: Arc<Client>,
+    channel_id: String,
+    instructions: String,
+) -> Result<()> {
+    let res: ChannelSetInstructionResult = client
+        .call(
+            method::CHANNEL_SET_INSTRUCTION,
+            json!({ "channelId": channel_id, "instructions": instructions }),
+        )
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+    } else {
+        println!("instructions set for channel {}", res.channel.id);
+    }
+    Ok(())
+}
+
+pub async fn get_instruction(client: Arc<Client>, channel_id: String) -> Result<()> {
+    let res: ChannelGetInstructionResult = client
+        .call(
+            method::CHANNEL_GET_INSTRUCTION,
+            json!({ "channelId": channel_id }),
+        )
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+        return Ok(());
+    }
+    match res.instructions {
+        Some(instructions) => println!("{}", instructions),
+        None => println!("(none)"),
+    }
+    Ok(())
+}
+
+pub async fn clear_instruction(client: Arc<Client>, channel_id: String) -> Result<()> {
+    let res: ChannelClearInstructionResult = client
+        .call(
+            method::CHANNEL_CLEAR_INSTRUCTION,
+            json!({ "channelId": channel_id }),
+        )
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+    } else if res.cleared {
+        println!("channel instructions cleared");
+    } else {
+        println!("channel instructions were already empty");
+    }
+    Ok(())
+}

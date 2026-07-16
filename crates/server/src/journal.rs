@@ -74,6 +74,12 @@ pub enum Mutation {
     ChannelDelete {
         channel_id: String,
     },
+    /// Set or replace the channel-level `instructions`. Idempotent on replay.
+    ChannelInstructionSet {
+        channel_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instructions: Option<String>,
+    },
     ThreadUpdate {
         thread_id: String,
         title: String,
@@ -84,6 +90,12 @@ pub enum Mutation {
     },
     ThreadDelete {
         thread_id: String,
+    },
+    /// Set or replace the thread-level `instructions`. Idempotent on replay.
+    ThreadInstructionSet {
+        thread_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instructions: Option<String>,
     },
     /// Add `actor_id` to `channel_id`'s member set. Idempotent on replay.
     ChannelGrant {

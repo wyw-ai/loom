@@ -871,6 +871,7 @@ mod tests {
                 channel_id: "chan_1".into(),
                 title: "topic".into(),
                 root_message_id: "msg_root".into(),
+                instructions: None,
                 archived_at: None,
                 _meta: None,
             }],

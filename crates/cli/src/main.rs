@@ -1,10 +1,29 @@
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use loom_cli::client::Client;
 use loom_cli::render::OutputMode;
 use loom_cli::{cmd, config, daemon_ipc, render};
+
+/// Resolve the instruction payload for `set-instruction` CLI commands.
+/// Exactly one of `file` or `text` must be provided.
+fn read_instruction_payload(file: Option<String>, text: Option<String>) -> Result<String> {
+    match (file, text) {
+        (Some(path), None) => {
+            let body = std::fs::read_to_string(&path)
+                .with_context(|| format!("read instruction file {path}"))?;
+            Ok(body)
+        }
+        (None, Some(value)) => Ok(value),
+        (Some(_), Some(_)) => Err(anyhow!(
+            "pass either --file or --text to set-instruction, not both"
+        )),
+        (None, None) => Err(anyhow!(
+            "set-instruction requires either --file or --text"
+        )),
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "loom", about = "Loom multi-actor collaboration CLI")]
@@ -600,6 +619,22 @@ enum ChannelCmd {
         channel_id: String,
         actor_id: String,
     },
+    /// Set the channel-level instructions projected into every member
+    /// agent's AGENTS.md. Use `--file` to load from a path or `--text`
+    /// for an inline value. Instructions are free-text with no size
+    /// limit; common uses include shared context, conventions, or
+    /// references to external shared layers (e.g. Obsidian vault paths).
+    SetInstruction {
+        channel_id: String,
+        #[arg(long, conflicts_with = "text")]
+        file: Option<String>,
+        #[arg(long, conflicts_with = "file")]
+        text: Option<String>,
+    },
+    /// Print the channel-level instructions (or "(none)").
+    GetInstruction { channel_id: String },
+    /// Clear the channel-level instructions.
+    ClearInstruction { channel_id: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -653,6 +688,22 @@ enum ThreadCmd {
     },
     /// Stop following a thread.
     Unfollow { thread_id: String },
+    /// Set the thread-level instructions appended to AGENTS.md in this
+    /// thread's scope. Use `--file` to load from a path or `--text` for
+    /// an inline value. Instructions are free-text with no size limit;
+    /// thread instructions override channel instructions for threads
+    /// that set them.
+    SetInstruction {
+        thread_id: String,
+        #[arg(long, conflicts_with = "text")]
+        file: Option<String>,
+        #[arg(long, conflicts_with = "file")]
+        text: Option<String>,
+    },
+    /// Print the thread-level instructions (or "(none)").
+    GetInstruction { thread_id: String },
+    /// Clear the thread-level instructions.
+    ClearInstruction { thread_id: String },
     /// Bootstrap an *existing* thread from a clone-manifest (or explicit
     /// mounts) artifact. Used when an already-open thread (e.g. a
     /// bug-fix loop's bugfix thread) needs target/reference repo
@@ -2068,6 +2119,20 @@ async fn async_main() -> Result<()> {
                 channel_id,
                 actor_id,
             } => cmd::channel::member_config_clear(client, channel_id, actor_id).await?,
+            ChannelCmd::SetInstruction {
+                channel_id,
+                file,
+                text,
+            } => {
+                let instructions = read_instruction_payload(file, text)?;
+                cmd::channel::set_instruction(client, channel_id, instructions).await?
+            }
+            ChannelCmd::GetInstruction { channel_id } => {
+                cmd::channel::get_instruction(client, channel_id).await?
+            }
+            ChannelCmd::ClearInstruction { channel_id } => {
+                cmd::channel::clear_instruction(client, channel_id).await?
+            }
         },
         Cmd::Thread { sub } => match sub {
             ThreadCmd::Create {
@@ -2109,6 +2174,20 @@ async fn async_main() -> Result<()> {
                 channel,
                 bootstrap_artifact,
             } => cmd::thread::bootstrap(client, channel, thread_id, bootstrap_artifact).await?,
+            ThreadCmd::SetInstruction {
+                thread_id,
+                file,
+                text,
+            } => {
+                let instructions = read_instruction_payload(file, text)?;
+                cmd::thread::set_instruction(client, thread_id, instructions).await?
+            }
+            ThreadCmd::GetInstruction { thread_id } => {
+                cmd::thread::get_instruction(client, thread_id).await?
+            }
+            ThreadCmd::ClearInstruction { thread_id } => {
+                cmd::thread::clear_instruction(client, thread_id).await?
+            }
         },
         Cmd::Message { sub } => match sub {
             MessageCmd::Send {

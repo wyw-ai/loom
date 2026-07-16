@@ -718,3 +718,271 @@ read `.agent` files and populate the same registries.
 | Version | Date | Change |
 |---------|------|--------|
 | Phase 2 | 2026-07-17 | Skill mounting: file-based channel/thread skill registries + priority chain + hot-pluggable symlinks + CLI. QA verified PASS on all 8 acceptance criteria. |
+
+---
+
+# Part 3: GUI Integration
+
+> **Commits**: `79b8bc6` (IPC layer), `93b7512` (Channel Configure panel), `710dc08` (Thread Configure panel)
+> **Files changed**: 13 files, +766/-6 lines (7 modified, 3 new components, 3 new/modified IPC modules)
+
+## Overview
+
+The GUI integration brings Channel/Thread Instructions and Skills management
+into the desktop application. Users can now configure scope-level
+instructions and skills directly from the Loom GUI — no CLI required.
+
+The GUI reuses the same backend as the CLI:
+- **Instructions** → JSON-RPC server handlers (same as CLI)
+- **Skills** → local file I/O on the same `channel-skills.json` /
+  `thread-skills.json` registries (same as CLI)
+
+Changes made via GUI are immediately visible to CLI and vice versa.
+
+---
+
+## GUI Entry Points
+
+### Channel Configure Tab
+
+The Channel Panel has four tabs. The **Configure** tab is the 4th tab:
+
+```
+┌──────────────────────────────────────────┐
+│  Channel Panel                           │
+├──────────────────────────────────────────┤
+│  [Threads] [Members] [Tasks] [Configure] │
+│                                   ^^^^^^ │
+│                                   4th tab│
+├──────────────────────────────────────────┤
+│  ┌─ Instructions ──────────────────────┐ │
+│  │  [textarea]                         │ │
+│  │  [Save]  [Clear]                    │ │
+│  └─────────────────────────────────────┘ │
+│  ┌─ Skills ────────────────────────────┐ │
+│  │  skill-id    source-path    [🗑]    │ │
+│  │  ...                                │ │
+│  │  [source path input]                │ │
+│  │  [skill id (optional)] [Add]        │ │
+│  └─────────────────────────────────────┘ │
+└──────────────────────────────────────────┘
+```
+
+**Location**: Open any channel → click the **Configure** tab (gear icon,
+4th position after Threads, Members, Tasks).
+
+### Thread Configure Button
+
+The Thread Panel has a **Settings gear icon** in the thread title bar
+(next to the ScopeTokenSummary and Close button). Clicking it toggles an
+inline collapsible configuration area:
+
+```
+┌──────────────────────────────────────────┐
+│  Thread Title             [📊] [⚙️] [✕]  │
+│                            token  config close│
+├──────────────────────────────────────────┤
+│  ⚙️ Configure (collapsible, max-h 40vh)  │
+│  ┌─ Instructions ──────────────────────┐ │
+│  │  [textarea]                         │ │
+│  │  [Save]  [Clear]                    │ │
+│  └─────────────────────────────────────┘ │
+│  ┌─ Skills ────────────────────────────┐ │
+│  │  ...                                │ │
+│  └─────────────────────────────────────┘ │
+├──────────────────────────────────────────┤
+│  Thread conversation (messages)          │
+└──────────────────────────────────────────┘
+```
+
+**Location**: Open any thread → click the **gear icon** (⚙️) in the
+thread header bar. The config area appears between the header and the
+message body, scrollable up to 40% of viewport height.
+
+---
+
+## Instructions Editing Flow
+
+1. **Open Configure** — Channel: click Configure tab. Thread: click gear icon.
+2. **Edit text** — A multi-line textarea (8 rows, monospace font) shows
+   the current instructions. Edit freely.
+3. **Save** — Click the **Save** button. The text is sent to the server
+   via JSON-RPC (`channel_set_instruction` / `thread_set_instruction`).
+   A green "Saved." confirmation flashes for 2 seconds.
+4. **Clear** — Click the **Clear** button to remove all instructions.
+   This calls `channel_clear_instruction` / `thread_clear_instruction`.
+5. **Immediate effect** — Saved instructions are injected into every
+   agent's AGENTS.md on their next turn. No restart needed.
+
+**Empty state**: When no instructions are set, the textarea shows a
+placeholder: *"Enter instructions for this channel/thread…"* and a hint:
+*"No instructions set. Agents in this {scope} will use only their
+agent-level instructions."*
+
+---
+
+## Skills Management Flow
+
+1. **View list** — The Skills section shows all mounted skills as cards.
+   Each card displays the skill **id** (bold) and **source path**
+   (monospace, truncated).
+2. **Add skill** — Enter the skill source path in the input field
+   (e.g., `C:/path/to/my-skill`). Optionally enter a custom **skill id**
+   in the second field. Click **Add**.
+   - If no id is provided, it is auto-derived from the source path
+     (directory name).
+   - If a skill with the same id already exists, it is replaced (upsert).
+3. **Remove skill** — Click the **trash can icon** (🗑) on any skill card
+   to remove it.
+4. **Immediate effect** — Skill changes write to the local JSON registry
+   file. On the next agent turn, the skill resolution reconciles
+   symlinks automatically. No restart needed.
+
+**Empty state**: When no skills are mounted, a dashed-border box shows:
+*"No skills mounted."*
+
+---
+
+## GUI ↔ CLI Equivalence Table
+
+Every GUI operation has a direct CLI equivalent. Both operate on the
+same backend state.
+
+| GUI Action | Location | CLI Equivalent |
+|------------|----------|----------------|
+| View channel instructions | Channel Configure → Instructions textarea | `loom channel get-instruction <channel_id>` |
+| Set channel instructions | Channel Configure → Instructions → Save | `loom channel set-instruction <channel_id> --text "..."` |
+| Clear channel instructions | Channel Configure → Instructions → Clear | `loom channel clear-instruction <channel_id>` |
+| View thread instructions | Thread gear → Instructions textarea | `loom thread get-instruction <thread_id>` |
+| Set thread instructions | Thread gear → Instructions → Save | `loom thread set-instruction <thread_id> --text "..."` |
+| Clear thread instructions | Thread gear → Instructions → Clear | `loom thread clear-instruction <thread_id>` |
+| List channel skills | Channel Configure → Skills list | `loom channel skill list <channel_id>` |
+| Add channel skill | Channel Configure → Skills → Add | `loom channel skill add <channel_id> <source> [--id <id>]` |
+| Remove channel skill | Channel Configure → Skills → 🗑 | `loom channel skill remove <channel_id> <skill_id>` |
+| List thread skills | Thread gear → Skills list | `loom thread skill list <thread_id>` |
+| Add thread skill | Thread gear → Skills → Add | `loom thread skill add <thread_id> <source> [--id <id>]` |
+| Remove thread skill | Thread gear → Skills → 🗑 | `loom thread skill remove <thread_id> <skill_id>` |
+
+---
+
+## Permission Model
+
+### Instructions (server-enforced)
+
+All instruction operations (get/set/clear) are routed through the Loom
+server's JSON-RPC handlers. The server enforces **channel membership
+gating**:
+
+- `channel_set_instruction` — caller must be a member of the channel
+- `channel_get_instruction` — caller must be a member of the channel
+- `channel_clear_instruction` — caller must be a member of the channel
+- `thread_set_instruction` — caller must be a member of the thread's
+  parent channel
+- `thread_get_instruction` — caller must be a member of the thread's
+  parent channel
+- `thread_clear_instruction` — caller must be a member of the thread's
+  parent channel
+
+Non-members receive an `APP_INVALID_STATE` error. **All channel members
+can view and edit instructions** — there is no per-role restriction
+beyond membership.
+
+### Skills (local file I/O, no server gating)
+
+Skill operations read/write the local JSON registry files directly
+(`channel-skills.json` / `thread-skills.json` in the agent data root).
+There is **no server-side membership check** for skill operations —
+anyone with local filesystem access to the agent data root can modify
+the registries. This matches the CLI behavior (skills are also pure
+local file I/O in the CLI).
+
+---
+
+## Technical Architecture
+
+### IPC Layer (commit 79b8bc6)
+
+The Tauri IPC layer bridges the React frontend to the Rust backend:
+
+```
+React Component
+    ↓ ipc.bridge TypeScript function
+    ↓ Tauri invoke()
+    ↓ Rust #[tauri::command] handler in crates/gui/src/ipc.rs
+    ↓
+    ├── Instructions → JSON-RPC call to Loom server (call_raw)
+    │   e.g., method::CHANNEL_SET_INSTRUCTION
+    │
+    └── Skills → Direct local file I/O
+        e.g., read_skill_registry() / write_skill_registry()
+```
+
+**Files**:
+- `crates/gui/src/ipc.rs` (+283 lines) — 12 Tauri command handlers
+  (6 instructions + 6 skills), `SkillEntryDto`, `SkillRegistryDto`,
+  `read_skill_registry()`, `write_skill_registry()`,
+  `derive_skill_id()`, `now_iso()` helpers
+- `crates/gui/src/main.rs` (+12 lines) — Command registration in the
+  Tauri builder
+- `apps/gui-web/src/ipc/bridge.ts` (+117 lines) — TypeScript wrapper
+  functions for all 12 IPC commands
+- `apps/gui-web/src/ipc/types.ts` (+6 lines) — `SkillEntry` type
+- `apps/gui-web/src/lib/types.ts` (+2 lines) — `ChannelPanelTab` type
+  gains `"configure"` variant
+- `apps/gui-web/src/lib/agent-utils.ts` (+2 lines) —
+  `channelPanelDetail`/`channelPanelTitle` for configure tab
+
+### Channel Configure Panel (commit 93b7512)
+
+**New components**:
+- `InstructionsSection.tsx` (+130 lines) — Reusable instructions
+  editor (textarea + Save/Clear buttons). Accepts `scope` ("channel" |
+  "thread") and `scopeId`. Used by both Channel and Thread panels.
+- `SkillsSection.tsx` (+153 lines) — Reusable skills manager (list +
+  add form + remove). Accepts `scope`, `channelId`, optional
+  `threadId`. Used by both Channel and Thread panels.
+- `ChannelConfigurePanel.tsx` (+16 lines) — Container that composes
+  `InstructionsSection` + `SkillsSection` for channel scope.
+
+**Modified files**:
+- `ChannelPanels.tsx` (+10 lines) — Adds "configure" tab to the tab
+  array, renders `ChannelConfigurePanel` when selected
+- `ChatHeader.tsx` (+3 lines) — Passes configure tab support
+
+### Thread Configure Panel (commit 710dc08)
+
+**Modified file**:
+- `ThreadPanel.tsx` (+35 lines) — Adds `showConfig` state, a gear-icon
+  toggle button in the thread header, and a collapsible config area
+  that renders `InstructionsSection` (scope="thread") +
+  `SkillsSection` (scope="thread"). The config area is capped at
+  `max-h-[40vh]` with overflow scroll.
+
+### Component Reuse
+
+`InstructionsSection` and `SkillsSection` are **shared components** —
+the same React component renders in both the Channel Configure tab and
+the Thread Configure collapsible. The `scope` prop ("channel" vs
+"thread") determines which IPC functions are called:
+
+```typescript
+// InstructionsSection dispatches based on scope:
+const fn = scope === "channel"
+  ? () => ipc.channelGetInstruction(scopeId)
+  : () => ipc.threadGetInstruction(scopeId);
+
+// SkillsSection dispatches based on scope:
+const res = scope === "channel"
+  ? await ipc.channelSkillList(channelId)
+  : await ipc.threadSkillList({ channelId, threadId: threadId! });
+```
+
+---
+
+## GUI Integration Change Log
+
+| Version | Date | Change |
+|---------|------|--------|
+| GUI Phase 1 | 2026-07-17 | IPC layer: 12 Tauri command handlers bridging React to Rust backend (instructions via JSON-RPC, skills via local file I/O) |
+| GUI Phase 2 | 2026-07-17 | Channel Configure panel: 4th tab in Channel Panel with Instructions + Skills sections |
+| GUI Phase 3 | 2026-07-17 | Thread Configure panel: inline collapsible area toggled by gear icon in thread header |

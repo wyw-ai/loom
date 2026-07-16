@@ -282,6 +282,7 @@ What to edit first:
   5. modes.print.args: the exact argv order for the provider CLI.
   6. models.default / models.choices: values shown in GUI and substituted into "{{model}}".
   7. stdout: how Loom reads agent output. Use "text" for plain stdout, or a provider decoder for JSON/JSONL streams.
+  8. timeoutMs / idleTimeoutMs: -1 means unlimited; a positive integer enables that millisecond limit.
 
 Prompt flow in this template:
   - Loom writes stable actor/channel context and AgentSpec.instructions to {{agent.workspace}}/AGENTS.md.
@@ -360,7 +361,9 @@ fn standard_provider_example() -> Value {
                 ],
                 "stdout": {
                     "format": "text"
-                }
+                },
+                "timeoutMs": -1,
+                "idleTimeoutMs": -1
             }
         },
         "models": {
@@ -699,6 +702,8 @@ mod tests {
             .args
             .iter()
             .any(|arg| matches!(arg, proto::methods::ProviderArgSpec::Literal(value) if value == "{prompt.full}")));
+        assert_eq!(manifest.modes["print"].timeout_ms, Some(-1));
+        assert_eq!(manifest.modes["print"].idle_timeout_ms, Some(-1));
         std::fs::remove_dir_all(config_dir).ok();
     }
 
@@ -713,6 +718,7 @@ mod tests {
         assert!(text.contains("loom.configDir"));
         assert!(text.contains("AgentSpec.promptAssembly"));
         assert!(text.contains("prompt.full"));
+        assert!(text.contains("timeoutMs / idleTimeoutMs: -1 means unlimited"));
         assert!(text.contains("```json"));
         assert!(!text.contains("\"workspaceFiles\""));
     }

@@ -192,6 +192,10 @@ export function ProviderAddDialog({
             className="mt-3 min-h-[360px] rounded-lg border-[#dfe3ec] bg-white font-mono text-xs shadow-none"
             spellCheck={false}
           />
+          <div className="mt-2 text-xs font-medium text-[#667085]">
+            Set timeoutMs or idleTimeoutMs to -1 for unlimited, or use a positive
+            millisecond value to enable that limit.
+          </div>
           {error && (
             <div className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm font-medium text-red-700">
               {error}

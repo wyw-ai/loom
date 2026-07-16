@@ -1150,7 +1150,7 @@ Provider variant，用 `extends` 继承已有 Provider，再覆盖 mode：
 
 | patch 字段 | 合并规则 |
 | --- | --- |
-| `timeoutMs` / `idleTimeoutMs` | 标量覆盖 |
+| `timeoutMs` / `idleTimeoutMs` | 标量覆盖；`-1` 表示永久，正整数表示毫秒限制。两者独立，完全不限制时都设为 `-1` |
 | `env.merge` | 合并到 provider env；同名 key 覆盖 |
 | `env.unset` | 从 provider env 删除指定 key |
 | `args.append` / `args.prepend` | 在 provider args 前后追加；元素使用同一套 argv item schema，适合安全小改动 |

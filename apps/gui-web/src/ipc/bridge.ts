@@ -27,6 +27,7 @@ import type {
   MessageIntent,
   Run,
   ScopeRef,
+  SkillEntry,
   StreamUpdate,
   Task,
   TaskAssignmentType,
@@ -565,4 +566,120 @@ export function onConnection(
     "loom://connection",
     (e) => cb(e.payload),
   );
+}
+
+// ---- channel/thread instructions ----
+
+export async function channelGetInstruction(
+  channelId: string,
+): Promise<{ instructions: string | null }> {
+  return invoke("channel_get_instruction", {
+    params: { channelId },
+  });
+}
+
+export async function channelSetInstruction(params: {
+  channelId: string;
+  instructions: string;
+}): Promise<{ channel: Channel }> {
+  return invoke("channel_set_instruction", { params });
+}
+
+export async function channelClearInstruction(
+  channelId: string,
+): Promise<{ channel: Channel }> {
+  return invoke("channel_clear_instruction", {
+    params: { channelId },
+  });
+}
+
+export async function threadGetInstruction(
+  threadId: string,
+): Promise<{ instructions: string | null }> {
+  return invoke("thread_get_instruction", {
+    params: { threadId },
+  });
+}
+
+export async function threadSetInstruction(params: {
+  threadId: string;
+  instructions: string;
+}): Promise<{ thread: Thread }> {
+  return invoke("thread_set_instruction", { params });
+}
+
+export async function threadClearInstruction(
+  threadId: string,
+): Promise<{ thread: Thread }> {
+  return invoke("thread_clear_instruction", {
+    params: { threadId },
+  });
+}
+
+// ---- channel/thread skills (local file I/O) ----
+
+export async function channelSkillList(
+  channelId: string,
+): Promise<{ skills: SkillEntry[] }> {
+  return invoke("channel_skill_list", { args: { channelId } });
+}
+
+export async function channelSkillAdd(params: {
+  channelId: string;
+  source: string;
+  skillId?: string;
+}): Promise<{ skills: SkillEntry[] }> {
+  return invoke("channel_skill_add", {
+    args: {
+      channelId: params.channelId,
+      source: params.source,
+      ...(params.skillId ? { skillId: params.skillId } : {}),
+    },
+  });
+}
+
+export async function channelSkillRemove(params: {
+  channelId: string;
+  skillId: string;
+}): Promise<{ skills: SkillEntry[] }> {
+  return invoke("channel_skill_remove", {
+    args: { channelId: params.channelId, skillId: params.skillId },
+  });
+}
+
+export async function threadSkillList(params: {
+  channelId: string;
+  threadId: string;
+}): Promise<{ skills: SkillEntry[] }> {
+  return invoke("thread_skill_list", { args: params });
+}
+
+export async function threadSkillAdd(params: {
+  channelId: string;
+  threadId: string;
+  source: string;
+  skillId?: string;
+}): Promise<{ skills: SkillEntry[] }> {
+  return invoke("thread_skill_add", {
+    args: {
+      channelId: params.channelId,
+      threadId: params.threadId,
+      source: params.source,
+      ...(params.skillId ? { skillId: params.skillId } : {}),
+    },
+  });
+}
+
+export async function threadSkillRemove(params: {
+  channelId: string;
+  threadId: string;
+  skillId: string;
+}): Promise<{ skills: SkillEntry[] }> {
+  return invoke("thread_skill_remove", {
+    args: {
+      channelId: params.channelId,
+      threadId: params.threadId,
+      skillId: params.skillId,
+    },
+  });
 }

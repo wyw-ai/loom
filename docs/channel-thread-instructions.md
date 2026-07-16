@@ -1,4 +1,12 @@
-# Channel/Thread Instructions
+# Channel/Thread Instructions & Skill Mounting
+
+> This document covers two related features:
+> - **Phase 1** — Channel/Thread Instructions (prompt-level constraints)
+> - **Phase 2** — Channel/Thread Skill Mounting (hot-pluggable skill registries)
+
+---
+
+# Phase 1: Channel/Thread Instructions
 
 ## Background
 
@@ -359,7 +367,7 @@ soft guideline of ~2KB per instruction layer.
 
 ---
 
-## Known Limitations
+## Phase 1 Known Limitations
 
 1. **No GUI management yet** — instructions can only be set via CLI.
    Future GUI support would add a settings panel for channel/thread
@@ -385,8 +393,328 @@ soft guideline of ~2KB per instruction layer.
 
 ---
 
-## Change Log
+## Phase 1 Change Log
 
 | Version | Date | Change |
 |---------|------|--------|
 | Phase 1 | 2026-07-17 | Initial implementation: channel/thread `instructions` field + AGENTS.md injection + CLI + JSON-RPC + journal persistence. QA verified PASS on all 8 acceptance criteria. |
+
+---
+
+# Phase 2: Channel/Thread Skill Mounting
+
+## Overview
+
+Phase 2 adds **file-based skill registries** for channel and thread
+scopes, enabling hot-pluggable skill mounting. Agents can now discover
+and use skills registered at the channel or thread level, in addition
+to the existing actor-bundle skills.
+
+When an agent starts a turn, the skill resolution process reads the
+channel and thread skill registry files, merges them with actor-bundle
+skills by priority, and reconciles symlinks in the workspace's `skills/`
+directory — all automatically, with no restart needed.
+
+> **Design authority**: ARCH short-term plan Section 3 (`loom-channel-agent-skill-design/ARCH-短期落地方案-channel-agent与skill入口设计.md`)
+> **Norms reference**: STRAT long-term architecture Section 2.3 (`loom-longterm-arch-design/05-workspace-attribute.md`)
+> **Implementation**: commit `132c8de` on branch `feat/channel-thread-instructions`
+
+---
+
+## How It Works
+
+### Skill priority chain
+
+When multiple layers register a skill with the same id, the higher
+priority layer overrides the lower one:
+
+```
+1. Thread skills              (highest — most specific scope)
+2. Channel skills
+3. Actor bundle skills        (per-agent skill bundles)
+4. Default loom skill         (lowest — built-in fallback)
+```
+
+This is implemented via a `BTreeMap<String, PathBuf>` where later
+inserts overwrite earlier ones. The resolution order in
+`current_scope_skill_targets()` is:
+
+1. Actor bundle skills are inserted first
+2. Channel skills are inserted next (overriding same-id actor skills)
+3. Thread skills are inserted last (overriding same-id channel skills)
+
+### Hot-pluggable design
+
+Skill registry changes take effect on the **next agent turn** — no
+restart needed. Here's why:
+
+1. Each turn calls `build_adapter_prompt()` which calls
+   `current_scope_skill_targets()`
+2. That function reads the registry files fresh from disk
+3. `ensure_scope_skill_targets()` reconciles symlinks in
+   `{workspace}/skills/` to match the resolved targets
+4. The agent discovers skills via the reconciled symlinks
+
+This means you can `loom channel skill add` while agents are running,
+and the next turn any agent in that channel picks up the new skill
+automatically.
+
+### Registry file locations
+
+```
+<data_root>/channels/<channel-id>/
+  channel-skills.json          ← channel-level skill registry
+
+<data_root>/channels/<channel-id>/threads/<thread-id>/
+  thread-skills.json           ← thread-level skill registry
+```
+
+The `<data_root>` is the agent data root (typically `~/.agentx/`).
+Registry files are read directly from the filesystem by the agent serve
+process — no server RPC involved.
+
+---
+
+## CLI Usage
+
+### Channel skills
+
+```bash
+# Add a skill to the channel registry
+# (id is derived from the source directory name if --id is omitted)
+loom channel skill add <channel_id> <source_path> [--id <skill_id>]
+
+# Remove a skill from the channel registry
+loom channel skill remove <channel_id> <skill_id>
+
+# List skills registered for the channel
+loom channel skill list <channel_id>
+```
+
+### Thread skills
+
+```bash
+# Add a skill to the thread registry
+loom thread skill add <thread_id> <source_path> [--id <skill_id>]
+
+# Remove a skill from the thread registry
+loom thread skill remove <thread_id> <skill_id>
+
+# List skills registered for the thread
+loom thread skill list <thread_id>
+```
+
+> **Note**: Thread skill commands resolve the `channel_id` from the
+> thread via a `thread.list` RPC call, then read/write the thread
+> registry at the resolved path.
+
+### JSON output
+
+All commands support `--json`:
+
+```bash
+loom --json channel skill list <channel_id>
+# → {"skills": [{"id": "obsidian", "source": "/path/to/skill", "added_at": "..."}]}
+```
+
+### Practical examples
+
+```bash
+# Mount an Obsidian skill at the channel level
+loom channel skill add chan_spec01 /home/user/skills/obsidian
+# → skill 'obsidian' added to channel chan_spec01
+
+# Mount a PDF skill with a custom id
+loom channel skill add chan_spec01 /home/user/skills/pdf-tools --id pdf
+# → skill 'pdf' added to channel chan_spec01
+
+# Override a channel skill at the thread level
+loom thread skill add thread_bugfix42 /home/user/skills/obsidian-v2 --id obsidian
+# → In thread_bugfix42, 'obsidian' now points to obsidian-v2 instead of the channel version
+
+# List what's registered
+loom channel skill list chan_spec01
+# → obsidian             /home/user/skills/obsidian
+#   pdf                  /home/user/skills/pdf-tools
+
+# Remove a skill
+loom channel skill remove chan_spec01 pdf
+# → skill 'pdf' removed from channel chan_spec01
+```
+
+---
+
+## Registry File Format
+
+Both `channel-skills.json` and `thread-skills.json` use the same format:
+
+```json
+{
+  "skills": [
+    {
+      "id": "obsidian",
+      "source": "/home/user/skills/obsidian",
+      "added_at": "1970-01-01T00:00:12345Z"
+    },
+    {
+      "id": "pdf",
+      "source": "/home/user/skills/pdf-tools",
+      "added_at": "1970-01-01T00:00:12346Z"
+    }
+  ]
+}
+```
+
+### Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | `string` | Skill identifier. Must be unique within the registry. Used as the symlink name in `skills/`. |
+| `source` | `string` | Absolute path to the skill directory. This is where the symlink points. |
+| `added_at` | `string` | Timestamp when the skill was added. *(See Known Limitation #1 — format is currently incorrect.)* |
+
+### Behavior
+
+- **Missing registry file**: Treated as empty (no skills). No error.
+  This ensures backward compatibility — channels/threads without
+  registry files work exactly as before.
+- **Upsert**: Adding a skill with an existing id replaces the previous
+  entry (source and added_at are updated).
+- **Remove absent skill**: Returns `removed: false`, no error. The
+  registry file is not rewritten.
+- **Parent directories**: Created automatically on first write
+  (`fs::create_dir_all`).
+
+---
+
+## Implementation Details
+
+### Module: `skill_registry.rs` (NEW)
+
+A new CLI module (`crates/cli/src/cmd/skill_registry.rs`) provides the
+core registry data structures and file I/O:
+
+- **`SkillEntry`** — single skill record (id, source, added_at)
+- **`SkillRegistry`** — collection of `SkillEntry` with `find()`,
+  `upsert()`, `remove()` methods
+- **Path helpers**: `channel_skill_registry_path()` and
+  `thread_skill_registry_path()` compute the on-disk paths
+- **Read/write**: `read_registry()` gracefully handles missing files
+  (returns empty registry); `write_registry()` creates parent dirs
+
+### Agent serve integration (`agent_serve.rs`)
+
+`current_scope_skill_targets()` was extended with a `thread_id`
+parameter. The resolution order:
+
+1. **Actor bundle skills** (existing logic, unchanged)
+2. **Channel skills** — reads `channel-skills.json` from data root,
+   inserts each entry into the `BTreeMap` (overriding same-id actor
+   skills)
+3. **Thread skills** (only in thread scope) — reads
+   `thread-skills.json`, inserts each entry (overriding same-id
+   channel skills)
+
+Registry read failures are logged at `debug` level and degrade
+gracefully (that layer's skills are simply skipped).
+
+### CLI commands (`channel.rs`, `thread.rs`, `main.rs`)
+
+Channel skill commands (`skill_add`, `skill_remove`, `skill_list`)
+operate directly on the filesystem via `skill_registry` module — no
+server connection needed (the `client` parameter is not used for
+channel skills).
+
+Thread skill commands require a `client` connection to resolve the
+`channel_id` from the `thread_id` via `thread.list` RPC, then operate
+on the filesystem identically to channel skills.
+
+The `--id` flag is optional. When omitted, the skill id is derived
+from the `source` path's file name.
+
+---
+
+## Design Rationale
+
+### Why file-based registries (not server RPC)?
+
+ARCH's design chose CLI-side file I/O over server-side RPC for skill
+registries because:
+
+1. **Skill registries live in the agent data root** — the same
+   filesystem the agent serve process already reads for workspace
+   setup, scope paths, and symlinks
+2. **No server state to persist** — skills are agent-side concerns,
+   not collaboration state like messages or tasks
+3. **Simpler implementation** — no new JSON-RPC methods, no journal
+   mutations, no store changes
+4. **Consistent with existing skill handling** — actor bundle skills
+   are already resolved agent-side via filesystem paths
+
+### Why BTreeMap for priority resolution?
+
+A `BTreeMap<String, PathBuf>` naturally implements "last insert wins"
+semantics. By inserting in priority order (actor → channel → thread),
+higher-priority entries automatically overwrite lower-priority ones
+for the same id. This is simpler and more efficient than explicit
+conflict detection.
+
+### Relationship to ARCH Phase 3 (.agent config file)
+
+ARCH's design includes an optional Phase 3: a `.agent` JSON config
+file that declaratively encapsulates instructions + skills + wake
+policy for a channel. Phase 2's registry files are the imperative
+(CLI-driven) equivalent of the skills portion. A future Phase 3 could
+read `.agent` files and populate the same registries.
+
+---
+
+## Files Changed (commit 132c8de)
+
+| File | Lines | Description |
+|------|-------|-------------|
+| `crates/cli/src/cmd/skill_registry.rs` | +288 | NEW: `SkillEntry`, `SkillRegistry`, path helpers, read/add/remove API, 6 unit tests |
+| `crates/cli/src/cmd/agent_serve.rs` | +46 | Extend `current_scope_skill_targets()` with `thread_id` param + registry reads |
+| `crates/cli/src/cmd/channel.rs` | +58 | `skill_add`, `skill_remove`, `skill_list` CLI functions |
+| `crates/cli/src/cmd/thread.rs` | +88 | `skill_add`, `skill_remove`, `skill_list` + `resolve_channel_id` helper |
+| `crates/cli/src/main.rs` | +72 | `ChannelSkillCmd` + `ThreadSkillCmd` enums, 6 dispatch arms |
+| `crates/cli/src/cmd/mod.rs` | +1 | Module registration |
+| **Total** | **+552** | **6 files changed** |
+
+---
+
+## Phase 2 Known Limitations
+
+1. **`added_at` timestamp format is incorrect** — The `now_iso()`
+   helper in `skill_registry.rs` formats the timestamp as
+   `1970-01-01T00:00:{epoch_secs}Z` instead of a proper RFC3339
+   UTC datetime. This is cosmetic only — the field is not used for
+   any functional logic. A future fix should use `chrono` or the
+   `time` crate for correct formatting.
+
+2. **No GUI management yet** — Skill registries can only be managed
+   via CLI. Future GUI support would add a skill management panel.
+
+3. **Thread skill commands require server connection** — Unlike
+   channel skill commands (which are pure filesystem I/O), thread
+   skill commands need a server connection to resolve `channel_id`
+   from `thread_id`. This is because the thread-to-channel mapping
+   lives on the server.
+
+4. **No skill validation** — Adding a skill does not verify that the
+   `source` path exists or contains a valid skill. Invalid paths
+   will result in broken symlinks at turn start. The agent will
+   simply not discover the skill.
+
+5. **No registry-level priority override** — Priority is fixed
+   (thread > channel > actor). There is no mechanism to change the
+   priority order or mark a channel skill as non-overridable by
+   thread skills.
+
+---
+
+## Phase 2 Change Log
+
+| Version | Date | Change |
+|---------|------|--------|
+| Phase 2 | 2026-07-17 | Skill mounting: file-based channel/thread skill registries + priority chain + hot-pluggable symlinks + CLI. QA verified PASS on all 8 acceptance criteria. |

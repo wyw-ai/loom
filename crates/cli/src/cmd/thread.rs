@@ -189,6 +189,60 @@ pub async fn unfollow(client: Arc<Client>, thread_id: String) -> Result<()> {
     Ok(())
 }
 
+pub async fn set_instruction(
+    client: Arc<Client>,
+    thread_id: String,
+    instructions: String,
+) -> Result<()> {
+    let res: ThreadSetInstructionResult = client
+        .call(
+            method::THREAD_SET_INSTRUCTION,
+            json!({ "threadId": thread_id, "instructions": instructions }),
+        )
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+    } else {
+        println!("instructions set for thread {}", res.thread.id);
+    }
+    Ok(())
+}
+
+pub async fn get_instruction(client: Arc<Client>, thread_id: String) -> Result<()> {
+    let res: ThreadGetInstructionResult = client
+        .call(
+            method::THREAD_GET_INSTRUCTION,
+            json!({ "threadId": thread_id }),
+        )
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+        return Ok(());
+    }
+    match res.instructions {
+        Some(instructions) => println!("{}", instructions),
+        None => println!("(none)"),
+    }
+    Ok(())
+}
+
+pub async fn clear_instruction(client: Arc<Client>, thread_id: String) -> Result<()> {
+    let res: ThreadClearInstructionResult = client
+        .call(
+            method::THREAD_CLEAR_INSTRUCTION,
+            json!({ "threadId": thread_id }),
+        )
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+    } else if res.cleared {
+        println!("thread instructions cleared");
+    } else {
+        println!("thread instructions were already empty");
+    }
+    Ok(())
+}
+
 /// `loom thread bootstrap --in <thread_id> --channel <chan> --bootstrap-artifact <uri>`.
 ///
 /// Bootstrap an *existing* thread from a clone-manifest / mounts artifact.

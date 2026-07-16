@@ -5155,7 +5155,12 @@ async fn build_adapter_prompt(
         .ok_or_else(|| anyhow!("cannot resolve channel for scope {}", scope.id))?;
     let workspace_override =
         channel_member_workspace_override(client, state, &channel_id, scope).await?;
-    let agents_md_context = agents_md_context_for_scope(client, state, &channel_id).await;
+    let thread_id = match scope.kind {
+        ScopeKind::Thread => Some(scope.id.as_str()),
+        ScopeKind::Channel => None,
+    };
+    let agents_md_context =
+        agents_md_context_for_scope(client, state, &channel_id, thread_id).await;
     let scope_paths = state.paths.ensure_scope(
         &state.actor_id,
         &channel_id,
@@ -6044,6 +6049,7 @@ async fn agents_md_context_for_scope(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
     channel_id: &str,
+    thread_id: Option<&str>,
 ) -> agent_runtime::AgentsMdContext {
     let channel = match client
         .call::<_, ChannelListResult>(method::CHANNEL_LIST, json!({}))
@@ -6062,6 +6068,32 @@ async fn agents_md_context_for_scope(
             );
             None
         }
+    };
+    let thread_instructions = match thread_id {
+        Some(tid) => match client
+            .call::<_, ThreadListResult>(
+                method::THREAD_LIST,
+                json!({ "channelId": channel_id }),
+            )
+            .await
+        {
+            Ok(result) => result
+                .threads
+                .into_iter()
+                .find(|thread| thread.id == tid)
+                .and_then(|thread| thread.instructions),
+            Err(err) => {
+                tracing::debug!(
+                    actor = %state.actor_id,
+                    channel = %channel_id,
+                    thread = %tid,
+                    %err,
+                    "thread list unavailable while rendering AGENTS.md"
+                );
+                None
+            }
+        },
+        None => None,
     };
     let members = match client
         .call::<_, ChannelMembersResult>(
@@ -6100,10 +6132,12 @@ async fn agents_md_context_for_scope(
             .as_ref()
             .map(|ch| ch.title.clone())
             .unwrap_or_default(),
-        channel_topic: channel.map(|ch| ch.topic).unwrap_or_default(),
+        channel_topic: channel.as_ref().map(|ch| ch.topic.clone()).unwrap_or_default(),
         workspace: String::new(),
         members,
         agent_instructions: agent_instructions_text(&state.spec),
+        channel_instructions: channel.and_then(|ch| ch.instructions),
+        thread_instructions,
         wake_policy: agents_md_wake_policy(&state.spec),
     }
 }
@@ -9425,6 +9459,8 @@ mod tests {
             workspace: String::new(),
             members: Vec::new(),
             agent_instructions: None,
+            channel_instructions: None,
+            thread_instructions: None,
             wake_policy: agent_runtime::AgentsMdWakePolicy::default(),
         };
         let scope_paths = paths
@@ -9712,6 +9748,8 @@ mod tests {
             workspace: String::new(),
             members: Vec::new(),
             agent_instructions: None,
+            channel_instructions: None,
+            thread_instructions: None,
             wake_policy: agent_runtime::AgentsMdWakePolicy::default(),
         };
 

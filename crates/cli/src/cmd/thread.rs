@@ -295,21 +295,15 @@ pub async fn skill_add(
 pub async fn skill_remove(client: Arc<Client>, thread_id: String, skill_id: String) -> Result<()> {
     let channel_id = resolve_channel_id(&client, &thread_id).await?;
     let data_root = crate::cmd::agent_serve::default_data_root_pub();
-    let (registry, removed) = super::skill_registry::remove_thread_skill(
-        &data_root,
-        &channel_id,
-        &thread_id,
-        &skill_id,
-    )
-    .map_err(|err| anyhow!("read/remove thread skill registry: {err}"))?;
+    let (registry, removed) =
+        super::skill_registry::remove_thread_skill(&data_root, &channel_id, &thread_id, &skill_id)
+            .map_err(|err| anyhow!("read/remove thread skill registry: {err}"))?;
     if render::is_json() {
         render::print_json(&registry);
     } else if removed {
         println!("skill '{skill_id}' removed from thread {thread_id}");
     } else {
-        println!(
-            "skill '{skill_id}' was not registered in thread {thread_id}"
-        );
+        println!("skill '{skill_id}' was not registered in thread {thread_id}");
     }
     Ok(())
 }

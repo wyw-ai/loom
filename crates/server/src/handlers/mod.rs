@@ -85,12 +85,8 @@ pub async fn dispatch(
         method::CHANNEL_MEMBER_CONFIG_CLEAR => {
             channel_member_config_clear(state, connection_id, params)
         }
-        method::CHANNEL_SET_INSTRUCTION => {
-            channel_set_instruction(state, connection_id, params)
-        }
-        method::CHANNEL_GET_INSTRUCTION => {
-            channel_get_instruction(state, connection_id, params)
-        }
+        method::CHANNEL_SET_INSTRUCTION => channel_set_instruction(state, connection_id, params),
+        method::CHANNEL_GET_INSTRUCTION => channel_get_instruction(state, connection_id, params),
         method::CHANNEL_CLEAR_INSTRUCTION => {
             channel_clear_instruction(state, connection_id, params)
         }
@@ -101,15 +97,9 @@ pub async fn dispatch(
         method::THREAD_DELETE => thread_delete(state, connection_id, params),
         method::THREAD_FOLLOW => thread_follow(state, connection_id, params),
         method::THREAD_UNFOLLOW => thread_unfollow(state, connection_id, params),
-        method::THREAD_SET_INSTRUCTION => {
-            thread_set_instruction(state, connection_id, params)
-        }
-        method::THREAD_GET_INSTRUCTION => {
-            thread_get_instruction(state, connection_id, params)
-        }
-        method::THREAD_CLEAR_INSTRUCTION => {
-            thread_clear_instruction(state, connection_id, params)
-        }
+        method::THREAD_SET_INSTRUCTION => thread_set_instruction(state, connection_id, params),
+        method::THREAD_GET_INSTRUCTION => thread_get_instruction(state, connection_id, params),
+        method::THREAD_CLEAR_INSTRUCTION => thread_clear_instruction(state, connection_id, params),
         method::TASK_CREATE => task_create(state, connection_id, params),
         method::TASK_GET => task_get(state, connection_id, params),
         method::TASK_LIST => task_list(state, connection_id, params),

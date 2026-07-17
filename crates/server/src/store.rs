@@ -7481,7 +7481,9 @@ mod tests {
     #[test]
     fn thread_instructions_round_trip_and_replay() {
         let store = fresh_store();
-        let ch = store.create_channel("th chan".into(), None).expect("create channel");
+        let ch = store
+            .create_channel("th chan".into(), None)
+            .expect("create channel");
         let thread = create_thread_under(&store, &ch.id, "actor_owner", "root_msg");
         assert!(store.get_thread(&thread.id).unwrap().instructions.is_none());
 
@@ -7493,7 +7495,11 @@ mod tests {
         let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
         let store2 = Store::open(journal).unwrap();
         assert_eq!(
-            store2.get_thread(&thread.id).unwrap().instructions.as_deref(),
+            store2
+                .get_thread(&thread.id)
+                .unwrap()
+                .instructions
+                .as_deref(),
             Some("thread guide")
         );
     }

@@ -55,11 +55,7 @@ pub fn channel_skill_registry_path(data_root: &Path, channel_id: &str) -> PathBu
 }
 
 /// `<data_root>/channels/<channel_id>/threads/<thread_id>/thread-skills.json`
-pub fn thread_skill_registry_path(
-    data_root: &Path,
-    channel_id: &str,
-    thread_id: &str,
-) -> PathBuf {
+pub fn thread_skill_registry_path(data_root: &Path, channel_id: &str, thread_id: &str) -> PathBuf {
     data_root
         .join("channels")
         .join(channel_id)
@@ -147,7 +143,9 @@ pub fn read_thread_skills(
     channel_id: &str,
     thread_id: &str,
 ) -> io::Result<SkillRegistry> {
-    read_registry(&thread_skill_registry_path(data_root, channel_id, thread_id))
+    read_registry(&thread_skill_registry_path(
+        data_root, channel_id, thread_id,
+    ))
 }
 
 /// Add or replace a skill in the thread registry.
@@ -221,8 +219,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
 
-        let reg = add_channel_skill(root, "chan1", "obsidian".into(), "/path/to/skill".into())
-            .unwrap();
+        let reg =
+            add_channel_skill(root, "chan1", "obsidian".into(), "/path/to/skill".into()).unwrap();
         assert_eq!(reg.skills.len(), 1);
         assert_eq!(reg.skills[0].id, "obsidian");
 
@@ -257,14 +255,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
 
-        let reg = add_thread_skill(
-            root,
-            "chan1",
-            "thr1",
-            "pdf".into(),
-            "/path/to/pdf".into(),
-        )
-        .unwrap();
+        let reg =
+            add_thread_skill(root, "chan1", "thr1", "pdf".into(), "/path/to/pdf".into()).unwrap();
         assert_eq!(reg.skills.len(), 1);
 
         let reg2 = read_thread_skills(root, "chan1", "thr1").unwrap();

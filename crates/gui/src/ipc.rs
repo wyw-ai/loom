@@ -3264,11 +3264,13 @@ fn agent_data_root() -> Result<PathBuf, String> {
 fn read_skill_registry(path: &Path) -> Result<SkillRegistryDto, String> {
     match fs::read_to_string(path) {
         Ok(text) => {
-            let reg: SkillRegistryDto = serde_json::from_str(&text)
-                .map_err(|e| format!("parse skill registry: {e}"))?;
+            let reg: SkillRegistryDto =
+                serde_json::from_str(&text).map_err(|e| format!("parse skill registry: {e}"))?;
             Ok(reg)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(SkillRegistryDto { skills: vec![] }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(SkillRegistryDto { skills: vec![] })
+        }
         Err(e) => Err(format!("read skill registry: {e}")),
     }
 }
@@ -3328,7 +3330,9 @@ pub async fn channel_skill_add(args: ChannelSkillAddArgs) -> Result<SkillRegistr
         .join("channels")
         .join(&args.channel_id)
         .join("channel-skills.json");
-    let id = args.skill_id.unwrap_or_else(|| derive_skill_id(&args.source));
+    let id = args
+        .skill_id
+        .unwrap_or_else(|| derive_skill_id(&args.source));
     let mut reg = read_skill_registry(&path)?;
     reg.skills.retain(|s| s.id != id);
     reg.skills.push(SkillEntryDto {
@@ -3348,7 +3352,9 @@ pub struct ChannelSkillRemoveArgs {
 }
 
 #[tauri::command]
-pub async fn channel_skill_remove(args: ChannelSkillRemoveArgs) -> Result<SkillRegistryDto, String> {
+pub async fn channel_skill_remove(
+    args: ChannelSkillRemoveArgs,
+) -> Result<SkillRegistryDto, String> {
     let data_root = agent_data_root()?;
     let path = data_root
         .join("channels")
@@ -3400,7 +3406,9 @@ pub async fn thread_skill_add(args: ThreadSkillAddArgs) -> Result<SkillRegistryD
         .join("threads")
         .join(&args.thread_id)
         .join("thread-skills.json");
-    let id = args.skill_id.unwrap_or_else(|| derive_skill_id(&args.source));
+    let id = args
+        .skill_id
+        .unwrap_or_else(|| derive_skill_id(&args.source));
     let mut reg = read_skill_registry(&path)?;
     reg.skills.retain(|s| s.id != id);
     reg.skills.push(SkillEntryDto {

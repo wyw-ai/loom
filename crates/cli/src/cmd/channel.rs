@@ -276,11 +276,7 @@ pub async fn clear_instruction(client: Arc<Client>, channel_id: String) -> Resul
 // Channel skill management (file-based registry, agent data root)
 // -----------------------------------------------------------------
 
-pub async fn skill_add(
-    channel_id: String,
-    source: String,
-    skill_id: Option<String>,
-) -> Result<()> {
+pub async fn skill_add(channel_id: String, source: String, skill_id: Option<String>) -> Result<()> {
     let data_root = crate::cmd::agent_serve::default_data_root_pub();
     let id = skill_id.unwrap_or_else(|| {
         // Derive skill id from the source path's file name.
@@ -290,8 +286,13 @@ pub async fn skill_add(
             .unwrap_or("skill")
             .to_string()
     });
-    let registry = super::skill_registry::add_channel_skill(&data_root, &channel_id, id.clone(), source.clone())
-        .map_err(|err| anyhow::anyhow!("write channel skill registry: {err}"))?;
+    let registry = super::skill_registry::add_channel_skill(
+        &data_root,
+        &channel_id,
+        id.clone(),
+        source.clone(),
+    )
+    .map_err(|err| anyhow::anyhow!("write channel skill registry: {err}"))?;
     if render::is_json() {
         render::print_json(&registry);
     } else {
@@ -302,8 +303,9 @@ pub async fn skill_add(
 
 pub async fn skill_remove(channel_id: String, skill_id: String) -> Result<()> {
     let data_root = crate::cmd::agent_serve::default_data_root_pub();
-    let (registry, removed) = super::skill_registry::remove_channel_skill(&data_root, &channel_id, &skill_id)
-        .map_err(|err| anyhow::anyhow!("read/remove channel skill registry: {err}"))?;
+    let (registry, removed) =
+        super::skill_registry::remove_channel_skill(&data_root, &channel_id, &skill_id)
+            .map_err(|err| anyhow::anyhow!("read/remove channel skill registry: {err}"))?;
     if render::is_json() {
         render::print_json(&registry);
     } else if removed {

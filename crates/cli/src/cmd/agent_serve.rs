@@ -6071,10 +6071,7 @@ async fn agents_md_context_for_scope(
     };
     let thread_instructions = match thread_id {
         Some(tid) => match client
-            .call::<_, ThreadListResult>(
-                method::THREAD_LIST,
-                json!({ "channelId": channel_id }),
-            )
+            .call::<_, ThreadListResult>(method::THREAD_LIST, json!({ "channelId": channel_id }))
             .await
         {
             Ok(result) => result
@@ -6132,7 +6129,10 @@ async fn agents_md_context_for_scope(
             .as_ref()
             .map(|ch| ch.title.clone())
             .unwrap_or_default(),
-        channel_topic: channel.as_ref().map(|ch| ch.topic.clone()).unwrap_or_default(),
+        channel_topic: channel
+            .as_ref()
+            .map(|ch| ch.topic.clone())
+            .unwrap_or_default(),
         workspace: String::new(),
         members,
         agent_instructions: agent_instructions_text(&state.spec),

@@ -19,9 +19,7 @@ fn read_instruction_payload(file: Option<String>, text: Option<String>) -> Resul
         (Some(_), Some(_)) => Err(anyhow!(
             "pass either --file or --text to set-instruction, not both"
         )),
-        (None, None) => Err(anyhow!(
-            "set-instruction requires either --file or --text"
-        )),
+        (None, None) => Err(anyhow!("set-instruction requires either --file or --text")),
     }
 }
 
@@ -761,10 +759,7 @@ enum ThreadSkillCmd {
         id: Option<String>,
     },
     /// Remove a skill from the thread registry.
-    Remove {
-        thread_id: String,
-        skill_id: String,
-    },
+    Remove { thread_id: String, skill_id: String },
     /// List skills registered for the thread.
     List { thread_id: String },
 }

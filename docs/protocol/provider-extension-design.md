@@ -895,6 +895,90 @@ config 仍默认来自用户级 `~/.config/opencode`；这部分暂时保留给 
 }
 ```
 
+### Kimi Code CLI
+
+Kimi Code CLI 的非交互入口是 `kimi -p <prompt>`(0.27.0 实测)。`--output-format`
+支持 `text` 和 `stream-json`;`-p` 与 `--yolo` / `--auto` 均不能同用(直接报错
+`Cannot combine --prompt with ...`),print 模式会自动执行工具调用,因此 manifest
+不传任何权限参数。`--add-dir` 可重复,`-m/--model` 选择 config.toml 里配置的模型
+别名;没有 reasoning effort 相关参数。
+
+stream-json 是 JSONL,帧为 OpenAI 风格(0.27.0 实测捕获):
+
+- `{"role":"assistant","content":"..."}` 文本帧(可能多条,最后一条是最终回答)
+- `{"role":"assistant","tool_calls":[{"type":"function","id":"...","function":{"name":"Bash","arguments":"<json字符串>"}}]}`
+  工具调用帧(`arguments` 是 JSON 编码字符串,ToolUse.input 以字符串呈现)
+- `{"role":"tool","tool_call_id":"...","content":"..."}` 工具结果帧(无需映射)
+- `{"role":"meta","type":"session.resume_hint","session_id":"session_xxx",...}`
+  收尾帧,session id 在 `$.session_id`
+- 工具的 stdout 会以非 JSON 原样行透传,decoder 跳过即可
+
+错误打到 stderr 纯文本并以非零码退出,走 Loom 现有 stderr/exit 错误通道;
+stream-json 不含 usage 帧,token 用量用估算值兜底。
+
+session 按 `provider_capture + --session` 接入:首轮从收尾帧捕获 `$.session_id`,
+后续 turn 用 `--session {session.id}`(实测 resume 后 session id 保持不变;`-r`
+是等价的未文档化别名,manifest 用文档化的 `--session`)。
+
+建议 print mode:
+
+```json
+{
+  "args": [
+    "--add-dir", "{agent.configDir}",
+    "--add-dir", "{agent.skillWorkspace}",
+    "--output-format", "stream-json",
+    { "when": "model", "args": ["--model", "{model}"] },
+    "-p", "{prompt.full}"
+  ],
+  "stdout": {
+    "format": "jsonl",
+    "events": [
+      {
+        "when": {
+          "all": [
+            { "path": "$.role", "equals": "assistant" },
+            { "path": "$.tool_calls", "notEmpty": true }
+          ]
+        },
+        "emit": {
+          "type": "tool_use",
+          "toolName": "$.tool_calls[0].function.name",
+          "input": "$.tool_calls[0].function.arguments"
+        }
+      }
+    ],
+    "reduce": {
+      "finalText": {
+        "mode": "lastNonEmpty",
+        "path": "$.content",
+        "when": {
+          "all": [
+            { "path": "$.role", "equals": "assistant" },
+            { "path": "$.content", "notEmpty": true }
+          ]
+        }
+      }
+    },
+    "capture": {
+      "session": { "mode": "lastNonEmpty", "path": "$.session_id" }
+    }
+  },
+  "session": {
+    "idSource": "provider_capture",
+    "scope": "actor_scope",
+    "resumeArgs": [
+      "--add-dir", "{agent.configDir}",
+      "--add-dir", "{agent.skillWorkspace}",
+      "--output-format", "stream-json",
+      { "when": "model", "args": ["--model", "{model}"] },
+      "--session", "{session.id}",
+      "-p", "{prompt.full}"
+    ]
+  }
+}
+```
+
 ## Runtime 架构
 
 建议分层：

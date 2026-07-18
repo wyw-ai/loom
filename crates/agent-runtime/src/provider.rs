@@ -417,6 +417,8 @@ pub fn builtin_provider_manifests() -> Vec<ProviderManifest> {
         copilot_manifest(),
         codex_manifest(),
         opencode_manifest(),
+        kimi_manifest(),
+        zcode_manifest(),
     ]
 }
 
@@ -2248,6 +2250,70 @@ fn opencode_jsonl_decoder() -> ProviderDecoderSpec {
     }
 }
 
+fn kimi_jsonl_decoder() -> ProviderDecoderSpec {
+    ProviderDecoderSpec {
+        format: "jsonl".into(),
+        name: None,
+        events: vec![ProviderDecoderEventSpec {
+            when: Some(ProviderJsonConditionSpec {
+                all: vec![
+                    json_condition_equals("$.role", "assistant"),
+                    ProviderJsonConditionSpec {
+                        path: Some("$.tool_calls".into()),
+                        not_empty: Some(true),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+            emit: ProviderDecoderEmitSpec {
+                emit_type: "tool_use".into(),
+                // OpenAI-style tool calls; `arguments` is a JSON-encoded
+                // string, so ToolUse.input surfaces as a string.
+                tool_name: Some("$.tool_calls[0].function.name".into()),
+                input: Some("$.tool_calls[0].function.arguments".into()),
+                ..Default::default()
+            },
+        }],
+        reduce: Some(ProviderJsonlReduceSpec {
+            final_text: Some(ProviderJsonlTextReducerSpec {
+                mode: "lastNonEmpty".into(),
+                path: "$.content".into(),
+                when: Some(ProviderJsonConditionSpec {
+                    all: vec![
+                        json_condition_equals("$.role", "assistant"),
+                        ProviderJsonConditionSpec {
+                            path: Some("$.content".into()),
+                            not_empty: Some(true),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }),
+                fallback: None,
+            }),
+        }),
+        capture: Some(session_capture("$.session_id")),
+    }
+}
+
+fn zcode_json_decoder() -> ProviderDecoderSpec {
+    ProviderDecoderSpec {
+        format: "json".into(),
+        name: None,
+        events: Vec::new(),
+        reduce: Some(ProviderJsonlReduceSpec {
+            final_text: Some(ProviderJsonlTextReducerSpec {
+                mode: "lastNonEmpty".into(),
+                path: "$.response".into(),
+                when: None,
+                fallback: None,
+            }),
+        }),
+        capture: Some(session_capture("$.sessionId")),
+    }
+}
+
 fn session_capture(path: &str) -> ProviderDecoderCaptureSpec {
     ProviderDecoderCaptureSpec {
         session: Some(ProviderJsonlTextReducerSpec {
@@ -2749,6 +2815,108 @@ fn opencode_manifest() -> ProviderManifest {
                 "opencode/nemotron-3-super-free",
                 "OpenCode Nemotron 3 Super Free",
             ),
+        ],
+    )
+}
+
+fn kimi_manifest() -> ProviderManifest {
+    // Kimi Code CLI print mode (`kimi -p`) rejects permission flags
+    // (`--yolo` / `--auto` fail with "Cannot combine --prompt ...") and
+    // auto-approves tool calls itself, so no permission args are passed.
+    // stream-json emits no usage frames; token usage falls back to estimates.
+    let first_args = vec![
+        lit("--add-dir"),
+        lit("{agent.configDir}"),
+        lit("--add-dir"),
+        lit("{agent.skillWorkspace}"),
+        lit("--output-format"),
+        lit("stream-json"),
+        when("model", vec![lit("--model"), lit("{model}")]),
+        lit("-p"),
+        lit("{prompt.full}"),
+    ];
+    let resume_args = vec![
+        lit("--add-dir"),
+        lit("{agent.configDir}"),
+        lit("--add-dir"),
+        lit("{agent.skillWorkspace}"),
+        lit("--output-format"),
+        lit("stream-json"),
+        when("model", vec![lit("--model"), lit("{model}")]),
+        lit("--session"),
+        lit("{session.id}"),
+        lit("-p"),
+        lit("{prompt.full}"),
+    ];
+    let mut mode = mode(
+        "{bin}",
+        first_args,
+        "text",
+        Some(ProviderSessionSpec {
+            id_source: Some(ProviderSessionIdSource::ProviderCapture),
+            resume_args,
+            scope: Some("actor_scope".into()),
+        }),
+    );
+    mode.stdout = kimi_jsonl_decoder();
+    manifest(
+        "kimi",
+        "Kimi Code CLI",
+        &["kimi"],
+        BTreeMap::from([("print".into(), mode)]),
+        &[
+            ("kimi-code/k3", "Kimi K3"),
+            ("kimi-code/kimi-for-coding", "Kimi K2.7 Coding"),
+            (
+                "kimi-code/kimi-for-coding-highspeed",
+                "Kimi K2.7 Coding Highspeed",
+            ),
+        ],
+    )
+}
+
+fn zcode_manifest() -> ProviderManifest {
+    // ZCode CLI ships inside the ZCode desktop app (no PATH shim); the
+    // bundled node bundle is directly executable. Headless mode is
+    // `--prompt`; permission mode defaults to yolo for --prompt, so no
+    // permission args are passed. `--json` prints a single result object
+    // {sessionId, traceId, response, usage?, ...} on stdout; errors go to
+    // stderr with a non-zero exit. There is no model CLI flag — model
+    // selection goes through config or the ZCODE_MODEL env var (empty
+    // means "fall back to the user's zcode config").
+    let first_args = vec![lit("--json"), lit("--prompt"), lit("{prompt.full}")];
+    let resume_args = vec![
+        lit("--json"),
+        lit("--resume"),
+        lit("{session.id}"),
+        lit("--prompt"),
+        lit("{prompt.full}"),
+    ];
+    let mut mode = mode(
+        "{bin}",
+        first_args,
+        "text",
+        Some(ProviderSessionSpec {
+            id_source: Some(ProviderSessionIdSource::ProviderCapture),
+            resume_args,
+            scope: Some("actor_scope".into()),
+        }),
+    );
+    mode.stdout = zcode_json_decoder();
+    mode.env.insert("ZCODE_MODEL".into(), "{model}".into());
+    manifest(
+        "zcode",
+        "ZCode",
+        &[
+            "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs",
+            "zcode",
+        ],
+        BTreeMap::from([("print".into(), mode)]),
+        &[
+            ("bigmodel/GLM-5.2", "GLM-5.2 (BigModel)"),
+            ("bigmodel/GLM-5-Turbo", "GLM-5 Turbo (BigModel)"),
+            ("zai/GLM-5.2", "GLM-5.2 (Z.AI)"),
+            ("zai/GLM-5-Turbo", "GLM-5 Turbo (Z.AI)"),
         ],
     )
 }
@@ -4021,7 +4189,9 @@ mod tests {
 
     #[test]
     fn builtin_command_print_modes_default_to_unlimited_turn_timeouts() {
-        for provider_id in ["claude", "qoder", "copilot", "codex", "opencode"] {
+        for provider_id in [
+            "claude", "qoder", "copilot", "codex", "opencode", "kimi", "zcode",
+        ] {
             let manifest = builtin_provider_manifests()
                 .into_iter()
                 .find(|manifest| manifest.id == provider_id)
@@ -4098,6 +4268,128 @@ mod tests {
             .and_then(|decoder| decoder.capture.as_ref())
             .and_then(|capture| capture.session.as_ref())
             .is_some_and(|session| session.path == "$.sessionID"));
+    }
+
+    #[test]
+    fn builtin_kimi_declares_jsonl_session_capture_and_resume() {
+        let dir = temp_dir("kimi-path");
+        make_executable(&dir.join("kimi"));
+        let registry = ProviderRegistry::load(&temp_dir("kimi-config")).expect("registry");
+        let provider = registry
+            .detect_with_path(dir.into_os_string())
+            .expect("detect")
+            .into_iter()
+            .find(|provider| provider.id == "kimi")
+            .expect("kimi");
+        let provider_ref = AgentProviderRef {
+            id: "kimi".into(),
+            mode: Some("print".into()),
+            model: Some("kimi-code/k3".into()),
+            reasoning_effort: None,
+            ..Default::default()
+        };
+        let plan = runtime_plan_from_manifest(
+            &provider.manifest,
+            "print",
+            provider.manifest.modes.get("print").unwrap(),
+            Path::new(&provider.command),
+            &provider_ref,
+        )
+        .expect("runtime plan");
+
+        assert_eq!(plan.provider_id, "kimi");
+        assert!(plan.args.contains(&"--output-format".into()));
+        assert!(plan.args.contains(&"stream-json".into()));
+        assert!(plan.args.contains(&"-p".into()));
+        assert!(plan.args.contains(&"{prompt.full}".into()));
+        assert!(plan.args.contains(&"--model".into()));
+        // The model value stays a template in the plan; it is expanded per run.
+        assert!(plan.args.contains(&"{model}".into()));
+        // Kimi print mode rejects permission flags; none may be present.
+        assert!(!plan.args.contains(&"--yolo".into()));
+        assert!(!plan.args.contains(&"--auto".into()));
+        assert_eq!(
+            plan.session.as_ref().and_then(|session| session.id_source),
+            Some(CommandSessionIdSource::ProviderCapture)
+        );
+        assert!(plan
+            .session
+            .as_ref()
+            .and_then(|session| session.resume_args.as_ref())
+            .is_some_and(|args| args.contains(&"--session".into())
+                && args.contains(&"{session_id}".into())
+                && args.contains(&"{prompt.full}".into())));
+        assert_eq!(
+            plan.decoder.as_ref().map(|decoder| decoder.format.as_str()),
+            Some("jsonl")
+        );
+        assert!(plan
+            .decoder
+            .as_ref()
+            .and_then(|decoder| decoder.capture.as_ref())
+            .and_then(|capture| capture.session.as_ref())
+            .is_some_and(|session| session.path == "$.session_id"));
+    }
+
+    #[test]
+    fn builtin_zcode_declares_json_session_capture_and_resume() {
+        let dir = temp_dir("zcode-path");
+        make_executable(&dir.join("zcode"));
+        let registry = ProviderRegistry::load(&temp_dir("zcode-config")).expect("registry");
+        let provider = registry
+            .detect_with_path(dir.into_os_string())
+            .expect("detect")
+            .into_iter()
+            .find(|provider| provider.id == "zcode")
+            .expect("zcode");
+        let provider_ref = AgentProviderRef {
+            id: "zcode".into(),
+            mode: Some("print".into()),
+            model: Some("bigmodel/GLM-5.2".into()),
+            reasoning_effort: None,
+            ..Default::default()
+        };
+        let plan = runtime_plan_from_manifest(
+            &provider.manifest,
+            "print",
+            provider.manifest.modes.get("print").unwrap(),
+            Path::new(&provider.command),
+            &provider_ref,
+        )
+        .expect("runtime plan");
+
+        assert_eq!(plan.provider_id, "zcode");
+        assert!(plan.args.contains(&"--json".into()));
+        assert!(plan.args.contains(&"--prompt".into()));
+        assert!(plan.args.contains(&"{prompt.full}".into()));
+        // Model selection is env-driven, not an argv flag.
+        assert_eq!(
+            plan.env.get("ZCODE_MODEL").map(String::as_str),
+            Some("{model}")
+        );
+        // Headless --prompt defaults to yolo; no permission args may be set.
+        assert!(!plan.args.contains(&"--mode".into()));
+        assert_eq!(
+            plan.session.as_ref().and_then(|session| session.id_source),
+            Some(CommandSessionIdSource::ProviderCapture)
+        );
+        assert!(plan
+            .session
+            .as_ref()
+            .and_then(|session| session.resume_args.as_ref())
+            .is_some_and(|args| args.contains(&"--resume".into())
+                && args.contains(&"{session_id}".into())
+                && args.contains(&"{prompt.full}".into())));
+        assert_eq!(
+            plan.decoder.as_ref().map(|decoder| decoder.format.as_str()),
+            Some("json")
+        );
+        assert!(plan
+            .decoder
+            .as_ref()
+            .and_then(|decoder| decoder.capture.as_ref())
+            .and_then(|capture| capture.session.as_ref())
+            .is_some_and(|session| session.path == "$.sessionId"));
     }
 
     #[test]
@@ -4256,7 +4548,7 @@ mod tests {
 
     #[test]
     fn builtin_provider_capture_sessions_are_declared_on_stdout_decoder() {
-        for provider_id in ["qoder", "codex", "opencode"] {
+        for provider_id in ["qoder", "codex", "opencode", "kimi", "zcode"] {
             let manifest = builtin_provider_manifests()
                 .into_iter()
                 .find(|manifest| manifest.id == provider_id)

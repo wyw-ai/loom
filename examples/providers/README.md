@@ -10,8 +10,10 @@ session/resume。它们不创建 actor；具体 agent 只在 AgentSpec 里通过
 loom provider example --claude --json
 loom provider example --codex --json
 loom provider example --copilot --json
+loom provider example --kimi --json
 loom provider example --opencode --json
 loom provider example --qoder --json
+loom provider example --zcode --json
 ```
 
 不带 provider 参数时，`loom provider example` 会输出带字段解释的通用模板。添加到本机

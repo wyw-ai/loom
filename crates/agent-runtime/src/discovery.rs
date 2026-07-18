@@ -166,6 +166,7 @@ mod tests {
         make_executable(&dir.join("kimi"));
         make_executable(&dir.join("opencode"));
         make_executable(&dir.join("qodercli"));
+        make_executable(&dir.join("zcode"));
 
         let providers = detect_agent_cli_providers_in_path_with_config_dir(
             dir.clone().into_os_string(),
@@ -174,7 +175,7 @@ mod tests {
         let ids = providers.iter().map(|p| p.id.as_str()).collect::<Vec<_>>();
         assert_eq!(
             ids,
-            vec!["claude", "codex", "copilot", "kimi", "opencode", "qoder"]
+            vec!["claude", "codex", "copilot", "kimi", "opencode", "qoder", "zcode"]
         );
         let claude = providers
             .iter()

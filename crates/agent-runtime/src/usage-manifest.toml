@@ -108,3 +108,11 @@ paths = []
 
 [providers.kimi.fields]
 
+[providers.zcode]
+# ZCode headless `--json` prints one result object with a top-level `usage`
+# object; the [default] "/usage" path already covers it. Placeholder kept so
+# the manifest enumerates the full built-in provider set.
+paths = []
+
+[providers.zcode.fields]
+

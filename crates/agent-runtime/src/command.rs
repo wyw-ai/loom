@@ -3920,6 +3920,68 @@ mod tests {
         );
     }
 
+    fn kimi_decoder() -> ProviderDecoderSpec {
+        crate::provider::builtin_provider_manifests()
+            .into_iter()
+            .find(|manifest| manifest.id == "kimi")
+            .and_then(|manifest| manifest.modes.get("print").map(|mode| mode.stdout.clone()))
+            .expect("kimi decoder")
+    }
+
+    #[test]
+    fn kimi_jsonl_tool_call_line_emits_tool_use_event() {
+        let line = r#"{"role":"assistant","tool_calls":[{"type":"function","id":"tool_1","function":{"name":"Bash","arguments":"{\"command\":\"echo hi\"}"}}]}"#;
+
+        let events = decode_decoder_event_line(&kimi_decoder(), line).expect("runtime events");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            ProviderRuntimeEvent::ToolUse { tool_name, input }
+                if tool_name == "Bash" && input.as_str() == Some("{\"command\":\"echo hi\"}")
+        ));
+    }
+
+    #[test]
+    fn kimi_jsonl_final_text_picks_last_assistant_content() {
+        // Real capture: tool-call frame, tool result frame, final text frame,
+        // then the meta resume hint (which also carries a `content` field and
+        // must not win the final text).
+        let stdout = "{\"role\":\"assistant\",\"tool_calls\":[{\"type\":\"function\",\"id\":\"tool_1\",\"function\":{\"name\":\"Bash\",\"arguments\":\"{}\"}}]}\n\
+                      {\"role\":\"tool\",\"tool_call_id\":\"tool_1\",\"content\":\"hi\\n\"}\n\
+                      {\"role\":\"assistant\",\"content\":\"Final answer\"}\n\
+                      {\"role\":\"meta\",\"type\":\"session.resume_hint\",\"session_id\":\"session_1\",\"command\":\"kimi -r session_1\",\"content\":\"To resume this session: kimi -r session_1\"}\n";
+
+        assert_eq!(
+            extract_decoder_final_text(Some(&kimi_decoder()), stdout),
+            Some("Final answer".into())
+        );
+    }
+
+    #[test]
+    fn kimi_jsonl_captures_session_from_resume_hint() {
+        let stdout = "{\"role\":\"assistant\",\"content\":\"OK\"}\n\
+                      {\"role\":\"meta\",\"type\":\"session.resume_hint\",\"session_id\":\"session_abc\",\"command\":\"kimi -r session_abc\"}\n";
+
+        assert_eq!(
+            capture_decoder_session_id(Some(&kimi_decoder()), stdout),
+            Some("session_abc".into())
+        );
+    }
+
+    #[test]
+    fn kimi_jsonl_ignores_non_json_passthrough_lines() {
+        // Tool stdout is echoed raw between JSONL frames; it must not produce
+        // events nor disturb final-text reduction.
+        assert!(decode_decoder_event_line(&kimi_decoder(), "hello-from-tool").is_none());
+        let stdout = "hello-from-tool\n\
+                      {\"role\":\"assistant\",\"content\":\"Done\"}\n";
+
+        assert_eq!(
+            extract_decoder_final_text(Some(&kimi_decoder()), stdout),
+            Some("Done".into())
+        );
+    }
+
     #[test]
     fn provider_jsonl_reducer_concats_wildcard_values() {
         let reducer = ProviderJsonlTextReducerSpec {

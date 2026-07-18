@@ -545,6 +545,11 @@ pub struct Message {
     pub attachments: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reactions: Vec<MessageReaction>,
+    /// Client-provided key used to make message creation idempotent within an
+    /// author and resolved scope. Persisting it on the append record lets the
+    /// server rebuild its deduplication index after a restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
     #[serde(default, rename = "metadata")]
     pub metadata: Meta,
 }

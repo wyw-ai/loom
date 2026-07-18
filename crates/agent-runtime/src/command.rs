@@ -3982,6 +3982,36 @@ mod tests {
         );
     }
 
+    fn zcode_decoder() -> ProviderDecoderSpec {
+        crate::provider::builtin_provider_manifests()
+            .into_iter()
+            .find(|manifest| manifest.id == "zcode")
+            .and_then(|manifest| manifest.modes.get("print").map(|mode| mode.stdout.clone()))
+            .expect("zcode decoder")
+    }
+
+    #[test]
+    fn zcode_json_reads_response_as_final_text() {
+        // Headless `zcode --prompt --json` prints a single result object.
+        let stdout = r#"{"sessionId":"sess_abc","traceId":"t1","turnId":"turn_1","response":"Final answer","usage":{"input_tokens":10,"output_tokens":5},"eventCount":3,"projection":{"status":"completed"}}"#;
+
+        assert_eq!(
+            extract_decoder_final_text(Some(&zcode_decoder()), stdout),
+            Some("Final answer".into())
+        );
+    }
+
+    #[test]
+    fn zcode_json_captures_session_id() {
+        let stdout =
+            r#"{"sessionId":"sess_abc","response":"OK","projection":{"status":"completed"}}"#;
+
+        assert_eq!(
+            capture_decoder_session_id(Some(&zcode_decoder()), stdout),
+            Some("sess_abc".into())
+        );
+    }
+
     #[test]
     fn provider_jsonl_reducer_concats_wildcard_values() {
         let reducer = ProviderJsonlTextReducerSpec {

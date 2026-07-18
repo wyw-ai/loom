@@ -979,6 +979,50 @@ session 按 `provider_capture + --session` 接入:首轮从收尾帧捕获 `$.se
 }
 ```
 
+### ZCode
+
+ZCode CLI(0.15.0 实测)随 ZCode 桌面应用分发,可执行文件是应用内的 node bundle
+(`/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs`,带 shebang 且可执行),
+没有 PATH shim;detect.candidates 以该绝对路径优先、`zcode` 兜底。非交互入口是
+`zcode --prompt <text>`;permission mode 在 `--prompt` 下默认 yolo,因此 manifest
+不传权限参数。`--resume <sessionId>` 续跑(sess_ 前缀),`-c/--continue` 续当前目录
+最近会话。
+
+`--json` 时 stdout 只打印**一个最终结果对象**(不是 JSONL 流):
+
+```json
+{"sessionId":"sess_...","traceId":"...","turnId":"turn_...","response":"最终文本","usage":{"input_tokens":...,"output_tokens":...},"eventCount":N,"projection":{"status":"completed"}}
+```
+
+因此 decoder 用 `format: "json"`:finalText 取 `$.response`,session 从 `$.sessionId`
+捕获,usage 走 default 提取器的 `/usage` 路径。错误打 stderr 并非零退出(如 provider
+429 时 stderr 输出结构化错误对象),不需要 stdout error 事件。
+
+没有 `--model` 类参数;模型选择走 `ZCODE_MODEL` 环境变量(`provider/model` 格式,
+空值回退到 zcode 自己的 `~/.zcode/cli/config.json`)。apiKey 解析顺序:
+`<PROVIDER>_API_KEY` / `ANTHROPIC_API_KEY` / `ZCODE_API_KEY`,或 config.json 里
+provider 的 `options.apiKey`。本机内置 provider 为 `bigmodel`(open.bigmodel.cn)
+和 `zai`(api.z.ai),内置模型 `GLM-5.2` / `GLM-5-Turbo`。
+
+建议 print mode:
+
+```json
+{
+  "args": ["--json", "--prompt", "{prompt.full}"],
+  "env": { "ZCODE_MODEL": "{model}" },
+  "stdout": {
+    "format": "json",
+    "reduce": { "finalText": { "mode": "lastNonEmpty", "path": "$.response" } },
+    "capture": { "session": { "mode": "lastNonEmpty", "path": "$.sessionId" } }
+  },
+  "session": {
+    "idSource": "provider_capture",
+    "scope": "actor_scope",
+    "resumeArgs": ["--json", "--resume", "{session.id}", "--prompt", "{prompt.full}"]
+  }
+}
+```
+
 ## Runtime 架构
 
 建议分层：

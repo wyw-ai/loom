@@ -212,6 +212,7 @@ pub struct ExampleSelection {
     pub codex: bool,
     pub opencode: bool,
     pub kimi: bool,
+    pub zcode: bool,
 }
 
 impl ExampleSelection {
@@ -234,6 +235,9 @@ impl ExampleSelection {
         }
         if self.kimi {
             ids.push("kimi");
+        }
+        if self.zcode {
+            ids.push("zcode");
         }
         ids
     }

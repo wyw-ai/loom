@@ -125,7 +125,7 @@ export type ProviderAvailabilityGroup = {
     provider: MachineAgentProviderInfo;
   }>;
 };
-export type ActorWorkspaceSection = "agents" | "hosts" | "services";
+export type ActorWorkspaceSection = "agents" | "hosts" | "humans" | "services";
 export type AgentDetailTab = "profile" | "prompt" | "skills" | "settings";
 export type ServiceDetailTab = "overview" | "spec" | "config";
 export type PromptTemplateDraft = {

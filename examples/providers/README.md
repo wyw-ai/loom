@@ -13,6 +13,7 @@ loom provider example --copilot --json
 loom provider example --kimi --json
 loom provider example --opencode --json
 loom provider example --qoder --json
+loom provider example --zcode --json
 ```
 
 不带 provider 参数时，`loom provider example` 会输出带字段解释的通用模板。添加到本机

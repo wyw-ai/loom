@@ -1,0 +1,76 @@
+{
+  "detect": {
+    "candidates": [
+      "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs",
+      "zcode"
+    ]
+  },
+  "displayName": "ZCode",
+  "id": "zcode",
+  "models": {
+    "choices": [
+      {
+        "id": "bigmodel/GLM-5.2",
+        "label": "GLM-5.2 (BigModel)"
+      },
+      {
+        "id": "bigmodel/GLM-5-Turbo",
+        "label": "GLM-5 Turbo (BigModel)"
+      },
+      {
+        "id": "zai/GLM-5.2",
+        "label": "GLM-5.2 (Z.AI)"
+      },
+      {
+        "id": "zai/GLM-5-Turbo",
+        "label": "GLM-5 Turbo (Z.AI)"
+      }
+    ],
+    "default": "bigmodel/GLM-5.2"
+  },
+  "modes": {
+    "print": {
+      "args": [
+        "--json",
+        "--prompt",
+        "{prompt.full}"
+      ],
+      "command": "{bin}",
+      "env": {
+        "ZCODE_MODEL": "{model}"
+      },
+      "idleTimeoutMs": -1,
+      "instructionsVia": "agents_md",
+      "session": {
+        "idSource": "provider_capture",
+        "resumeArgs": [
+          "--json",
+          "--resume",
+          "{session.id}",
+          "--prompt",
+          "{prompt.full}"
+        ],
+        "scope": "actor_scope"
+      },
+      "stdout": {
+        "capture": {
+          "session": {
+            "mode": "lastNonEmpty",
+            "path": "$.sessionId"
+          }
+        },
+        "events": [],
+        "format": "json",
+        "reduce": {
+          "finalText": {
+            "mode": "lastNonEmpty",
+            "path": "$.response"
+          }
+        }
+      },
+      "timeoutMs": -1,
+      "transport": "command"
+    }
+  },
+  "schemaVersion": 1
+}

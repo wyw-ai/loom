@@ -1515,6 +1515,9 @@ enum ProviderCmd {
         /// Print the built-in OpenCode provider manifest.
         #[arg(long)]
         opencode: bool,
+        /// Print the built-in Kimi Code CLI provider manifest.
+        #[arg(long)]
+        kimi: bool,
     },
     /// Validate a provider manifest JSON file.
     Validate { path: PathBuf },
@@ -1828,12 +1831,14 @@ async fn async_main() -> Result<()> {
                 copilot,
                 codex,
                 opencode,
+                kimi,
             } => cmd::provider::example(cmd::provider::ExampleSelection {
                 claude,
                 qoder,
                 copilot,
                 codex,
                 opencode,
+                kimi,
             })?,
             ProviderCmd::Validate { path } => cmd::provider::validate(path)?,
             ProviderCmd::Add { path, replace } => cmd::provider::add(path, replace)?,
@@ -3464,18 +3469,29 @@ mod tests {
 
     #[test]
     fn provider_example_accepts_builtin_flags() {
-        let args = Args::try_parse_from(["loom", "provider", "example", "--claude", "--opencode"])
-            .expect("parse provider example");
+        let args = Args::try_parse_from([
+            "loom",
+            "provider",
+            "example",
+            "--claude",
+            "--opencode",
+            "--kimi",
+        ])
+        .expect("parse provider example");
 
         match args.cmd {
             Cmd::Provider {
                 sub:
                     ProviderCmd::Example {
-                        claude, opencode, ..
+                        claude,
+                        opencode,
+                        kimi,
+                        ..
                     },
             } => {
                 assert!(claude);
                 assert!(opencode);
+                assert!(kimi);
             }
             other => panic!("unexpected command: {other:?}"),
         }

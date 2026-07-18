@@ -163,6 +163,7 @@ mod tests {
         make_executable(&dir.join("claude"));
         make_executable(&dir.join("codex"));
         make_executable(&dir.join("copilot"));
+        make_executable(&dir.join("kimi"));
         make_executable(&dir.join("opencode"));
         make_executable(&dir.join("qodercli"));
 
@@ -171,7 +172,10 @@ mod tests {
             &config_dir,
         );
         let ids = providers.iter().map(|p| p.id.as_str()).collect::<Vec<_>>();
-        assert_eq!(ids, vec!["claude", "codex", "copilot", "opencode", "qoder"]);
+        assert_eq!(
+            ids,
+            vec!["claude", "codex", "copilot", "kimi", "opencode", "qoder"]
+        );
         let claude = providers
             .iter()
             .find(|provider| provider.id == "claude")

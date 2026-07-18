@@ -1,0 +1,134 @@
+{
+  "detect": {
+    "candidates": [
+      "kimi"
+    ]
+  },
+  "displayName": "Kimi Code CLI",
+  "id": "kimi",
+  "models": {
+    "choices": [
+      {
+        "id": "kimi-code/k3",
+        "label": "Kimi K3"
+      },
+      {
+        "id": "kimi-code/kimi-for-coding",
+        "label": "Kimi K2.7 Coding"
+      },
+      {
+        "id": "kimi-code/kimi-for-coding-highspeed",
+        "label": "Kimi K2.7 Coding Highspeed"
+      }
+    ],
+    "default": "kimi-code/k3"
+  },
+  "modes": {
+    "print": {
+      "args": [
+        "--add-dir",
+        "{agent.configDir}",
+        "--add-dir",
+        "{agent.skillWorkspace}",
+        "--output-format",
+        "stream-json",
+        {
+          "args": [
+            "--model",
+            "{model}"
+          ],
+          "when": "model"
+        },
+        "-p",
+        "{prompt.full}"
+      ],
+      "command": "{bin}",
+      "idleTimeoutMs": -1,
+      "instructionsVia": "agents_md",
+      "session": {
+        "idSource": "provider_capture",
+        "resumeArgs": [
+          "--add-dir",
+          "{agent.configDir}",
+          "--add-dir",
+          "{agent.skillWorkspace}",
+          "--output-format",
+          "stream-json",
+          {
+            "args": [
+              "--model",
+              "{model}"
+            ],
+            "when": "model"
+          },
+          "--session",
+          "{session.id}",
+          "-p",
+          "{prompt.full}"
+        ],
+        "scope": "actor_scope"
+      },
+      "stdout": {
+        "capture": {
+          "session": {
+            "mode": "lastNonEmpty",
+            "path": "$.session_id"
+          }
+        },
+        "events": [
+          {
+            "emit": {
+              "input": "$.tool_calls[0].function.arguments",
+              "toolName": "$.tool_calls[0].function.name",
+              "type": "tool_use"
+            },
+            "when": {
+              "all": [
+                {
+                  "all": [],
+                  "any": [],
+                  "equals": "assistant",
+                  "path": "$.role"
+                },
+                {
+                  "all": [],
+                  "any": [],
+                  "notEmpty": true,
+                  "path": "$.tool_calls"
+                }
+              ],
+              "any": []
+            }
+          }
+        ],
+        "format": "jsonl",
+        "reduce": {
+          "finalText": {
+            "mode": "lastNonEmpty",
+            "path": "$.content",
+            "when": {
+              "all": [
+                {
+                  "all": [],
+                  "any": [],
+                  "equals": "assistant",
+                  "path": "$.role"
+                },
+                {
+                  "all": [],
+                  "any": [],
+                  "notEmpty": true,
+                  "path": "$.content"
+                }
+              ],
+              "any": []
+            }
+          }
+        }
+      },
+      "timeoutMs": -1,
+      "transport": "command"
+    }
+  },
+  "schemaVersion": 1
+}

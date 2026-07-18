@@ -1076,6 +1076,9 @@ enum MessageCmd {
         /// Only send if this is still the latest message in the target scope.
         #[arg(long = "if-latest")]
         if_latest: Option<String>,
+        /// Deduplicate retries by caller and resolved channel/thread scope.
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
         #[arg(long = "attachment-id")]
         attachment_ids: Vec<String>,
     },
@@ -1098,6 +1101,9 @@ enum MessageCmd {
         /// Only send if this is still the latest message in the target scope.
         #[arg(long = "if-latest")]
         if_latest: Option<String>,
+        /// Deduplicate retries by caller and resolved channel/thread scope.
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
         #[arg(long = "attachment-id")]
         attachment_ids: Vec<String>,
     },
@@ -2120,6 +2126,7 @@ async fn async_main() -> Result<()> {
                 intent,
                 delivery_policy,
                 if_latest,
+                idempotency_key,
                 attachment_ids,
                 allow_escaped_newlines,
             } => {
@@ -2134,6 +2141,7 @@ async fn async_main() -> Result<()> {
                     intent,
                     delivery_policy,
                     if_latest,
+                    idempotency_key,
                     attachment_ids,
                     allow_escaped_newlines,
                 )
@@ -2145,6 +2153,7 @@ async fn async_main() -> Result<()> {
                 thread,
                 text,
                 if_latest,
+                idempotency_key,
                 attachment_ids,
                 allow_escaped_newlines,
             } => {
@@ -2156,6 +2165,7 @@ async fn async_main() -> Result<()> {
                     recipients,
                     text,
                     if_latest,
+                    idempotency_key,
                     attachment_ids,
                     allow_escaped_newlines,
                 )
@@ -2980,6 +2990,8 @@ mod tests {
             "wake_agent",
             "--if-latest",
             "msg_latest",
+            "--idempotency-key",
+            "review-request-42",
             "--text",
             "please review",
         ])
@@ -2995,6 +3007,7 @@ mod tests {
                         intent,
                         delivery_policy,
                         if_latest,
+                        idempotency_key,
                         text,
                         ..
                     },
@@ -3005,6 +3018,7 @@ mod tests {
                 assert_eq!(intent.as_deref(), Some("request_action"));
                 assert_eq!(delivery_policy.as_deref(), Some("wake_agent"));
                 assert_eq!(if_latest.as_deref(), Some("msg_latest"));
+                assert_eq!(idempotency_key.as_deref(), Some("review-request-42"));
                 assert_eq!(text.as_deref(), Some("please review"));
             }
             other => panic!("unexpected command: {other:?}"),
@@ -3025,6 +3039,8 @@ mod tests {
             "#chan_123:msg_root",
             "--if-latest",
             "msg_latest",
+            "--idempotency-key",
+            "ask-reviewers-42",
             "--text",
             "please respond",
         ])
@@ -3038,12 +3054,14 @@ mod tests {
                         target,
                         text,
                         if_latest,
+                        idempotency_key,
                         ..
                     },
             } => {
                 assert_eq!(recipients, vec!["@actor_a", "@actor_b", "@all"]);
                 assert_eq!(target.as_deref(), Some("#chan_123:msg_root"));
                 assert_eq!(if_latest.as_deref(), Some("msg_latest"));
+                assert_eq!(idempotency_key.as_deref(), Some("ask-reviewers-42"));
                 assert_eq!(text.as_deref(), Some("please respond"));
             }
             other => panic!("unexpected command: {other:?}"),

@@ -253,6 +253,8 @@ impl Store {
             visibility,
             members,
             instructions: None,
+            instructions_modified_by: None,
+            instructions_modified_at: None,
             _meta: None,
         };
         self.journal
@@ -718,18 +720,27 @@ impl Store {
 
     /// Set or replace the channel-level `instructions`. Pass `None` (or an
     /// empty string, which is normalized to `None`) to clear.
+    ///
+    /// `caller_actor_id` is the member who performed the edit; it is written
+    /// to the `instructions_modified_by` / `instructions_modified_at` audit
+    /// fields so the collaborative note remains attributable. Permission
+    /// checks (is_channel_member) stay at the handler layer.
     pub fn set_channel_instructions(
         &self,
         id: &str,
         instructions: Option<String>,
+        caller_actor_id: &str,
     ) -> StoreResult<Channel> {
         if self.get_channel(id).is_none() {
             return Err(StoreError::NotFound(format!("channel {id}")));
         }
         let normalized = normalize_instructions(instructions);
+        let now = Utc::now();
         let mutation = Mutation::ChannelInstructionSet {
             channel_id: id.to_string(),
             instructions: normalized,
+            modified_by: Some(caller_actor_id.to_string()),
+            modified_at: Some(now),
         };
         self.journal.append(&mutation)?;
         let mut inner = self.inner.write();
@@ -857,6 +868,8 @@ impl Store {
             title,
             root_message_id,
             instructions: None,
+            instructions_modified_by: None,
+            instructions_modified_at: None,
             archived_at: None,
             _meta: None,
         };
@@ -969,18 +982,27 @@ impl Store {
 
     /// Set or replace the thread-level `instructions`. Pass `None` (or an
     /// empty string, which is normalized to `None`) to clear.
+    ///
+    /// `caller_actor_id` is the member who performed the edit; it is written
+    /// to the `instructions_modified_by` / `instructions_modified_at` audit
+    /// fields. Permission checks (is_channel_member) stay at the handler
+    /// layer.
     pub fn set_thread_instructions(
         &self,
         id: &str,
         instructions: Option<String>,
+        caller_actor_id: &str,
     ) -> StoreResult<Thread> {
         if self.get_thread(id).is_none() {
             return Err(StoreError::NotFound(format!("thread {id}")));
         }
         let normalized = normalize_instructions(instructions);
+        let now = Utc::now();
         let mutation = Mutation::ThreadInstructionSet {
             thread_id: id.to_string(),
             instructions: normalized,
+            modified_by: Some(caller_actor_id.to_string()),
+            modified_at: Some(now),
         };
         self.journal.append(&mutation)?;
         let mut inner = self.inner.write();
@@ -4182,6 +4204,8 @@ impl Store {
             title: format!("thread {root_message_id}"),
             root_message_id: root_message_id.to_string(),
             instructions: None,
+            instructions_modified_by: None,
+            instructions_modified_at: None,
             archived_at: None,
             _meta: None,
         };
@@ -4206,6 +4230,8 @@ impl Store {
             visibility: ChannelVisibility::Private,
             members: vec![actor_id.to_string(), peer.to_string()],
             instructions: None,
+            instructions_modified_by: None,
+            instructions_modified_at: None,
             _meta: None,
         };
         self.journal
@@ -5401,9 +5427,13 @@ fn apply(inner: &mut Inner, m: Mutation) {
         Mutation::ChannelInstructionSet {
             channel_id,
             instructions,
+            modified_by,
+            modified_at,
         } => {
             if let Some(c) = inner.channels.get_mut(&channel_id) {
                 c.instructions = instructions;
+                c.instructions_modified_by = modified_by;
+                c.instructions_modified_at = modified_at;
             }
         }
         Mutation::ChannelDelete { channel_id } => {
@@ -5467,9 +5497,13 @@ fn apply(inner: &mut Inner, m: Mutation) {
         Mutation::ThreadInstructionSet {
             thread_id,
             instructions,
+            modified_by,
+            modified_at,
         } => {
             if let Some(t) = inner.threads.get_mut(&thread_id) {
                 t.instructions = instructions;
+                t.instructions_modified_by = modified_by;
+                t.instructions_modified_at = modified_at;
             }
         }
         Mutation::ChannelGrant {
@@ -7689,28 +7723,51 @@ mod tests {
         assert!(store.get_channel(&ch.id).unwrap().instructions.is_none());
 
         let set = store
-            .set_channel_instructions(&ch.id, Some("channel rules".into()))
+            .set_channel_instructions(&ch.id, Some("channel rules".into()), "actor_owner")
             .expect("set instructions");
         assert_eq!(set.instructions.as_deref(), Some("channel rules"));
         assert_eq!(
             store.get_channel(&ch.id).unwrap().instructions.as_deref(),
             Some("channel rules")
         );
+        assert_eq!(
+            store
+                .get_channel(&ch.id)
+                .unwrap()
+                .instructions_modified_by
+                .as_deref(),
+            Some("actor_owner")
+        );
+        assert!(store
+            .get_channel(&ch.id)
+            .unwrap()
+            .instructions_modified_at
+            .is_some());
 
-        // Empty string normalizes to None (clear).
+        // Empty string normalizes to None (clear). Clear also stamps audit.
         let cleared = store
-            .set_channel_instructions(&ch.id, Some("  ".into()))
+            .set_channel_instructions(&ch.id, Some("  ".into()), "actor_owner")
             .expect("clear instructions");
         assert!(cleared.instructions.is_none());
+        assert_eq!(cleared.instructions_modified_by.as_deref(), Some("actor_owner"));
 
         // Re-open from journal: the last (cleared) state must replay.
         let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
         let store2 = Store::open(journal).unwrap();
         assert!(store2.get_channel(&ch.id).unwrap().instructions.is_none());
+        // Audit fields survive replay.
+        assert_eq!(
+            store2
+                .get_channel(&ch.id)
+                .unwrap()
+                .instructions_modified_by
+                .as_deref(),
+            Some("actor_owner")
+        );
 
         // Re-set on the replayed store and verify it persists again.
         let _ = store2
-            .set_channel_instructions(&ch.id, Some("after replay".into()))
+            .set_channel_instructions(&ch.id, Some("after replay".into()), "actor_owner")
             .expect("set after replay");
         assert_eq!(
             store2.get_channel(&ch.id).unwrap().instructions.as_deref(),
@@ -7728,9 +7785,14 @@ mod tests {
         assert!(store.get_thread(&thread.id).unwrap().instructions.is_none());
 
         let set = store
-            .set_thread_instructions(&thread.id, Some("thread guide".into()))
+            .set_thread_instructions(&thread.id, Some("thread guide".into()), "actor_owner")
             .expect("set thread instructions");
         assert_eq!(set.instructions.as_deref(), Some("thread guide"));
+        assert_eq!(
+            set.instructions_modified_by.as_deref(),
+            Some("actor_owner")
+        );
+        assert!(set.instructions_modified_at.is_some());
 
         let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
         let store2 = Store::open(journal).unwrap();
@@ -7741,6 +7803,15 @@ mod tests {
                 .instructions
                 .as_deref(),
             Some("thread guide")
+        );
+        // Audit fields survive replay.
+        assert_eq!(
+            store2
+                .get_thread(&thread.id)
+                .unwrap()
+                .instructions_modified_by
+                .as_deref(),
+            Some("actor_owner")
         );
     }
 
@@ -7775,12 +7846,12 @@ mod tests {
             match *scope {
                 "channel" => {
                     store
-                        .set_channel_instructions(&ch.id, value)
+                        .set_channel_instructions(&ch.id, value, "actor_owner")
                         .expect("set channel instructions");
                 }
                 "thread" => {
                     store
-                        .set_thread_instructions(&thread.id, value)
+                        .set_thread_instructions(&thread.id, value, "actor_owner")
                         .expect("set thread instructions");
                 }
                 _ => unreachable!(),
@@ -7801,6 +7872,75 @@ mod tests {
         assert_eq!(v_online_thread, v_replay_thread, "thread V_online != V_replay");
         assert_eq!(v_online_channel.as_deref(), Some("final"));
         assert_eq!(v_online_thread.as_deref(), Some("final"));
+    }
+
+    /// Regression for issue #8: each instruction edit must stamp the caller's
+    /// actor id into `instructions_modified_by` and a fresh timestamp into
+    /// `instructions_modified_at`, and the latest caller wins on both channel
+    /// and thread scopes. The audit fields must also survive journal replay.
+    #[test]
+    fn instructions_audit_fields_track_latest_caller_through_replay() {
+        let store = fresh_store();
+        let ch = store
+            .create_channel("audit chan".into(), None)
+            .expect("create channel");
+        let thread = create_thread_under(&store, &ch.id, "actor_owner", "root_msg");
+
+        // First edit by actor_owner.
+        let first_ts = {
+            let ch_updated = store
+                .set_channel_instructions(&ch.id, Some("v1".into()), "actor_owner")
+                .expect("set channel v1");
+            let ts = ch_updated.instructions_modified_at.expect("ts stamped");
+            assert_eq!(ch_updated.instructions_modified_by.as_deref(), Some("actor_owner"));
+            store
+                .set_thread_instructions(&thread.id, Some("v1".into()), "actor_owner")
+                .expect("set thread v1");
+            ts
+        };
+
+        // Second edit by a different caller must overwrite the audit fields.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let second_ts = {
+            let ch_updated = store
+                .set_channel_instructions(&ch.id, Some("v2".into()), "actor_bob")
+                .expect("set channel v2");
+            let ts = ch_updated.instructions_modified_at.expect("ts stamped");
+            assert_eq!(ch_updated.instructions_modified_by.as_deref(), Some("actor_bob"));
+            assert!(ts > first_ts, "timestamp must advance on second edit");
+            store
+                .set_thread_instructions(&thread.id, Some("v2".into()), "actor_bob")
+                .expect("set thread v2");
+            ts
+        };
+        assert!(second_ts > first_ts);
+
+        // Live state reflects the latest caller.
+        let live_ch = store.get_channel(&ch.id).unwrap();
+        assert_eq!(live_ch.instructions.as_deref(), Some("v2"));
+        assert_eq!(live_ch.instructions_modified_by.as_deref(), Some("actor_bob"));
+        let live_th = store.get_thread(&thread.id).unwrap();
+        assert_eq!(live_th.instructions.as_deref(), Some("v2"));
+        assert_eq!(live_th.instructions_modified_by.as_deref(), Some("actor_bob"));
+
+        // Audit fields survive journal replay.
+        let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
+        let replayed = Store::open(journal).unwrap();
+        let replayed_ch = replayed.get_channel(&ch.id).unwrap();
+        assert_eq!(replayed_ch.instructions.as_deref(), Some("v2"));
+        assert_eq!(replayed_ch.instructions_modified_by.as_deref(), Some("actor_bob"));
+        assert!(replayed_ch.instructions_modified_at.is_some());
+        let replayed_th = replayed.get_thread(&thread.id).unwrap();
+        assert_eq!(replayed_th.instructions.as_deref(), Some("v2"));
+        assert_eq!(replayed_th.instructions_modified_by.as_deref(), Some("actor_bob"));
+        assert!(replayed_th.instructions_modified_at.is_some());
+
+        // Clear also stamps the audit fields with the clearing caller.
+        let cleared = store
+            .set_channel_instructions(&ch.id, None, "actor_carol")
+            .expect("clear channel");
+        assert!(cleared.instructions.is_none());
+        assert_eq!(cleared.instructions_modified_by.as_deref(), Some("actor_carol"));
     }
 
     #[test]

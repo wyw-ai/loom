@@ -892,6 +892,8 @@ mod tests {
                 title: "topic".into(),
                 root_message_id: "msg_root".into(),
                 instructions: None,
+                instructions_modified_by: None,
+                instructions_modified_at: None,
                 archived_at: None,
                 _meta: None,
             }],

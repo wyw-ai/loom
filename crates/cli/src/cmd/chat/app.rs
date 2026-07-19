@@ -864,6 +864,8 @@ mod tests {
                 visibility: ChannelVisibility::Private,
                 members: vec!["actor_human_current".into(), "actor_agent_alpha".into()],
                 instructions: None,
+                instructions_modified_by: None,
+                instructions_modified_at: None,
                 _meta: None,
             },
             Channel {
@@ -873,6 +875,8 @@ mod tests {
                 visibility: ChannelVisibility::Public,
                 members: vec!["actor_agent_gamma".into()],
                 instructions: None,
+                instructions_modified_by: None,
+                instructions_modified_at: None,
                 _meta: None,
             },
         ]);
@@ -884,6 +888,8 @@ mod tests {
                 title: "demo".into(),
                 root_message_id: "evt_root".into(),
                 instructions: None,
+                instructions_modified_by: None,
+                instructions_modified_at: None,
                 archived_at: None,
                 _meta: None,
             }],
@@ -932,6 +938,8 @@ mod tests {
             visibility: ChannelVisibility::Public,
             members: vec![],
             instructions: None,
+            instructions_modified_by: None,
+            instructions_modified_at: None,
             _meta: None,
         }]);
         sidebar.replace_threads(
@@ -942,6 +950,8 @@ mod tests {
                 title: "demo".into(),
                 root_message_id: "evt_root".into(),
                 instructions: None,
+                instructions_modified_by: None,
+                instructions_modified_at: None,
                 archived_at: None,
                 _meta: None,
             }],

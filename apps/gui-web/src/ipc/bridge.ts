@@ -587,7 +587,7 @@ export async function channelSetInstruction(params: {
 
 export async function channelClearInstruction(
   channelId: string,
-): Promise<{ channel: Channel }> {
+): Promise<{ cleared: boolean }> {
   return invoke("channel_clear_instruction", {
     params: { channelId },
   });
@@ -610,7 +610,7 @@ export async function threadSetInstruction(params: {
 
 export async function threadClearInstruction(
   threadId: string,
-): Promise<{ thread: Thread }> {
+): Promise<{ cleared: boolean }> {
   return invoke("thread_clear_instruction", {
     params: { threadId },
   });

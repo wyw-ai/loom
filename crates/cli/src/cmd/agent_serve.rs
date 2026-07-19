@@ -6232,10 +6232,22 @@ async fn current_scope_skill_targets(
     }
 
     // 2. Channel skills (from file-based registry).
-    //    Channel skills override actor bundle skills for the same id.
+    //    Channel skills override actor bundle skills for the same id,
+    //    EXCEPT for reserved skill ids (e.g. "loom") which are always
+    //    backed by the embedded builtin skill and must not be overridden
+    //    by user-supplied registries.
     match crate::cmd::skill_registry::read_channel_skills(&state.paths.data_root, channel_id) {
         Ok(registry) => {
             for entry in &registry.skills {
+                if is_reserved_skill_id(&entry.id) {
+                    tracing::warn!(
+                        actor = %state.actor_id,
+                        channel = %channel_id,
+                        skill = %entry.id,
+                        "ignoring channel skill with reserved id; reserved ids are backed by builtins"
+                    );
+                    continue;
+                }
                 targets.insert(entry.id.clone(), PathBuf::from(&entry.source));
             }
         }
@@ -6250,7 +6262,8 @@ async fn current_scope_skill_targets(
     }
 
     // 3. Thread skills (only in thread scope).
-    //    Thread skills override channel skills for the same id.
+    //    Thread skills override channel skills for the same id, EXCEPT
+    //    for reserved ids (same rule as channel skills).
     if let Some(tid) = thread_id {
         match crate::cmd::skill_registry::read_thread_skills(
             &state.paths.data_root,
@@ -6259,6 +6272,15 @@ async fn current_scope_skill_targets(
         ) {
             Ok(registry) => {
                 for entry in &registry.skills {
+                    if is_reserved_skill_id(&entry.id) {
+                        tracing::warn!(
+                            actor = %state.actor_id,
+                            thread = %tid,
+                            skill = %entry.id,
+                            "ignoring thread skill with reserved id; reserved ids are backed by builtins"
+                        );
+                        continue;
+                    }
                     targets.insert(entry.id.clone(), PathBuf::from(&entry.source));
                 }
             }
@@ -6274,6 +6296,16 @@ async fn current_scope_skill_targets(
     }
 
     targets
+}
+
+/// Returns true if `skill_id` is a reserved skill id backed by a builtin
+/// skill snapshot and therefore must not be overridden by channel/thread
+/// skill registries. The reserved set is intentionally small and
+/// load-bearing: overriding "loom" would let a user-supplied registry
+/// shadow the official Loom skill that agents rely on for the Loom
+/// operating protocol.
+fn is_reserved_skill_id(skill_id: &str) -> bool {
+    skill_id == DEFAULT_LOOM_SKILL_ID
 }
 
 fn actor_bundle_source(agents_root: &Path, actor_id: &str) -> std::io::Result<Option<PathBuf>> {
@@ -13541,5 +13573,23 @@ mod tests {
             "actor_engineering",
             &TaskAssignmentStatus::Running,
         ));
+    }
+
+    /// Regression for issue #4: `loom` is a reserved skill id and must
+    /// never be treated as overridable. This unit test pins the
+    /// `is_reserved_skill_id` predicate so that any future change to the
+    /// reserved set is a deliberate edit here.
+    #[test]
+    fn loom_is_reserved_skill_id_and_cannot_be_overridden() {
+        assert!(is_reserved_skill_id(DEFAULT_LOOM_SKILL_ID));
+        assert_eq!(DEFAULT_LOOM_SKILL_ID, "loom");
+        // Non-reserved ids are not flagged.
+        assert!(!is_reserved_skill_id("obsidian"));
+        assert!(!is_reserved_skill_id("pdf"));
+        assert!(!is_reserved_skill_id("my-skill"));
+        // Empty / lookalikes are not reserved (they are just invalid elsewhere).
+        assert!(!is_reserved_skill_id(""));
+        assert!(!is_reserved_skill_id("Loom"));
+        assert!(!is_reserved_skill_id("loom-v2"));
     }
 }

@@ -443,6 +443,18 @@ inserts overwrite earlier ones. The resolution order in
 2. Channel skills are inserted next (overriding same-id actor skills)
 3. Thread skills are inserted last (overriding same-id channel skills)
 
+#### Reserved skill ids
+
+`loom` is a **reserved skill id**. The official Loom skill is always
+backed by the embedded builtin snapshot materialized under
+`<data_root>/builtin/skills/loom` and projected into every workspace
+via `ensure_default_loom_skill()` + the final `workspace_skill_targets
+.insert("loom", loom_skill)` step in `build_adapter_prompt()`.
+Channel and thread skill registries MUST NOT override it: entries with
+a reserved id are ignored at resolution time and a warning is logged.
+This prevents a user-supplied (or malicious) registry from shadowing
+the Loom operating-protocol skill that every agent relies on.
+
 ### Hot-pluggable design
 
 Skill registry changes take effect on the **next agent turn** — no

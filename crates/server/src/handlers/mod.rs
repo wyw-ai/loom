@@ -2116,7 +2116,7 @@ fn message_send(state: &AppState, connection_id: &str, params: Option<Value>) ->
     let kind = message_kind_for_actor(state.store.get_actor(&actor_id));
     let message = state
         .store
-        .append_message(
+        .append_message_idempotent(
             actor_id,
             p.target,
             kind,
@@ -2130,6 +2130,7 @@ fn message_send(state: &AppState, connection_id: &str, params: Option<Value>) ->
             p.attachments,
             p.metadata,
             p.if_latest_message_id,
+            p.idempotency_key,
         )
         .map_err(map_store_err)?;
     ok(MessageSendResult { message })
@@ -3255,6 +3256,58 @@ mod tests {
         )
         .await
         .expect("connection/open agent");
+    }
+
+    #[tokio::test]
+    async fn message_send_rpc_returns_first_message_for_an_idempotent_retry() {
+        let state = fresh_state("message-send-idempotency");
+        open_conn(&state, "conn_alice", "actor_alice").await;
+        let channel = state
+            .store
+            .create_channel("idempotent messages".into(), Some("actor_alice".into()))
+            .unwrap();
+        let target = format!("#{}", channel.id);
+
+        let first_value = dispatch(
+            &state,
+            "conn_alice",
+            method::MESSAGE_SEND,
+            Some(json!({
+                "target": target,
+                "body": "first body",
+                "idempotencyKey": "status-for-head-abc"
+            })),
+        )
+        .await
+        .expect("first message.send");
+        let first: MessageSendResult = serde_json::from_value(first_value).expect("first result");
+
+        let retry_value = dispatch(
+            &state,
+            "conn_alice",
+            method::MESSAGE_SEND,
+            Some(json!({
+                "target": target,
+                "body": "different retry body",
+                "idempotencyKey": "status-for-head-abc",
+                "ifLatestMessageId": "stale-optimistic-guard"
+            })),
+        )
+        .await
+        .expect("idempotent retry");
+        let retry: MessageSendResult = serde_json::from_value(retry_value).expect("retry result");
+
+        assert_eq!(retry.message.id, first.message.id);
+        assert_eq!(retry.message.body, "first body");
+        assert_eq!(
+            retry.message.idempotency_key.as_deref(),
+            Some("status-for-head-abc")
+        );
+        let (messages, _) = state
+            .store
+            .read_messages_for_target("actor_alice", &target, 10, None)
+            .unwrap();
+        assert_eq!(messages.len(), 1);
     }
 
     #[tokio::test]

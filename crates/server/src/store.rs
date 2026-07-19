@@ -726,20 +726,21 @@ impl Store {
         if self.get_channel(id).is_none() {
             return Err(StoreError::NotFound(format!("channel {id}")));
         }
-        let normalized = instructions
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-        self.journal.append(&Mutation::ChannelInstructionSet {
+        let normalized = normalize_instructions(instructions);
+        let mutation = Mutation::ChannelInstructionSet {
             channel_id: id.to_string(),
-            instructions: normalized.clone(),
-        })?;
+            instructions: normalized,
+        };
+        self.journal.append(&mutation)?;
         let mut inner = self.inner.write();
-        let ch = inner
+        // Reuse the single `apply()` path so V_online == V_replay: the
+        // in-memory mutation is the same code that replays from the journal.
+        apply(&mut inner, mutation);
+        let updated = inner
             .channels
-            .get_mut(id)
+            .get(id)
+            .cloned()
             .ok_or_else(|| StoreError::NotFound(format!("channel {id}")))?;
-        ch.instructions = normalized;
-        let updated = ch.clone();
         drop(inner);
         self.emit(StoreEvent::ChannelUpdated(updated.clone()));
         Ok(updated)
@@ -976,20 +977,21 @@ impl Store {
         if self.get_thread(id).is_none() {
             return Err(StoreError::NotFound(format!("thread {id}")));
         }
-        let normalized = instructions
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-        self.journal.append(&Mutation::ThreadInstructionSet {
+        let normalized = normalize_instructions(instructions);
+        let mutation = Mutation::ThreadInstructionSet {
             thread_id: id.to_string(),
-            instructions: normalized.clone(),
-        })?;
+            instructions: normalized,
+        };
+        self.journal.append(&mutation)?;
         let mut inner = self.inner.write();
-        let t = inner
+        // Reuse the single `apply()` path so V_online == V_replay: the
+        // in-memory mutation is the same code that replays from the journal.
+        apply(&mut inner, mutation);
+        let thread = inner
             .threads
-            .get_mut(id)
+            .get(id)
+            .cloned()
             .ok_or_else(|| StoreError::NotFound(format!("thread {id}")))?;
-        t.instructions = normalized;
-        let thread = t.clone();
         drop(inner);
         self.emit(StoreEvent::ThreadUpdated(thread.clone()));
         Ok(thread)
@@ -5168,6 +5170,15 @@ impl Store {
     }
 }
 
+/// Normalize free-form instructions input: trim, and treat empty / whitespace
+/// as `None` (clear). Used by the instruction setters so the value appended
+/// to the journal is already canonical and `apply()` is a pure assignment.
+fn normalize_instructions(instructions: Option<String>) -> Option<String> {
+    instructions
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn apply(inner: &mut Inner, m: Mutation) {
     match m {
         Mutation::ActorUpsert(a) => {
@@ -7731,6 +7742,65 @@ mod tests {
                 .as_deref(),
             Some("thread guide")
         );
+    }
+
+    /// Regression for issue #7: the live (`V_online`) and replayed
+    /// (`V_replay`) channel/thread instructions must stay bit-for-bit equal
+    /// after a sequence of concurrent set/clear calls. Because both code paths
+    /// now route through the same `apply()` function, any divergence is a bug.
+    #[test]
+    fn instructions_online_matches_replay_after_mixed_sets() {
+        let store = fresh_store();
+        let ch = store
+            .create_channel("concurrency chan".into(), None)
+            .expect("create channel");
+        let thread = create_thread_under(&store, &ch.id, "actor_owner", "root_msg");
+
+        // Interleaved set/clear on both channel and thread scopes.
+        let sequence: &[(&str, &str)] = &[
+            ("channel", "first"),
+            ("thread", "first"),
+            ("channel", "second"),
+            ("thread", ""),
+            ("channel", ""),
+            ("thread", "final"),
+            ("channel", "final"),
+        ];
+        for (scope, text) in sequence {
+            let value = if text.is_empty() {
+                None
+            } else {
+                Some((*text).to_string())
+            };
+            match *scope {
+                "channel" => {
+                    store
+                        .set_channel_instructions(&ch.id, value)
+                        .expect("set channel instructions");
+                }
+                "thread" => {
+                    store
+                        .set_thread_instructions(&thread.id, value)
+                        .expect("set thread instructions");
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        // V_online: live in-memory state.
+        let v_online_channel = store.get_channel(&ch.id).unwrap().instructions.clone();
+        let v_online_thread = store.get_thread(&thread.id).unwrap().instructions.clone();
+
+        // V_replay: reopen from journal.
+        let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
+        let replayed = Store::open(journal).unwrap();
+        let v_replay_channel = replayed.get_channel(&ch.id).unwrap().instructions.clone();
+        let v_replay_thread = replayed.get_thread(&thread.id).unwrap().instructions.clone();
+
+        assert_eq!(v_online_channel, v_replay_channel, "channel V_online != V_replay");
+        assert_eq!(v_online_thread, v_replay_thread, "thread V_online != V_replay");
+        assert_eq!(v_online_channel.as_deref(), Some("final"));
+        assert_eq!(v_online_thread.as_deref(), Some("final"));
     }
 
     #[test]

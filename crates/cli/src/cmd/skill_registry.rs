@@ -1,14 +1,25 @@
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use fs2::FileExt;
+use proto::path_component::validate_path_component;
 use serde::{Deserialize, Serialize};
 
 /// A single skill entry in a channel or thread skill registry.
+///
+/// `#[serde(rename_all = "camelCase")]` keeps this struct wire-compatible
+/// with the GUI's `SkillEntryDto`, which serializes `added_at` as
+/// `addedAt`. `#[serde(alias = "added_at")]` on `added_at` preserves
+/// backward compatibility with older `snake_case` registry files written
+/// by previous CLI versions.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct SkillEntry {
     pub id: String,
     pub source: String,
+    #[serde(alias = "added_at", alias = "addedAt")]
     pub added_at: String,
 }
 
@@ -46,6 +57,44 @@ impl SkillRegistry {
 // Path helpers
 // ---------------------------------------------------------------------
 
+/// Validate a scope identifier (channel or thread id) before joining it
+/// into a runtime-managed directory. Returns an `io::Error` on failure so
+/// callers can surface it through the existing `io::Result` API.
+fn validate_scope_id(scope: &str, what: &str) -> io::Result<()> {
+    match validate_path_component(scope, what) {
+        Ok(()) => Ok(()),
+        Err(err) => Err(io::Error::new(io::ErrorKind::InvalidInput, err)),
+    }
+}
+
+/// Validate a skill id. Skill ids become part of agent prompt assembly and
+/// may be used in file lookups, so they must satisfy the same path-component
+/// safety rules as channel/thread ids.
+fn validate_skill_id(skill_id: &str) -> io::Result<()> {
+    validate_scope_id(skill_id, "skill_id")
+}
+
+/// Validate a skill `source` field. `source` is either a directory path or
+/// a URL-like identifier; we do NOT reject slashes (legit absolute paths),
+/// but we reject any `..` segment so a malicious source cannot escape the
+/// data root via path traversal when source is interpreted as a filesystem
+/// path by the agent runtime.
+fn validate_skill_source(source: &str) -> io::Result<()> {
+    if source.split('/').any(|seg| seg == "..") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "skill source must not contain `..` path segments",
+        ));
+    }
+    if source.split('\\').any(|seg| seg == "..") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "skill source must not contain `..` path segments",
+        ));
+    }
+    Ok(())
+}
+
 /// `<data_root>/channels/<channel_id>/channel-skills.json`
 pub fn channel_skill_registry_path(data_root: &Path, channel_id: &str) -> PathBuf {
     data_root
@@ -68,6 +117,9 @@ pub fn thread_skill_registry_path(data_root: &Path, channel_id: &str, thread_id:
 // Read / write
 // ---------------------------------------------------------------------
 
+/// Max time to wait for the cross-process registry lock before failing.
+const REGISTRY_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Read a skill registry from `path`. Returns an empty registry if the
 /// file does not exist (graceful backward compatibility).
 fn read_registry(path: &Path) -> io::Result<SkillRegistry> {
@@ -83,13 +135,112 @@ fn read_registry(path: &Path) -> io::Result<SkillRegistry> {
 }
 
 /// Write a skill registry to `path`, creating parent directories.
+///
+/// The write is atomic: we serialize into a temp file in the same
+/// directory, `flush` + `sync_all` to durability, then `rename` over the
+/// target. Partial writes from a crashed process therefore never leave a
+/// corrupt registry file visible to readers.
 fn write_registry(path: &Path, registry: &SkillRegistry) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let text = serde_json::to_string_pretty(registry)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-    fs::write(path, text)
+
+    // Write to a sibling temp file then atomically rename. Using the same
+    // directory guarantees the rename is atomic on POSIX and replace-on-POSIX
+    // + same-volume on Windows.
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(text.as_bytes())?;
+    tmp.as_file_mut().sync_all()?;
+    tmp.persist(path).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("atomic persist failed: {err}"),
+        )
+    })?;
+    Ok(())
+}
+
+/// Cross-process lock guard for a skill registry file. We lock a sibling
+/// `.lock` file (creating it if needed) for the duration of a read-modify-
+/// write cycle so concurrent CLI/GUI/agent processes cannot interleave and
+/// clobber each other's edits.
+struct RegistryLock(fs::File);
+
+impl RegistryLock {
+    fn acquire(path: &Path, timeout: Duration) -> io::Result<Self> {
+        let lock_path = lock_file_for(path);
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lock_path)?;
+        // Spin-wait with short sleeps until the exclusive lock is acquired
+        // or the timeout elapses. `try_lock_exclusive` is non-blocking.
+        //
+        // On Windows, a contended `try_lock_exclusive` returns a raw OS
+        // error (ERROR_LOCK_VIOLATION = 33) rather than `WouldBlock`, so
+        // we treat both the explicit `WouldBlock` kind and the
+        // `Uncategorized` raw-error-33 case as "retry".
+        let start = std::time::Instant::now();
+        loop {
+            match file.try_lock_exclusive() {
+                Ok(()) => return Ok(RegistryLock(file)),
+                Err(ref err) if is_lock_contended(err) => {
+                    if start.elapsed() >= timeout {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "timed out waiting for skill registry lock",
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+}
+
+/// Returns true if `err` represents a "lock is held by someone else"
+/// condition rather than a real I/O failure. fs2 surfaces this differently
+/// per platform: `WouldBlock` on Unix, raw OS error 33 (ERROR_LOCK_VIOLATION)
+/// on Windows.
+fn is_lock_contended(err: &io::Error) -> bool {
+    if err.kind() == io::ErrorKind::WouldBlock {
+        return true;
+    }
+    // Windows: ERROR_LOCK_VIOLATION = 33. fs2 surfaces the raw OS error
+    // with `Uncategorized` kind on stable Rust.
+    #[cfg(windows)]
+    if let Some(raw) = err.raw_os_error() {
+        if raw == 33 {
+            return true;
+        }
+    }
+    false
+}
+
+impl Drop for RegistryLock {
+    fn drop(&mut self) {
+        // Best-effort unlock; ignore errors.
+        let _ = self.0.unlock();
+    }
+}
+
+fn lock_file_for(registry_path: &Path) -> PathBuf {
+    let mut name = registry_path
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("registry"));
+    name.push(".lock");
+    registry_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(name)
 }
 
 // ---------------------------------------------------------------------
@@ -98,6 +249,7 @@ fn write_registry(path: &Path, registry: &SkillRegistry) -> io::Result<()> {
 
 /// Read the channel skill registry. Returns empty if missing.
 pub fn read_channel_skills(data_root: &Path, channel_id: &str) -> io::Result<SkillRegistry> {
+    validate_scope_id(channel_id, "channel_id")?;
     read_registry(&channel_skill_registry_path(data_root, channel_id))
 }
 
@@ -108,13 +260,18 @@ pub fn add_channel_skill(
     skill_id: String,
     source: String,
 ) -> io::Result<SkillRegistry> {
-    let mut reg = read_channel_skills(data_root, channel_id)?;
+    validate_scope_id(channel_id, "channel_id")?;
+    validate_skill_id(&skill_id)?;
+    validate_skill_source(&source)?;
+    let path = channel_skill_registry_path(data_root, channel_id);
+    let _lock = RegistryLock::acquire(&path, REGISTRY_LOCK_TIMEOUT)?;
+    let mut reg = read_registry(&path)?;
     reg.upsert(SkillEntry {
         id: skill_id,
         source,
         added_at: now_iso(),
     });
-    write_registry(&channel_skill_registry_path(data_root, channel_id), &reg)?;
+    write_registry(&path, &reg)?;
     Ok(reg)
 }
 
@@ -125,10 +282,14 @@ pub fn remove_channel_skill(
     channel_id: &str,
     skill_id: &str,
 ) -> io::Result<(SkillRegistry, bool)> {
-    let mut reg = read_channel_skills(data_root, channel_id)?;
+    validate_scope_id(channel_id, "channel_id")?;
+    validate_skill_id(skill_id)?;
+    let path = channel_skill_registry_path(data_root, channel_id);
+    let _lock = RegistryLock::acquire(&path, REGISTRY_LOCK_TIMEOUT)?;
+    let mut reg = read_registry(&path)?;
     let removed = reg.remove(skill_id);
     if removed {
-        write_registry(&channel_skill_registry_path(data_root, channel_id), &reg)?;
+        write_registry(&path, &reg)?;
     }
     Ok((reg, removed))
 }
@@ -143,6 +304,8 @@ pub fn read_thread_skills(
     channel_id: &str,
     thread_id: &str,
 ) -> io::Result<SkillRegistry> {
+    validate_scope_id(channel_id, "channel_id")?;
+    validate_scope_id(thread_id, "thread_id")?;
     read_registry(&thread_skill_registry_path(
         data_root, channel_id, thread_id,
     ))
@@ -156,16 +319,19 @@ pub fn add_thread_skill(
     skill_id: String,
     source: String,
 ) -> io::Result<SkillRegistry> {
-    let mut reg = read_thread_skills(data_root, channel_id, thread_id)?;
+    validate_scope_id(channel_id, "channel_id")?;
+    validate_scope_id(thread_id, "thread_id")?;
+    validate_skill_id(&skill_id)?;
+    validate_skill_source(&source)?;
+    let path = thread_skill_registry_path(data_root, channel_id, thread_id);
+    let _lock = RegistryLock::acquire(&path, REGISTRY_LOCK_TIMEOUT)?;
+    let mut reg = read_registry(&path)?;
     reg.upsert(SkillEntry {
         id: skill_id,
         source,
         added_at: now_iso(),
     });
-    write_registry(
-        &thread_skill_registry_path(data_root, channel_id, thread_id),
-        &reg,
-    )?;
+    write_registry(&path, &reg)?;
     Ok(reg)
 }
 
@@ -177,13 +343,15 @@ pub fn remove_thread_skill(
     thread_id: &str,
     skill_id: &str,
 ) -> io::Result<(SkillRegistry, bool)> {
-    let mut reg = read_thread_skills(data_root, channel_id, thread_id)?;
+    validate_scope_id(channel_id, "channel_id")?;
+    validate_scope_id(thread_id, "thread_id")?;
+    validate_skill_id(skill_id)?;
+    let path = thread_skill_registry_path(data_root, channel_id, thread_id);
+    let _lock = RegistryLock::acquire(&path, REGISTRY_LOCK_TIMEOUT)?;
+    let mut reg = read_registry(&path)?;
     let removed = reg.remove(skill_id);
     if removed {
-        write_registry(
-            &thread_skill_registry_path(data_root, channel_id, thread_id),
-            &reg,
-        )?;
+        write_registry(&path, &reg)?;
     }
     Ok((reg, removed))
 }
@@ -276,5 +444,175 @@ mod tests {
 
         assert_eq!(ch.skills[0].source, "/channel");
         assert_eq!(th.skills[0].source, "/thread");
+    }
+
+    // ---- Regression: issue #2 path validation ---------------------------
+
+    #[test]
+    fn rejects_channel_id_with_path_traversal() {
+        let tmp = TempDir::new().unwrap();
+        let err = add_channel_skill(
+            tmp.path(),
+            "../escape",
+            "skill1".into(),
+            "/src".into(),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let err = read_channel_skills(tmp.path(), "..").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let err = remove_channel_skill(tmp.path(), "..", "skill1").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn rejects_thread_id_with_path_traversal() {
+        let tmp = TempDir::new().unwrap();
+        let err = add_thread_skill(
+            tmp.path(),
+            "chan1",
+            "../../etc",
+            "skill1".into(),
+            "/src".into(),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let err = read_thread_skills(tmp.path(), "chan1", "../../etc").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn rejects_unsafe_skill_id() {
+        let tmp = TempDir::new().unwrap();
+        for bad in ["..", "../escape", "-flag", "a/b", "foo..bar", ".hidden"] {
+            let err = add_channel_skill(tmp.path(), "chan1", bad.into(), "/src".into())
+                .err()
+                .unwrap_or_else(|| panic!("expected reject for {bad}"));
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "skill_id={bad}");
+        }
+    }
+
+    #[test]
+    fn rejects_skill_source_with_dotdot_segment() {
+        let tmp = TempDir::new().unwrap();
+        for bad in [
+            "../escape",
+            "/abs/../../etc",
+            "foo/../../bar",
+            "a\\..\\..\\b",
+        ] {
+            let err = add_channel_skill(tmp.path(), "chan1", "skill1".into(), bad.into())
+                .err()
+                .unwrap_or_else(|| panic!("expected reject for {bad}"));
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "source={bad}");
+        }
+        // Legit absolute path with no `..` segment is accepted.
+        add_channel_skill(
+            tmp.path(),
+            "chan1",
+            "skill_ok".into(),
+            "/abs/path/to/skill".into(),
+        )
+        .expect("legit absolute source");
+    }
+
+    // ---- Regression: issue #5 camelCase / snake_case compat -------------
+
+    #[test]
+    fn skill_entry_serializes_as_camel_case_to_match_gui() {
+        let entry = SkillEntry {
+            id: "obsidian".into(),
+            source: "/path".into(),
+            added_at: "1970-01-01T00:00:00000Z".into(),
+        };
+        let json = serde_json::to_value(&entry).unwrap();
+        // GUI reads `addedAt`; CLI must emit the same key for wire compat.
+        assert!(json.get("addedAt").is_some(), "must emit addedAt: {json}");
+        assert!(
+            json.get("added_at").is_none(),
+            "must not emit snake_case added_at: {json}"
+        );
+    }
+
+    #[test]
+    fn skill_entry_deserializes_both_camel_and_snake_case() {
+        // Legacy CLI-written file (snake_case).
+        let snake = r#"{"id":"a","source":"/s","added_at":"1970-01-01T00:00:00000Z"}"#;
+        let e: SkillEntry = serde_json::from_str(snake).expect("parse snake_case");
+        assert_eq!(e.id, "a");
+        assert_eq!(e.added_at, "1970-01-01T00:00:00000Z");
+
+        // GUI-written file (camelCase).
+        let camel = r#"{"id":"b","source":"/s","addedAt":"1970-01-01T00:00:00001Z"}"#;
+        let e: SkillEntry = serde_json::from_str(camel).expect("parse camelCase");
+        assert_eq!(e.id, "b");
+        assert_eq!(e.added_at, "1970-01-01T00:00:00001Z");
+    }
+
+    #[test]
+    fn round_trip_preserves_camel_case_on_disk() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        add_channel_skill(root, "chan1", "obs".into(), "/p".into()).unwrap();
+        let on_disk =
+            fs::read_to_string(channel_skill_registry_path(root, "chan1")).unwrap();
+        assert!(
+            on_disk.contains("\"addedAt\""),
+            "on-disk file must use camelCase: {on_disk}"
+        );
+        assert!(
+            !on_disk.contains("\"added_at\""),
+            "on-disk file must not use snake_case: {on_disk}"
+        );
+    }
+
+    // ---- Regression: issue #6 atomic write + cross-process lock ---------
+
+    #[test]
+    fn atomic_write_leaves_no_partial_file_on_success() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        add_channel_skill(root, "chan1", "s1".into(), "/p".into()).unwrap();
+        // After a successful write, only the final registry file should
+        // exist (no leftover temp files in the directory).
+        let registry_path = channel_skill_registry_path(root, "chan1");
+        let dir = registry_path.parent().unwrap();
+        let files: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !files.iter().any(|f| f.starts_with(".tmp") || f.contains("tmp")),
+            "leftover temp file: {files:?}"
+        );
+        assert!(files.iter().any(|f| f == "channel-skills.json"));
+    }
+
+    #[test]
+    fn concurrent_writes_do_not_lose_edits() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let root = root.clone();
+            handles.push(std::thread::spawn(move || {
+                add_channel_skill(
+                    &root,
+                    "chan1",
+                    format!("skill_{i}"),
+                    format!("/src/{i}"),
+                )
+                .expect("add channel skill");
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let reg = read_channel_skills(&root, "chan1").unwrap();
+        // All 8 concurrent upserts must be present (lock prevents lost updates).
+        assert_eq!(reg.skills.len(), 8, "concurrent writes lost edits");
     }
 }

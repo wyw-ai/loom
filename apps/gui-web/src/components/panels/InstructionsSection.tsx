@@ -14,14 +14,17 @@ export function InstructionsSection({
   channelId?: string;
 }) {
   const [text, setText] = useState("");
-  const [loaded, setLoaded] = useState(false);
+  const [loadState, setLoadState] = useState<"loading" | "ready" | "error">(
+    "loading",
+  );
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [savedFlash, setSavedFlash] = useState(false);
+  const [reloadNonce, setReloadNonce] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
-    setLoaded(false);
+    setLoadState("loading");
     setError(null);
     const fn =
       scope === "channel"
@@ -31,17 +34,17 @@ export function InstructionsSection({
       .then((res) => {
         if (cancelled) return;
         setText(res.instructions ?? "");
-        setLoaded(true);
+        setLoadState("ready");
       })
       .catch((err) => {
         if (cancelled) return;
         setError(errorText(err));
-        setLoaded(true);
+        setLoadState("error");
       });
     return () => {
       cancelled = true;
     };
-  }, [scope, scopeId]);
+  }, [scope, scopeId, reloadNonce]);
 
   const handleSave = async () => {
     setSaving(true);
@@ -83,10 +86,21 @@ export function InstructionsSection({
   return (
     <section>
       <h3 className="mb-2 text-sm font-bold text-[#111827]">📝 Instructions</h3>
-      {!loaded ? (
+      {loadState === "loading" ? (
         <div className="flex items-center gap-2 py-4 text-sm text-[#667085]">
           <Loader2 size={14} className="animate-spin" />
           Loading…
+        </div>
+      ) : loadState === "error" ? (
+        <div className="space-y-2 py-2">
+          {error && <p className="text-xs text-red-500">{error}</p>}
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => setReloadNonce((n) => n + 1)}
+          >
+            Retry
+          </Button>
         </div>
       ) : (
         <>

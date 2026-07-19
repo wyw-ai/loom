@@ -30,6 +30,7 @@ pub async fn send(
     intent: Option<String>,
     delivery_policy: Option<String>,
     if_latest: Option<String>,
+    idempotency_key: Option<String>,
     attachment_ids: Vec<String>,
     allow_escaped_newlines: bool,
 ) -> Result<()> {
@@ -107,6 +108,9 @@ pub async fn send(
     if let Some(if_latest) = if_latest.filter(|value| !value.trim().is_empty()) {
         params["ifLatestMessageId"] = json!(if_latest);
     }
+    if let Some(idempotency_key) = idempotency_key {
+        params["idempotencyKey"] = json!(idempotency_key);
+    }
     let will_wake = !private_to.is_empty() || delivery_policy == Some(DeliveryPolicy::WakeAgent);
     let has_targeted_audience = !private_to.is_empty() || inferred_reply.is_some();
     if !will_wake && !has_targeted_audience && looks_like_call_for_action(&body) {
@@ -145,6 +149,7 @@ pub async fn ask(
     recipients: Vec<String>,
     text: Option<String>,
     if_latest: Option<String>,
+    idempotency_key: Option<String>,
     attachment_ids: Vec<String>,
     allow_escaped_newlines: bool,
 ) -> Result<()> {
@@ -163,7 +168,14 @@ pub async fn ask(
         allow_escaped_newlines,
         agent_turn_is_active(),
     )?;
-    let params = build_ask_params(target.clone(), recipients, body, if_latest, attachment_ids)?;
+    let params = build_ask_params(
+        target.clone(),
+        recipients,
+        body,
+        if_latest,
+        idempotency_key,
+        attachment_ids,
+    )?;
     if let Some(warning) = channel_fragmentation_warning(&target, false) {
         eprintln!("{warning}");
     }
@@ -322,6 +334,7 @@ fn build_ask_params(
     recipients: Vec<String>,
     body: String,
     if_latest: Option<String>,
+    idempotency_key: Option<String>,
     attachment_ids: Vec<String>,
 ) -> Result<Value> {
     let audience = normalize_audience_refs(recipients)?;
@@ -335,6 +348,9 @@ fn build_ask_params(
     });
     if let Some(if_latest) = if_latest.filter(|value| !value.trim().is_empty()) {
         params["ifLatestMessageId"] = json!(if_latest);
+    }
+    if let Some(idempotency_key) = idempotency_key {
+        params["idempotencyKey"] = json!(idempotency_key);
     }
     Ok(params)
 }
@@ -806,6 +822,7 @@ mod tests {
             vec!["@actor_agent_qzz_729cf432".into()],
             "Q仔，请开始白天发言。".into(),
             Some("msg_latest".into()),
+            Some("wake-qzz-once".into()),
             Vec::new(),
         )
         .expect("build ask params");
@@ -814,6 +831,7 @@ mod tests {
         assert_eq!(params["intent"], "ask");
         assert_eq!(params["deliveryPolicy"], "wake_agent");
         assert_eq!(params["ifLatestMessageId"], "msg_latest");
+        assert_eq!(params["idempotencyKey"], "wake-qzz-once");
         assert_eq!(params["audience"][0]["kind"], "actor");
         assert_eq!(params["audience"][0]["id"], "actor_agent_qzz_729cf432");
     }
@@ -827,6 +845,7 @@ mod tests {
                 "actor_agent_b,@all,@agents,@humans,group:reviewers".into(),
             ],
             "please respond".into(),
+            None,
             None,
             Vec::new(),
         )
@@ -854,6 +873,7 @@ mod tests {
             "#chan_1".into(),
             vec!["@Q仔".into()],
             "please respond".into(),
+            None,
             None,
             Vec::new(),
         )
@@ -1063,6 +1083,7 @@ mod read_tests {
             task_id: None,
             attachments: Vec::new(),
             reactions: Vec::new(),
+            idempotency_key: None,
             metadata: Default::default(),
         }
     }

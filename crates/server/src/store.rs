@@ -130,6 +130,9 @@ struct Inner {
     /// scope ref -> ordered messages
     messages_by_scope: HashMap<ScopeRef, Vec<String>>,
     messages: HashMap<String, Message>,
+    /// (author actor, resolved scope, client key) -> first appended message.
+    /// Rebuilt from MessageAppend records on replay.
+    message_idempotency: HashMap<(String, ScopeRef, String), String>,
     /// (turn_id) -> next seq
     turn_seq: HashMap<String, u64>,
     runs: HashMap<String, Run>,
@@ -3297,6 +3300,7 @@ impl Store {
                 Vec::new(),
                 metadata,
                 None,
+                None,
                 true,
             )?),
             None => None,
@@ -3473,6 +3477,42 @@ impl Store {
         metadata: Meta,
         if_latest_message_id: Option<String>,
     ) -> StoreResult<Message> {
+        self.append_message_idempotent(
+            author_actor_id,
+            target,
+            kind,
+            body,
+            explicit_mentions,
+            explicit_audience,
+            intent,
+            delivery_policy,
+            parent_message_id,
+            thread_root_message_id,
+            attachments,
+            metadata,
+            if_latest_message_id,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_message_idempotent(
+        &self,
+        author_actor_id: String,
+        target: String,
+        kind: MessageKind,
+        body: String,
+        explicit_mentions: Vec<MessageMention>,
+        explicit_audience: Vec<AudienceRef>,
+        intent: MessageIntent,
+        delivery_policy: DeliveryPolicy,
+        parent_message_id: Option<String>,
+        thread_root_message_id: Option<String>,
+        attachments: Vec<String>,
+        metadata: Meta,
+        if_latest_message_id: Option<String>,
+        idempotency_key: Option<String>,
+    ) -> StoreResult<Message> {
         let _guard = self.structure_lock.lock();
         self.append_message_locked(
             author_actor_id,
@@ -3488,6 +3528,7 @@ impl Store {
             attachments,
             metadata,
             if_latest_message_id,
+            idempotency_key,
             true,
         )
     }
@@ -3508,14 +3549,29 @@ impl Store {
         attachments: Vec<String>,
         metadata: Meta,
         if_latest_message_id: Option<String>,
+        idempotency_key: Option<String>,
         merge_mention_audience: bool,
     ) -> StoreResult<Message> {
+        let resolved = self.resolve_message_target_for_append(&target, &author_actor_id)?;
+        self.check_scope_access(&resolved.scope, &author_actor_id)?;
+        let idempotency_key = normalize_message_idempotency_key(idempotency_key)?;
+        if let Some(key) = idempotency_key.as_ref() {
+            let inner = self.inner.read();
+            if let Some(message_id) = inner.message_idempotency.get(&(
+                author_actor_id.clone(),
+                resolved.scope.clone(),
+                key.clone(),
+            )) {
+                return inner.messages.get(message_id).cloned().ok_or_else(|| {
+                    StoreError::InvalidState(format!(
+                        "idempotent message {message_id} is missing from the store"
+                    ))
+                });
+            }
+        }
         if body.trim().is_empty() && attachments.is_empty() {
             return Err(StoreError::InvalidState("message body is empty".into()));
         }
-
-        let resolved = self.resolve_message_target_for_append(&target, &author_actor_id)?;
-        self.check_scope_access(&resolved.scope, &author_actor_id)?;
         if let Some(expected) = if_latest_message_id
             .as_deref()
             .map(str::trim)
@@ -3584,6 +3640,7 @@ impl Store {
             task_id: task_context.as_ref().map(|task| task.id.clone()),
             attachments,
             reactions: Vec::new(),
+            idempotency_key: idempotency_key.clone(),
             metadata,
         };
         let private_actor_ids = Self::message_private_actor_ids(&message);
@@ -3613,6 +3670,12 @@ impl Store {
                 .or_default()
                 .push(message.id.clone());
             inner.messages.insert(message.id.clone(), message.clone());
+            if let Some(key) = idempotency_key {
+                inner.message_idempotency.insert(
+                    (author_actor_id.clone(), message.scope.clone(), key),
+                    message.id.clone(),
+                );
+            }
         }
 
         let _ = self.touch_membership(
@@ -4601,6 +4664,7 @@ impl Store {
             Vec::new(),
             metadata,
             None,
+            None,
             false,
         )
     }
@@ -5186,6 +5250,12 @@ fn apply(inner: &mut Inner, m: Mutation) {
             inner.coordination_steps.insert(step.id.clone(), step);
         }
         Mutation::MessageAppend(m) => {
+            if let Some(key) = m.idempotency_key.as_ref() {
+                inner
+                    .message_idempotency
+                    .entry((m.author_actor_id.clone(), m.scope.clone(), key.clone()))
+                    .or_insert_with(|| m.id.clone());
+            }
             inner
                 .messages_by_scope
                 .entry(m.scope.clone())
@@ -5343,6 +5413,24 @@ fn apply(inner: &mut Inner, m: Mutation) {
 fn short_id() -> String {
     let id = Uuid::new_v4().simple().to_string();
     id[..12].to_string()
+}
+
+fn normalize_message_idempotency_key(key: Option<String>) -> StoreResult<Option<String>> {
+    let Some(key) = key else {
+        return Ok(None);
+    };
+    let key = key.trim();
+    if key.is_empty() {
+        return Err(StoreError::InvalidState(
+            "message idempotency key is empty".into(),
+        ));
+    }
+    if key.len() > 256 {
+        return Err(StoreError::InvalidState(
+            "message idempotency key exceeds 256 bytes".into(),
+        ));
+    }
+    Ok(Some(key.to_string()))
 }
 
 #[derive(Debug, Clone)]
@@ -6391,6 +6479,147 @@ mod tests {
                 None,
             )
             .expect("append message")
+    }
+
+    fn send_test_message_idempotent(
+        store: &Arc<Store>,
+        actor_id: &str,
+        target: &str,
+        body: &str,
+        key: &str,
+    ) -> Message {
+        store
+            .append_message_idempotent(
+                actor_id.into(),
+                target.into(),
+                MessageKind::Human,
+                body.into(),
+                Vec::new(),
+                Vec::new(),
+                MessageIntent::Chat,
+                DeliveryPolicy::NotifyOnly,
+                None,
+                None,
+                Vec::new(),
+                Meta::default(),
+                None,
+                Some(key.into()),
+            )
+            .expect("append idempotent message")
+    }
+
+    #[test]
+    fn message_idempotency_is_scoped_by_actor_and_resolved_thread_and_replays() {
+        let store = fresh_store();
+        for actor in [
+            test_actor("actor_owner", ActorKind::Human, "Owner"),
+            test_actor("actor_bob", ActorKind::Human, "Bob"),
+        ] {
+            store.upsert_actor(actor).unwrap();
+        }
+        let channel = store
+            .create_channel("idempotency".into(), Some("actor_owner".into()))
+            .unwrap();
+        store.grant_channel(&channel.id, "actor_bob").unwrap();
+        let root_message_id = append_channel_root(&store, &channel.id, "actor_owner", "root");
+        let thread = store
+            .create_thread(channel.id.clone(), "root".into(), root_message_id.clone())
+            .unwrap();
+        let canonical_target = format!("#{}:{}", channel.id, root_message_id);
+        let alias_target = format!("#{}:{}", channel.id, thread.id);
+
+        let first = send_test_message_idempotent(
+            &store,
+            "actor_owner",
+            &canonical_target,
+            "first body",
+            "  stable-key  ",
+        );
+        let retry = send_test_message_idempotent(
+            &store,
+            "actor_owner",
+            &alias_target,
+            "different retry body",
+            "stable-key",
+        );
+        assert_eq!(retry.id, first.id);
+        assert_eq!(retry.body, "first body");
+        assert_eq!(retry.idempotency_key.as_deref(), Some("stable-key"));
+
+        let other_actor = send_test_message_idempotent(
+            &store,
+            "actor_bob",
+            &canonical_target,
+            "bob body",
+            "stable-key",
+        );
+        assert_ne!(other_actor.id, first.id);
+
+        let second_root = append_channel_root(&store, &channel.id, "actor_owner", "second root");
+        let other_scope = send_test_message_idempotent(
+            &store,
+            "actor_owner",
+            &format!("#{}:{}", channel.id, second_root),
+            "other thread body",
+            "stable-key",
+        );
+        assert_ne!(other_scope.id, first.id);
+
+        let replayed = Store::open(Journal::open(store.journal.path().to_path_buf()).unwrap())
+            .expect("replay store");
+        let replayed_retry = send_test_message_idempotent(
+            &replayed,
+            "actor_owner",
+            &canonical_target,
+            "retry after restart",
+            "stable-key",
+        );
+        assert_eq!(replayed_retry.id, first.id);
+        let (messages, _) = replayed
+            .read_messages_for_target("actor_owner", &canonical_target, 10, None)
+            .unwrap();
+        assert_eq!(messages.len(), 2, "one owner message and one bob message");
+    }
+
+    #[test]
+    fn concurrent_message_retries_append_exactly_once() {
+        let store = fresh_store();
+        store
+            .upsert_actor(test_actor("actor_owner", ActorKind::Human, "Owner"))
+            .unwrap();
+        let channel = store
+            .create_channel("idempotency race".into(), Some("actor_owner".into()))
+            .unwrap();
+        let root_message_id = append_channel_root(&store, &channel.id, "actor_owner", "root");
+        let target = format!("#{}:{}", channel.id, root_message_id);
+        let workers = 8;
+        let barrier = Arc::new(Barrier::new(workers));
+        let mut handles = Vec::new();
+        for index in 0..workers {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            let target = target.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                send_test_message_idempotent(
+                    &store,
+                    "actor_owner",
+                    &target,
+                    &format!("body {index}"),
+                    "concurrent-key",
+                )
+                .id
+            }));
+        }
+        let ids: HashSet<String> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("worker"))
+            .collect();
+        assert_eq!(ids.len(), 1);
+        let (messages, _) = store
+            .read_messages_for_target("actor_owner", &target, 20, None)
+            .unwrap();
+        assert_eq!(messages.len(), 1);
     }
 
     #[test]

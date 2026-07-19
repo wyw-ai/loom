@@ -122,16 +122,49 @@ const REGISTRY_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Read a skill registry from `path`. Returns an empty registry if the
 /// file does not exist (graceful backward compatibility).
+///
+/// If the main file exists but is corrupt (e.g. a partial write from a
+/// crash that somehow bypassed the atomic rename), falls back to the
+/// `.bak` sidecar file as a last-known-good copy (issue #6
+/// defense-in-depth).
 fn read_registry(path: &Path) -> io::Result<SkillRegistry> {
     match fs::read_to_string(path) {
-        Ok(text) => {
-            let reg: SkillRegistry = serde_json::from_str(&text)
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-            Ok(reg)
+        Ok(text) => match serde_json::from_str::<SkillRegistry>(&text) {
+            Ok(reg) => Ok(reg),
+            Err(parse_err) => {
+                // Main file is corrupt; try the .bak fallback.
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %parse_err,
+                    "skill registry JSON corrupt, falling back to .bak (issue #6 defense-in-depth)"
+                );
+                read_bak_registry(path).or_else(|bak_err| {
+                    Err(io::Error::new(io::ErrorKind::InvalidData, format!("{parse_err}; .bak also unavailable: {bak_err}")))
+                })
+            }
+        },
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            // No main file; try .bak in case only the backup survived,
+            // otherwise return an empty registry (graceful default).
+            read_bak_registry(path).or(Ok(SkillRegistry::default()))
         }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(SkillRegistry::default()),
         Err(err) => Err(err),
     }
+}
+
+/// Attempt to read the `.bak` sidecar for `path`. Returns `Ok(registry)`
+/// if the backup exists and parses, or an `Err(NotFound)` if there is no
+/// backup (so callers can treat the absence as "no fallback available").
+fn read_bak_registry(path: &Path) -> io::Result<SkillRegistry> {
+    let bak = bak_file_for(path);
+    let text = fs::read_to_string(&bak)?;
+    let reg: SkillRegistry = serde_json::from_str(&text)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    tracing::info!(
+        bak = %bak.display(),
+        "restored skill registry from .bak backup"
+    );
+    Ok(reg)
 }
 
 /// Write a skill registry to `path`, creating parent directories.
@@ -140,10 +173,31 @@ fn read_registry(path: &Path) -> io::Result<SkillRegistry> {
 /// directory, `flush` + `sync_all` to durability, then `rename` over the
 /// target. Partial writes from a crashed process therefore never leave a
 /// corrupt registry file visible to readers.
+///
+/// Before overwriting, the previous version (if any) is copied to a
+/// `.bak` sidecar so `read_registry` can recover if the main file is ever
+/// corrupted (issue #6 defense-in-depth).
 fn write_registry(path: &Path, registry: &SkillRegistry) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+
+    // Save the current file as .bak before writing the new one. We only
+    // copy (not rename) so the current file stays in place for the atomic
+    // rename below. If the copy fails we proceed anyway: the .bak is a
+    // best-effort fallback, not a correctness requirement.
+    if path.exists() {
+        let bak = bak_file_for(path);
+        if let Err(err) = fs::copy(path, &bak) {
+            tracing::debug!(
+                path = %path.display(),
+                bak = %bak.display(),
+                error = %err,
+                "failed to write .bak backup (non-fatal)"
+            );
+        }
+    }
+
     let text = serde_json::to_string_pretty(registry)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
 
@@ -237,6 +291,21 @@ fn lock_file_for(registry_path: &Path) -> PathBuf {
         .map(|s| s.to_os_string())
         .unwrap_or_else(|| std::ffi::OsString::from("registry"));
     name.push(".lock");
+    registry_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(name)
+}
+
+/// Return the `.bak` sidecar path for a registry file. Used by
+/// `write_registry` (to save the previous version) and `read_registry`
+/// (to recover when the main file is corrupt).
+fn bak_file_for(registry_path: &Path) -> PathBuf {
+    let mut name = registry_path
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("registry"));
+    name.push(".bak");
     registry_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -614,5 +683,76 @@ mod tests {
         let reg = read_channel_skills(&root, "chan1").unwrap();
         // All 8 concurrent upserts must be present (lock prevents lost updates).
         assert_eq!(reg.skills.len(), 8, "concurrent writes lost edits");
+    }
+
+    /// Regression for issue #6 (defense-in-depth): if the main registry
+    /// file is corrupt, read_registry must fall back to the `.bak`
+    /// sidecar written by the previous successful write_registry call.
+    #[test]
+    fn read_registry_falls_back_to_bak_when_main_is_corrupt() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // Write a valid registry twice: the first write creates the file,
+        // the second write saves a .bak of the first version.
+        add_channel_skill(root, "chan1", "obsidian".into(), "/src".into()).unwrap();
+        add_channel_skill(root, "chan1", "pdf".into(), "/pdf".into()).unwrap();
+
+        let main_path = channel_skill_registry_path(root, "chan1");
+        assert!(main_path.exists(), "main file should exist after write");
+
+        // .bak should exist (second write saved the first version).
+        let bak_path = bak_file_for(&main_path);
+        assert!(bak_path.exists(), ".bak should exist after second write");
+
+        // Corrupt the main file.
+        fs::write(&main_path, b"NOT VALID JSON{{{").unwrap();
+
+        // read should fall back to .bak and return the saved skill(s).
+        let recovered = read_channel_skills(root, "chan1").unwrap();
+        // .bak has the state from the first write (1 skill: obsidian).
+        assert_eq!(recovered.skills.len(), 1, "bak should have 1 skill (from first write)");
+        assert_eq!(recovered.skills[0].id, "obsidian");
+    }
+
+    /// Regression for issue #6 (defense-in-depth): write_registry must
+    /// create/refresh the .bak sidecar on every write, so the backup
+    /// always reflects the most recent successful state.
+    #[test]
+    fn write_registry_creates_bak_on_each_write() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let main_path = channel_skill_registry_path(root, "chan1");
+        let bak_path = bak_file_for(&main_path);
+
+        // First write: no prior file, so no .bak yet.
+        add_channel_skill(root, "chan1", "skill_a".into(), "/a".into()).unwrap();
+        assert!(!bak_path.exists(), "no .bak on first write (no prior file)");
+
+        // Second write: prior file exists, .bak should be created.
+        add_channel_skill(root, "chan1", "skill_b".into(), "/b".into()).unwrap();
+        assert!(bak_path.exists(), ".bak should exist after second write");
+
+        // .bak should contain the state from the first write (1 skill: skill_a).
+        let bak_text = fs::read_to_string(&bak_path).unwrap();
+        let bak_reg: SkillRegistry = serde_json::from_str(&bak_text).unwrap();
+        assert_eq!(bak_reg.skills.len(), 1, "bak should have 1 skill (from first write)");
+        assert_eq!(bak_reg.skills[0].id, "skill_a");
+
+        // Third write: .bak should now reflect the second write (2 skills).
+        add_channel_skill(root, "chan1", "skill_c".into(), "/c".into()).unwrap();
+        let bak_text = fs::read_to_string(&bak_path).unwrap();
+        let bak_reg: SkillRegistry = serde_json::from_str(&bak_text).unwrap();
+        assert_eq!(bak_reg.skills.len(), 2, "bak should have 2 skills (from second write)");
+    }
+
+    /// Regression for issue #6 (defense-in-depth): if both the main file
+    /// and .bak are missing, read_registry returns an empty registry
+    /// (graceful default), not an error.
+    #[test]
+    fn read_registry_returns_empty_when_both_main_and_bak_missing() {
+        let tmp = TempDir::new().unwrap();
+        let reg = read_channel_skills(tmp.path(), "chan_no_files").unwrap();
+        assert!(reg.skills.is_empty());
     }
 }

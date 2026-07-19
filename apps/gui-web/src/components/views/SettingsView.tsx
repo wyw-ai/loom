@@ -9,16 +9,18 @@ import { ProviderAddDialog } from "@/components/settings/ProviderComponents";
 import { HostListItem, RegisteredHostsEmpty, HostRegisterDialog, MachineCard } from "@/components/settings/MachineComponents";
 import { MemberListItem, AgentRosterOverview, AgentCreateDialog, AgentMemberDetail } from "@/components/settings/AgentComponents";
 import { ServiceListItem, ServiceMemberDetail, ServiceRosterOverview } from "@/components/settings/ServiceComponents";
+import { HumanListItem, HumanRosterOverview } from "@/components/settings/HumanComponents";
 import { Button } from "@/components/ui/button";
 import { agentMemberEntries, serviceMemberEntries } from "@/lib/agent-utils";
-import { agentFormForMachine, findAgentMemberEntry, machineCanCreateAgent } from "@/lib/format-utils";
+import { agentFormForMachine, displayName, findAgentMemberEntry, machineCanCreateAgent } from "@/lib/format-utils";
 import { cn } from "@/lib/utils";
-import { Bot, ChevronDown, ListChecks, Loader2, Plus, RefreshCw, Server, Split } from "lucide-react";
-import type { MachineInfo, Run } from "@/ipc/types";
+import { Bot, ChevronDown, ListChecks, Loader2, Plus, RefreshCw, Server, Split, Users } from "lucide-react";
+import type { Actor, MachineInfo, Run } from "@/ipc/types";
 import type { ActorWorkspaceSection, AgentFormState, AgentMemberEntry, AgentUpdatePatch, ServiceMemberEntry } from "@/lib/types";
 
 
 export function SettingsView({
+  actors,
   busy,
   agentForm,
   setAgentForm,
@@ -35,6 +37,7 @@ export function SettingsView({
   onRemoveAgent,
   onOpenLocalPath,
 }: {
+  actors: Record<string, Actor>;
   busy: string | null;
   agentForm: AgentFormState;
   setAgentForm: (form: AgentFormState) => void;
@@ -68,6 +71,9 @@ export function SettingsView({
   const [memberCreateMenuOpen, setMemberCreateMenuOpen] = useState(false);
   const memberCreateMenuRef = useRef<HTMLDivElement | null>(null);
   const handledTargetAgentIdRef = useRef<string | null>(null);
+  const humanActors = Object.values(actors)
+    .filter((actor) => actor.kind === "human")
+    .sort((left, right) => displayName(left).localeCompare(displayName(right)));
   const memberEntries = agentMemberEntries(machines);
   const serviceEntries = serviceMemberEntries(machines);
   const onlineAgents = memberEntries.filter((entry) => entry.agent.status === "online").length;
@@ -85,6 +91,7 @@ export function SettingsView({
     icon: ComponentType<{ size?: string | number; className?: string }>;
   }> = [
     { id: "hosts", label: "Registered Hosts", count: machines.length, icon: Server },
+    { id: "humans", label: "Humans", count: humanActors.length, icon: Users },
     { id: "agents", label: "Agents", count: memberEntries.length, icon: Bot },
     { id: "services", label: "Services", count: serviceEntries.length, icon: Split },
   ];
@@ -274,7 +281,9 @@ export function SettingsView({
   }
 
   const detailContent =
-    activeSection === "agents" ? (
+    activeSection === "humans" ? (
+      <HumanRosterOverview humans={humanActors} />
+    ) : activeSection === "agents" ? (
       selectedMemberEntry ? (
         <AgentMemberDetail
           entry={selectedMemberEntry}
@@ -328,7 +337,7 @@ export function SettingsView({
     <section className="flex min-h-0 flex-1 flex-col">
       <PageHeader
         title="Actors"
-        detail={`${onlineAgents}/${memberEntries.length} agents online / ${machines.length} hosts / ${providerCount} providers / ${serviceEntries.length} services`}
+        detail={`${humanActors.length} humans / ${onlineAgents}/${memberEntries.length} agents online / ${machines.length} hosts / ${providerCount} providers / ${serviceEntries.length} services`}
       />
       <div className="min-h-0 flex-1 overflow-hidden bg-white">
         <div className="grid h-full min-h-0 grid-cols-1 lg:grid-cols-[minmax(208px,224px)_minmax(0,1fr)]">
@@ -427,6 +436,27 @@ export function SettingsView({
                         onSelect={() => selectMachine(machine)}
                       />
                     ))
+                  )}
+                </div>
+              )}
+              {activeSection === "humans" && (
+                <div>
+                  <div className="mb-2 flex items-center justify-between px-1">
+                    <div className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
+                      Humans
+                    </div>
+                    <span className="count-badge">{humanActors.length}</span>
+                  </div>
+                  {humanActors.length === 0 ? (
+                    <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-white p-3 text-xs text-[#667085]">
+                      No humans registered.
+                    </div>
+                  ) : (
+                    <div className="space-y-1.5">
+                      {humanActors.map((human) => (
+                        <HumanListItem key={human.id} human={human} />
+                      ))}
+                    </div>
                   )}
                 </div>
               )}

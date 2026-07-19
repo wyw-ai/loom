@@ -101,3 +101,18 @@ paths = []
 
 [providers.qoder.fields]
 
+[providers.kimi]
+# Kimi Code CLI stream-json emits no usage frames (verified against 0.27.0);
+# token usage falls back to [default] paths and then to estimation.
+paths = []
+
+[providers.kimi.fields]
+
+[providers.zcode]
+# ZCode headless `--json` prints one result object with a top-level `usage`
+# object; the [default] "/usage" path already covers it. Placeholder kept so
+# the manifest enumerates the full built-in provider set.
+paths = []
+
+[providers.zcode.fields]
+

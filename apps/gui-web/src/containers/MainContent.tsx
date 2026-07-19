@@ -357,6 +357,7 @@ export function MainContent(props: MainContentProps) {
     <>
       <ErrorBanner error={p.error} />
       <SettingsView
+        actors={p.actors}
         busy={p.busy}
         agentForm={p.agentForm}
         setAgentForm={p.setAgentForm}

@@ -1194,6 +1194,7 @@ mod tests {
             task_id: None,
             attachments: Vec::new(),
             reactions: Vec::new(),
+            idempotency_key: None,
             metadata: Default::default(),
         }
     }

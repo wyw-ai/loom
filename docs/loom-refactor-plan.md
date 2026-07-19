@@ -920,7 +920,11 @@ MessageMention {
 }
 ```
 
-`idempotency_key` 由 client/CLI/daemon 生成。server 按 `actor_id + idempotency_scope + idempotency_key` 去重，其中 `idempotency_scope` 使用 RPC method，例如 `message.send`、`task.claim`。重复提交返回第一次成功的结果，不再次生成 delivery。
+`idempotency_key` 由 client/CLI/daemon 生成。对于 `message.send`，server 按
+`actor_id + resolved channel/thread scope + idempotency_key` 去重，使同一 thread 的
+root-message target 与 thread-id target 归一，同时避免不同 thread 之间误去重；其他
+支持幂等键的 RPC 可使用 method-specific scope。重复提交返回第一次成功的结果，不再
+生成 message 或 delivery。
 
 #### 16.2.3 RPC 分类
 

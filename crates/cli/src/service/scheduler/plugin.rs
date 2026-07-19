@@ -186,9 +186,14 @@ impl ServicePlugin for SchedulerPlugin {
 /// their decimal form, nested objects/arrays their compact JSON).
 fn build_substitutions(ctx: &ServiceContext) -> HashMap<String, String> {
     let mut subs: HashMap<String, String> = HashMap::new();
-    let service_data_dir = ctx.runtime.state_dir().display().to_string();
-    subs.insert("{service.data_dir}".to_string(), service_data_dir.clone());
-    subs.insert("{instance.data_dir}".to_string(), service_data_dir);
+    subs.insert(
+        "{service.data_dir}".to_string(),
+        ctx.runtime.service_state_dir().display().to_string(),
+    );
+    subs.insert(
+        "{instance.data_dir}".to_string(),
+        ctx.runtime.state_dir().display().to_string(),
+    );
     if let Some(path) = ctx.spec_path.as_ref() {
         if let Some(dir) = path.parent() {
             let dir_str = dir.display().to_string();
@@ -901,8 +906,11 @@ mod tests {
     use std::collections::BTreeMap;
 
     use chrono::TimeZone;
+    use proto::methods::ServiceSpec;
+    use tokio::sync::watch;
 
     use super::super::spec::{ScopeBinding, Source};
+    use crate::service::instance::{InstanceRequest, InstanceScope};
 
     fn job(id: &str) -> JobSpec {
         JobSpec {
@@ -1159,6 +1167,120 @@ mod tests {
             json!("/data/channels/chan_repo/shared/.loom/repos/manifest.json")
         );
         assert_eq!(v["args"][2], json!("/svc/repo-cache/cache"));
+    }
+
+    #[tokio::test]
+    async fn service_context_maps_shared_service_dir_and_isolated_instance_dirs() {
+        let data_root = tempfile::tempdir().expect("data root");
+        let rpc_root = tempfile::tempdir().expect("file rpc root");
+        let client =
+            crate::client::Client::connect(&format!("file-rpc://{}", rpc_root.path().display()))
+                .await
+                .expect("test client");
+        let spec: ServiceSpec = serde_json::from_value(json!({
+            "id": "mr-monitor",
+            "kind": "scheduler",
+            "actor": {
+                "id": "svc_mr_monitor",
+                "kind": "service",
+                "displayName": "MR Monitor"
+            },
+            "autostart": false,
+            "lifecycle": "thread_bound",
+            "config": {}
+        }))
+        .expect("service spec");
+        let request = |thread_id: &str| InstanceRequest {
+            version: 1,
+            spec_id: spec.id.clone(),
+            scope: InstanceScope {
+                kind: "thread".into(),
+                id: thread_id.into(),
+                channel_id: Some("chan_autodev".into()),
+            },
+            params: json!({"mr_url": format!("https://code/{thread_id}")}),
+            created_at: None,
+        };
+        let runtime_a = ServiceRuntime::start_instance(
+            spec.id.clone(),
+            spec.actor.id.clone(),
+            "thread_a".into(),
+            client.clone(),
+            data_root.path(),
+        )
+        .expect("runtime a");
+        let runtime_b = ServiceRuntime::start_instance(
+            spec.id.clone(),
+            spec.actor.id.clone(),
+            "thread_b".into(),
+            client,
+            data_root.path(),
+        )
+        .expect("runtime b");
+        let request_a = request("thread_a");
+        let request_b = request("thread_b");
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let ctx_a = ServiceContext {
+            spec: spec.clone(),
+            spec_path: None,
+            runtime: runtime_a.clone(),
+            shutdown: shutdown_rx.clone(),
+            instance: Some(request_a),
+        };
+        let ctx_b = ServiceContext {
+            spec,
+            spec_path: None,
+            runtime: runtime_b.clone(),
+            shutdown: shutdown_rx,
+            instance: Some(request_b),
+        };
+
+        let subs_a = build_substitutions(&ctx_a);
+        let subs_b = build_substitutions(&ctx_b);
+        let expected_service = data_root.path().join("services").join("mr-monitor");
+        let expected_a = expected_service.join("instances").join("thread_a");
+        let expected_b = expected_service.join("instances").join("thread_b");
+        assert_eq!(
+            subs_a.get("{service.data_dir}"),
+            Some(&expected_service.display().to_string())
+        );
+        assert_eq!(
+            subs_b.get("{service.data_dir}"),
+            Some(&expected_service.display().to_string())
+        );
+        assert_eq!(
+            subs_a.get("{instance.data_dir}"),
+            Some(&expected_a.display().to_string())
+        );
+        assert_eq!(
+            subs_b.get("{instance.data_dir}"),
+            Some(&expected_b.display().to_string())
+        );
+        assert_ne!(
+            subs_a.get("{instance.data_dir}"),
+            subs_b.get("{instance.data_dir}")
+        );
+
+        runtime_a.cursor_save("probe", "a").expect("cursor a");
+        runtime_b.cursor_save("probe", "b").expect("cursor b");
+        assert_eq!(
+            runtime_a.cursor_load("probe").unwrap().as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            runtime_b.cursor_load("probe").unwrap().as_deref(),
+            Some("b")
+        );
+
+        let mut rendered_a = json!({
+            "shared": "{service.data_dir}/cache",
+            "private": "{instance.data_dir}/cursor"
+        });
+        let mut rendered_b = rendered_a.clone();
+        substitute_in_value(&mut rendered_a, &subs_a);
+        substitute_in_value(&mut rendered_b, &subs_b);
+        assert_eq!(rendered_a["shared"], rendered_b["shared"]);
+        assert_ne!(rendered_a["private"], rendered_b["private"]);
     }
 
     #[test]

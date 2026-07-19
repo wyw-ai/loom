@@ -734,6 +734,12 @@ impl Store {
         if self.get_channel(id).is_none() {
             return Err(StoreError::NotFound(format!("channel {id}")));
         }
+        // Hold the structure lock across journal.append + apply so the
+        // append-then-apply pair is atomic with respect to other mutating
+        // operations. Without this, two concurrent setters can interleave
+        // as A.append -> B.append -> B.apply -> A.apply, which leaves
+        // V_online != V_replay (issue #7 regression).
+        let _guard = self.structure_lock.lock();
         let normalized = normalize_instructions(instructions);
         let now = Utc::now();
         let mutation = Mutation::ChannelInstructionSet {
@@ -996,6 +1002,12 @@ impl Store {
         if self.get_thread(id).is_none() {
             return Err(StoreError::NotFound(format!("thread {id}")));
         }
+        // Hold the structure lock across journal.append + apply so the
+        // append-then-apply pair is atomic with respect to other mutating
+        // operations. Without this, two concurrent setters can interleave
+        // as A.append -> B.append -> B.apply -> A.apply, which leaves
+        // V_online != V_replay (issue #7 regression).
+        let _guard = self.structure_lock.lock();
         let normalized = normalize_instructions(instructions);
         let now = Utc::now();
         let mutation = Mutation::ThreadInstructionSet {
@@ -7941,6 +7953,46 @@ mod tests {
             .expect("clear channel");
         assert!(cleared.instructions.is_none());
         assert_eq!(cleared.instructions_modified_by.as_deref(), Some("actor_carol"));
+    }
+
+    /// Regression for issue #7 (concurrency): multiple threads concurrently
+    /// calling `set_channel_instructions` must not interleave
+    /// append/apply in a way that leaves V_online != V_replay. The
+    /// `structure_lock` guard serializes the append+apply pair so the
+    /// journal order matches the in-memory apply order.
+    #[test]
+    fn instructions_concurrent_sets_keep_online_equal_to_replay() {
+        let store = fresh_store();
+        let ch = store
+            .create_channel("concurrency chan".into(), None)
+            .expect("create channel");
+
+        // Spawn several threads that each write a distinct value.
+        let store = std::sync::Arc::new(store);
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let store = store.clone();
+            let ch_id = ch.id.clone();
+            handles.push(std::thread::spawn(move || {
+                store
+                    .set_channel_instructions(&ch_id, Some(format!("writer-{i}")), "concurrent")
+                    .expect("set channel instructions");
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("writer thread panicked");
+        }
+
+        // V_online: live in-memory state.
+        let v_online = store.get_channel(&ch.id).unwrap().instructions.clone();
+
+        // V_replay: reopen from journal.
+        let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
+        let replayed = Store::open(journal).unwrap();
+        let v_replay = replayed.get_channel(&ch.id).unwrap().instructions.clone();
+
+        assert_eq!(v_online, v_replay, "V_online != V_replay after concurrent sets");
+        assert!(v_online.is_some(), "some writer must have won");
     }
 
     #[test]

@@ -1848,6 +1848,13 @@ fn reconcile_skill_mount_dir(
         .keys()
         .map(String::as_str)
         .collect::<HashSet<_>>();
+    // Defense-in-depth (issue #2): canonicalize the skills directory and
+    // reject any entry whose canonical path escapes it. validate_path_component
+    // already blocks path-traversal in skill ids/sources at the registry layer,
+    // but a pre-existing symlink inside skills_dir could point outside. We
+    // refuse to remove such escaped entries (they are not ours to manage) and
+    // log a warning instead.
+    let skills_dir_canon = skills_dir.canonicalize().ok();
     if let Ok(entries) = std::fs::read_dir(skills_dir) {
         for entry in entries {
             let entry = entry?;
@@ -1863,6 +1870,25 @@ fn reconcile_skill_mount_dir(
                 Err(err) => return Err(err),
             };
             if meta.file_type().is_symlink() {
+                // Containment check: only remove symlinks whose resolved
+                // target stays within skills_dir. A symlink escaping
+                // skills_dir is suspicious (not created by our mount logic)
+                // and is left untouched with a warning.
+                if let Some(ref dir_canon) = skills_dir_canon {
+                    let entry_canon = entry.path().canonicalize();
+                    let contained = match entry_canon {
+                        Ok(ref p) => p.starts_with(dir_canon),
+                        Err(_) => false, // broken symlink: safe to remove
+                    };
+                    if !contained {
+                        tracing::warn!(
+                            entry = %entry.path().display(),
+                            skills_dir = %dir_canon.display(),
+                            "reconcile_skill_mount_dir: skipping symlink that escapes skills_dir (issue #2 defense-in-depth)"
+                        );
+                        continue;
+                    }
+                }
                 remove_path_if_exists(&entry.path())?;
             }
         }
@@ -13569,5 +13595,61 @@ mod tests {
         assert!(!is_reserved_skill_id(""));
         assert!(!is_reserved_skill_id("Loom"));
         assert!(!is_reserved_skill_id("loom-v2"));
+    }
+
+    /// Regression for issue #2 (defense-in-depth): reconcile_skill_mount_dir
+    /// must NOT remove a symlink whose canonical path escapes the skills
+    /// directory. validate_path_component already blocks path traversal in
+    /// skill ids at the registry layer; this containment check guards
+    /// against a pre-existing or maliciously-placed symlink inside
+    /// skills_dir that points outside.
+    #[test]
+    fn reconcile_skill_mount_dir_skips_symlink_escaping_skills_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skills_dir = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills_dir).expect("create skills_dir");
+
+        // An outside target directory that the escaping symlink will point to.
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("create outside");
+
+        // A symlink inside skills_dir that points outside (escape).
+        let escaping_link = skills_dir.join("escape-link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &escaping_link).expect("symlink");
+        #[cfg(windows)]
+        {
+            // On Windows, creating a symlink may require elevated privileges.
+            // If it fails, skip this test rather than failing.
+            if std::os::windows::fs::symlink_dir(&outside, &escaping_link).is_err() {
+                eprintln!("skipping reconcile containment test: cannot create symlink on Windows");
+                return;
+            }
+        }
+
+        // A legitimate symlink inside skills_dir pointing to a subdir within.
+        let inner_target = skills_dir.join("legit-target");
+        std::fs::create_dir_all(&inner_target).expect("create inner target");
+        let legit_link = skills_dir.join("legit");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&inner_target, &legit_link).expect("symlink legit");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&inner_target, &legit_link)
+            .expect("symlink legit");
+
+        // reconcile with an empty desired set (no skills wanted).
+        let targets: BTreeMap<String, PathBuf> = BTreeMap::new();
+        reconcile_skill_mount_dir(&skills_dir, &targets).expect("reconcile");
+
+        // The escaping symlink must still exist (was skipped).
+        assert!(
+            escaping_link.exists(),
+            "escaping symlink should NOT have been removed"
+        );
+        // The legitimate symlink within skills_dir was removed (it is not desired).
+        assert!(
+            !legit_link.exists(),
+            "legit symlink should have been removed (not in desired set)"
+        );
     }
 }

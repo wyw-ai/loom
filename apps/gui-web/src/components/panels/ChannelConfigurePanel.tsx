@@ -10,7 +10,11 @@ export function ChannelConfigurePanel({
   return (
     <div className="space-y-6">
       <InstructionsSection scope="channel" scopeId={channel.id} />
-      <SkillsSection scope="channel" channelId={channel.id} />
+      <SkillsSection
+        key={`channel:${channel.id}`}
+        scope="channel"
+        channelId={channel.id}
+      />
     </div>
   );
 }

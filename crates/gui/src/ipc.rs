@@ -3244,17 +3244,30 @@ pub struct SkillRegistryDto {
 }
 
 /// Resolve the agent data root using the same logic as the CLI
-/// `default_data_root()`: honor `LOOM_AGENT_DATA_ROOT` if set, otherwise fall
-/// back to `<data_dir>/loom/agents`.
+/// `default_data_root()` (crates/cli/src/cmd/agent_serve.rs): honor
+/// `LOOM_AGENT_DATA_ROOT` if set, otherwise fall back to
+/// `<data_dir>/loom/agents`, and finally `.loom/agents-data` as a
+/// last-resort relative path so the GUI and CLI read/write the same
+/// skill registry file.
+///
+/// Deployment model: the GUI is a frontend over the CLI/daemon via IPC.
+/// The GUI launches per-machine daemons with
+/// `LOOM_AGENT_DATA_ROOT=<machine data_root>`. In the common single-host
+/// case (no env override), the GUI and CLI both resolve to
+/// `<data_dir>/loom/agents`, so the GUI-written skill registry is visible
+/// to agents. The multi-host case (per-machine data roots) requires the
+/// skill IPC commands to carry a machineId so they can target the right
+/// machine's data root; that is a larger IPC signature change tracked
+/// separately and out of scope for this fix.
 fn agent_data_root() -> Result<PathBuf, String> {
     if let Ok(s) = std::env::var("LOOM_AGENT_DATA_ROOT") {
         if !s.is_empty() {
             return Ok(PathBuf::from(s));
         }
     }
-    dirs::data_dir()
+    Ok(dirs::data_dir()
         .map(|d| d.join("loom").join("agents"))
-        .ok_or_else(|| "cannot determine agent data root".to_string())
+        .unwrap_or_else(|| PathBuf::from(".loom").join("agents-data")))
 }
 
 fn read_skill_registry(path: &Path) -> Result<SkillRegistryDto, String> {
@@ -4122,5 +4135,42 @@ mod tests {
         });
 
         assert!(server_machine_info_from_actor(&actor, &cfg, "ws://example/rpc").is_none());
+    }
+
+    #[test]
+    fn agent_data_root_honors_env_override() {
+        // Env override takes precedence over the default data_dir path.
+        // SAFETY: env var mutation is process-local; this test owns
+        // LOOM_AGENT_DATA_ROOT for its duration and restores it after.
+        let key = "LOOM_AGENT_DATA_ROOT";
+        let saved = std::env::var(key).ok();
+        std::env::set_var(key, "/tmp/loom-gui-test-data-root");
+        let root = agent_data_root().expect("agent data root with env override");
+        assert_eq!(root, PathBuf::from("/tmp/loom-gui-test-data-root"));
+        // Restore so we do not leak the override into other tests.
+        match saved {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    #[test]
+    fn agent_data_root_env_override_ignores_empty_value() {
+        // An empty LOOM_AGENT_DATA_ROOT must not short-circuit; the resolver
+        // must fall through to the data_dir default. This mirrors the CLI's
+        // default_data_root() semantics.
+        let key = "LOOM_AGENT_DATA_ROOT";
+        let saved = std::env::var(key).ok();
+        std::env::set_var(key, "");
+        let root = agent_data_root().expect("agent data root falls through empty env");
+        // We cannot assert the exact path (depends on the host's data_dir),
+        // but it must NOT be the empty PathBuf and must end with the
+        // default `loom/agents` suffix.
+        assert_ne!(root, PathBuf::from(""));
+        assert!(root.ends_with("agents"), "expected <data_dir>/loom/agents, got {}", root.display());
+        match saved {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
     }
 }

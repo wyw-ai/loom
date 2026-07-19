@@ -1166,6 +1166,9 @@ enum MessageCmd {
         /// Only send if this is still the latest message in the target scope.
         #[arg(long = "if-latest")]
         if_latest: Option<String>,
+        /// Deduplicate retries by caller and resolved channel/thread scope.
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
         #[arg(long = "attachment-id")]
         attachment_ids: Vec<String>,
     },
@@ -1188,6 +1191,9 @@ enum MessageCmd {
         /// Only send if this is still the latest message in the target scope.
         #[arg(long = "if-latest")]
         if_latest: Option<String>,
+        /// Deduplicate retries by caller and resolved channel/thread scope.
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
         #[arg(long = "attachment-id")]
         attachment_ids: Vec<String>,
     },
@@ -1605,6 +1611,12 @@ enum ProviderCmd {
         /// Print the built-in OpenCode provider manifest.
         #[arg(long)]
         opencode: bool,
+        /// Print the built-in Kimi Code CLI provider manifest.
+        #[arg(long)]
+        kimi: bool,
+        /// Print the built-in ZCode provider manifest.
+        #[arg(long)]
+        zcode: bool,
     },
     /// Validate a provider manifest JSON file.
     Validate { path: PathBuf },
@@ -1918,12 +1930,16 @@ async fn async_main() -> Result<()> {
                 copilot,
                 codex,
                 opencode,
+                kimi,
+                zcode,
             } => cmd::provider::example(cmd::provider::ExampleSelection {
                 claude,
                 qoder,
                 copilot,
                 codex,
                 opencode,
+                kimi,
+                zcode,
             })?,
             ProviderCmd::Validate { path } => cmd::provider::validate(path)?,
             ProviderCmd::Add { path, replace } => cmd::provider::add(path, replace)?,
@@ -2266,6 +2282,7 @@ async fn async_main() -> Result<()> {
                 intent,
                 delivery_policy,
                 if_latest,
+                idempotency_key,
                 attachment_ids,
                 allow_escaped_newlines,
             } => {
@@ -2280,6 +2297,7 @@ async fn async_main() -> Result<()> {
                     intent,
                     delivery_policy,
                     if_latest,
+                    idempotency_key,
                     attachment_ids,
                     allow_escaped_newlines,
                 )
@@ -2291,6 +2309,7 @@ async fn async_main() -> Result<()> {
                 thread,
                 text,
                 if_latest,
+                idempotency_key,
                 attachment_ids,
                 allow_escaped_newlines,
             } => {
@@ -2302,6 +2321,7 @@ async fn async_main() -> Result<()> {
                     recipients,
                     text,
                     if_latest,
+                    idempotency_key,
                     attachment_ids,
                     allow_escaped_newlines,
                 )
@@ -3126,6 +3146,8 @@ mod tests {
             "wake_agent",
             "--if-latest",
             "msg_latest",
+            "--idempotency-key",
+            "review-request-42",
             "--text",
             "please review",
         ])
@@ -3141,6 +3163,7 @@ mod tests {
                         intent,
                         delivery_policy,
                         if_latest,
+                        idempotency_key,
                         text,
                         ..
                     },
@@ -3151,6 +3174,7 @@ mod tests {
                 assert_eq!(intent.as_deref(), Some("request_action"));
                 assert_eq!(delivery_policy.as_deref(), Some("wake_agent"));
                 assert_eq!(if_latest.as_deref(), Some("msg_latest"));
+                assert_eq!(idempotency_key.as_deref(), Some("review-request-42"));
                 assert_eq!(text.as_deref(), Some("please review"));
             }
             other => panic!("unexpected command: {other:?}"),
@@ -3171,6 +3195,8 @@ mod tests {
             "#chan_123:msg_root",
             "--if-latest",
             "msg_latest",
+            "--idempotency-key",
+            "ask-reviewers-42",
             "--text",
             "please respond",
         ])
@@ -3184,12 +3210,14 @@ mod tests {
                         target,
                         text,
                         if_latest,
+                        idempotency_key,
                         ..
                     },
             } => {
                 assert_eq!(recipients, vec!["@actor_a", "@actor_b", "@all"]);
                 assert_eq!(target.as_deref(), Some("#chan_123:msg_root"));
                 assert_eq!(if_latest.as_deref(), Some("msg_latest"));
+                assert_eq!(idempotency_key.as_deref(), Some("ask-reviewers-42"));
                 assert_eq!(text.as_deref(), Some("please respond"));
             }
             other => panic!("unexpected command: {other:?}"),
@@ -3610,18 +3638,32 @@ mod tests {
 
     #[test]
     fn provider_example_accepts_builtin_flags() {
-        let args = Args::try_parse_from(["loom", "provider", "example", "--claude", "--opencode"])
-            .expect("parse provider example");
+        let args = Args::try_parse_from([
+            "loom",
+            "provider",
+            "example",
+            "--claude",
+            "--opencode",
+            "--kimi",
+            "--zcode",
+        ])
+        .expect("parse provider example");
 
         match args.cmd {
             Cmd::Provider {
                 sub:
                     ProviderCmd::Example {
-                        claude, opencode, ..
+                        claude,
+                        opencode,
+                        kimi,
+                        zcode,
+                        ..
                     },
             } => {
                 assert!(claude);
                 assert!(opencode);
+                assert!(kimi);
+                assert!(zcode);
             }
             other => panic!("unexpected command: {other:?}"),
         }

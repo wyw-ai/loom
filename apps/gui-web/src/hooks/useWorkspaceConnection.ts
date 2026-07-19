@@ -103,6 +103,21 @@ export function useWorkspaceConnection(deps: WorkspaceConnectionDeps) {
     d.setInbox(result.deliveries);
   }, []);
 
+  const refreshActors = useCallback(async () => {
+    const result = await ipc.actorList();
+    d.setActors((current) => {
+      const next = Object.fromEntries(
+        Object.entries(current).filter(([, actor]) => actor.kind !== "human"),
+      );
+      for (const actor of result.actors) {
+        if (actor.kind === "human") next[actor.id] = actor;
+      }
+      if (d.account) next[d.account.actorId] = accountToActor(d.account);
+      return next;
+    });
+    return result.actors.filter((actor) => actor.kind === "human");
+  }, [d.account]);
+
   const applyMachines = useCallback((nextMachines: MachineInfo[]) => {
     d.setMachines(nextMachines);
     d.setAgentForm((current: AgentFormState) => normalizeAgentForm(current, nextMachines));
@@ -233,6 +248,7 @@ export function useWorkspaceConnection(deps: WorkspaceConnectionDeps) {
     prepareLocalServerSpace,
     clearReconnectTimer,
     refreshInbox,
+    refreshActors,
     applyMachines,
     loadMachines,
     loadConfig,

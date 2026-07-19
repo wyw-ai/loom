@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Loader2 } from "lucide-react";
 import { type ChannelMemberConfig, type ScopeRef, type Workspace } from "@/ipc/types";
-import { detailPanelBreakpoint } from "@/lib/constants";
+import { detailPanelBreakpoint, machineStatusPollIntervalMs } from "@/lib/constants";
 import type { AgentFormState } from "@/lib/types";
 import { defaultWakeSpec } from "@/lib/wake-utils";
 import { channelMentionAgentActors } from "@/lib/channel-utils";
@@ -113,6 +113,7 @@ export function App() {
     prepareLocalServerSpace,
     clearReconnectTimer,
     refreshInbox,
+    refreshActors,
     applyMachines,
     loadMachines,
     loadConfig,
@@ -210,6 +211,20 @@ export function App() {
   useEffect(() => {
     activeDirectActorIdRef.current = activeDirectActor?.id ?? null;
   }, [activeDirectActor?.id]);
+
+  useEffect(() => {
+    const actorDirectoryVisible =
+      view === "settings" ||
+      (view === "chat" && channelPanelTab === "members" && Boolean(activeChannel));
+    if (connection !== "open" || !actorDirectoryVisible) return;
+
+    const refresh = () => {
+      void refreshActors().catch(() => {});
+    };
+    refresh();
+    const interval = window.setInterval(refresh, machineStatusPollIntervalMs);
+    return () => window.clearInterval(interval);
+  }, [activeChannel?.id, channelPanelTab, connection, refreshActors, view]);
 
   useChannelScope({
     connection,

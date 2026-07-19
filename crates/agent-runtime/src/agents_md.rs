@@ -301,16 +301,14 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
         block.push('\n');
     }
 
-    if let Some(instructions) = context
-        .thread_instructions
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        block.push_str("\n## Thread instructions\n\n");
-        block.push_str(&sanitize_marker_text(instructions));
-        block.push('\n');
-    }
+    // NOTE: Thread instructions are intentionally NOT rendered into the
+    // shared AGENTS.md block. Two threads share one workspace, so writing
+    // thread-scoped instructions into the shared AGENTS.md would let one
+    // thread's instructions overwrite another's (issue #1). Thread
+    // instructions are shelved at the projection layer; the data model
+    // (Thread.instructions, AgentsMdContext.thread_instructions field) is
+    // preserved for a future per-Run provider-scope implementation. See
+    // docs/channel-thread-instructions.md and the PR40 fix #1+#9.
 
     block.push_str(&format!("\n{END_MARKER}"));
     block
@@ -528,11 +526,24 @@ mod tests {
 
     #[test]
     fn thread_instructions_section_rendered_when_present() {
+        // Regression for issue #1+#9: thread instructions are shelved at
+        // the projection layer and must NOT appear in the shared AGENTS.md
+        // block, even when AgentsMdContext.thread_instructions is populated.
+        // Two threads share one workspace, so projecting thread-scoped
+        // instructions into AGENTS.md would let one thread overwrite
+        // another's. The data model is preserved; only the projection is
+        // removed.
         let mut cx = context("actor_b", "chan_b");
         cx.thread_instructions = Some("Thread-specific guidance.".into());
         let out = loom_block(&cx);
-        assert!(out.contains("## Thread instructions"));
-        assert!(out.contains("Thread-specific guidance."));
+        assert!(
+            !out.contains("## Thread instructions"),
+            "thread instructions must not be projected into AGENTS.md: {out}"
+        );
+        assert!(
+            !out.contains("Thread-specific guidance."),
+            "thread instructions text must not leak into AGENTS.md: {out}"
+        );
     }
 
     #[test]

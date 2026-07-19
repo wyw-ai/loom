@@ -6049,7 +6049,7 @@ async fn agents_md_context_for_scope(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
     channel_id: &str,
-    thread_id: Option<&str>,
+    _thread_id: Option<&str>,
 ) -> agent_runtime::AgentsMdContext {
     let channel = match client
         .call::<_, ChannelListResult>(method::CHANNEL_LIST, json!({}))
@@ -6069,29 +6069,7 @@ async fn agents_md_context_for_scope(
             None
         }
     };
-    let thread_instructions = match thread_id {
-        Some(tid) => match client
-            .call::<_, ThreadListResult>(method::THREAD_LIST, json!({ "channelId": channel_id }))
-            .await
-        {
-            Ok(result) => result
-                .threads
-                .into_iter()
-                .find(|thread| thread.id == tid)
-                .and_then(|thread| thread.instructions),
-            Err(err) => {
-                tracing::debug!(
-                    actor = %state.actor_id,
-                    channel = %channel_id,
-                    thread = %tid,
-                    %err,
-                    "thread list unavailable while rendering AGENTS.md"
-                );
-                None
-            }
-        },
-        None => None,
-    };
+    let thread_instructions = None;
     let members = match client
         .call::<_, ChannelMembersResult>(
             method::CHANNEL_MEMBERS,

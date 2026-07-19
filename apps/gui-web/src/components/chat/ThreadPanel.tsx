@@ -211,6 +211,7 @@ export function ThreadPanel({
               channelId={channel.id}
             />
             <SkillsSection
+              key={`thread:${thread.id}`}
               scope="thread"
               channelId={channel.id}
               threadId={thread.id}

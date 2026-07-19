@@ -22,23 +22,35 @@ export function SkillsSection({
   const [adding, setAdding] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const reload = useCallback(async () => {
+  const reload = useCallback(async (signal: { cancelled: boolean }) => {
     setError(null);
     try {
       const res =
         scope === "channel"
           ? await ipc.channelSkillList(channelId)
           : await ipc.threadSkillList({ channelId, threadId: threadId! });
+      if (signal.cancelled) return;
       setSkills(res.skills);
       setLoaded(true);
     } catch (err) {
+      if (signal.cancelled) return;
       setError(errorText(err));
       setLoaded(true);
     }
   }, [scope, channelId, threadId]);
 
   useEffect(() => {
-    reload();
+    // Reset baseline state for this scope instance so draft/loading do not
+    // leak across scope changes.
+    setLoaded(false);
+    setNewSource("");
+    setNewId("");
+    setError(null);
+    const signal = { cancelled: false };
+    reload(signal);
+    return () => {
+      signal.cancelled = true;
+    };
   }, [reload]);
 
   const handleAdd = async () => {

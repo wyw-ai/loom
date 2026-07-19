@@ -194,6 +194,7 @@ pub async fn set_instruction(
     thread_id: String,
     instructions: String,
 ) -> Result<()> {
+    warn_thread_instructions_deprecated("set");
     let res: ThreadSetInstructionResult = client
         .call(
             method::THREAD_SET_INSTRUCTION,
@@ -209,6 +210,7 @@ pub async fn set_instruction(
 }
 
 pub async fn get_instruction(client: Arc<Client>, thread_id: String) -> Result<()> {
+    warn_thread_instructions_deprecated("get");
     let res: ThreadGetInstructionResult = client
         .call(
             method::THREAD_GET_INSTRUCTION,
@@ -227,6 +229,7 @@ pub async fn get_instruction(client: Arc<Client>, thread_id: String) -> Result<(
 }
 
 pub async fn clear_instruction(client: Arc<Client>, thread_id: String) -> Result<()> {
+    warn_thread_instructions_deprecated("clear");
     let res: ThreadClearInstructionResult = client
         .call(
             method::THREAD_CLEAR_INSTRUCTION,
@@ -241,6 +244,24 @@ pub async fn clear_instruction(client: Arc<Client>, thread_id: String) -> Result
         println!("thread instructions were already empty");
     }
     Ok(())
+}
+
+/// Emits a deprecation warning to stderr for the thread instruction CLI
+/// subcommands. Thread-scoped instructions are shelved at the runtime
+/// projection layer (issue #1+#9): the data model (Thread.instructions,
+/// journal Mutation::ThreadInstructionSet) is preserved and the CLI
+/// commands remain functional so existing scripts keep working and the
+/// feature can be re-enabled in a future per-Run provider-scope
+/// implementation, but values written here are NOT projected into the
+/// shared AGENTS.md block consumed by agent runs. The warning is sent to
+/// stderr (not stdout) so JSON output is unaffected.
+fn warn_thread_instructions_deprecated(action: &str) {
+    eprintln!(
+        "warning: thread instructions are not projected to agent runtime in this version \
+         (issue #1+#9, shelved). `loom thread instruction {action}` still reads/writes the \
+         stored value, but it will not affect agent behavior. The data model is preserved \
+         for a future per-Run provider-scope implementation."
+    );
 }
 
 // -----------------------------------------------------------------

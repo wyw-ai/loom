@@ -20,8 +20,12 @@ env:
 
 jobs:
   rust:
-    name: Rust
-    runs-on: ubuntu-latest
+    name: Rust (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     env:
       LOOM_GUIDE_DIR: ${{ github.workspace }}/crates/cli/fixtures/ci-runtime-content/loom-guide
       LOOM_SKILLS_DIR: ${{ github.workspace }}/crates/cli/fixtures/ci-runtime-content/loom-skills
@@ -30,9 +34,10 @@ jobs:
         uses: actions/checkout@v6.0.3
 
       - name: Validate CI runtime content fixture
+        shell: bash
         run: |
-          test -f "$LOOM_GUIDE_DIR/guides/runtime-awareness.md"
-          test -f "$LOOM_SKILLS_DIR/skills/loom/SKILL.md"
+          test -f crates/cli/fixtures/ci-runtime-content/loom-guide/guides/runtime-awareness.md
+          test -f crates/cli/fixtures/ci-runtime-content/loom-skills/skills/loom/SKILL.md
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -41,6 +46,8 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
 
       - name: Format
         run: cargo fmt --all --check
@@ -52,6 +59,9 @@ jobs:
         run: cargo build
 
       - name: E2E smoke
+        # E2E scripts use bash + /tmp + python3 idioms that are Linux-only.
+        # Windows/macOS runners don't reliably provide all three.
+        if: runner.os == 'Linux'
         run: bash scripts/e2e/run-all.sh
 
   frontend:

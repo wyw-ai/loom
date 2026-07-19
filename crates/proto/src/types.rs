@@ -99,6 +99,16 @@ pub struct Channel {
     /// shared context conventions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+    /// Actor id of the member who last set/cleared the channel
+    /// instructions. `None` when the instructions have never been set, or
+    /// in journals predating this audit field (forward-compat via
+    /// `#[serde(default)]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions_modified_by: Option<String>,
+    /// Server-side UTC timestamp of the last instructions edit. `None`
+    /// when never set, or for legacy journals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions_modified_at: Option<Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
     pub _meta: Option<Meta>,
 }
@@ -166,6 +176,15 @@ pub struct Thread {
     /// scope-specific guidance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+    /// Actor id of the member who last set/cleared the thread
+    /// instructions. `None` when never set, or in journals predating this
+    /// audit field (forward-compat via `#[serde(default)]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions_modified_by: Option<String>,
+    /// Server-side UTC timestamp of the last thread instructions edit.
+    /// `None` when never set, or for legacy journals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions_modified_at: Option<Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]

@@ -616,7 +616,7 @@ fn channel_set_instruction(
     }
     let channel = state
         .store
-        .set_channel_instructions(&p.channel_id, Some(p.instructions))
+        .set_channel_instructions(&p.channel_id, Some(p.instructions), &caller)
         .map_err(map_store_err)?;
     ok(ChannelSetInstructionResult { channel })
 }
@@ -669,7 +669,7 @@ fn channel_clear_instruction(
         .is_some();
     let _ = state
         .store
-        .set_channel_instructions(&p.channel_id, None)
+        .set_channel_instructions(&p.channel_id, None, &caller)
         .map_err(map_store_err)?;
     ok(ChannelClearInstructionResult { cleared: existing })
 }
@@ -822,7 +822,7 @@ fn thread_set_instruction(
     }
     let thread = state
         .store
-        .set_thread_instructions(&p.thread_id, Some(p.instructions))
+        .set_thread_instructions(&p.thread_id, Some(p.instructions), &caller)
         .map_err(map_store_err)?;
     let thread = state
         .store
@@ -890,7 +890,7 @@ fn thread_clear_instruction(
         .is_some();
     let _ = state
         .store
-        .set_thread_instructions(&p.thread_id, None)
+        .set_thread_instructions(&p.thread_id, None, &caller)
         .map_err(map_store_err)?;
     ok(ThreadClearInstructionResult { cleared: existing })
 }

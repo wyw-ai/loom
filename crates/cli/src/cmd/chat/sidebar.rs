@@ -666,6 +666,8 @@ mod tests {
             visibility: ChannelVisibility::Public,
             members: Vec::new(),
             instructions: None,
+            instructions_modified_by: None,
+            instructions_modified_at: None,
             _meta: None,
         }
     }
@@ -676,6 +678,8 @@ mod tests {
             title: title.into(),
             root_message_id: format!("evt_root_{id}"),
             instructions: None,
+            instructions_modified_by: None,
+            instructions_modified_at: None,
             archived_at: None,
             _meta: None,
         }

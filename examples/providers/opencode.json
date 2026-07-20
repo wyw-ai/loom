@@ -48,7 +48,7 @@
           ],
           "when": "reasoningEffort"
         },
-        "{prompt.user}"
+        "{prompt.full}"
       ],
       "command": "{bin}",
       "env": {
@@ -80,7 +80,7 @@
             ],
             "when": "reasoningEffort"
           },
-          "{prompt.user}"
+          "{prompt.full}"
         ],
         "scope": "actor_scope"
       },
@@ -132,6 +132,8 @@
           }
         }
       },
+      "timeoutMs": -1,
+      "idleTimeoutMs": -1,
       "transport": "command"
     }
   },

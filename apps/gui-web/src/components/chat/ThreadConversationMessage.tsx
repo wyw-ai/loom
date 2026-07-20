@@ -1,15 +1,23 @@
+import { lazy, memo, Suspense } from "react";
 import type { Actor, MachineInfo, Message, Run } from "@/ipc/types";
 import { bodyPollFromMessage, actionChoices, metadataText } from "@/lib/message-utils";
 import { displayName, actorName } from "@/lib/format-utils";
 import { formatTime } from "@/lib/utils";
 import { cn } from "@/lib/utils";
 import { AgentMessageAvatar } from "@/components/agent/AgentMessageAvatar";
-import { MessageMarkdown } from "@/components/chat/MessageMarkdown";
 import { AttachmentStack } from "@/components/chat/AttachmentStack";
 import { PollCard } from "@/components/chat/PollCard";
 import { ReactionPicker } from "@/components/chat/ReactionPicker";
 
-export function ThreadConversationMessage({
+const MessageMarkdown = lazy(() =>
+  import("@/components/chat/MessageMarkdown").then((m) => ({ default: m.MessageMarkdown })),
+);
+
+function MarkdownFallback() {
+  return <div className="min-h-[1em]" />;
+}
+
+export const ThreadConversationMessage = memo(function ThreadConversationMessage({
   actor,
   actors,
   currentActorId,
@@ -64,11 +72,13 @@ export function ThreadConversationMessage({
             </span>
           </div>
           <div className="message-markdown mt-1 max-w-none break-words text-[15px] leading-6 text-[#111827]">
-            <MessageMarkdown
-              actors={actors}
-              body={displayBody}
-              mentions={displayBody === message.body ? message.mentions : []}
-            />
+            <Suspense fallback={<MarkdownFallback />}>
+              <MessageMarkdown
+                actors={actors}
+                body={displayBody}
+                mentions={displayBody === message.body ? message.mentions : []}
+              />
+            </Suspense>
           </div>
           {pollChoices.length > 0 && (
             <PollCard choices={pollChoices} disabled />
@@ -123,4 +133,11 @@ export function ThreadConversationMessage({
       </div>
     </article>
   );
-}
+}, (prev, next) => {
+  return (
+    prev.message === next.message &&
+    prev.actor === next.actor &&
+    prev.busy === next.busy &&
+    prev.root === next.root
+  );
+});

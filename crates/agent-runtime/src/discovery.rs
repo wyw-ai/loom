@@ -163,22 +163,28 @@ mod tests {
         make_executable(&dir.join("claude"));
         make_executable(&dir.join("codex"));
         make_executable(&dir.join("copilot"));
+        make_executable(&dir.join("kimi"));
         make_executable(&dir.join("opencode"));
         make_executable(&dir.join("qodercli"));
+        make_executable(&dir.join("zcode"));
 
         let providers = detect_agent_cli_providers_in_path_with_config_dir(
             dir.clone().into_os_string(),
             &config_dir,
         );
         let ids = providers.iter().map(|p| p.id.as_str()).collect::<Vec<_>>();
-        assert_eq!(ids, vec!["claude", "codex", "copilot", "opencode", "qoder"]);
+        assert_eq!(
+            ids,
+            vec!["claude", "codex", "copilot", "kimi", "opencode", "qoder", "zcode"]
+        );
         let claude = providers
             .iter()
             .find(|provider| provider.id == "claude")
             .expect("claude provider");
-        assert!(claude.args.contains(&"--append-system-prompt".into()));
-        assert!(claude.args.contains(&"{prompt.system}".into()));
-        assert!(claude.args.contains(&"{prompt.user}".into()));
+        assert!(!claude.args.contains(&"--append-system-prompt".into()));
+        assert!(!claude.args.contains(&"{prompt.system}".into()));
+        assert!(!claude.args.contains(&"{prompt.user}".into()));
+        assert!(claude.args.contains(&"{prompt.full}".into()));
         let claude_transport = claude.transport();
         assert_eq!(
             claude_transport.output_format,
@@ -199,7 +205,7 @@ mod tests {
         let resume_args = claude_session.resume_args.as_ref().expect("resume args");
         assert!(resume_args.contains(&"--resume".into()));
         assert!(resume_args.contains(&"{session_id}".into()));
-        assert!(resume_args.contains(&"{prompt.user}".into()));
+        assert!(resume_args.contains(&"{prompt.full}".into()));
         assert!(resume_args.contains(&"{agent.skillWorkspace}".into()));
         assert!(claude_session.resume_arg_specs.iter().any(|arg| matches!(
             arg,
@@ -210,7 +216,8 @@ mod tests {
             .iter()
             .find(|provider| provider.id == "qoder")
             .expect("qoder provider");
-        assert!(qoder.args.contains(&"--append-system-prompt".into()));
+        assert!(!qoder.args.contains(&"--append-system-prompt".into()));
+        assert!(qoder.args.contains(&"{prompt.full}".into()));
         let qoder_plan = qoder.runtime_plan.as_ref().expect("qoder runtime plan");
         assert_eq!(qoder_plan.provider_id, "qoder");
         assert_eq!(qoder_plan.mode, "print");
@@ -248,7 +255,7 @@ mod tests {
                 .env
                 .get("COPILOT_CUSTOM_INSTRUCTIONS_DIRS")
                 .map(String::as_str),
-            Some("{loom_agent_home}")
+            Some("{agent.workspace}")
         );
         assert!(copilot
             .transport()

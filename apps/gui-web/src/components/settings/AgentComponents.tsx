@@ -1,5 +1,6 @@
 import {
   useEffect,
+  useId,
   useRef,
   useState,
 } from "react";
@@ -17,7 +18,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { machineDirList } from "@/ipc/bridge";
 import { actorAvatarUrl, agentDisplayName, agentModelValue, agentSettingsDraft, getActorRunContext, providerAvailabilityGroups, providerForAgent, runStatusAnimationName, runStatusDotClass, runStatusFullLabel } from "@/lib/agent-utils";
 import { avatarLibraryUrls, reasoningEffortChoices } from "@/lib/constants";
-import { agentFormForMachine, capitalize, errorText, machineCanCreateAgent, resolveAgentProvider, statusDotClass } from "@/lib/format-utils";
+import { agentFormForMachine, capitalize, errorText, machineCanCreateAgent, machineCanRunCommands, resolveAgentProvider, statusDotClass } from "@/lib/format-utils";
 import { cn } from "@/lib/utils";
 import { ArrowLeft, Bot, Check, ChevronLeft, FileText, Folder, HardDrive, Loader2, Plus, RefreshCw, Settings, Trash2, Wrench, X } from "lucide-react";
 import type { MachineAgentProviderInfo, MachineDirListResult, MachineInfo, Run } from "@/ipc/types";
@@ -191,8 +192,10 @@ export function AgentRosterOverview({
                 </div>
               ) : (
                 hostRows.map(({ machine, canCreate }) => {
-                  const reason = !machineCanCreateAgent(machine)
-                    ? "read only"
+                  const reason = machine.connectionStatus !== "online"
+                    ? "offline"
+                    : !machineCanRunCommands(machine)
+                      ? "unavailable"
                     : machine.providers.length === 0
                       ? "no runtime"
                       : "ready";
@@ -302,7 +305,7 @@ export function AgentRosterRow({
         <Badge variant={entry.agent.status === "online" ? "success" : "outline"}>
           {entry.agent.status}
         </Badge>
-        {!entry.machine.readOnly && (
+        {machineCanRunCommands(entry.machine) && (
           <Button
             variant="ghost"
             size="icon"
@@ -360,13 +363,17 @@ export function AgentCreateDialog({
   const readyHosts = machines.filter(
     (item) => machineCanCreateAgent(item) && item.providers.length > 0,
   );
-  const createStatusText = !canCreateAgent
-    ? "This host is read-only for the current account."
+  const createStatusText = machine.connectionStatus !== "online"
+    ? "Start the host daemon before creating agents."
+    : !machineCanRunCommands(machine)
+      ? "This host cannot run agent commands for the current account."
     : !selectedProvider
       ? "No runtime detected for this host."
       : `${selectedProvider.name} on ${machine.name}`;
-  const createStatusBadge = !canCreateAgent
-    ? "read only"
+  const createStatusBadge = machine.connectionStatus !== "online"
+    ? "offline"
+    : !machineCanRunCommands(machine)
+      ? "unavailable"
     : selectedProvider
       ? "ready"
       : "no runtime";
@@ -509,8 +516,10 @@ export function AgentCreateDialog({
                   machines.map((item) => {
                     const selected = item.id === machine.id;
                     const ready = machineCanCreateAgent(item) && item.providers.length > 0;
-                    const blockedReason = !machineCanCreateAgent(item)
-                      ? "Read only"
+                    const blockedReason = item.connectionStatus !== "online"
+                      ? "Offline"
+                      : !machineCanRunCommands(item)
+                        ? "Unavailable"
                       : item.providers.length === 0
                         ? "No runtime"
                         : "";
@@ -794,7 +803,7 @@ export function AgentMemberDetail({
   const saving = busy === `agent:update:${actor.id}`;
   const skillAdding = busy === `agent:skill:add:${actor.id}`;
   const removing = busy === `agent:remove:${actor.id}`;
-  const canEdit = !machine.readOnly;
+  const canEdit = machineCanRunCommands(machine);
   const detailTabs: Array<{
     id: AgentDetailTab;
     label: string;
@@ -936,7 +945,11 @@ export function AgentMemberDetail({
                   {agent.status}
                 </Badge>
                 <Badge variant="secondary">{machine.name}</Badge>
-                {machine.readOnly && <Badge variant="warning">read only</Badge>}
+                {machine.connectionStatus !== "online" ? (
+                  <Badge variant="warning">host offline</Badge>
+                ) : machine.readOnly ? (
+                  <Badge variant="warning">read only</Badge>
+                ) : null}
               </div>
             </div>
           </div>
@@ -1328,7 +1341,7 @@ export function AgentMemberDetail({
                   Remove this member from {machine.name}.
                 </div>
               </div>
-              {!machine.readOnly ? (
+              {canEdit ? (
                 <Button
                   variant="destructive"
                   size="sm"
@@ -1341,7 +1354,9 @@ export function AgentMemberDetail({
                   Remove Agent
                 </Button>
               ) : (
-                <Badge variant="warning">read only</Badge>
+                <Badge variant="warning">
+                  {machine.connectionStatus === "online" ? "unavailable" : "host offline"}
+                </Badge>
               )}
             </div>
           </HostDetailSection>
@@ -1365,11 +1380,11 @@ function AgentSkillAddDialog({
   onAddSkill: (source: string) => Promise<boolean> | boolean;
 }) {
   const canBrowseRemote = Boolean(
-    machine.canCommand && machine.capabilities.includes("fs.dir.list"),
+    machineCanRunCommands(machine) && machine.capabilities.includes("fs.dir.list"),
   );
+  const skillDirectoryInputId = useId();
   const [browserPath, setBrowserPath] = useState<string | undefined>();
   const [browserReloadKey, setBrowserReloadKey] = useState(0);
-  const [browserPathDraft, setBrowserPathDraft] = useState("");
   const [browser, setBrowser] = useState<MachineDirListResult | null>(null);
   const [browserLoading, setBrowserLoading] = useState(false);
   const [browserError, setBrowserError] = useState<string | null>(null);
@@ -1379,7 +1394,12 @@ function AgentSkillAddDialog({
   const canAdd = canEdit && skillSource.length > 0 && !saving;
 
   useEffect(() => {
-    if (!canBrowseRemote) return;
+    if (!canBrowseRemote) {
+      setBrowser(null);
+      setBrowserLoading(false);
+      setBrowserError(null);
+      return;
+    }
     let cancelled = false;
     setBrowserLoading(true);
     setBrowserError(null);
@@ -1387,10 +1407,10 @@ function AgentSkillAddDialog({
       .then((result) => {
         if (cancelled) return;
         setBrowser(result);
-        setBrowserPathDraft(result.path);
       })
       .catch((err) => {
         if (cancelled) return;
+        setBrowser(null);
         setBrowserError(errorText(err));
       })
       .finally(() => {
@@ -1439,20 +1459,46 @@ function AgentSkillAddDialog({
 
         <div className="grid min-h-0 gap-4 overflow-y-auto px-5 py-4 soft-scrollbar lg:grid-cols-[minmax(260px,0.42fr)_minmax(0,1fr)]">
           <div className="space-y-3">
-            <label className="block">
-              <span className="mb-1 block text-xs font-bold text-[#596174]">Skill directory</span>
-              <Input
-                value={selectedSkillPath}
-                onChange={(event) => setSelectedSkillPath(event.target.value)}
-                placeholder="/path/to/skill"
-                className="h-10 rounded-lg border-[#dfe3ec] bg-white font-mono text-xs shadow-none"
-                disabled={!canEdit}
-                autoFocus
-              />
-            </label>
+            <div>
+              <label
+                htmlFor={skillDirectoryInputId}
+                className="mb-1 block text-xs font-bold text-[#596174]"
+              >
+                Skill directory
+              </label>
+              <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-2">
+                <Input
+                  id={skillDirectoryInputId}
+                  value={selectedSkillPath}
+                  onChange={(event) => setSelectedSkillPath(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key !== "Enter") return;
+                    event.preventDefault();
+                    openBrowserPath(selectedSkillPath);
+                  }}
+                  placeholder="/path/to/skill"
+                  className="h-10 rounded-lg border-[#dfe3ec] bg-white font-mono text-xs shadow-none"
+                  disabled={!canEdit}
+                  autoFocus
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => openBrowserPath(selectedSkillPath)}
+                  disabled={!canBrowseRemote || browserLoading}
+                  className="h-10 rounded-lg"
+                >
+                  <Folder size={13} />
+                  Browse
+                </Button>
+              </div>
+            </div>
             {!canBrowseRemote && (
               <div className="rounded-lg border border-[#edf0f5] bg-[#fbfbfd] px-3 py-2 text-xs text-[#667085]">
-                Directory browsing is unavailable on this host.
+                {machine.connectionStatus === "online"
+                  ? "Directory browsing is unavailable on this host."
+                  : "Start the host daemon to browse or add skills."}
               </div>
             )}
           </div>
@@ -1498,34 +1544,18 @@ function AgentSkillAddDialog({
               </Button>
             </div>
 
-            <div className="grid gap-2 border-b border-[#edf0f5] px-3 py-2 sm:grid-cols-[minmax(0,1fr)_auto_auto]">
-              <Input
-                value={browserPathDraft}
-                onChange={(event) => setBrowserPathDraft(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key !== "Enter") return;
-                  event.preventDefault();
-                  openBrowserPath(browserPathDraft);
-                }}
-                placeholder="Remote directory path"
-                className="h-9 rounded-lg border-[#dfe3ec] bg-white font-mono text-xs shadow-none"
-                disabled={!canBrowseRemote}
-              />
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={() => openBrowserPath(browserPathDraft)}
-                disabled={!canBrowseRemote || browserLoading}
-                className="h-9 rounded-lg"
+            <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-2 border-b border-[#edf0f5] px-3 py-2">
+              <div
+                className="flex h-9 min-w-0 items-center truncate rounded-lg border border-[#dfe3ec] bg-white px-3 font-mono text-xs text-[#667085]"
+                title={browser?.path}
               >
-                Go
-              </Button>
+                {browser?.path ?? "No directory open"}
+              </div>
               <Button
                 type="button"
                 variant="outline"
                 size="icon"
-                onClick={() => openBrowserPath(browser?.path ?? browserPathDraft)}
+                onClick={() => openBrowserPath(browser?.path ?? browserPath)}
                 disabled={!canBrowseRemote || browserLoading}
                 title="Refresh"
                 className="h-9 w-9 rounded-lg"

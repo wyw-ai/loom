@@ -219,9 +219,34 @@ fn connection_open(state: &AppState, connection_id: &str, params: Option<Value>)
             state.store.upsert_actor(new_actor).map_err(map_store_err)?
         }
     };
-    state
-        .subscriptions
-        .bind_actor(connection_id, actor_id.clone(), claim_kind, p.claim_inbox);
+    // A short-lived CLI or GUI may reuse LOOM_ACTOR from an agent/service
+    // environment while opening as the default Human kind. It may share the
+    // identity for RPC authorization, but it must not become the runtime inbox
+    // owner. Otherwise a persisted machine actor can look online after its
+    // daemon has stopped, and machine commands are delivered to a client that
+    // cannot execute them. Long-lived agent/service connections must still be
+    // able to recover an actor that was previously auto-created as Human.
+    let human_observer = claim_kind == ActorKind::Human
+        && matches!(actor.kind, ActorKind::Agent | ActorKind::Service);
+    let claim_inbox = p.claim_inbox && !human_observer;
+    if p.claim_inbox && human_observer {
+        tracing::debug!(
+            actor = %actor_id,
+            requested_kind = ?claim_kind,
+            stored_kind = ?actor.kind,
+            "actor-kind mismatch bound as observer",
+        );
+    }
+    state.subscriptions.bind_actor(
+        connection_id,
+        actor_id.clone(),
+        if human_observer {
+            actor.kind
+        } else {
+            claim_kind
+        },
+        claim_inbox,
+    );
     let endpoint_id = format!(
         "ep_{}",
         p.endpoint
@@ -5954,6 +5979,118 @@ mod tests {
                 .output
                 .and_then(|value| value.get("done").and_then(Value::as_bool).map(bool::from)),
             Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn human_connection_reusing_machine_actor_id_is_observer_only() {
+        let state = fresh_state("machine-human-observer");
+        open_conn(&state, "conn_owner", "actor_human").await;
+        dispatch(
+            &state,
+            "conn_owner",
+            method::ACTOR_UPSERT,
+            Some(json!({
+                "actor": {
+                    "id": "actor_service_machine_remote",
+                    "kind": "service",
+                    "displayName": "Remote Machine",
+                    "_meta": {
+                        "role": "machine",
+                        "source": "daemon",
+                        "inventoryVersion": 2,
+                        "machineId": "machine_remote",
+                        "ownerActorId": "actor_human",
+                        "capabilities": ["inventory.read", "machine.command"],
+                        "revision": 11
+                    }
+                }
+            })),
+        )
+        .await
+        .expect("actor/upsert machine");
+
+        let (observer_tx, _observer_rx) = mpsc::unbounded_channel();
+        state.subscriptions.add_connection(Connection {
+            id: "conn_observer".into(),
+            actor_id: None,
+            tx: observer_tx,
+        });
+        dispatch(
+            &state,
+            "conn_observer",
+            method::CONNECTION_OPEN,
+            Some(json!({ "actorId": "actor_service_machine_remote" })),
+        )
+        .await
+        .expect("human observer connection/open");
+
+        let value = dispatch(
+            &state,
+            "conn_owner",
+            method::CONNECTION_LIST,
+            Some(json!({ "actorIds": ["actor_service_machine_remote"] })),
+        )
+        .await
+        .expect("connection/list without daemon");
+        let connections: ConnectionListResult =
+            serde_json::from_value(value).expect("decode connection/list");
+        assert!(connections.actor_ids.is_empty());
+
+        let err = dispatch(
+            &state,
+            "conn_owner",
+            method::MACHINE_COMMAND,
+            Some(json!({
+                "machineId": "machine_remote",
+                "machineActorId": "actor_service_machine_remote",
+                "ifInventoryRevision": 11,
+                "command": { "op": "agent.create", "actorId": "actor_agent" },
+                "timeoutMs": 1_000
+            })),
+        )
+        .await
+        .expect_err("observer must not receive machine commands");
+        assert_eq!(err.code, ErrorCode::APP_INVALID_STATE);
+        assert!(err.message.contains("daemon is not connected"));
+
+        let _service_rx =
+            open_service_conn(&state, "conn_machine", "actor_service_machine_remote").await;
+        let value = dispatch(
+            &state,
+            "conn_owner",
+            method::CONNECTION_LIST,
+            Some(json!({ "actorIds": ["actor_service_machine_remote"] })),
+        )
+        .await
+        .expect("connection/list with daemon");
+        let connections: ConnectionListResult =
+            serde_json::from_value(value).expect("decode connection/list");
+        assert_eq!(
+            connections.actor_ids,
+            vec!["actor_service_machine_remote".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn service_connection_recovers_actor_previously_created_as_human() {
+        let state = fresh_state("service-recovers-human-actor");
+        open_conn(&state, "conn_bootstrap", "actor_service_runtime").await;
+
+        let _service_rx = open_service_conn(&state, "conn_service", "actor_service_runtime").await;
+        let value = dispatch(
+            &state,
+            "conn_service",
+            method::CONNECTION_LIST,
+            Some(json!({ "actorIds": ["actor_service_runtime"] })),
+        )
+        .await
+        .expect("connection/list after service recovery");
+        let connections: ConnectionListResult =
+            serde_json::from_value(value).expect("decode connection/list");
+        assert_eq!(
+            connections.actor_ids,
+            vec!["actor_service_runtime".to_string()]
         );
     }
 

@@ -11,7 +11,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { actorKindLabel, channelPanelDetail, channelPanelTitle, getActorRunContext, memberPresence, runStatusDotClass, runStatusFullLabel } from "@/lib/agent-utils";
 import { canAddChannelMember, canRemoveChannelMember, channelTaskGroups, taskProgressPercent } from "@/lib/channel-utils";
-import { displayName, errorText, fallbackActor, findAgentMemberEntry, formatShortDateTime, shortActorAlias, statusDotClass, taskStatusBadgeClass } from "@/lib/format-utils";
+import { displayName, errorText, fallbackActor, findAgentMemberEntry, formatShortDateTime, machineCanRunCommands, shortActorAlias, statusDotClass, taskStatusBadgeClass } from "@/lib/format-utils";
 import { metadataString, metadataText, threadLastReplyLabel, threadParticipants, threadReplyCount } from "@/lib/message-utils";
 import { cn, formatTime, shortId } from "@/lib/utils";
 import { Check, ChevronLeft, Clock, Folder, FolderCog, HardDrive, Hash, Loader2, Plus, RefreshCw, Search, Split, UserPlus, Users, X } from "lucide-react";
@@ -651,7 +651,9 @@ function ChannelMemberWorkspaceDialog({
   const agentEntry = findAgentMemberEntry(machines, actor.id);
   const browseMachine = agentEntry?.machine ?? machineForActorMeta(actor, machines);
   const canBrowseRemote = Boolean(
-    browseMachine?.canCommand && browseMachine.capabilities.includes("fs.dir.list"),
+    browseMachine &&
+      machineCanRunCommands(browseMachine) &&
+      browseMachine.capabilities.includes("fs.dir.list"),
   );
 
   useEffect(() => {
@@ -994,5 +996,4 @@ export function ChannelTaskCard({
     </div>
   );
 }
-
 

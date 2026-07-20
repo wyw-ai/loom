@@ -76,6 +76,7 @@ pub async fn agent_create(
     name: String,
     instructions: Option<String>,
     instructions_file: Option<PathBuf>,
+    source_root: Option<PathBuf>,
     model: Option<String>,
     reasoning_effort: Option<String>,
     autostart: bool,
@@ -90,6 +91,7 @@ pub async fn agent_create(
     });
     insert_if_nonempty(&mut command, "actorId", actor_id);
     insert_if_nonempty(&mut command, "instructions", instructions);
+    insert_source_root(&mut command, source_root)?;
     insert_if_nonempty(&mut command, "model", model);
     insert_if_nonempty(&mut command, "reasoningEffort", reasoning_effort);
 
@@ -109,6 +111,71 @@ pub async fn agent_create(
         }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn agent_update(
+    client: Arc<Client>,
+    machine_id: String,
+    actor_id: String,
+    name: Option<String>,
+    instructions: Option<String>,
+    instructions_file: Option<PathBuf>,
+    source_root: Option<PathBuf>,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+) -> Result<()> {
+    let machine = require_machine(&client, &machine_id).await?;
+    let command = agent_update_command(
+        actor_id,
+        name,
+        instructions,
+        instructions_file,
+        source_root,
+        model,
+        reasoning_effort,
+    )?;
+    let output = run_machine_command(client, machine, command).await?;
+    if render::is_json() {
+        render::print_json(&output);
+    } else {
+        let actor_id = output
+            .pointer("/agentSpec/actor/id")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>");
+        let path = output.get("path").and_then(Value::as_str).unwrap_or("");
+        if path.is_empty() {
+            println!("updated agent {actor_id}");
+        } else {
+            println!("updated agent {actor_id}\t{path}");
+        }
+    }
+    Ok(())
+}
+
+fn agent_update_command(
+    actor_id: String,
+    name: Option<String>,
+    instructions: Option<String>,
+    instructions_file: Option<PathBuf>,
+    source_root: Option<PathBuf>,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+) -> Result<Value> {
+    let instructions = read_instructions(instructions, instructions_file)?;
+    let mut command = json!({
+        "op": "agent.update",
+        "actorId": actor_id,
+    });
+    if let Some(name) = name.and_then(nonempty_owned) {
+        command["name"] = json!(name.clone());
+        command["displayName"] = json!(name);
+    }
+    insert_if_nonempty(&mut command, "instructions", instructions);
+    insert_source_root(&mut command, source_root)?;
+    insert_if_nonempty(&mut command, "model", model);
+    insert_if_nonempty(&mut command, "reasoningEffort", reasoning_effort);
+    Ok(command)
 }
 
 pub async fn agent_remove(client: Arc<Client>, machine_id: String, actor_id: String) -> Result<()> {
@@ -361,6 +428,23 @@ fn insert_if_nonempty(target: &mut Value, key: &str, value: Option<String>) {
     target[key] = json!(value);
 }
 
+fn insert_source_root(target: &mut Value, value: Option<PathBuf>) -> Result<()> {
+    let Some(path) = value else {
+        return Ok(());
+    };
+    let canonical = std::fs::canonicalize(&path)
+        .with_context(|| format!("resolve source root {}", path.display()))?;
+    if !canonical.is_dir() {
+        bail!("source root is not a directory: {}", canonical.display());
+    }
+    insert_if_nonempty(
+        target,
+        "sourceRoot",
+        Some(canonical.to_string_lossy().to_string()),
+    );
+    Ok(())
+}
+
 fn nonempty_owned(value: String) -> Option<String> {
     let value = value.trim().to_string();
     if value.is_empty() {
@@ -376,4 +460,54 @@ fn nonempty_string(value: Option<&Value>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_update_command_uses_update_operation_and_omits_unspecified_fields() {
+        let source_root = std::env::current_dir().expect("current directory");
+        let command = agent_update_command(
+            "actor_impl".into(),
+            Some("Implementation Agent".into()),
+            None,
+            None,
+            Some(PathBuf::from(".")),
+            None,
+            Some("high".into()),
+        )
+        .expect("build agent update command");
+
+        assert_eq!(
+            command,
+            json!({
+                "op": "agent.update",
+                "actorId": "actor_impl",
+                "name": "Implementation Agent",
+                "displayName": "Implementation Agent",
+                "sourceRoot": source_root,
+                "reasoningEffort": "high",
+            })
+        );
+    }
+
+    #[test]
+    fn agent_update_command_rejects_two_instruction_sources() {
+        let error = agent_update_command(
+            "actor_impl".into(),
+            None,
+            Some("inline".into()),
+            Some(PathBuf::from("AGENTS.md")),
+            None,
+            None,
+            None,
+        )
+        .expect_err("two instruction sources must be rejected");
+
+        assert!(error
+            .to_string()
+            .contains("use either --instructions or --instructions-file"));
+    }
 }

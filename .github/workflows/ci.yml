@@ -26,9 +26,18 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      LOOM_GUIDE_DIR: ${{ github.workspace }}/crates/cli/fixtures/ci-runtime-content/loom-guide
+      LOOM_SKILLS_DIR: ${{ github.workspace }}/crates/cli/fixtures/ci-runtime-content/loom-skills
     steps:
       - name: Checkout
         uses: actions/checkout@v6.0.3
+
+      - name: Validate CI runtime content fixture
+        shell: bash
+        run: |
+          test -f crates/cli/fixtures/ci-runtime-content/loom-guide/guides/runtime-awareness.md
+          test -f crates/cli/fixtures/ci-runtime-content/loom-skills/skills/loom/SKILL.md
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

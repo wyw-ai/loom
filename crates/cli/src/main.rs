@@ -145,6 +145,16 @@ enum Cmd {
         #[command(subcommand)]
         sub: ProviderCmd,
     },
+    /// Read or update the official Loom operating guide.
+    Guide {
+        #[command(subcommand)]
+        sub: GuideCmd,
+    },
+    /// Materialize embedded official Loom skills for external runtimes.
+    Skill {
+        #[command(subcommand)]
+        sub: SkillCmd,
+    },
     /// Manage daemon machines through server-routed machine commands.
     Machine {
         #[command(subcommand)]
@@ -1054,6 +1064,9 @@ enum MessageCmd {
         private_to: Vec<String>,
         #[arg(long)]
         text: Option<String>,
+        /// Allow literal backslash-n sequences in --text from an agent run.
+        #[arg(long = "allow-escaped-newlines")]
+        allow_escaped_newlines: bool,
         /// Message intent: chat, ask, request_action, assign_task, status_update, review, notify.
         #[arg(long)]
         intent: Option<String>,
@@ -1063,6 +1076,9 @@ enum MessageCmd {
         /// Only send if this is still the latest message in the target scope.
         #[arg(long = "if-latest")]
         if_latest: Option<String>,
+        /// Deduplicate retries by caller and resolved channel/thread scope.
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
         #[arg(long = "attachment-id")]
         attachment_ids: Vec<String>,
     },
@@ -1079,9 +1095,15 @@ enum MessageCmd {
         thread: Option<String>,
         #[arg(long)]
         text: Option<String>,
+        /// Allow literal backslash-n sequences in --text from an agent run.
+        #[arg(long = "allow-escaped-newlines")]
+        allow_escaped_newlines: bool,
         /// Only send if this is still the latest message in the target scope.
         #[arg(long = "if-latest")]
         if_latest: Option<String>,
+        /// Deduplicate retries by caller and resolved channel/thread scope.
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
         #[arg(long = "attachment-id")]
         attachment_ids: Vec<String>,
     },
@@ -1499,6 +1521,12 @@ enum ProviderCmd {
         /// Print the built-in OpenCode provider manifest.
         #[arg(long)]
         opencode: bool,
+        /// Print the built-in Kimi Code CLI provider manifest.
+        #[arg(long)]
+        kimi: bool,
+        /// Print the built-in ZCode provider manifest.
+        #[arg(long)]
+        zcode: bool,
     },
     /// Validate a provider manifest JSON file.
     Validate { path: PathBuf },
@@ -1517,6 +1545,31 @@ enum ProviderCmd {
     Remove { provider_id: String },
     /// Validate and check local command detection for one provider.
     Doctor { provider_id: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum GuideCmd {
+    /// List available guide topics.
+    List,
+    /// Show one guide topic.
+    Show { topic: String },
+    /// Search guide topics.
+    Search { query: String },
+    /// Refresh the local guide cache from the official repository.
+    Update,
+}
+
+#[derive(Subcommand, Debug)]
+enum SkillCmd {
+    /// Write the embedded official Loom skill into a dedicated directory.
+    Materialize {
+        /// Embedded skill id. Currently only `loom` is available.
+        #[arg(value_name = "SKILL_ID", value_parser = ["loom"])]
+        id: String,
+        /// Dedicated skill directory to reconcile. Its contents are managed by Loom.
+        #[arg(long, value_name = "SKILL_DIR")]
+        output: PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1546,12 +1599,35 @@ enum MachineAgentCmd {
         instructions: Option<String>,
         #[arg(long = "instructions-file")]
         instructions_file: Option<PathBuf>,
+        /// Local source root whose AGENTS.md/CLAUDE.md and skill directories are daemon-managed.
+        #[arg(long = "source-root")]
+        source_root: Option<PathBuf>,
         #[arg(long)]
         model: Option<String>,
         #[arg(long = "reasoning-effort")]
         reasoning_effort: Option<String>,
         #[arg(long = "no-autostart")]
         no_autostart: bool,
+    },
+    /// Update an AgentSpec on the target daemon via machine/command.
+    Update {
+        #[arg(long)]
+        machine: String,
+        #[arg(long = "actor-id")]
+        actor_id: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        instructions: Option<String>,
+        #[arg(long = "instructions-file")]
+        instructions_file: Option<PathBuf>,
+        /// Local source root whose AGENTS.md/CLAUDE.md and skill directories are daemon-managed.
+        #[arg(long = "source-root")]
+        source_root: Option<PathBuf>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long = "reasoning-effort")]
+        reasoning_effort: Option<String>,
     },
     /// Remove an AgentSpec from the target daemon via machine/command.
     Remove {
@@ -1623,6 +1699,11 @@ async fn async_main() -> Result<()> {
     } else {
         OutputMode::Pretty
     });
+    if let Cmd::Skill { sub } = &args.cmd {
+        return match sub {
+            SkillCmd::Materialize { id, output } => cmd::skill::materialize(id, output),
+        };
+    }
     if let Cmd::Memory { sub } = &args.cmd {
         return match sub {
             MemoryCmd::Query {
@@ -1759,12 +1840,16 @@ async fn async_main() -> Result<()> {
                 copilot,
                 codex,
                 opencode,
+                kimi,
+                zcode,
             } => cmd::provider::example(cmd::provider::ExampleSelection {
                 claude,
                 qoder,
                 copilot,
                 codex,
                 opencode,
+                kimi,
+                zcode,
             })?,
             ProviderCmd::Validate { path } => cmd::provider::validate(path)?,
             ProviderCmd::Add { path, replace } => cmd::provider::add(path, replace)?,
@@ -1772,6 +1857,16 @@ async fn async_main() -> Result<()> {
             ProviderCmd::Show { provider_id } => cmd::provider::show(provider_id)?,
             ProviderCmd::Remove { provider_id } => cmd::provider::remove(provider_id)?,
             ProviderCmd::Doctor { provider_id } => cmd::provider::doctor(provider_id)?,
+        }
+        return Ok(());
+    }
+
+    if let Cmd::Guide { sub } = &args.cmd {
+        match sub {
+            GuideCmd::List => cmd::guide::list()?,
+            GuideCmd::Show { topic } => cmd::guide::show(topic)?,
+            GuideCmd::Search { query } => cmd::guide::search(query)?,
+            GuideCmd::Update => cmd::guide::update()?,
         }
         return Ok(());
     }
@@ -2041,7 +2136,9 @@ async fn async_main() -> Result<()> {
                 intent,
                 delivery_policy,
                 if_latest,
+                idempotency_key,
                 attachment_ids,
+                allow_escaped_newlines,
             } => {
                 cmd::message::send(
                     client,
@@ -2054,7 +2151,9 @@ async fn async_main() -> Result<()> {
                     intent,
                     delivery_policy,
                     if_latest,
+                    idempotency_key,
                     attachment_ids,
+                    allow_escaped_newlines,
                 )
                 .await?
             }
@@ -2064,7 +2163,9 @@ async fn async_main() -> Result<()> {
                 thread,
                 text,
                 if_latest,
+                idempotency_key,
                 attachment_ids,
+                allow_escaped_newlines,
             } => {
                 cmd::message::ask(
                     client,
@@ -2074,7 +2175,9 @@ async fn async_main() -> Result<()> {
                     recipients,
                     text,
                     if_latest,
+                    idempotency_key,
                     attachment_ids,
+                    allow_escaped_newlines,
                 )
                 .await?
             }
@@ -2622,6 +2725,8 @@ async fn async_main() -> Result<()> {
         }
         Cmd::Agent { .. } => unreachable!("handled before client setup"),
         Cmd::Provider { .. } => unreachable!("handled before client setup"),
+        Cmd::Guide { .. } => unreachable!("handled before client setup"),
+        Cmd::Skill { .. } => unreachable!("handled before client setup"),
         Cmd::Mcp { .. } => unreachable!("handled before client setup"),
         Cmd::Memory { .. } => unreachable!("handled before client setup"),
         Cmd::Machine { sub } => match sub {
@@ -2634,6 +2739,7 @@ async fn async_main() -> Result<()> {
                     name,
                     instructions,
                     instructions_file,
+                    source_root,
                     model,
                     reasoning_effort,
                     no_autostart,
@@ -2646,9 +2752,33 @@ async fn async_main() -> Result<()> {
                         name,
                         instructions,
                         instructions_file,
+                        source_root,
                         model,
                         reasoning_effort,
                         !no_autostart,
+                    )
+                    .await?
+                }
+                MachineAgentCmd::Update {
+                    machine,
+                    actor_id,
+                    name,
+                    instructions,
+                    instructions_file,
+                    source_root,
+                    model,
+                    reasoning_effort,
+                } => {
+                    cmd::machine::agent_update(
+                        client,
+                        machine,
+                        actor_id,
+                        name,
+                        instructions,
+                        instructions_file,
+                        source_root,
+                        model,
+                        reasoning_effort,
                     )
                     .await?
                 }
@@ -2870,6 +3000,8 @@ mod tests {
             "wake_agent",
             "--if-latest",
             "msg_latest",
+            "--idempotency-key",
+            "review-request-42",
             "--text",
             "please review",
         ])
@@ -2885,6 +3017,7 @@ mod tests {
                         intent,
                         delivery_policy,
                         if_latest,
+                        idempotency_key,
                         text,
                         ..
                     },
@@ -2895,6 +3028,7 @@ mod tests {
                 assert_eq!(intent.as_deref(), Some("request_action"));
                 assert_eq!(delivery_policy.as_deref(), Some("wake_agent"));
                 assert_eq!(if_latest.as_deref(), Some("msg_latest"));
+                assert_eq!(idempotency_key.as_deref(), Some("review-request-42"));
                 assert_eq!(text.as_deref(), Some("please review"));
             }
             other => panic!("unexpected command: {other:?}"),
@@ -2915,6 +3049,8 @@ mod tests {
             "#chan_123:msg_root",
             "--if-latest",
             "msg_latest",
+            "--idempotency-key",
+            "ask-reviewers-42",
             "--text",
             "please respond",
         ])
@@ -2928,12 +3064,14 @@ mod tests {
                         target,
                         text,
                         if_latest,
+                        idempotency_key,
                         ..
                     },
             } => {
                 assert_eq!(recipients, vec!["@actor_a", "@actor_b", "@all"]);
                 assert_eq!(target.as_deref(), Some("#chan_123:msg_root"));
                 assert_eq!(if_latest.as_deref(), Some("msg_latest"));
+                assert_eq!(idempotency_key.as_deref(), Some("ask-reviewers-42"));
                 assert_eq!(text.as_deref(), Some("please respond"));
             }
             other => panic!("unexpected command: {other:?}"),
@@ -3354,21 +3492,75 @@ mod tests {
 
     #[test]
     fn provider_example_accepts_builtin_flags() {
-        let args = Args::try_parse_from(["loom", "provider", "example", "--claude", "--opencode"])
-            .expect("parse provider example");
+        let args = Args::try_parse_from([
+            "loom",
+            "provider",
+            "example",
+            "--claude",
+            "--opencode",
+            "--kimi",
+            "--zcode",
+        ])
+        .expect("parse provider example");
 
         match args.cmd {
             Cmd::Provider {
                 sub:
                     ProviderCmd::Example {
-                        claude, opencode, ..
+                        claude,
+                        opencode,
+                        kimi,
+                        zcode,
+                        ..
                     },
             } => {
                 assert!(claude);
                 assert!(opencode);
+                assert!(kimi);
+                assert!(zcode);
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn skill_materialize_accepts_dedicated_output_directory() {
+        let args = Args::try_parse_from([
+            "loom",
+            "--json",
+            "skill",
+            "materialize",
+            "loom",
+            "--output",
+            "/tmp/loom-skill",
+        ])
+        .expect("parse skill materialize");
+
+        assert!(args.json);
+        match args.cmd {
+            Cmd::Skill {
+                sub: SkillCmd::Materialize { id, output },
+            } => {
+                assert_eq!(id, "loom");
+                assert_eq!(output, PathBuf::from("/tmp/loom-skill"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn skill_materialize_rejects_unknown_embedded_skill() {
+        let error = Args::try_parse_from([
+            "loom",
+            "skill",
+            "materialize",
+            "unknown",
+            "--output",
+            "/tmp/unknown-skill",
+        ])
+        .expect_err("unknown embedded skill should be rejected");
+
+        assert!(error.to_string().contains("possible values: loom"));
     }
 
     #[test]
@@ -3435,6 +3627,77 @@ mod tests {
             "cloud-dev",
         ])
         .expect("parse machine agent skill remove");
+    }
+
+    #[test]
+    fn machine_agent_update_parses_all_options() {
+        let args = Args::try_parse_from([
+            "loom",
+            "machine",
+            "agent",
+            "update",
+            "--machine",
+            "macmini",
+            "--actor-id",
+            "actor_impl",
+            "--name",
+            "Implementation Agent",
+            "--instructions-file",
+            "AGENTS.md",
+            "--source-root",
+            "/repo/qca",
+            "--model",
+            "gpt-5",
+            "--reasoning-effort",
+            "high",
+        ])
+        .expect("parse machine agent update");
+
+        match args.cmd {
+            Cmd::Machine {
+                sub:
+                    MachineCmd::Agent {
+                        sub:
+                            MachineAgentCmd::Update {
+                                machine,
+                                actor_id,
+                                name,
+                                instructions,
+                                instructions_file,
+                                source_root,
+                                model,
+                                reasoning_effort,
+                            },
+                    },
+            } => {
+                assert_eq!(machine, "macmini");
+                assert_eq!(actor_id, "actor_impl");
+                assert_eq!(name.as_deref(), Some("Implementation Agent"));
+                assert_eq!(instructions, None);
+                assert_eq!(instructions_file, Some(PathBuf::from("AGENTS.md")));
+                assert_eq!(source_root, Some(PathBuf::from("/repo/qca")));
+                assert_eq!(model.as_deref(), Some("gpt-5"));
+                assert_eq!(reasoning_effort.as_deref(), Some("high"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn machine_agent_update_requires_actor_id() {
+        let error = Args::try_parse_from([
+            "loom",
+            "machine",
+            "agent",
+            "update",
+            "--machine",
+            "macmini",
+            "--name",
+            "Implementation Agent",
+        ])
+        .expect_err("machine agent update must require --actor-id");
+
+        assert!(error.to_string().contains("--actor-id"));
     }
 
     #[test]

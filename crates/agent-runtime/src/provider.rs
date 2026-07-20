@@ -29,6 +29,9 @@ use serde_json::{json, Map, Value};
 
 use crate::adapter::{PromptPart, PromptRoleHint};
 
+const DEFAULT_COMMAND_TIMEOUT_MS: i64 = -1;
+const DEFAULT_COMMAND_IDLE_TIMEOUT_MS: i64 = -1;
+
 #[derive(Debug, Clone)]
 pub struct DetectedProvider {
     pub id: String,
@@ -74,14 +77,15 @@ pub struct ProviderRuntimePlan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stdin: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout_ms: Option<u64>,
+    pub timeout_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub idle_timeout_ms: Option<u64>,
+    pub idle_timeout_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interactive: Option<InteractiveCommandSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<InteractiveProviderSpec>,
-    /// How instructions are injected. "prompt" or "agents_md".
+    /// Deprecated compatibility field. Runtime guidance is now projected
+    /// through workspace AGENTS.md plus skills.
     #[serde(default)]
     pub instructions_via: String,
 }
@@ -320,6 +324,8 @@ pub fn validate_manifest(manifest: &ProviderManifest) -> Result<(), String> {
                 manifest.id
             ));
         }
+        validate_mode_timeout(manifest, mode_name, "timeoutMs", mode.timeout_ms)?;
+        validate_mode_timeout(manifest, mode_name, "idleTimeoutMs", mode.idle_timeout_ms)?;
         validate_mode_command(manifest, mode_name, mode)?;
         validate_decoder_spec(manifest, mode_name, "stdout", &mode.stdout)?;
         if let Some(stderr) = mode.stderr.as_ref() {
@@ -327,6 +333,21 @@ pub fn validate_manifest(manifest: &ProviderManifest) -> Result<(), String> {
         }
         validate_prompt_references(manifest, mode_name, mode)?;
         validate_interactive_mode(manifest, mode_name, mode)?;
+    }
+    Ok(())
+}
+
+fn validate_mode_timeout(
+    manifest: &ProviderManifest,
+    mode_name: &str,
+    field: &str,
+    value: Option<i64>,
+) -> Result<(), String> {
+    if value.is_some_and(|ms| ms < -1) {
+        return Err(format!(
+            "provider `{}` mode `{mode_name}` {field} must be -1 (unlimited) or a non-negative millisecond value",
+            manifest.id
+        ));
     }
     Ok(())
 }
@@ -396,6 +417,8 @@ pub fn builtin_provider_manifests() -> Vec<ProviderManifest> {
         copilot_manifest(),
         codex_manifest(),
         opencode_manifest(),
+        kimi_manifest(),
+        zcode_manifest(),
     ]
 }
 
@@ -671,18 +694,10 @@ fn is_builtin_prompt_part_placeholder(key: &str) -> bool {
 
 fn preset_parts(preset: &str) -> Result<Vec<&'static str>, String> {
     match preset {
-        "loom_system" => Ok(vec![
-            "actor_context",
-            "agent_instructions",
-            "bootstrap_memory",
-            "scope_bootstrap",
-        ]),
+        "loom_system" => Ok(vec!["bootstrap_memory"]),
         "loom_turn" => Ok(vec!["turn_memory", "runtime_context", "user_message"]),
         "loom_full" => Ok(vec![
-            "actor_context",
-            "agent_instructions",
             "bootstrap_memory",
-            "scope_bootstrap",
             "turn_memory",
             "runtime_context",
             "user_message",
@@ -2152,8 +2167,8 @@ fn mode(
         },
         stderr: None,
         session,
-        timeout_ms: None,
-        idle_timeout_ms: None,
+        timeout_ms: Some(DEFAULT_COMMAND_TIMEOUT_MS),
+        idle_timeout_ms: Some(DEFAULT_COMMAND_IDLE_TIMEOUT_MS),
         interactive: None,
         provider: None,
     }
@@ -2232,6 +2247,70 @@ fn opencode_jsonl_decoder() -> ProviderDecoderSpec {
             }),
         }),
         capture: Some(session_capture("$.sessionID")),
+    }
+}
+
+fn kimi_jsonl_decoder() -> ProviderDecoderSpec {
+    ProviderDecoderSpec {
+        format: "jsonl".into(),
+        name: None,
+        events: vec![ProviderDecoderEventSpec {
+            when: Some(ProviderJsonConditionSpec {
+                all: vec![
+                    json_condition_equals("$.role", "assistant"),
+                    ProviderJsonConditionSpec {
+                        path: Some("$.tool_calls".into()),
+                        not_empty: Some(true),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+            emit: ProviderDecoderEmitSpec {
+                emit_type: "tool_use".into(),
+                // OpenAI-style tool calls; `arguments` is a JSON-encoded
+                // string, so ToolUse.input surfaces as a string.
+                tool_name: Some("$.tool_calls[0].function.name".into()),
+                input: Some("$.tool_calls[0].function.arguments".into()),
+                ..Default::default()
+            },
+        }],
+        reduce: Some(ProviderJsonlReduceSpec {
+            final_text: Some(ProviderJsonlTextReducerSpec {
+                mode: "lastNonEmpty".into(),
+                path: "$.content".into(),
+                when: Some(ProviderJsonConditionSpec {
+                    all: vec![
+                        json_condition_equals("$.role", "assistant"),
+                        ProviderJsonConditionSpec {
+                            path: Some("$.content".into()),
+                            not_empty: Some(true),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }),
+                fallback: None,
+            }),
+        }),
+        capture: Some(session_capture("$.session_id")),
+    }
+}
+
+fn zcode_json_decoder() -> ProviderDecoderSpec {
+    ProviderDecoderSpec {
+        format: "json".into(),
+        name: None,
+        events: Vec::new(),
+        reduce: Some(ProviderJsonlReduceSpec {
+            final_text: Some(ProviderJsonlTextReducerSpec {
+                mode: "lastNonEmpty".into(),
+                path: "$.response".into(),
+                when: None,
+                fallback: None,
+            }),
+        }),
+        capture: Some(session_capture("$.sessionId")),
     }
 }
 
@@ -2320,10 +2399,8 @@ fn claude_manifest() -> ProviderManifest {
         lit("--session-id"),
         lit("{session.id}"),
         when("model", vec![lit("--model"), lit("{model}")]),
-        lit("--append-system-prompt"),
-        lit("{prompt.system}"),
         lit("-p"),
-        lit("{prompt.user}"),
+        lit("{prompt.full}"),
     ];
     let resume_args = vec![
         lit("--add-dir"),
@@ -2338,19 +2415,15 @@ fn claude_manifest() -> ProviderManifest {
         lit("--resume"),
         lit("{session.id}"),
         when("model", vec![lit("--model"), lit("{model}")]),
-        lit("--append-system-prompt"),
-        lit("{prompt.system}"),
         lit("-p"),
-        lit("{prompt.user}"),
+        lit("{prompt.full}"),
     ];
     let session = ProviderSessionSpec {
         id_source: Some(ProviderSessionIdSource::LoomUuid),
         resume_args,
         scope: Some("actor_scope".into()),
     };
-    let mut print_mode = mode("{bin}", first_args, "claude_stream_json", Some(session));
-    print_mode.timeout_ms = Some(30 * 60 * 1000);
-    print_mode.idle_timeout_ms = Some(5 * 60 * 1000);
+    let print_mode = mode("{bin}", first_args, "claude_stream_json", Some(session));
     let nonprint_mode = ProviderModeSpec {
         transport: "interactive_command".into(),
         command: "{bin}".into(),
@@ -2462,10 +2535,8 @@ fn qoder_manifest() -> ProviderManifest {
             "reasoningEffort",
             vec![lit("--reasoning-effort"), lit("{reasoningEffort}")],
         ),
-        lit("--append-system-prompt"),
-        lit("{prompt.system}"),
         lit("-p"),
-        lit("{prompt.user}"),
+        lit("{prompt.full}"),
     ];
     let resume_args = vec![
         lit("--add-dir"),
@@ -2480,12 +2551,10 @@ fn qoder_manifest() -> ProviderManifest {
             "reasoningEffort",
             vec![lit("--reasoning-effort"), lit("{reasoningEffort}")],
         ),
-        lit("--append-system-prompt"),
-        lit("{prompt.system}"),
         lit("--resume"),
         lit("{session.id}"),
         lit("-p"),
-        lit("{prompt.user}"),
+        lit("{prompt.full}"),
     ];
     let session = ProviderSessionSpec {
         id_source: Some(ProviderSessionIdSource::ProviderCapture),
@@ -2572,7 +2641,7 @@ fn copilot_manifest() -> ProviderManifest {
             mode.instructions_via = "agents_md".into();
             mode.env.insert(
                 "COPILOT_CUSTOM_INSTRUCTIONS_DIRS".into(),
-                "{loom_agent_home}".into(),
+                "{agent.workspace}".into(),
             );
             // Deliver prompt via stdin to avoid Windows command-line length
             // limits.  Copilot reads from stdin when no -p flag is present.
@@ -2580,23 +2649,28 @@ fn copilot_manifest() -> ProviderManifest {
             mode
         })]),
         &[
-            ("gpt-5.5", "GPT-5.5"),
-            ("gpt-5.4", "GPT-5.4"),
-            ("gpt-5.3-codex", "GPT-5.3 Codex"),
-            ("gpt-5.2-codex", "GPT-5.2 Codex"),
-            ("gpt-5.2", "GPT-5.2"),
-            ("gpt-5.1", "GPT-5.1"),
-            ("gpt-5.4-mini", "GPT-5.4 Mini"),
-            ("gpt-5-mini", "GPT-5 Mini"),
-            ("gpt-4.1", "GPT-4.1"),
+            ("claude-sonnet-5", "Claude Sonnet 5"),
+            ("auto", "Auto"),
             ("claude-sonnet-4.6", "Claude Sonnet 4.6"),
             ("claude-sonnet-4.5", "Claude Sonnet 4.5"),
             ("claude-haiku-4.5", "Claude Haiku 4.5"),
+            ("claude-fable-5", "Claude Fable 5"),
+            ("claude-opus-4.8", "Claude Opus 4.8"),
+            ("claude-opus-4.8-fast", "Claude Opus 4.8 (fast mode)"),
             ("claude-opus-4.7", "Claude Opus 4.7"),
             ("claude-opus-4.6", "Claude Opus 4.6"),
-            ("claude-opus-4.6-fast", "Claude Opus 4.6 Fast"),
             ("claude-opus-4.5", "Claude Opus 4.5"),
-            ("claude-sonnet-4", "Claude Sonnet 4"),
+            ("gpt-5.6-sol", "GPT-5.6 Sol"),
+            ("gpt-5.6-terra", "GPT-5.6 Terra"),
+            ("gpt-5.6-luna", "GPT-5.6 Luna"),
+            ("gpt-5.5", "GPT-5.5"),
+            ("gpt-5.4", "GPT-5.4"),
+            ("gpt-5.3-codex", "GPT-5.3 Codex"),
+            ("gpt-5.4-mini", "GPT-5.4 Mini"),
+            ("gpt-5-mini", "GPT-5 Mini"),
+            ("gemini-3.1-pro-preview", "Gemini 3.1 Pro"),
+            ("gemini-3.5-flash", "Gemini 3.5 Flash"),
+            ("kimi-k2.7-code", "Kimi K2.7 Code"),
         ],
     )
 }
@@ -2615,6 +2689,10 @@ fn codex_manifest() -> ProviderManifest {
         lit("--add-dir"),
         lit("{agent.skillWorkspace}"),
         when("model", vec![lit("--model"), lit("{model}")]),
+        when(
+            "reasoningEffort",
+            vec![lit("-c"), lit("model_reasoning_effort={reasoningEffort}")],
+        ),
         lit("{prompt.full}"),
     ];
     let resume_args = vec![
@@ -2632,6 +2710,10 @@ fn codex_manifest() -> ProviderManifest {
         lit("--add-dir"),
         lit("{agent.skillWorkspace}"),
         when("model", vec![lit("--model"), lit("{model}")]),
+        when(
+            "reasoningEffort",
+            vec![lit("-c"), lit("model_reasoning_effort={reasoningEffort}")],
+        ),
         lit("{prompt.full}"),
     ];
     let mut mode = mode(
@@ -2652,12 +2734,13 @@ fn codex_manifest() -> ProviderManifest {
         &["codex", "codexcli"],
         BTreeMap::from([("print".into(), mode)]),
         &[
+            ("gpt-5.6-sol", "GPT-5.6 Sol"),
+            ("gpt-5.6-terra", "GPT-5.6 Terra"),
+            ("gpt-5.6-luna", "GPT-5.6 Luna"),
             ("gpt-5.5", "GPT-5.5"),
             ("gpt-5.4", "GPT-5.4"),
             ("gpt-5.4-mini", "GPT-5.4 Mini"),
-            ("gpt-5.3-codex", "GPT-5.3 Codex"),
             ("gpt-5.3-codex-spark", "GPT-5.3 Codex Spark"),
-            ("gpt-5.2", "GPT-5.2"),
         ],
     )
 }
@@ -2732,6 +2815,108 @@ fn opencode_manifest() -> ProviderManifest {
                 "opencode/nemotron-3-super-free",
                 "OpenCode Nemotron 3 Super Free",
             ),
+        ],
+    )
+}
+
+fn kimi_manifest() -> ProviderManifest {
+    // Kimi Code CLI print mode (`kimi -p`) rejects permission flags
+    // (`--yolo` / `--auto` fail with "Cannot combine --prompt ...") and
+    // auto-approves tool calls itself, so no permission args are passed.
+    // stream-json emits no usage frames; token usage falls back to estimates.
+    let first_args = vec![
+        lit("--add-dir"),
+        lit("{agent.configDir}"),
+        lit("--add-dir"),
+        lit("{agent.skillWorkspace}"),
+        lit("--output-format"),
+        lit("stream-json"),
+        when("model", vec![lit("--model"), lit("{model}")]),
+        lit("-p"),
+        lit("{prompt.full}"),
+    ];
+    let resume_args = vec![
+        lit("--add-dir"),
+        lit("{agent.configDir}"),
+        lit("--add-dir"),
+        lit("{agent.skillWorkspace}"),
+        lit("--output-format"),
+        lit("stream-json"),
+        when("model", vec![lit("--model"), lit("{model}")]),
+        lit("--session"),
+        lit("{session.id}"),
+        lit("-p"),
+        lit("{prompt.full}"),
+    ];
+    let mut mode = mode(
+        "{bin}",
+        first_args,
+        "text",
+        Some(ProviderSessionSpec {
+            id_source: Some(ProviderSessionIdSource::ProviderCapture),
+            resume_args,
+            scope: Some("actor_scope".into()),
+        }),
+    );
+    mode.stdout = kimi_jsonl_decoder();
+    manifest(
+        "kimi",
+        "Kimi Code CLI",
+        &["kimi"],
+        BTreeMap::from([("print".into(), mode)]),
+        &[
+            ("kimi-code/k3", "Kimi K3"),
+            ("kimi-code/kimi-for-coding", "Kimi K2.7 Coding"),
+            (
+                "kimi-code/kimi-for-coding-highspeed",
+                "Kimi K2.7 Coding Highspeed",
+            ),
+        ],
+    )
+}
+
+fn zcode_manifest() -> ProviderManifest {
+    // ZCode CLI ships inside the ZCode desktop app (no PATH shim); the
+    // bundled node bundle is directly executable. Headless mode is
+    // `--prompt`; permission mode defaults to yolo for --prompt, so no
+    // permission args are passed. `--json` prints a single result object
+    // {sessionId, traceId, response, usage?, ...} on stdout; errors go to
+    // stderr with a non-zero exit. There is no model CLI flag — model
+    // selection goes through config or the ZCODE_MODEL env var (empty
+    // means "fall back to the user's zcode config").
+    let first_args = vec![lit("--json"), lit("--prompt"), lit("{prompt.full}")];
+    let resume_args = vec![
+        lit("--json"),
+        lit("--resume"),
+        lit("{session.id}"),
+        lit("--prompt"),
+        lit("{prompt.full}"),
+    ];
+    let mut mode = mode(
+        "{bin}",
+        first_args,
+        "text",
+        Some(ProviderSessionSpec {
+            id_source: Some(ProviderSessionIdSource::ProviderCapture),
+            resume_args,
+            scope: Some("actor_scope".into()),
+        }),
+    );
+    mode.stdout = zcode_json_decoder();
+    mode.env.insert("ZCODE_MODEL".into(), "{model}".into());
+    manifest(
+        "zcode",
+        "ZCode",
+        &[
+            "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs",
+            "zcode",
+        ],
+        BTreeMap::from([("print".into(), mode)]),
+        &[
+            ("bigmodel/GLM-5.2", "GLM-5.2 (BigModel)"),
+            ("bigmodel/GLM-5-Turbo", "GLM-5 Turbo (BigModel)"),
+            ("zai/GLM-5.2", "GLM-5.2 (Z.AI)"),
+            ("zai/GLM-5-Turbo", "GLM-5 Turbo (Z.AI)"),
         ],
     )
 }
@@ -2934,7 +3119,7 @@ mod tests {
     }
 
     #[test]
-    fn base_prompt_keeps_dynamic_turn_context_out_of_system_output() {
+    fn base_prompt_keeps_runtime_turn_context_out_of_system_output() {
         let parts = vec![
             prompt_part("actor_context", "actor context"),
             prompt_part("bootstrap_memory", "bootstrap memory"),
@@ -2947,8 +3132,9 @@ mod tests {
             render_prompt_outputs(Some(&base_prompt()), &parts, "full prompt").expect("outputs");
 
         let system = outputs.get("system").expect("system");
-        assert!(system.contains("actor context"));
-        assert!(system.contains("scope bootstrap"));
+        assert!(!system.contains("actor context"));
+        assert!(system.contains("bootstrap memory"));
+        assert!(!system.contains("scope bootstrap"));
         assert!(!system.contains("turn memory"));
         assert!(!system.contains("runtime context"));
         assert!(!system.contains("user message"));
@@ -2972,7 +3158,7 @@ mod tests {
 
         assert_eq!(
             outputs.get("full").map(String::as_str),
-            Some("actor context\n\nruntime context\n\nuser message")
+            Some("runtime context\n\nuser message")
         );
         assert!(!outputs.contains_key("system"));
         assert!(!outputs.contains_key("user"));
@@ -3769,7 +3955,7 @@ mod tests {
     }
 
     #[test]
-    fn builtin_claude_uses_system_and_user_prompt_outputs() {
+    fn builtin_claude_uses_full_prompt_without_system_append() {
         let dir = temp_dir("path");
         make_executable(&dir.join("claude"));
         let registry = ProviderRegistry::load(&temp_dir("config")).expect("registry");
@@ -3792,9 +3978,10 @@ mod tests {
             },
         )
         .expect("transport");
-        assert!(transport.args.contains(&"--append-system-prompt".into()));
-        assert!(transport.args.contains(&"{prompt.system}".into()));
-        assert!(transport.args.contains(&"{prompt.user}".into()));
+        assert!(!transport.args.contains(&"--append-system-prompt".into()));
+        assert!(!transport.args.contains(&"{prompt.system}".into()));
+        assert!(!transport.args.contains(&"{prompt.user}".into()));
+        assert!(transport.args.contains(&"{prompt.full}".into()));
         assert!(transport.args.contains(&"{agent.configDir}".into()));
         assert!(transport.args.contains(&"{agent.skillWorkspace}".into()));
         assert!(!transport.args.contains(&"{loom.configDir}".into()));
@@ -3806,8 +3993,11 @@ mod tests {
             transport.session.as_ref().and_then(|s| s.scope.as_deref()),
             Some("actor_scope")
         );
-        assert_eq!(transport.timeout_ms, Some(30 * 60 * 1000));
-        assert_eq!(transport.idle_timeout_ms, Some(5 * 60 * 1000));
+        assert_eq!(transport.timeout_ms, Some(DEFAULT_COMMAND_TIMEOUT_MS));
+        assert_eq!(
+            transport.idle_timeout_ms,
+            Some(DEFAULT_COMMAND_IDLE_TIMEOUT_MS)
+        );
     }
 
     #[test]
@@ -3865,6 +4055,116 @@ mod tests {
     }
 
     #[test]
+    fn builtin_codex_and_copilot_model_catalogs_match_current_clis() {
+        let manifests = builtin_provider_manifests();
+        let codex = manifests
+            .iter()
+            .find(|manifest| manifest.id == "codex")
+            .expect("codex");
+        let codex_models = codex.models.as_ref().expect("codex models");
+        assert_eq!(codex_models.default.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(
+            codex_models
+                .choices
+                .iter()
+                .map(|choice| choice.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-5.5",
+                "gpt-5.4",
+                "gpt-5.4-mini",
+                "gpt-5.3-codex-spark",
+            ]
+        );
+
+        let copilot = manifests
+            .iter()
+            .find(|manifest| manifest.id == "copilot")
+            .expect("copilot");
+        let copilot_models = copilot.models.as_ref().expect("copilot models");
+        assert_eq!(copilot_models.default.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(
+            copilot_models
+                .choices
+                .iter()
+                .map(|choice| choice.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "claude-sonnet-5",
+                "auto",
+                "claude-sonnet-4.6",
+                "claude-sonnet-4.5",
+                "claude-haiku-4.5",
+                "claude-fable-5",
+                "claude-opus-4.8",
+                "claude-opus-4.8-fast",
+                "claude-opus-4.7",
+                "claude-opus-4.6",
+                "claude-opus-4.5",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-5.5",
+                "gpt-5.4",
+                "gpt-5.3-codex",
+                "gpt-5.4-mini",
+                "gpt-5-mini",
+                "gemini-3.1-pro-preview",
+                "gemini-3.5-flash",
+                "kimi-k2.7-code",
+            ]
+        );
+    }
+
+    #[test]
+    fn builtin_codex_forwards_reasoning_effort_on_new_and_resumed_turns() {
+        let manifest = codex_manifest();
+        let mode = manifest.modes.get("print").expect("print mode");
+        let resume_args = &mode.session.as_ref().expect("session").resume_args;
+
+        for args in [&mode.args, resume_args] {
+            assert!(args.iter().any(|arg| matches!(
+                arg,
+                ProviderArgSpec::Conditional(spec)
+                    if spec.when == "reasoningEffort"
+                        && matches!(spec.args.as_slice(), [
+                            ProviderArgSpec::Literal(flag),
+                            ProviderArgSpec::Literal(value),
+                        ] if flag == "-c" && value == "model_reasoning_effort={reasoningEffort}")
+            )));
+        }
+    }
+
+    #[test]
+    fn checked_in_codex_and_copilot_examples_match_builtin_models() {
+        for (provider_id, example) in [
+            (
+                "codex",
+                include_str!("../../../examples/providers/codex.json"),
+            ),
+            (
+                "copilot",
+                include_str!("../../../examples/providers/copilot.json"),
+            ),
+        ] {
+            let checked_in: ProviderManifest =
+                serde_json::from_str(example).expect("checked-in provider example");
+            let builtin = builtin_provider_manifests()
+                .into_iter()
+                .find(|manifest| manifest.id == provider_id)
+                .expect("builtin provider");
+            assert_eq!(
+                serde_json::to_value(checked_in.models).expect("checked-in models"),
+                serde_json::to_value(builtin.models).expect("builtin models"),
+                "{provider_id} example model list drifted from the builtin manifest"
+            );
+        }
+    }
+
+    #[test]
     fn builtins_default_add_dir_to_agent_config_and_skill_workspace() {
         for provider_id in ["claude", "qoder", "copilot", "codex"] {
             let manifest = builtin_provider_manifests()
@@ -3884,6 +4184,31 @@ mod tests {
                 !rendered.contains("{loom.configDir}"),
                 "{provider_id} should not expose the daemon config dir by default"
             );
+        }
+    }
+
+    #[test]
+    fn builtin_command_print_modes_default_to_unlimited_turn_timeouts() {
+        for provider_id in [
+            "claude", "qoder", "copilot", "codex", "opencode", "kimi", "zcode",
+        ] {
+            let manifest = builtin_provider_manifests()
+                .into_iter()
+                .find(|manifest| manifest.id == provider_id)
+                .expect("provider");
+            let mode = manifest.modes.get("print").expect("print mode");
+            if mode.transport == "command" {
+                assert_eq!(
+                    mode.timeout_ms,
+                    Some(DEFAULT_COMMAND_TIMEOUT_MS),
+                    "{provider_id} should not impose a total command turn limit"
+                );
+                assert_eq!(
+                    mode.idle_timeout_ms,
+                    Some(DEFAULT_COMMAND_IDLE_TIMEOUT_MS),
+                    "{provider_id} should not impose an idle command turn limit"
+                );
+            }
         }
     }
 
@@ -3943,6 +4268,128 @@ mod tests {
             .and_then(|decoder| decoder.capture.as_ref())
             .and_then(|capture| capture.session.as_ref())
             .is_some_and(|session| session.path == "$.sessionID"));
+    }
+
+    #[test]
+    fn builtin_kimi_declares_jsonl_session_capture_and_resume() {
+        let dir = temp_dir("kimi-path");
+        make_executable(&dir.join("kimi"));
+        let registry = ProviderRegistry::load(&temp_dir("kimi-config")).expect("registry");
+        let provider = registry
+            .detect_with_path(dir.into_os_string())
+            .expect("detect")
+            .into_iter()
+            .find(|provider| provider.id == "kimi")
+            .expect("kimi");
+        let provider_ref = AgentProviderRef {
+            id: "kimi".into(),
+            mode: Some("print".into()),
+            model: Some("kimi-code/k3".into()),
+            reasoning_effort: None,
+            ..Default::default()
+        };
+        let plan = runtime_plan_from_manifest(
+            &provider.manifest,
+            "print",
+            provider.manifest.modes.get("print").unwrap(),
+            Path::new(&provider.command),
+            &provider_ref,
+        )
+        .expect("runtime plan");
+
+        assert_eq!(plan.provider_id, "kimi");
+        assert!(plan.args.contains(&"--output-format".into()));
+        assert!(plan.args.contains(&"stream-json".into()));
+        assert!(plan.args.contains(&"-p".into()));
+        assert!(plan.args.contains(&"{prompt.full}".into()));
+        assert!(plan.args.contains(&"--model".into()));
+        // The model value stays a template in the plan; it is expanded per run.
+        assert!(plan.args.contains(&"{model}".into()));
+        // Kimi print mode rejects permission flags; none may be present.
+        assert!(!plan.args.contains(&"--yolo".into()));
+        assert!(!plan.args.contains(&"--auto".into()));
+        assert_eq!(
+            plan.session.as_ref().and_then(|session| session.id_source),
+            Some(CommandSessionIdSource::ProviderCapture)
+        );
+        assert!(plan
+            .session
+            .as_ref()
+            .and_then(|session| session.resume_args.as_ref())
+            .is_some_and(|args| args.contains(&"--session".into())
+                && args.contains(&"{session_id}".into())
+                && args.contains(&"{prompt.full}".into())));
+        assert_eq!(
+            plan.decoder.as_ref().map(|decoder| decoder.format.as_str()),
+            Some("jsonl")
+        );
+        assert!(plan
+            .decoder
+            .as_ref()
+            .and_then(|decoder| decoder.capture.as_ref())
+            .and_then(|capture| capture.session.as_ref())
+            .is_some_and(|session| session.path == "$.session_id"));
+    }
+
+    #[test]
+    fn builtin_zcode_declares_json_session_capture_and_resume() {
+        let dir = temp_dir("zcode-path");
+        make_executable(&dir.join("zcode"));
+        let registry = ProviderRegistry::load(&temp_dir("zcode-config")).expect("registry");
+        let provider = registry
+            .detect_with_path(dir.into_os_string())
+            .expect("detect")
+            .into_iter()
+            .find(|provider| provider.id == "zcode")
+            .expect("zcode");
+        let provider_ref = AgentProviderRef {
+            id: "zcode".into(),
+            mode: Some("print".into()),
+            model: Some("bigmodel/GLM-5.2".into()),
+            reasoning_effort: None,
+            ..Default::default()
+        };
+        let plan = runtime_plan_from_manifest(
+            &provider.manifest,
+            "print",
+            provider.manifest.modes.get("print").unwrap(),
+            Path::new(&provider.command),
+            &provider_ref,
+        )
+        .expect("runtime plan");
+
+        assert_eq!(plan.provider_id, "zcode");
+        assert!(plan.args.contains(&"--json".into()));
+        assert!(plan.args.contains(&"--prompt".into()));
+        assert!(plan.args.contains(&"{prompt.full}".into()));
+        // Model selection is env-driven, not an argv flag.
+        assert_eq!(
+            plan.env.get("ZCODE_MODEL").map(String::as_str),
+            Some("{model}")
+        );
+        // Headless --prompt defaults to yolo; no permission args may be set.
+        assert!(!plan.args.contains(&"--mode".into()));
+        assert_eq!(
+            plan.session.as_ref().and_then(|session| session.id_source),
+            Some(CommandSessionIdSource::ProviderCapture)
+        );
+        assert!(plan
+            .session
+            .as_ref()
+            .and_then(|session| session.resume_args.as_ref())
+            .is_some_and(|args| args.contains(&"--resume".into())
+                && args.contains(&"{session_id}".into())
+                && args.contains(&"{prompt.full}".into())));
+        assert_eq!(
+            plan.decoder.as_ref().map(|decoder| decoder.format.as_str()),
+            Some("json")
+        );
+        assert!(plan
+            .decoder
+            .as_ref()
+            .and_then(|decoder| decoder.capture.as_ref())
+            .and_then(|capture| capture.session.as_ref())
+            .is_some_and(|session| session.path == "$.sessionId"));
     }
 
     #[test]
@@ -4101,7 +4548,7 @@ mod tests {
 
     #[test]
     fn builtin_provider_capture_sessions_are_declared_on_stdout_decoder() {
-        for provider_id in ["qoder", "codex", "opencode"] {
+        for provider_id in ["qoder", "codex", "opencode", "kimi", "zcode"] {
             let manifest = builtin_provider_manifests()
                 .into_iter()
                 .find(|manifest| manifest.id == provider_id)
@@ -4215,6 +4662,28 @@ mod tests {
             Some("codex_stream_json"),
             "patch must preserve base parser"
         );
+    }
+
+    #[test]
+    fn provider_timeouts_reject_negative_values_below_unlimited_sentinel() {
+        let registry =
+            ProviderRegistry::load(&temp_dir("invalid-timeout-config")).expect("registry");
+        for field in ["timeoutMs", "idleTimeoutMs"] {
+            let mut value = json!({
+                "schemaVersion": 1,
+                "id": "codex_invalid_timeout",
+                "displayName": "Codex Invalid Timeout",
+                "extends": "codex",
+                "modes": {
+                    "print": {}
+                }
+            });
+            value["modes"]["print"][field] = json!(-2);
+            let err = registry
+                .resolve_manifest_value(value)
+                .expect_err("timeout below -1 should fail");
+            assert!(err.contains(&format!("{field} must be -1 (unlimited)")));
+        }
     }
 
     #[test]

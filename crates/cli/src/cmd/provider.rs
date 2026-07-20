@@ -211,6 +211,8 @@ pub struct ExampleSelection {
     pub copilot: bool,
     pub codex: bool,
     pub opencode: bool,
+    pub kimi: bool,
+    pub zcode: bool,
 }
 
 impl ExampleSelection {
@@ -230,6 +232,12 @@ impl ExampleSelection {
         }
         if self.opencode {
             ids.push("opencode");
+        }
+        if self.kimi {
+            ids.push("kimi");
+        }
+        if self.zcode {
+            ids.push("zcode");
         }
         ids
     }
@@ -282,18 +290,20 @@ What to edit first:
   5. modes.print.args: the exact argv order for the provider CLI.
   6. models.default / models.choices: values shown in GUI and substituted into "{{model}}".
   7. stdout: how Loom reads agent output. Use "text" for plain stdout, or a provider decoder for JSON/JSONL streams.
+  8. timeoutMs / idleTimeoutMs: -1 means unlimited; a positive integer enables that millisecond limit.
 
 Prompt flow in this template:
-  - Loom first composes standard prompt parts such as actor_context, agent_instructions, scope_bootstrap, runtime_context, and user_message.
-  - AgentSpec.promptAssembly decides how those parts and agent-owned prompt files become prompt.system, prompt.user, and prompt.full.
-  - On each agent turn Loom writes prompt.system to {{loom_agent_home}}/AGENTS.md, replacing the file only when the content changes.
-  - Loom creates provider-native skill directories under {{agent.workspace}} and symlinks individual scope / actor-local skills into each directory.
+  - Loom writes stable actor/channel context and AgentSpec.instructions to {{agent.workspace}}/AGENTS.md.
+  - Loom no longer injects a Loom-owned system prompt or scope bootstrap manifest.
+  - AgentSpec.promptAssembly decides how memory, profile prompt files, runtime context, assignment context, and user_message become prompt.system, prompt.user, and prompt.full.
+  - Loom creates provider-native skill directories under {{agent.workspace}} and projects the default "loom" skill plus scope / actor-local skills into each directory.
   - Providers launched with {{agent.workspace}} as cwd can discover skills/, .agents/skills, .claude/skills, .qoder/skills, or .opencode/skills directly. Extra workspace dirs are only needed for provider-specific file access.
   - ProviderManifest only declares how the provider CLI receives those rendered prompt outputs.
-  - Simple providers can pass "{{prompt.full}}" directly; providers that read AGENTS.md usually point their instruction/home setting at {{loom_agent_home}} and pass "{{prompt.user}}" per turn.
+  - Simple providers should pass "{{prompt.full}}" directly. Providers that need an explicit instruction directory should point it at {{agent.workspace}}.
 
 Common runtime path variables:
-  - {{loom_agent_home}} points at the current agent's runtime home. Loom writes AGENTS.md there.
+  - {{agent.workspace}} is the provider cwd and the authoritative AGENTS.md location for the current actor in the current channel.
+  - {{loom_agent_home}} points at the current agent's runtime home for profile, bundle, and session data; it is not the default AGENTS.md location.
   - {{agent.skillWorkspace}} is a compatibility alias for {{agent.workspace}}.
   - {{agent.skills}} and {{scope.skills}} point at the shared scope skill registry that is projected into {{agent.workspace}}.
   - {{agent.configDir}} points at the current agent's config directory, normally $LOOM_CONFIG_DIR/agents/<actor_id>.
@@ -302,6 +312,7 @@ Common runtime path variables:
 
 Prompt delivery variables:
   - {{prompt.system}}, {{prompt.user}}, and {{prompt.full}} are rendered by AgentSpec.promptAssembly.
+  - Built-in providers no longer pass {{prompt.system}} through provider system-prompt flags.
   - ProviderManifest should not declare agent profile or workspace prompt files.
   - Keep provider fields focused on command, args, env, stdin, stdout, session, model, and detection.
 
@@ -358,7 +369,9 @@ fn standard_provider_example() -> Value {
                 ],
                 "stdout": {
                     "format": "text"
-                }
+                },
+                "timeoutMs": -1,
+                "idleTimeoutMs": -1
             }
         },
         "models": {
@@ -697,6 +710,8 @@ mod tests {
             .args
             .iter()
             .any(|arg| matches!(arg, proto::methods::ProviderArgSpec::Literal(value) if value == "{prompt.full}")));
+        assert_eq!(manifest.modes["print"].timeout_ms, Some(-1));
+        assert_eq!(manifest.modes["print"].idle_timeout_ms, Some(-1));
         std::fs::remove_dir_all(config_dir).ok();
     }
 
@@ -711,6 +726,7 @@ mod tests {
         assert!(text.contains("loom.configDir"));
         assert!(text.contains("AgentSpec.promptAssembly"));
         assert!(text.contains("prompt.full"));
+        assert!(text.contains("timeoutMs / idleTimeoutMs: -1 means unlimited"));
         assert!(text.contains("```json"));
         assert!(!text.contains("\"workspaceFiles\""));
     }

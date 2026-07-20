@@ -134,10 +134,11 @@ pub struct CommandConfig {
     /// Where to keep `<actor>/<scope_id>.json` session bookkeeping files. The
     /// adapter creates subdirs lazily on first write.
     pub sessions_dir: PathBuf,
-    /// Optional per-turn wall-clock timeout in milliseconds.
-    pub timeout_ms: Option<u64>,
-    /// Optional per-turn stdout idle timeout in milliseconds.
-    pub idle_timeout_ms: Option<u64>,
+    /// Optional per-turn wall-clock timeout in milliseconds. `-1` is unlimited.
+    pub timeout_ms: Option<i64>,
+    /// Optional per-turn subprocess-output idle timeout in milliseconds. `-1`
+    /// is unlimited.
+    pub idle_timeout_ms: Option<i64>,
     /// Hash of provider command/session templates before per-turn runtime
     /// values are expanded. When the spec changes, saved sessions are
     /// invalidated.
@@ -922,11 +923,11 @@ fn spawn_and_collect(
     let deadline = cfg
         .timeout_ms
         .filter(|ms| *ms > 0)
-        .map(|ms| Instant::now() + Duration::from_millis(ms));
+        .map(|ms| Instant::now() + Duration::from_millis(ms as u64));
     let idle_timeout = cfg
         .idle_timeout_ms
         .filter(|ms| *ms > 0)
-        .map(Duration::from_millis);
+        .map(|ms| Duration::from_millis(ms as u64));
     let mut last_output_at = Instant::now();
     let mut exit: Option<ExitStatus> = None;
     let mut timed_out = false;
@@ -3919,6 +3920,98 @@ mod tests {
         );
     }
 
+    fn kimi_decoder() -> ProviderDecoderSpec {
+        crate::provider::builtin_provider_manifests()
+            .into_iter()
+            .find(|manifest| manifest.id == "kimi")
+            .and_then(|manifest| manifest.modes.get("print").map(|mode| mode.stdout.clone()))
+            .expect("kimi decoder")
+    }
+
+    #[test]
+    fn kimi_jsonl_tool_call_line_emits_tool_use_event() {
+        let line = r#"{"role":"assistant","tool_calls":[{"type":"function","id":"tool_1","function":{"name":"Bash","arguments":"{\"command\":\"echo hi\"}"}}]}"#;
+
+        let events = decode_decoder_event_line(&kimi_decoder(), line).expect("runtime events");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            ProviderRuntimeEvent::ToolUse { tool_name, input }
+                if tool_name == "Bash" && input.as_str() == Some("{\"command\":\"echo hi\"}")
+        ));
+    }
+
+    #[test]
+    fn kimi_jsonl_final_text_picks_last_assistant_content() {
+        // Real capture: tool-call frame, tool result frame, final text frame,
+        // then the meta resume hint (which also carries a `content` field and
+        // must not win the final text).
+        let stdout = "{\"role\":\"assistant\",\"tool_calls\":[{\"type\":\"function\",\"id\":\"tool_1\",\"function\":{\"name\":\"Bash\",\"arguments\":\"{}\"}}]}\n\
+                      {\"role\":\"tool\",\"tool_call_id\":\"tool_1\",\"content\":\"hi\\n\"}\n\
+                      {\"role\":\"assistant\",\"content\":\"Final answer\"}\n\
+                      {\"role\":\"meta\",\"type\":\"session.resume_hint\",\"session_id\":\"session_1\",\"command\":\"kimi -r session_1\",\"content\":\"To resume this session: kimi -r session_1\"}\n";
+
+        assert_eq!(
+            extract_decoder_final_text(Some(&kimi_decoder()), stdout),
+            Some("Final answer".into())
+        );
+    }
+
+    #[test]
+    fn kimi_jsonl_captures_session_from_resume_hint() {
+        let stdout = "{\"role\":\"assistant\",\"content\":\"OK\"}\n\
+                      {\"role\":\"meta\",\"type\":\"session.resume_hint\",\"session_id\":\"session_abc\",\"command\":\"kimi -r session_abc\"}\n";
+
+        assert_eq!(
+            capture_decoder_session_id(Some(&kimi_decoder()), stdout),
+            Some("session_abc".into())
+        );
+    }
+
+    #[test]
+    fn kimi_jsonl_ignores_non_json_passthrough_lines() {
+        // Tool stdout is echoed raw between JSONL frames; it must not produce
+        // events nor disturb final-text reduction.
+        assert!(decode_decoder_event_line(&kimi_decoder(), "hello-from-tool").is_none());
+        let stdout = "hello-from-tool\n\
+                      {\"role\":\"assistant\",\"content\":\"Done\"}\n";
+
+        assert_eq!(
+            extract_decoder_final_text(Some(&kimi_decoder()), stdout),
+            Some("Done".into())
+        );
+    }
+
+    fn zcode_decoder() -> ProviderDecoderSpec {
+        crate::provider::builtin_provider_manifests()
+            .into_iter()
+            .find(|manifest| manifest.id == "zcode")
+            .and_then(|manifest| manifest.modes.get("print").map(|mode| mode.stdout.clone()))
+            .expect("zcode decoder")
+    }
+
+    #[test]
+    fn zcode_json_reads_response_as_final_text() {
+        // Headless `zcode --prompt --json` prints a single result object.
+        let stdout = r#"{"sessionId":"sess_abc","traceId":"t1","turnId":"turn_1","response":"Final answer","usage":{"input_tokens":10,"output_tokens":5},"eventCount":3,"projection":{"status":"completed"}}"#;
+
+        assert_eq!(
+            extract_decoder_final_text(Some(&zcode_decoder()), stdout),
+            Some("Final answer".into())
+        );
+    }
+
+    #[test]
+    fn zcode_json_captures_session_id() {
+        let stdout =
+            r#"{"sessionId":"sess_abc","response":"OK","projection":{"status":"completed"}}"#;
+
+        assert_eq!(
+            capture_decoder_session_id(Some(&zcode_decoder()), stdout),
+            Some("sess_abc".into())
+        );
+    }
+
     #[test]
     fn provider_jsonl_reducer_concats_wildcard_values() {
         let reducer = ProviderJsonlTextReducerSpec {
@@ -4550,6 +4643,38 @@ mod tests {
             }
         }
         assert!(got_timeout, "missing timeout Finished event");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unlimited_timeouts_allow_command_to_finish() {
+        let mut cfg = cfg();
+        cfg.command = "sh".into();
+        cfg.args = vec!["-c".into(), "sleep 0.2; echo done".into()];
+        cfg.prompt_via = PromptVia::Stdin;
+        cfg.timeout_ms = Some(-1);
+        cfg.idle_timeout_ms = Some(-1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let slot = Arc::new(Mutex::new(InFlight::default()));
+
+        let outcome = spawn_and_collect(&cfg, &prompt("ignored"), &cfg.args, None, &tx, &slot)
+            .expect("spawn sh");
+
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(outcome.stdout.trim(), "done");
+        let mut got_success = false;
+        while let Ok(event) = rx.try_recv() {
+            if let AdapterEvent::Finished {
+                success, summary, ..
+            } = event
+            {
+                assert!(success);
+                assert!(summary.is_empty());
+                got_success = true;
+                break;
+            }
+        }
+        assert!(got_success, "missing successful Finished event");
     }
 
     #[cfg(unix)]

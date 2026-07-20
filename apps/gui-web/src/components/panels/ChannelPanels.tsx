@@ -398,7 +398,7 @@ export function ChannelMembersPanel({
         channelMemberConfigs={channelMemberConfigs}
         items={onlineMembers}
         runs={runs}
-        title="在线"
+        title="Online"
         onRemoveMember={onRemoveMember}
         onEditMemberWorkspace={setEditingWorkspaceActor}
       />
@@ -408,7 +408,7 @@ export function ChannelMembersPanel({
         channelMemberConfigs={channelMemberConfigs}
         items={offlineMembers}
         runs={runs}
-        title="离线"
+        title="Offline"
         onRemoveMember={onRemoveMember}
         onEditMemberWorkspace={setEditingWorkspaceActor}
       />

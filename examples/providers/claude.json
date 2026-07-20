@@ -131,10 +131,8 @@
           ],
           "when": "model"
         },
-        "--append-system-prompt",
-        "{prompt.system}",
         "-p",
-        "{prompt.user}"
+        "{prompt.full}"
       ],
       "command": "{bin}",
       "session": {
@@ -158,10 +156,8 @@
             ],
             "when": "model"
           },
-          "--append-system-prompt",
-          "{prompt.system}",
           "-p",
-          "{prompt.user}"
+          "{prompt.full}"
         ],
         "scope": "actor_scope"
       },
@@ -170,6 +166,8 @@
         "format": "builtin",
         "name": "claude_stream_json"
       },
+      "timeoutMs": -1,
+      "idleTimeoutMs": -1,
       "transport": "command"
     }
   },

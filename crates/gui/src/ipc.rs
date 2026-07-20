@@ -1206,6 +1206,8 @@ pub struct AgentCreateArgs {
     #[serde(default)]
     pub prompt_assembly: Option<Value>,
     #[serde(default)]
+    pub wake: Option<Value>,
+    #[serde(default)]
     pub model: String,
     #[serde(default)]
     pub reasoning_effort: String,
@@ -1290,6 +1292,8 @@ pub struct AgentUpdateArgs {
     #[serde(default)]
     pub prompt_assembly: Option<Value>,
     #[serde(default)]
+    pub wake: Option<Value>,
+    #[serde(default)]
     pub env: Option<std::collections::BTreeMap<String, String>>,
     #[serde(default)]
     pub bundle_skills: Option<Value>,
@@ -1346,6 +1350,9 @@ pub async fn agent_update(
     });
     if let Some(prompt_assembly) = args.prompt_assembly {
         command["promptAssembly"] = prompt_assembly;
+    }
+    if let Some(wake) = args.wake {
+        command["wake"] = wake;
     }
     if let Some(bundle_skills) = args.bundle_skills {
         command["bundleSkills"] = bundle_skills;
@@ -1914,6 +1921,7 @@ pub async fn machine_agent_create(
                 "description": args.description,
                 "instructions": args.instructions,
                 "promptAssembly": args.prompt_assembly,
+                "wake": args.wake,
                 "model": args.model,
                 "reasoningEffort": args.reasoning_effort,
                 "autostart": args.autostart,
@@ -2805,7 +2813,6 @@ fn actor_ids_from_connection_list(value: &Value) -> HashSet<String> {
 
 fn filter_actor_list_for_active_context(mut value: Value, cfg: &DesktopConfig) -> Value {
     let mut allowed_agents = HashSet::new();
-    let active_owner = config::active_owner_actor_id(cfg);
 
     if let Some(actors) = value.get("actors").and_then(Value::as_array) {
         for actor in actors {
@@ -2833,9 +2840,6 @@ fn filter_actor_list_for_active_context(mut value: Value, cfg: &DesktopConfig) -
         let actor_id = actor.get("id").and_then(Value::as_str).unwrap_or_default();
         match kind {
             "agent" => allowed_agents.contains(actor_id),
-            "human" => active_owner
-                .as_deref()
-                .is_none_or(|owner| actor_id == owner),
             _ => true,
         }
     });
@@ -3380,7 +3384,7 @@ mod tests {
     }
 
     #[test]
-    fn actor_list_filter_keeps_only_active_human_identity() {
+    fn actor_list_filter_keeps_all_server_human_identities() {
         let account = test_account();
         let cfg = DesktopConfig {
             active: Some("default".into()),
@@ -3411,8 +3415,8 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(actor_ids.contains(&account.actor_id.as_str()));
-        assert!(!actor_ids.contains(&"actor_human_local_default"));
-        assert!(!actor_ids.contains(&"actor_human_old"));
+        assert!(actor_ids.contains(&"actor_human_local_default"));
+        assert!(actor_ids.contains(&"actor_human_old"));
         assert!(actor_ids.contains(&"actor_service_machine"));
     }
 

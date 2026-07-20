@@ -1102,6 +1102,25 @@ mod tests {
         assert_eq!(transport.timeout_ms, Some(7_200_000));
         assert_eq!(transport.idle_timeout_ms, Some(1_200_000));
     }
+
+    #[test]
+    fn command_transport_round_trips_unlimited_turn_timeouts() {
+        let transport: AgentTransport = serde_json::from_str(
+            r#"{
+                "kind": "command",
+                "command": "codex",
+                "timeoutMs": -1,
+                "idleTimeoutMs": -1
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(transport.timeout_ms, Some(-1));
+        assert_eq!(transport.idle_timeout_ms, Some(-1));
+
+        let serialized = serde_json::to_value(transport).unwrap();
+        assert_eq!(serialized["timeoutMs"], -1);
+        assert_eq!(serialized["idleTimeoutMs"], -1);
+    }
 }
 
 // ---- run.* ----
@@ -1948,28 +1967,28 @@ pub struct AgentTransport {
     /// variable including `{prompt.full}` or `{prompt.user}`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stdin: Option<String>,
-    /// Optional hard timeout for one command-transport turn. When exceeded the
-    /// daemon cancels the subprocess and fails the turn so later triggers can
-    /// drain instead of being stranded behind a hung CLI.
+    /// Optional hard timeout for one command-transport turn. Positive values
+    /// are milliseconds; `-1` means unlimited. When a positive timeout is
+    /// exceeded, the daemon cancels the subprocess and fails the turn.
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "timeoutMs")]
-    pub timeout_ms: Option<u64>,
-    /// Optional idle timeout for one command-transport turn. The timer resets
-    /// whenever the subprocess emits stdout. This catches provider CLIs that
-    /// have already produced their last useful stream event but remain alive
-    /// because one of their tool subprocesses leaked.
+    pub timeout_ms: Option<i64>,
+    /// Optional idle timeout for one command-transport turn. Positive values
+    /// are milliseconds; `-1` means unlimited. The timer resets whenever the
+    /// subprocess emits output.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         rename = "idleTimeoutMs"
     )]
-    pub idle_timeout_ms: Option<u64>,
+    pub idle_timeout_ms: Option<i64>,
 
     // ---- interactive_command only; ignored by other transports ----
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interactive: Option<InteractiveCommandSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<InteractiveProviderSpec>,
-    /// How instructions are injected (copied from ProviderModeSpec). "prompt" or "agents_md".
+    /// Deprecated compatibility mirror from ProviderModeSpec. Current Loom
+    /// runtime awareness is projected through workspace AGENTS.md plus skills.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -2096,26 +2115,28 @@ pub struct ProviderModeSpec {
     pub stderr: Option<ProviderDecoderSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<ProviderSessionSpec>,
+    /// Hard turn timeout in milliseconds. `-1` means unlimited.
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "timeoutMs")]
-    pub timeout_ms: Option<u64>,
+    pub timeout_ms: Option<i64>,
+    /// Output-idle timeout in milliseconds. `-1` means unlimited.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         rename = "idleTimeoutMs"
     )]
-    pub idle_timeout_ms: Option<u64>,
+    pub idle_timeout_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interactive: Option<InteractiveCommandSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<InteractiveProviderSpec>,
-    /// How instructions are injected: "prompt" (default, injected into prompt text) or
-    /// "agents_md" (written to workspace AGENTS.md, auto-loaded by provider).
+    /// Deprecated compatibility field. Current default providers no longer use
+    /// this to split Loom runtime guidance between prompt and AGENTS.md.
     #[serde(default = "default_instructions_via", rename = "instructionsVia")]
     pub instructions_via: String,
 }
 
 pub fn default_instructions_via() -> String {
-    "prompt".into()
+    "agents_md".into()
 }
 
 fn default_provider_transport() -> String {
@@ -2720,9 +2741,8 @@ pub enum PromptVia {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSpec {
     pub actor: Actor,
-    /// Static instructions for this agent actor. Loom injects these as a
-    /// system-side prompt part so providers with a native system prompt can
-    /// keep this content stable across turns.
+    /// Static instructions for this agent actor. Loom projects these into the
+    /// workspace AGENTS.md Loom block with other stable actor/channel context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
     /// Provider-catalog based runtime selection. The host resolves this into a
@@ -2762,6 +2782,12 @@ pub struct AgentSpec {
     /// `/delivery` or `/discovery`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger: Option<TriggerSpec>,
+    /// Optional wake / turn-intake policy: burst coalescing, dispatch
+    /// debounce, and reply-reminder frequency. Absent fields fall back to
+    /// runtime defaults (coalesce on, no debounce, full reminder on the
+    /// first scope turn then a one-line pointer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake: Option<WakeSpec>,
     /// Optional per-agent prompt assembly. This is the agent-owned rule that
     /// turns Loom prompt parts and controlled profile/workspace files into the
     /// named outputs providers consume through `{prompt.system}`,
@@ -2822,6 +2848,66 @@ pub enum TriggerPrefixApplyOn {
     FirstTurn,
     #[default]
     EveryTurn,
+}
+
+/// Wake / turn-intake policy. See `AgentSpec.wake`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WakeSpec {
+    /// Merge triggers that queued up behind a busy scope into a single turn
+    /// instead of replaying them one full turn per message. Only plain
+    /// messages with the same reply target and visibility are merged;
+    /// task/assignment triggers always run alone. Default: true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coalesce: Option<bool>,
+    /// Milliseconds to wait after a scope becomes free before composing the
+    /// prompt, so a burst of quick messages lands in one turn instead of
+    /// several. Default: 0 (dispatch immediately).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debounce_ms: Option<u64>,
+    /// How often the response-delivery reminder is appended to the turn
+    /// input. The full rules always live in the workspace `AGENTS.md`;
+    /// this only controls the per-turn repetition. Default: `first-turn`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_reminder: Option<ReplyReminderMode>,
+    /// What to do when a human message arrives while the same scope already
+    /// has an in-flight provider turn. Default: `queue`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_human_message_while_busy: Option<OnHumanMessageWhileBusy>,
+    /// Approximate token budget for bootstrap / pending-delivery context
+    /// injected outside the structured wake body. Default is runtime-defined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_token_budget: Option<u64>,
+}
+
+/// Reply-reminder frequency. See `WakeSpec.reply_reminder`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReplyReminderMode {
+    /// Append the full reminder block to every turn input.
+    EveryTurn,
+    /// Full reminder on the first turn of a scope (per worker run), then a
+    /// one-line pointer to AGENTS.md on later turns.
+    #[default]
+    FirstTurn,
+    /// Never append reminder text; rely on `AGENTS.md` / skills only.
+    Off,
+}
+
+/// Busy-scope policy for newly arriving human messages. See `WakeSpec`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OnHumanMessageWhileBusy {
+    /// Preserve current behavior: enqueue the new trigger behind the active
+    /// turn, subject to wake coalescing when it eventually dispatches.
+    #[default]
+    Queue,
+    /// Cancel the active provider turn, requeue its trigger batch, and let the
+    /// cancelled batch coalesce with the new human message.
+    CancelAndRequeue,
+    /// Reserved for transports that can append input to an existing provider
+    /// process. Unsupported transports treat this as `queue`.
+    Inject,
 }
 
 /// Per-actor prompt template (design §5). All three lists are joined with

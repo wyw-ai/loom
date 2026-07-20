@@ -1,12 +1,10 @@
-//! Prompt envelope: turns a loose set of Loom-owned per-actor / per-turn
-//! sections into a single prompt payload.
+//! Prompt envelope: turns Loom-owned per-turn sections into a single prompt
+//! payload.
 //!
 //! The envelope is structured as a sequence of labeled markdown sections so
-//! the model can distinguish actor metadata, memory, scope/runtime context,
-//! and the user turn. Section order is intentional: stable actor and memory
-//! context go before dynamic per-turn context so provider-side prefix caches
-//! can reuse the longest possible prompt prefix. The latest user message
-//! stays at the bottom so it's closest to the model's attention.
+//! the model can distinguish memory, runtime context, and the user turn. The
+//! latest user message stays at the bottom so it's closest to the model's
+//! attention.
 //!
 //! Sections with empty content are skipped.
 //!
@@ -31,20 +29,11 @@ pub struct PromptSection {
 /// formatted by `MemoryRenderer`) are passed through verbatim.
 #[derive(Debug, Clone, Default)]
 pub struct EnvelopeInput<'a> {
-    /// Runtime actor context resolved by Loom itself. This is protocol
-    /// metadata (actor id/display name) and should be injected every prompt.
-    pub actor_context: &'a str,
-    /// Static per-agent instructions from AgentSpec. This belongs with the
-    /// system-side prompt parts, not the per-turn user message.
-    pub agent_instructions: &'a str,
     pub bootstrap_memory: &'a str,
     pub turn_memory: &'a str,
     /// Dynamic runtime facts for this turn, such as the local wall clock used
-    /// by the UI. This is injected every prompt, unlike scope bootstrap.
+    /// by the UI.
     pub runtime_context: &'a str,
-    /// One-shot scope manifest (who you are, what scope, what CLI is
-    /// available). Expected to fire per (actor, scope) on first prompt.
-    pub scope_bootstrap: &'a str,
     pub user_message: &'a str,
 }
 
@@ -56,23 +45,8 @@ pub fn compose_prompt(input: &EnvelopeInput<'_>) -> (String, Vec<PromptSection>)
 
     push_nonempty(
         &mut sections,
-        "actor_context",
-        input.actor_context.trim().to_string(),
-    );
-    push_nonempty(
-        &mut sections,
-        "agent_instructions",
-        input.agent_instructions.trim().to_string(),
-    );
-    push_nonempty(
-        &mut sections,
         "bootstrap_memory",
         input.bootstrap_memory.trim().to_string(),
-    );
-    push_nonempty(
-        &mut sections,
-        "scope_bootstrap",
-        input.scope_bootstrap.trim().to_string(),
     );
     push_nonempty(
         &mut sections,
@@ -118,15 +92,9 @@ use crate::memory::{
     load_bootstrap_and_turn, JsonlMemoryStore, MemoryRenderer, MemorySelector, MemoryStore,
 };
 
-/// Inputs for [`build_envelope`]. Callers resolve actor-scoped data
-/// (profile dir, specs, current channel) once and hand it in.
+/// Inputs for [`build_envelope`].
 #[derive(Debug)]
 pub struct BuildContext<'a> {
-    /// Loom-resolved actor identity section. Stable for this actor, so callers
-    /// should keep volatile facts out of it for better prompt-cache reuse.
-    pub actor_context: &'a str,
-    /// Static agent instructions resolved from AgentSpec.
-    pub agent_instructions: &'a str,
     /// Absolute path to this actor's profile dir. Memory roots are resolved
     /// under this when relative.
     pub profile_dir: &'a Path,
@@ -144,9 +112,6 @@ pub struct BuildContext<'a> {
     /// The user's message (or equivalent directed payload). Goes verbatim
     /// into the final `=== User message ===` block.
     pub user_message: &'a str,
-    /// Scope bootstrap text (loom CLI manifest). Empty string when this is
-    /// not the first prompt in the (actor, scope).
-    pub scope_bootstrap: &'a str,
 }
 
 /// Load memory, compose. Never fails loud — a memory selector error gets
@@ -172,12 +137,9 @@ pub fn build_envelope(cx: &BuildContext<'_>) -> (String, Vec<PromptSection>) {
     };
 
     compose_prompt(&EnvelopeInput {
-        actor_context: cx.actor_context,
-        agent_instructions: cx.agent_instructions,
         bootstrap_memory: &bootstrap_rendered,
         turn_memory: &turn_rendered,
         runtime_context: cx.runtime_context,
-        scope_bootstrap: cx.scope_bootstrap,
         user_message: cx.user_message,
     })
 }
@@ -224,46 +186,25 @@ mod tests {
     #[test]
     fn full_envelope_orders_sections() {
         let (body, sections) = compose_prompt(&EnvelopeInput {
-            actor_context:
-                "=== System: Loom actor identity ===\nYou are Coder (@actor_agent_coder).",
-            agent_instructions: "=== System: Agent instructions ===\nHost concise games.",
             bootstrap_memory: "Bootstrap memory:\n- [fact / high] a",
             turn_memory: "Relevant memory:\n- [note / medium] b",
-            runtime_context: "",
-            scope_bootstrap: "=== loom bootstrap ===\nscope: thread:x",
+            runtime_context: "=== System: Local time context ===\nCurrent local time: x",
             user_message: "hi",
         });
         let names: Vec<_> = sections.iter().map(|s| s.name).collect();
         assert_eq!(
             names,
             vec![
-                "actor_context",
-                "agent_instructions",
                 "bootstrap_memory",
-                "scope_bootstrap",
                 "turn_memory",
+                "runtime_context",
                 "user_message",
             ]
         );
-        assert!(body.find("Loom actor identity").unwrap() < body.find("Bootstrap memory").unwrap());
-        assert!(body.find("Agent instructions").unwrap() < body.find("Bootstrap memory").unwrap());
+        assert!(body.find("Bootstrap memory").unwrap() < body.find("Relevant memory").unwrap());
+        assert!(body.find("Relevant memory").unwrap() < body.find("Local time context").unwrap());
         assert!(
-            body.find("Bootstrap memory").unwrap() < body.find("=== User message ===").unwrap()
-        );
-    }
-
-    #[test]
-    fn actor_context_is_injected_before_user_message() {
-        let (body, sections) = compose_prompt(&EnvelopeInput {
-            actor_context:
-                "=== System: Loom actor identity ===\nYou are Coder (@actor_agent_coder).",
-            user_message: "hi",
-            ..Default::default()
-        });
-        let names: Vec<_> = sections.iter().map(|s| s.name).collect();
-        assert_eq!(names, vec!["actor_context", "user_message"]);
-        assert!(
-            body.find("Loom actor identity").unwrap() < body.find("=== User message ===").unwrap()
+            body.find("Local time context").unwrap() < body.find("=== User message ===").unwrap()
         );
     }
 
@@ -280,19 +221,14 @@ mod tests {
     }
 
     #[test]
-    fn stable_scope_bootstrap_precedes_dynamic_runtime_context_for_cache_reuse() {
+    fn runtime_context_precedes_user_message() {
         let (body, sections) = compose_prompt(&EnvelopeInput {
             runtime_context: "=== System: Local time context ===\nCurrent local time: x",
-            scope_bootstrap: "=== loom bootstrap ===\nscope: thread:x",
             user_message: "hi",
             ..Default::default()
         });
         let names: Vec<_> = sections.iter().map(|s| s.name).collect();
-        assert_eq!(
-            names,
-            vec!["scope_bootstrap", "runtime_context", "user_message"]
-        );
-        assert!(body.find("loom bootstrap").unwrap() < body.find("Local time context").unwrap());
+        assert_eq!(names, vec!["runtime_context", "user_message"]);
         assert!(
             body.find("Local time context").unwrap() < body.find("=== User message ===").unwrap()
         );

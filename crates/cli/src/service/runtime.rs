@@ -37,6 +37,7 @@ pub struct ServiceRuntime {
     actor_id: String,
     instance_id: Option<String>,
     client: Arc<Client>,
+    service_state_dir: PathBuf,
     state_dir: PathBuf,
     dedupe: DedupeStore,
 }
@@ -72,6 +73,7 @@ impl ServiceRuntime {
             actor_id,
             instance_id: None,
             client,
+            service_state_dir: state_dir.clone(),
             state_dir,
             dedupe,
         }))
@@ -89,12 +91,14 @@ impl ServiceRuntime {
         data_root: &Path,
     ) -> Result<Arc<Self>> {
         let state_dir = state::ensure_instance_state_dir(data_root, &service_id, &instance_id)?;
+        let service_state_dir = state::state_dir(data_root, &service_id);
         let dedupe = DedupeStore::open(&state_dir)?;
         Ok(Arc::new(Self {
             service_id,
             actor_id,
             instance_id: Some(instance_id),
             client,
+            service_state_dir,
             state_dir,
             dedupe,
         }))
@@ -118,6 +122,13 @@ impl ServiceRuntime {
 
     pub fn state_dir(&self) -> &Path {
         &self.state_dir
+    }
+
+    /// State shared by every instance of this service. For a singleton this
+    /// is the same directory as [`Self::state_dir`]; for a thread-bound
+    /// runtime it is the parent `<data_root>/services/<service_id>/` directory.
+    pub fn service_state_dir(&self) -> &Path {
+        &self.service_state_dir
     }
 
     /// §8.4 dedupe primitive. Returns `Ok(true)` if `key` is new (caller

@@ -30,7 +30,9 @@ pub async fn send(
     intent: Option<String>,
     delivery_policy: Option<String>,
     if_latest: Option<String>,
+    idempotency_key: Option<String>,
     attachment_ids: Vec<String>,
+    allow_escaped_newlines: bool,
 ) -> Result<()> {
     let private_to = normalize_actor_ids(private_to)?;
     if to.is_some() && !private_to.is_empty() {
@@ -38,13 +40,26 @@ pub async fn send(
     }
     let target =
         resolve_send_target(client.as_ref(), target, thread, to, !private_to.is_empty()).await?;
+    let text_contains_escaped_newline = text
+        .as_deref()
+        .map(|value| value.contains("\\n"))
+        .unwrap_or(false);
     let body = read_message_body(text)?;
     if body.trim().is_empty() && attachment_ids.is_empty() {
         bail!("message body is empty");
     }
+    check_escaped_newlines(
+        &body,
+        text_contains_escaped_newline,
+        allow_escaped_newlines,
+        agent_turn_is_active(),
+    )?;
     let is_private = !private_to.is_empty();
     let mut intent = parse_message_intent(intent)?;
     let mut delivery_policy = parse_delivery_policy(delivery_policy)?;
+    let explicit_notify_intent = matches!(intent, Some(MessageIntent::Notify));
+    let explicit_silent_policy = matches!(delivery_policy, Some(DeliveryPolicy::Silent));
+    let infer_default_agent_reply = agent_turn_is_active() && !explicit_notify_intent;
     if is_private {
         intent.get_or_insert(MessageIntent::RequestAction);
         delivery_policy.get_or_insert(DeliveryPolicy::WakeAgent);
@@ -84,25 +99,40 @@ pub async fn send(
         &body,
         delivery_policy,
         trigger_actor.as_deref(),
+        infer_default_agent_reply,
     );
+    if inferred_reply.is_some() && delivery_policy.is_none() {
+        delivery_policy = Some(DeliveryPolicy::WakeAgent);
+        params["deliveryPolicy"] = serde_json::to_value(DeliveryPolicy::WakeAgent)?;
+    }
     if let Some(if_latest) = if_latest.filter(|value| !value.trim().is_empty()) {
         params["ifLatestMessageId"] = json!(if_latest);
     }
-    let res: MessageSendResult = client.call(method::MESSAGE_SEND, params).await?;
-    if let Some(warning) = channel_fragmentation_warning(&target, !private_to.is_empty()) {
-        eprintln!("{warning}");
+    if let Some(idempotency_key) = idempotency_key {
+        params["idempotencyKey"] = json!(idempotency_key);
     }
     let will_wake = !private_to.is_empty() || delivery_policy == Some(DeliveryPolicy::WakeAgent);
     let has_targeted_audience = !private_to.is_empty() || inferred_reply.is_some();
     if !will_wake && !has_targeted_audience && looks_like_call_for_action(&body) {
-        eprintln!(
-            "loom: warning: this message is notify_only and will wake nobody, but its \
-             text looks like a call for others to act (discuss/vote/answer/your turn). \
-             If you expect a response, send it with `loom message ask @actor_id ...` \
-             (or `--private-to @actor_id` for a hidden prompt). A notify_only \
-             call-for-action wakes no one and is the #1 cause of stalled multi-actor flows."
-        );
+        let warning = notify_only_call_for_action_warning();
+        if should_reject_notify_only_call_for_action(
+            agent_turn_is_active(),
+            explicit_notify_intent,
+            explicit_silent_policy,
+        ) {
+            bail!(
+                "{warning} This is blocked inside an agent run. Use `loom message ask @actor_id ...` \
+                 or `loom message send --private-to @actor_id --target \"$LOOM_REPLY_TARGET\" ...` \
+                 for hidden same-scope work. If this is intentionally a no-action notification, \
+                 rerun with `--intent notify`."
+            );
+        }
+        eprintln!("{warning}");
     }
+    if let Some(warning) = channel_fragmentation_warning(&target, !private_to.is_empty()) {
+        eprintln!("{warning}");
+    }
+    let res: MessageSendResult = client.call(method::MESSAGE_SEND, params).await?;
     if render::is_json() {
         render::print_json(&res);
     } else {
@@ -119,18 +149,37 @@ pub async fn ask(
     recipients: Vec<String>,
     text: Option<String>,
     if_latest: Option<String>,
+    idempotency_key: Option<String>,
     attachment_ids: Vec<String>,
+    allow_escaped_newlines: bool,
 ) -> Result<()> {
     let target = resolve_send_target(client.as_ref(), target, thread, None, false).await?;
+    let text_contains_escaped_newline = text
+        .as_deref()
+        .map(|value| value.contains("\\n"))
+        .unwrap_or(false);
     let body = read_message_body(text)?;
     if body.trim().is_empty() && attachment_ids.is_empty() {
         bail!("message body is empty");
     }
-    let params = build_ask_params(target.clone(), recipients, body, if_latest, attachment_ids)?;
-    let res: MessageSendResult = client.call(method::MESSAGE_SEND, params).await?;
+    check_escaped_newlines(
+        &body,
+        text_contains_escaped_newline,
+        allow_escaped_newlines,
+        agent_turn_is_active(),
+    )?;
+    let params = build_ask_params(
+        target.clone(),
+        recipients,
+        body,
+        if_latest,
+        idempotency_key,
+        attachment_ids,
+    )?;
     if let Some(warning) = channel_fragmentation_warning(&target, false) {
         eprintln!("{warning}");
     }
+    let res: MessageSendResult = client.call(method::MESSAGE_SEND, params).await?;
     if render::is_json() {
         render::print_json(&res);
     } else {
@@ -174,6 +223,56 @@ fn looks_like_call_for_action(body: &str) -> bool {
         "开始投票",
     ];
     CUES.iter().any(|cue| lower.contains(cue))
+}
+
+fn notify_only_call_for_action_warning() -> &'static str {
+    "loom: warning: this message is notify_only and will wake nobody, but its text looks \
+     like a call for others to act (discuss/vote/answer/your turn). If you expect a \
+     response, send it with `loom message ask @actor_id ...` (or `--private-to @actor_id` \
+     for a hidden prompt). A notify_only call-for-action wakes no one and is the #1 cause \
+     of stalled multi-actor flows."
+}
+
+fn check_escaped_newlines(
+    body: &str,
+    text_contains_escaped_newline: bool,
+    allow_escaped_newlines: bool,
+    agent_turn_active: bool,
+) -> Result<()> {
+    if let Some(warning) = escaped_newline_warning(body) {
+        if agent_turn_active && text_contains_escaped_newline && !allow_escaped_newlines {
+            bail!(
+                "{warning} This is blocked inside an agent run because `--text` preserves \
+                 backslash-n literally. For multiline messages, omit `--text` and pipe \
+                 stdin/heredoc with real newline characters. If the literal `\\n` text is \
+                 intentional, pass `--allow-escaped-newlines`."
+            );
+        }
+        eprintln!("{warning}");
+    }
+    Ok(())
+}
+
+fn escaped_newline_warning(body: &str) -> Option<&'static str> {
+    body.contains("\\n").then_some(
+        "loom: warning: message text contains literal `\\n`. Loom stores text literally; \
+         for multiline messages, omit `--text` and pipe stdin/heredoc so real newline \
+         characters are sent.",
+    )
+}
+
+fn agent_turn_is_active() -> bool {
+    std::env::var("LOOM_RUN_ID")
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn should_reject_notify_only_call_for_action(
+    agent_turn_active: bool,
+    explicit_notify_intent: bool,
+    explicit_silent_policy: bool,
+) -> bool {
+    agent_turn_active && !explicit_notify_intent && !explicit_silent_policy
 }
 
 /// Best-effort, non-blocking nudge: warn when a non-private message is being
@@ -235,6 +334,7 @@ fn build_ask_params(
     recipients: Vec<String>,
     body: String,
     if_latest: Option<String>,
+    idempotency_key: Option<String>,
     attachment_ids: Vec<String>,
 ) -> Result<Value> {
     let audience = normalize_audience_refs(recipients)?;
@@ -248,6 +348,9 @@ fn build_ask_params(
     });
     if let Some(if_latest) = if_latest.filter(|value| !value.trim().is_empty()) {
         params["ifLatestMessageId"] = json!(if_latest);
+    }
+    if let Some(idempotency_key) = idempotency_key {
+        params["idempotencyKey"] = json!(idempotency_key);
     }
     Ok(params)
 }
@@ -446,10 +549,8 @@ fn inferred_reply_audience<'a>(
     body: &str,
     delivery_policy: Option<DeliveryPolicy>,
     trigger_actor: Option<&'a str>,
+    infer_default_agent_reply: bool,
 ) -> Option<&'a str> {
-    if delivery_policy != Some(DeliveryPolicy::WakeAgent) {
-        return None;
-    }
     if !target.trim().starts_with('#') || !target.contains(':') {
         return None;
     }
@@ -461,6 +562,13 @@ fn inferred_reply_audience<'a>(
         .filter(|value| !value.is_empty())
         .filter(|value| *value != actor_id)
         .filter(|value| value.starts_with("actor_"))?;
+    let should_wake = delivery_policy == Some(DeliveryPolicy::WakeAgent)
+        || (delivery_policy.is_none()
+            && infer_default_agent_reply
+            && trigger_actor.starts_with("actor_agent_"));
+    if !should_wake {
+        return None;
+    }
     Some(trigger_actor)
 }
 
@@ -472,12 +580,19 @@ fn apply_inferred_reply_audience(
     body: &str,
     delivery_policy: Option<DeliveryPolicy>,
     trigger_actor: Option<&str>,
+    infer_default_agent_reply: bool,
 ) -> Option<String> {
     if is_private {
         return None;
     }
-    let reply_actor_id =
-        inferred_reply_audience(target, actor_id, body, delivery_policy, trigger_actor)?;
+    let reply_actor_id = inferred_reply_audience(
+        target,
+        actor_id,
+        body,
+        delivery_policy,
+        trigger_actor,
+        infer_default_agent_reply,
+    )?;
     params["audience"] = json!([{ "kind": "actor", "id": reply_actor_id }]);
     Some(reply_actor_id.to_string())
 }
@@ -495,6 +610,48 @@ mod tests {
             "天亮了，昨晚是平安夜，无人死亡。"
         ));
         assert!(!looks_like_call_for_action("Game over. Villagers win."));
+    }
+
+    #[test]
+    fn agent_turn_rejects_notify_only_call_for_action_unless_explicitly_notify() {
+        assert!(should_reject_notify_only_call_for_action(
+            true, false, false
+        ));
+        assert!(!should_reject_notify_only_call_for_action(
+            false, false, false
+        ));
+        assert!(!should_reject_notify_only_call_for_action(
+            true, true, false
+        ));
+        assert!(!should_reject_notify_only_call_for_action(
+            true, false, true
+        ));
+    }
+
+    #[test]
+    fn escaped_newline_warning_flags_literal_backslash_n() {
+        let warning =
+            escaped_newline_warning("line one\\nline two").expect("literal newline warning");
+        assert!(warning.contains("literal `\\n`"));
+        assert!(warning.contains("stdin/heredoc"));
+        assert!(escaped_newline_warning("line one\nline two").is_none());
+    }
+
+    #[test]
+    fn agent_turn_rejects_escaped_newline_text_unless_allowed() {
+        let error = check_escaped_newlines("line one\\nline two", true, false, true)
+            .expect_err("agent --text literal newline escape should be rejected");
+        assert!(error.to_string().contains("blocked inside an agent run"));
+        assert!(error.to_string().contains("--allow-escaped-newlines"));
+
+        check_escaped_newlines("line one\\nline two", true, true, true)
+            .expect("explicit allow should pass");
+        check_escaped_newlines("line one\\nline two", true, false, false)
+            .expect("manual CLI use should only warn");
+        check_escaped_newlines("line one\nline two", true, false, true)
+            .expect("real newline should pass");
+        check_escaped_newlines("line one\\nline two", false, false, true)
+            .expect("stdin body with literal sequence should only warn");
     }
 
     #[test]
@@ -532,6 +689,7 @@ mod tests {
                 "偏小，继续猜。",
                 Some(DeliveryPolicy::WakeAgent),
                 Some("actor_agent_guesser"),
+                false,
             ),
             Some("actor_agent_guesser")
         );
@@ -546,6 +704,7 @@ mod tests {
                 "@actor_agent_guesser 偏小，继续猜。",
                 Some(DeliveryPolicy::WakeAgent),
                 Some("actor_agent_guesser"),
+                false,
             ),
             None
         );
@@ -573,6 +732,7 @@ mod tests {
             "【私信·身份】你的身份是狼人。",
             Some(DeliveryPolicy::WakeAgent),
             Some("actor_human_local"),
+            false,
         );
 
         assert_eq!(params["audience"][0]["id"], "actor_agent_player");
@@ -596,9 +756,63 @@ mod tests {
             "继续。",
             Some(DeliveryPolicy::WakeAgent),
             Some("actor_agent_player"),
+            false,
         );
 
         assert_eq!(params["audience"][0]["id"], "actor_agent_player");
+    }
+
+    #[test]
+    fn agent_thread_reply_without_explicit_policy_infers_agent_requester() {
+        let mut params = json!({
+            "target": "#chan_1:msg_root",
+            "body": "到",
+        });
+
+        let inferred = apply_inferred_reply_audience(
+            &mut params,
+            false,
+            "#chan_1:msg_root",
+            "actor_agent_player",
+            "到",
+            None,
+            Some("actor_agent_dm"),
+            true,
+        );
+
+        if inferred.is_some() {
+            params["deliveryPolicy"] = serde_json::to_value(DeliveryPolicy::WakeAgent).unwrap();
+        }
+
+        assert_eq!(inferred.as_deref(), Some("actor_agent_dm"));
+        assert_eq!(params["audience"][0]["id"], "actor_agent_dm");
+        assert_eq!(params["deliveryPolicy"], "wake_agent");
+    }
+
+    #[test]
+    fn default_reply_inference_does_not_wake_humans_or_explicit_notify() {
+        assert_eq!(
+            inferred_reply_audience(
+                "#chan:msg_root",
+                "actor_agent_worker",
+                "done",
+                None,
+                Some("actor_human_owner"),
+                true,
+            ),
+            None
+        );
+        assert_eq!(
+            inferred_reply_audience(
+                "#chan:msg_root",
+                "actor_agent_worker",
+                "done",
+                None,
+                Some("actor_agent_owner"),
+                false,
+            ),
+            None
+        );
     }
 
     #[test]
@@ -608,6 +822,7 @@ mod tests {
             vec!["@actor_agent_qzz_729cf432".into()],
             "Q仔，请开始白天发言。".into(),
             Some("msg_latest".into()),
+            Some("wake-qzz-once".into()),
             Vec::new(),
         )
         .expect("build ask params");
@@ -616,6 +831,7 @@ mod tests {
         assert_eq!(params["intent"], "ask");
         assert_eq!(params["deliveryPolicy"], "wake_agent");
         assert_eq!(params["ifLatestMessageId"], "msg_latest");
+        assert_eq!(params["idempotencyKey"], "wake-qzz-once");
         assert_eq!(params["audience"][0]["kind"], "actor");
         assert_eq!(params["audience"][0]["id"], "actor_agent_qzz_729cf432");
     }
@@ -629,6 +845,7 @@ mod tests {
                 "actor_agent_b,@all,@agents,@humans,group:reviewers".into(),
             ],
             "please respond".into(),
+            None,
             None,
             Vec::new(),
         )
@@ -656,6 +873,7 @@ mod tests {
             "#chan_1".into(),
             vec!["@Q仔".into()],
             "please respond".into(),
+            None,
             None,
             Vec::new(),
         )
@@ -865,6 +1083,7 @@ mod read_tests {
             task_id: None,
             attachments: Vec::new(),
             reactions: Vec::new(),
+            idempotency_key: None,
             metadata: Default::default(),
         }
     }

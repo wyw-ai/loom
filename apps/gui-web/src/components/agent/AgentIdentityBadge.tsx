@@ -56,7 +56,7 @@ export type AgentIdentityBadgeProps = {
    * Three-state usage display (Iter#5 Part D). When provided, overrides
    * `hasUsageData` for the usage-region rendering logic:
    * - `available`: render existing segment bar (no regression)
-   * - `no_data`: show "暂无用量数据" (agent hasn't completed a turn)
+   * - `no_data`: show "No usage data yet" (agent hasn't completed a turn)
    * - `estimated_only`: silently hide the usage region (provider doesn't
    *   return real token data)
    */
@@ -125,12 +125,12 @@ const defaultSegments: AgentIdentityBadgeSegment[] = [
 ];
 
 const runStatusLabels: Record<string, string> = {
-  queued: "排队中",
-  preparing_context: "准备中",
-  running: "思考中",
-  waiting_tool: "等待工具",
-  failed: "运行失败",
-  canceled: "已取消",
+  queued: "Queued",
+  preparing_context: "Preparing",
+  running: "Thinking",
+  waiting_tool: "Waiting for tool",
+  failed: "Failed",
+  canceled: "Canceled",
 };
 
 function runStatusModifierClass(status: RunStatus | null | undefined, isStale?: boolean, isTerminal?: boolean): string {
@@ -379,10 +379,10 @@ function AgentIdentityDetailCard({
   // Iter#5 Part D — three-state usage rendering.
   // estimated_only: silently hide the entire usage region (both sections).
   const hideUsageRegion = usageState?.kind === "estimated_only";
-  // no_data: show "暂无用量数据" instead of "Token tracking unavailable..."
+  // no_data: show "No usage data yet" instead of "Token tracking unavailable..."
   const usageEmptyText =
     usageState?.kind === "no_data"
-      ? "暂无用量数据"
+      ? "No usage data yet"
       : hasUsageData
         ? "Token statistics will appear once this agent finishes a turn."
         : "Token tracking unavailable for this provider.";
@@ -541,7 +541,7 @@ function AgentIdentityDetailCard({
         ) : (
           <p className="agent-detail-context__empty">
             {usageState?.kind === "no_data"
-              ? "暂无用量数据"
+              ? "No usage data yet"
               : hasUsageData
                 ? "Breakdown will populate after the first turn completes."
                 : "Token tracking unavailable for this provider."}

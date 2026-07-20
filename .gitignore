@@ -11,6 +11,7 @@
 __pycache__/
 /docs/*
 !/docs/README.md
+!/docs/agent-turn-input-analysis.md
 !/docs/gui-actor-provider-management-design.md
 !/docs/loom-refactor-plan.md
 !/docs/loop-engineering.md
@@ -22,6 +23,7 @@ __pycache__/
 !/docs/ISSUES.md
 !/docs/protocol/
 !/docs/protocol/agent-coordination-workflow.md
+!/docs/protocol/turn-input-contract-v1.md
 !/docs/superpowers/
 !/docs/windows-build-guide.md
 !/docs/ci/
@@ -30,6 +32,7 @@ data
 # Desktop GUI (apps/gui-web + Tauri build artifacts)
 /apps/gui-web/node_modules/
 /apps/gui-web/dist/
+/apps/gui-web/dist-preview/
 /apps/gui-web/.vite/
 /apps/gui-web/*.tsbuildinfo
 /apps/gui-web/vite.config.d.ts
@@ -38,3 +41,6 @@ data
 /crates/gui/target/
 /logs/
 /tmp/
+# In-repo checkouts of official runtime content (CI checks these out here)
+/loom-guide/
+/loom-skills/

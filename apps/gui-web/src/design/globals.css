@@ -343,6 +343,10 @@
     background: #e6e8ef;
   }
 
+  .date-divider-first {
+    padding-top: 4px;
+  }
+
   .reaction-chip {
     display: inline-flex;
     height: 28px;
@@ -653,18 +657,23 @@
 
   .composer-box {
     display: flex;
-    min-height: 78px;
-    align-items: flex-end;
+    min-height: 48px;
+    align-items: flex-start;
     gap: 12px;
     border: 1px solid #dfe3ec;
     border-radius: 12px;
     background: #ffffff;
-    padding: 10px 12px;
+    padding: 8px 12px;
     box-shadow: 0 1px 2px rgb(16 24 40 / 0.02);
   }
 
   .composer-box-compact {
-    min-height: 72px;
+    min-height: 44px;
+  }
+
+  .composer-box-manual textarea {
+    height: 100% !important;
+    max-height: none !important;
   }
 
   .composer-icon {
@@ -838,7 +847,8 @@
   }
 
   .message-markdown pre {
-    overflow-x: auto;
+    overflow: visible;
+    position: relative;
     border: 1px solid #dfe3ec;
     border-radius: 10px;
     background: #f7f8fb;
@@ -846,8 +856,63 @@
   }
 
   .message-markdown pre code {
+    display: block;
+    overflow-x: auto;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
     background: transparent;
     padding: 0;
+  }
+
+  .message-markdown pre code::-webkit-scrollbar {
+    display: none;
+  }
+
+  .code-block-wrapper {
+    position: relative;
+    margin: 0 0 0.45rem;
+  }
+
+  .code-block-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 4px 12px;
+    border: 1px solid #dfe3ec;
+    border-bottom: none;
+    border-radius: 10px 10px 0 0;
+    background: #edeff5;
+    font-size: 0.75rem;
+  }
+
+  .code-block-header + pre {
+    border-radius: 0 0 10px 10px;
+    border-top: 1px solid #dfe3ec;
+  }
+
+  .code-lang-label {
+    font-family: monospace;
+    text-transform: lowercase;
+    color: #667085;
+    font-weight: 500;
+  }
+
+  .code-copy-btn {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 6px;
+    border-radius: 4px;
+    color: #667085;
+    transition: color 0.15s, background 0.15s;
+  }
+
+  .code-copy-btn:hover {
+    color: #111827;
+    background: rgba(0, 0, 0, 0.05);
+  }
+
+  .code-copy-btn.copied {
+    color: #16a34a;
   }
 
   /* GFM elements (remark-gfm): tables, strikethrough, task lists, headings,
@@ -855,10 +920,19 @@
      into the wider app. Loom-native palette (see ARCH Part A §2.2). */
   .message-markdown table {
     border-collapse: collapse;
-    width: 100%;
-    display: block;
-    overflow-x: auto;
+    width: max-content;
     margin: 0 0 0.45rem;
+  }
+
+  .message-markdown .table-wrapper {
+    overflow-x: auto;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+    margin: 0 0 0.45rem;
+  }
+
+  .message-markdown .table-wrapper::-webkit-scrollbar {
+    display: none;
   }
 
   .message-markdown thead th {
@@ -934,9 +1008,16 @@
 
   .message-markdown blockquote {
     margin: 0 0 0.45rem;
-    padding: 0.2rem 0 0.2rem 0.9rem;
+    padding: 0.5rem 0 0.5rem 0.9rem;
     border-left: 3px solid #5843d7;
+    background: #f7f8fb;
+    border-radius: 0 6px 6px 0;
     color: #485063;
+  }
+
+  .message-markdown blockquote blockquote {
+    border-left-color: #b1b5c5;
+    background: #fbfbfd;
   }
 
   .message-markdown hr {
@@ -944,9 +1025,27 @@
     border-top: 1px solid #dfe3ec;
     margin: 0.8rem 0;
   }
+
+  .message-markdown img {
+    max-width: 100%;
+    border-radius: 8px;
+    margin: 0.25rem 0;
+  }
 }
 
 @layer utilities {
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border-width: 0;
+  }
+
   .stable-scrollbar {
     scrollbar-gutter: stable;
   }
@@ -996,3 +1095,83 @@
   animation: chat-header-pulse 2s ease-in-out infinite;
 }
 
+
+  /* highlight.js github theme — scoped under .message-markdown pre code
+     so it only applies to code blocks inside messages. */
+  .message-markdown pre code.hljs {
+    color: #24292e;
+    background: transparent;
+  }
+  .message-markdown .hljs-doctag,
+  .message-markdown .hljs-keyword,
+  .message-markdown .hljs-meta .hljs-keyword,
+  .message-markdown .hljs-template-tag,
+  .message-markdown .hljs-template-variable,
+  .message-markdown .hljs-type,
+  .message-markdown .hljs-variable.language_ {
+    color: #d73a49;
+  }
+  .message-markdown .hljs-title,
+  .message-markdown .hljs-title.class_,
+  .message-markdown .hljs-title.class_.inherited__,
+  .message-markdown .hljs-title.function_ {
+    color: #6f42c1;
+  }
+  .message-markdown .hljs-attr,
+  .message-markdown .hljs-attribute,
+  .message-markdown .hljs-literal,
+  .message-markdown .hljs-meta,
+  .message-markdown .hljs-number,
+  .message-markdown .hljs-operator,
+  .message-markdown .hljs-variable,
+  .message-markdown .hljs-selector-attr,
+  .message-markdown .hljs-selector-class,
+  .message-markdown .hljs-selector-id {
+    color: #005cc5;
+  }
+  .message-markdown .hljs-regexp,
+  .message-markdown .hljs-string,
+  .message-markdown .hljs-meta .hljs-string {
+    color: #032f62;
+  }
+  .message-markdown .hljs-built_in,
+  .message-markdown .hljs-symbol {
+    color: #e36209;
+  }
+  .message-markdown .hljs-comment,
+  .message-markdown .hljs-code,
+  .message-markdown .hljs-formula {
+    color: #6a737d;
+  }
+  .message-markdown .hljs-name,
+  .message-markdown .hljs-quote,
+  .message-markdown .hljs-selector-tag,
+  .message-markdown .hljs-selector-pseudo {
+    color: #22863a;
+  }
+  .message-markdown .hljs-subst {
+    color: #24292e;
+  }
+  .message-markdown .hljs-section {
+    color: #005cc5;
+    font-weight: bold;
+  }
+  .message-markdown .hljs-bullet {
+    color: #735c0f;
+  }
+  .message-markdown .hljs-emphasis {
+    color: #24292e;
+    font-style: italic;
+  }
+  .message-markdown .hljs-strong {
+    color: #24292e;
+    font-weight: bold;
+  }
+  .message-markdown .hljs-addition {
+    color: #22863a;
+    background-color: #f0fff4;
+  }
+  .message-markdown .hljs-deletion {
+    color: #b31d28;
+    background-color: #ffeef0;
+  }

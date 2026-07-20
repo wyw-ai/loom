@@ -18,7 +18,7 @@ use agent_runtime::provider::{
 use anyhow::{anyhow, Context, Result};
 use proto::methods::{
     AgentBundleSkillSpec, AgentBundleSpec, AgentModelSpec, AgentPromptAssemblySpec,
-    AgentProviderRef, AgentSpec, ProviderManifest, ServiceSpec,
+    AgentProviderRef, AgentSpec, ProviderManifest, ServiceSpec, WakeSpec,
 };
 use proto::types::{Actor, ActorKind};
 use serde::{Deserialize, Serialize};
@@ -599,6 +599,11 @@ fn agent_spec_from_command(
                 .context("parse promptAssembly")
         })
         .transpose()?;
+    let wake = command
+        .get("wake")
+        .filter(|value| !value.is_null())
+        .map(|value| serde_json::from_value::<WakeSpec>(value.clone()).context("parse wake"))
+        .transpose()?;
 
     let env: BTreeMap<String, String> = command
         .get("env")
@@ -656,6 +661,7 @@ fn agent_spec_from_command(
         memory: None,
         announcement: None,
         trigger: None,
+        wake,
         prompt_assembly,
         prompt_template: None,
     })
@@ -766,6 +772,13 @@ fn update_agent_spec_from_command(
                 serde_json::from_value::<AgentPromptAssemblySpec>(value.clone())
                     .context("parse promptAssembly")?,
             )
+        };
+    }
+    if let Some(value) = command.get("wake") {
+        spec.wake = if value.is_null() {
+            None
+        } else {
+            Some(serde_json::from_value::<WakeSpec>(value.clone()).context("parse wake")?)
         };
     }
     if let Some(env_value) = command.get("env") {
@@ -1731,13 +1744,7 @@ fn render_prompt_assembly_outputs(
         .unwrap_or_else(|| {
             join_prompt_preview_parts(
                 &part_map,
-                &[
-                    "actor_context",
-                    "agent_instructions",
-                    "bootstrap_memory",
-                    "scope_bootstrap",
-                    "profile_prompt_files",
-                ],
+                &["bootstrap_memory", "profile_prompt_files"],
                 "\n\n",
                 warnings,
             )
@@ -1802,16 +1809,10 @@ fn prompt_output_preview_include(spec: &Value, warnings: &mut Vec<String>) -> Ve
             .collect();
     }
     match spec.get("preset").and_then(Value::as_str) {
-        Some("loom_system") => [
-            "actor_context",
-            "agent_instructions",
-            "bootstrap_memory",
-            "scope_bootstrap",
-            "profile_prompt_files",
-        ]
-        .into_iter()
-        .map(ToString::to_string)
-        .collect(),
+        Some("loom_system") => ["bootstrap_memory", "profile_prompt_files"]
+            .into_iter()
+            .map(ToString::to_string)
+            .collect(),
         Some("loom_turn") => [
             "turn_memory",
             "runtime_context",
@@ -1822,10 +1823,7 @@ fn prompt_output_preview_include(spec: &Value, warnings: &mut Vec<String>) -> Ve
         .map(ToString::to_string)
         .collect(),
         Some("loom_full") => [
-            "actor_context",
-            "agent_instructions",
             "bootstrap_memory",
-            "scope_bootstrap",
             "profile_prompt_files",
             "turn_memory",
             "runtime_context",
@@ -2886,6 +2884,7 @@ mod tests {
             memory: None,
             announcement: None,
             trigger: None,
+            wake: None,
             prompt_assembly: None,
             prompt_template: None,
         }];
@@ -2966,6 +2965,7 @@ mod tests {
             memory: None,
             announcement: None,
             trigger: None,
+            wake: None,
             prompt_assembly: None,
             prompt_template: None,
         };
@@ -3193,6 +3193,7 @@ mod tests {
             memory: None,
             announcement: None,
             trigger: None,
+            wake: None,
             prompt_assembly: None,
             prompt_template: None,
         };

@@ -34,18 +34,36 @@ provider manifest，再让 agent 的 `providerRef.id` 指向它。
     "mode": "print",
     "model": "sonnet"
   },
+  "wake": {
+    "coalesce": true,
+    "debounceMs": 750,
+    "replyReminder": "first-turn",
+    "onHumanMessageWhileBusy": "queue",
+    "contextTokenBudget": 900
+  },
   "autostart": false
 }
 ```
 
-`instructions` 是这个 agent 自己的静态行为说明。Loom 会把它作为
-`agent_instructions` prompt part 交给 `AgentSpec.promptAssembly`；运行时把
-`prompt.system` 写入该 agent home 下的 `AGENTS.md`，provider manifest 只决定当前
-CLI 是读取 `AGENTS.md` 后接收 `prompt.user`，还是直接接收 `prompt.system` /
-`prompt.user` / `prompt.full`。
+`instructions` 是这个 agent 自己的静态行为说明。Loom 会把它和 actor/channel 级基础
+上下文写入当前 workspace 的 `AGENTS.md`。默认 provider 不再通过 system prompt 参数
+注入 Loom 规则；每个 turn 只把当前动态输入按 `AgentSpec.promptAssembly` 渲染成
+`prompt.full` 等输出交给 CLI。
+
+每个 agent workspace 默认也会投影官方 `loom` skill。这个 skill 只负责场景指路：
+需要更详细的运行规则时，agent 应通过 `loom guide` 读取官方 guide。
 
 `providerRef.model` 和 `providerRef.reasoningEffort` 是具体 agent 的偏好。provider
 manifest 负责声明这些值如何映射成 CLI 参数，例如 `--model {model}`。
+
+`wake` 控制 turn intake 行为：
+
+- `coalesce` 合并忙碌期间积压的兼容消息；
+- `debounceMs` 在 dispatch 前等待短窗口，吸收连续分段输入；
+- `replyReminder` 控制每回合 reply contract 的重复频率；
+- `onHumanMessageWhileBusy` 可选 `queue`、`cancel_and_requeue`、`inject`；
+- `contextTokenBudget` 限制 bootstrap / pending delivery 上下文预算，超出时转为
+  `unreadGap` 提示。
 
 如果 agent 配置了 `bundle.source`，Loom 会把 bundle 安装到该 agent home 下，并把当前
 scope 可见的 agent bundles 以 symlink 方式挂到该 agent 自己的

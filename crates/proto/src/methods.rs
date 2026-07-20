@@ -2718,11 +2718,28 @@ pub enum PromptVia {
     Env,
 }
 
+/// Controls whether Loom teaches its native runtime protocol to the provider.
+/// Hidden mode is intended for host applications that expose their own agent-facing tools.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeAwareness {
+    #[default]
+    Native,
+    Hidden,
+}
+
+impl RuntimeAwareness {
+    pub fn is_native(value: &Self) -> bool {
+        matches!(value, Self::Native)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSpec {
     pub actor: Actor,
-    /// Static instructions for this agent actor. Loom projects these into the
-    /// workspace AGENTS.md Loom block with other stable actor/channel context.
+    /// Static instructions for this agent actor. Native awareness projects
+    /// these into the workspace AGENTS.md block; hidden awareness delegates
+    /// instruction delivery to the host application's provider integration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
     /// Provider-catalog based runtime selection. The host resolves this into a
@@ -2731,6 +2748,14 @@ pub struct AgentSpec {
     pub provider_ref: AgentProviderRef,
     #[serde(default)]
     pub autostart: bool,
+    /// Whether Loom projects its AGENTS.md rules, default skill, turn contract,
+    /// and runtime environment into the provider. Defaults to native behavior.
+    #[serde(
+        default,
+        rename = "runtimeAwareness",
+        skip_serializing_if = "RuntimeAwareness::is_native"
+    )]
+    pub runtime_awareness: RuntimeAwareness,
     /// Optional model menu for this actor. Loom treats these as runtime-level
     /// model ids: `loom-daemon` can surface them through `/models` and
     /// pass the selected id to transports that support model selection.

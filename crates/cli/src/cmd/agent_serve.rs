@@ -30,7 +30,7 @@ use proto::methods::{
     BundleInstallMode, ChannelListResult, ChannelMemberConfigGetResult, ChannelMembersResult,
     InboxListResult, MessageListResult, MessageSendResult, OnHumanMessageWhileBusy,
     PromptTemplateSpec, ReplyReminderMode, RunAppendResult, RunCloseResult, RunOpenResult,
-    TaskAssignmentContextResult, TaskAssignmentUpdateResult, ThreadListResult,
+    RuntimeAwareness, TaskAssignmentContextResult, TaskAssignmentUpdateResult, ThreadListResult,
     TriggerPrefixApplyOn,
 };
 use proto::types::trace::TraceKind;
@@ -1010,6 +1010,7 @@ impl AgentPaths {
         scope_ref: &ScopeRef,
         workspace_override: Option<&Path>,
         agents_md_context: &agent_runtime::AgentsMdContext,
+        runtime_awareness: RuntimeAwareness,
     ) -> std::io::Result<ScopePaths> {
         let scope =
             self.scope_with_workspace_override(actor_id, channel_id, scope_ref, workspace_override);
@@ -1060,17 +1061,34 @@ impl AgentPaths {
             );
             e
         })?;
-        let mut agents_md_context = agents_md_context.clone();
-        agents_md_context.workspace = scope.workspace.display().to_string();
-        agent_runtime::ensure_agents_md(&scope.workspace, &agents_md_context).map_err(|e| {
-            tracing::error!(
-                actor = %actor_id,
-                workspace = %scope.workspace.display(),
-                %e,
-                "ensure_scope: ensure_agents_md failed"
-            );
-            e
-        })?;
+        match runtime_awareness {
+            RuntimeAwareness::Native => {
+                let mut agents_md_context = agents_md_context.clone();
+                agents_md_context.workspace = scope.workspace.display().to_string();
+                agent_runtime::ensure_agents_md(&scope.workspace, &agents_md_context).map_err(
+                    |e| {
+                        tracing::error!(
+                            actor = %actor_id,
+                            workspace = %scope.workspace.display(),
+                            %e,
+                            "ensure_scope: ensure_agents_md failed"
+                        );
+                        e
+                    },
+                )?;
+            }
+            RuntimeAwareness::Hidden => {
+                agent_runtime::remove_agents_md(&scope.workspace).map_err(|e| {
+                    tracing::error!(
+                        actor = %actor_id,
+                        workspace = %scope.workspace.display(),
+                        %e,
+                        "ensure_scope: remove_agents_md failed"
+                    );
+                    e
+                })?;
+            }
+        }
         ensure_opencode_skill_workspace_config(
             &scope.workspace,
             &scope.workspace.join("AGENTS.md"),
@@ -3347,9 +3365,16 @@ fn model_choice_label(choice: &AgentModelChoice) -> &str {
     }
 }
 
-async fn run_agent_worker(spec: AgentSpec, server_url: String, data_root: PathBuf) -> Result<()> {
+async fn run_agent_worker(
+    mut spec: AgentSpec,
+    server_url: String,
+    data_root: PathBuf,
+) -> Result<()> {
     let transport = resolve_transport_for_spec(&spec)
         .with_context(|| format!("resolve transport for agent {}", spec.actor.id))?;
+    if requires_hidden_host_runtime(&spec, &transport) {
+        spec.runtime_awareness = RuntimeAwareness::Hidden;
+    }
     let actor_id = spec.actor.id.clone();
     let display_name = if spec.actor.display_name.is_empty() {
         actor_id.clone()
@@ -3438,6 +3463,14 @@ fn resolve_transport_for_spec(spec: &AgentSpec) -> Result<AgentTransport> {
     agent_runtime::provider::default_registry()
         .and_then(|registry| registry.resolve_transport(&spec.provider_ref))
         .map_err(|e| anyhow!(e))
+}
+
+fn requires_hidden_host_runtime(spec: &AgentSpec, transport: &AgentTransport) -> bool {
+    spec.actor.id.starts_with("am.")
+        || spec.provider_ref.id.starts_with("am-")
+        || transport
+            .env
+            .contains_key("AM_BOT_PROVIDER_LAUNCHER_VERSION")
 }
 
 async fn publish_runtime_agent_config(
@@ -5162,6 +5195,7 @@ async fn build_adapter_prompt(
         scope,
         workspace_override.as_deref(),
         &agents_md_context,
+        state.spec.runtime_awareness,
     )?;
     let skill_targets = current_scope_skill_targets(client, state, &channel_id).await;
     ensure_scope_skill_targets(&scope_paths.skills, &skill_targets)
@@ -5175,9 +5209,11 @@ async fn build_adapter_prompt(
             .actor_bundle_skill_targets(&state.spec, &bundle_paths)
             .with_context(|| format!("resolve actor bundle skills for {}", state.actor_id))?,
     );
-    let loom_skill = ensure_default_loom_skill(&state.paths.data_root)
-        .context("ensure default Loom skill snapshot")?;
-    workspace_skill_targets.insert(DEFAULT_LOOM_SKILL_ID.into(), loom_skill);
+    if state.spec.runtime_awareness == RuntimeAwareness::Native {
+        let loom_skill = ensure_default_loom_skill(&state.paths.data_root)
+            .context("ensure default Loom skill snapshot")?;
+        workspace_skill_targets.insert(DEFAULT_LOOM_SKILL_ID.into(), loom_skill);
+    }
     ensure_workspace_skill_targets(&scope_paths.workspace, &workspace_skill_targets)
         .with_context(|| format!("project workspace skills for scope {}", scope.id))?;
     let mut template_vars =
@@ -5220,6 +5256,17 @@ async fn build_adapter_prompt(
     )?);
     let outputs =
         render_agent_prompt_outputs(state.spec.prompt_assembly.as_ref(), &parts, &prompt.content)?;
+    let mut env = state.paths.scope_env_for_scope(
+        &state.actor_id,
+        &channel_id,
+        scope,
+        &state.agent_server_url,
+        active,
+        &scope_paths,
+    );
+    if state.spec.runtime_awareness == RuntimeAwareness::Hidden {
+        hide_runtime_environment(&mut env);
+    }
     Ok(AdapterPrompt {
         scope: scope.clone(),
         content: prompt.content.clone(),
@@ -5227,16 +5274,17 @@ async fn build_adapter_prompt(
         outputs,
         model: state.current_model(),
         cwd: scope_paths.workspace.clone(),
-        env: state.paths.scope_env_for_scope(
-            &state.actor_id,
-            &channel_id,
-            scope,
-            &state.agent_server_url,
-            active,
-            &scope_paths,
-        ),
+        env,
         template_vars,
     })
+}
+
+fn hide_runtime_environment(env: &mut BTreeMap<String, String>) {
+    let trigger_message_id = env.get("LOOM_TRIGGER_MESSAGE_ID").cloned();
+    env.retain(|key, _| !key.starts_with("LOOM_") && !key.starts_with("AGENTX_"));
+    if let Some(trigger_message_id) = trigger_message_id {
+        env.insert("RUNTIME_TRIGGER_MESSAGE_ID".into(), trigger_message_id);
+    }
 }
 
 const AGENT_PROMPT_FILE_MAX_BYTES: u64 = 128 * 1024;
@@ -5771,6 +5819,28 @@ async fn render_trigger_prompt(
     let Some(primary) = batch.last() else {
         return TriggerPromptText::default();
     };
+    if state.spec.runtime_awareness == RuntimeAwareness::Hidden {
+        let actor_names = actor_display_map_for_prompt(client, state, primary.scope()).await;
+        let delivery_context = hidden_delivery_context(client, state, primary, batch, &actor_names)
+            .await
+            .unwrap_or_else(|err| {
+                tracing::debug!(
+                    actor = %state.actor_id,
+                    trigger = %primary.id(),
+                    %err,
+                    "hidden delivery context unavailable"
+                );
+                String::new()
+            });
+        let latest_message = render_hidden_turn_input(batch);
+        let turn_input = join_prompt_sections([delivery_context.clone(), latest_message.clone()]);
+        return TriggerPromptText {
+            latest_message: latest_message.clone(),
+            delivery_context,
+            turn_input,
+            ..Default::default()
+        };
+    }
     let actor_names = actor_display_map_for_prompt(client, state, primary.scope()).await;
     let reminder = reminder_render_for_turn(&state.spec, first_turn);
     let delivery_context = delivery_cursor_context(client, state, batch, first_turn, &actor_names)
@@ -5813,6 +5883,48 @@ async fn render_trigger_prompt(
         turn_input,
         ack_source_ids: delivery_context.ack_source_ids,
     }
+}
+
+fn render_hidden_turn_input(batch: &[AgentTrigger]) -> String {
+    batch
+        .iter()
+        .map(render_prompt)
+        .filter(|message| !message.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+async fn hidden_delivery_context(
+    client: &Arc<Client>,
+    state: &Arc<WorkerState>,
+    primary: &AgentTrigger,
+    batch: &[AgentTrigger],
+    actor_names: &HashMap<String, String>,
+) -> Result<String> {
+    let Some(message) = trigger_message(primary) else {
+        return Ok(String::new());
+    };
+    let target = reply_target_for_message(message);
+    let result: MessageListResult = client
+        .call(
+            method::MESSAGE_LIST,
+            json!({
+                "target": target,
+                "limit": 30,
+            }),
+        )
+        .await
+        .with_context(|| format!("message.list target={target} for hidden context"))?;
+    let exclude_ids: HashSet<&str> = batch.iter().map(|trigger| trigger.id()).collect();
+    let budget = wake_context_token_budget(&state.spec);
+    Ok(format_hidden_visible_history(
+        &result.messages,
+        &exclude_ids,
+        &state.actor_id,
+        actor_names,
+        budget,
+        result.page_info.has_more,
+    ))
 }
 
 async fn delivery_cursor_context(
@@ -6265,6 +6377,79 @@ fn format_recent_conversation_context(
     )
 }
 
+fn format_hidden_visible_history(
+    messages: &[Message],
+    exclude_ids: &HashSet<&str>,
+    local_actor_id: &str,
+    actor_names: &HashMap<String, String>,
+    budget: u64,
+    has_more: bool,
+) -> String {
+    let mut out = String::from(
+        "=== Visible collaboration history ===\n\
+         Prior visible messages in this bot conversation. Use them as shared context; they are history, not new work.",
+    );
+    let header = out.clone();
+    let mut rendered = Vec::new();
+    for message in messages
+        .iter()
+        .filter(|message| !exclude_ids.contains(message.id.as_str()))
+        .filter(|message| message.created_at <= Utc::now())
+        .filter(|message| {
+            message.metadata.get("kind").and_then(Value::as_str) != Some("run.started_ack")
+        })
+        .filter(|message| message_visible_to_actor_for_prompt(message, local_actor_id))
+    {
+        let body = compact_message_body(&message_body_for_prompt(message));
+        if body.is_empty() {
+            continue;
+        }
+        let visibility = message_visibility_label(message, actor_names)
+            .map(|label| format!(" [{label}]"))
+            .unwrap_or_default();
+        rendered.push(format!(
+            "- {}{}: {}",
+            actor_label(&message.author_actor_id, actor_names),
+            visibility,
+            body
+        ));
+    }
+
+    let mut selected_newest_first: Vec<String> = Vec::new();
+    let mut omitted = 0usize;
+    for line in rendered.iter().rev() {
+        let mut candidate_lines = selected_newest_first.clone();
+        candidate_lines.push(line.clone());
+        let candidate = render_hidden_history_lines(&header, &candidate_lines);
+        if usage::estimate_tokens(&candidate) > budget {
+            omitted += 1;
+            continue;
+        }
+        selected_newest_first = candidate_lines;
+    }
+
+    if selected_newest_first.is_empty() {
+        return String::new();
+    }
+    out = render_hidden_history_lines(&header, &selected_newest_first);
+    if omitted > 0 || has_more {
+        out.push_str(&format!(
+            "\nHistory gap: {} earlier messages omitted by context budget.",
+            omitted + usize::from(has_more)
+        ));
+    }
+    out
+}
+
+fn render_hidden_history_lines(header: &str, newest_first: &[String]) -> String {
+    let mut out = header.to_string();
+    for line in newest_first.iter().rev() {
+        out.push('\n');
+        out.push_str(line);
+    }
+    out
+}
+
 fn compact_message_body(body: &str) -> String {
     let compact = body.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.chars().count() <= 800 {
@@ -6277,7 +6462,8 @@ fn compact_message_body(body: &str) -> String {
 fn join_prompt_sections(sections: impl IntoIterator<Item = String>) -> String {
     sections
         .into_iter()
-        .filter(|section| !section.trim().is_empty())
+        .map(|section| section.trim().to_string())
+        .filter(|section| !section.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n")
 }
@@ -8055,7 +8241,7 @@ async fn translate_one(
             let mut effective_success = success;
             let mut effective_summary = summary;
             if effective_success
-                && turn_requires_visible_outcome(&active)
+                && runtime_requires_visible_outcome(state.spec.runtime_awareness, &active)
                 && !active.cancel_requested
                 && !turn_no_reply_requested(&active)
             {
@@ -8569,6 +8755,13 @@ fn turn_requires_visible_outcome(active: &ActiveTurn) -> bool {
         .trigger_batch
         .iter()
         .any(trigger_requires_visible_outcome)
+}
+
+fn runtime_requires_visible_outcome(
+    runtime_awareness: RuntimeAwareness,
+    active: &ActiveTurn,
+) -> bool {
+    runtime_awareness == RuntimeAwareness::Native && turn_requires_visible_outcome(active)
 }
 
 fn trigger_requires_visible_outcome(trigger: &AgentTrigger) -> bool {
@@ -9103,6 +9296,7 @@ mod tests {
                 ..Default::default()
             },
             autostart: false,
+            runtime_awareness: RuntimeAwareness::Native,
             models: None,
             bundle,
             memory: None,
@@ -9428,7 +9622,14 @@ mod tests {
             wake_policy: agent_runtime::AgentsMdWakePolicy::default(),
         };
         let scope_paths = paths
-            .ensure_scope("actor_demo", "chan_demo", &scope, None, &agents_md_context)
+            .ensure_scope(
+                "actor_demo",
+                "chan_demo",
+                &scope,
+                None,
+                &agents_md_context,
+                RuntimeAwareness::Native,
+            )
             .expect("ensure scope");
 
         assert!(scope_paths.workspace.join("skills").is_dir());
@@ -9440,6 +9641,115 @@ mod tests {
         assert!(scope_paths.skills.exists());
 
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn hidden_runtime_awareness_removes_loom_agents_block() {
+        let root = temp_path("hidden-runtime-awareness");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        let scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: "thread_demo".into(),
+        };
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::write(workspace.join("AGENTS.md"), "# Project rules\n").expect("project rules");
+        let context = agent_runtime::AgentsMdContext {
+            actor_id: "actor_demo".into(),
+            actor_display_name: "Demo".into(),
+            channel_id: "chan_demo".into(),
+            ..Default::default()
+        };
+        paths
+            .ensure_scope(
+                "actor_demo",
+                "chan_demo",
+                &scope,
+                Some(&workspace),
+                &context,
+                RuntimeAwareness::Native,
+            )
+            .expect("native scope");
+        assert!(std::fs::read_to_string(workspace.join("AGENTS.md"))
+            .expect("native agents")
+            .contains("# Loom runtime bootstrap"));
+
+        paths
+            .ensure_scope(
+                "actor_demo",
+                "chan_demo",
+                &scope,
+                Some(&workspace),
+                &context,
+                RuntimeAwareness::Hidden,
+            )
+            .expect("hidden scope");
+
+        let agents = std::fs::read_to_string(workspace.join("AGENTS.md")).expect("project agents");
+        assert_eq!(agents, "# Project rules\n");
+        assert!(!agents.contains("Loom"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn native_runtime_awareness_is_not_serialized_by_default() {
+        let mut spec = sample_spec(None);
+        spec.runtime_awareness = RuntimeAwareness::Native;
+        let value = serde_json::to_value(&spec).expect("native spec json");
+        assert!(value.get("runtimeAwareness").is_none());
+
+        spec.runtime_awareness = RuntimeAwareness::Hidden;
+        let value = serde_json::to_value(&spec).expect("hidden spec json");
+        assert_eq!(
+            value.get("runtimeAwareness").and_then(Value::as_str),
+            Some("hidden")
+        );
+    }
+
+    #[test]
+    fn am_provider_runtime_is_hidden_without_serialized_agent_spec_field() {
+        let mut spec = sample_spec(None);
+        spec.actor.id = "am.dingbot".into();
+        spec.provider_ref.id = "am-qoder-dingbot".into();
+        spec.runtime_awareness = RuntimeAwareness::Native;
+        let value = serde_json::to_value(&spec).expect("am spec json");
+        assert!(value.get("runtimeAwareness").is_none());
+
+        let transport = test_command_transport();
+        assert!(requires_hidden_host_runtime(&spec, &transport));
+    }
+
+    #[test]
+    fn hidden_runtime_input_and_environment_do_not_expose_loom_protocol() {
+        let message = sample_message(
+            "msg-hidden",
+            ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_hidden".into(),
+            },
+            "#chan:root",
+            None,
+            Some("root"),
+        );
+        let prompt = render_hidden_turn_input(&[AgentTrigger::Message(message)]);
+        assert!(!prompt.contains("Loom turn input"));
+        assert!(!prompt.contains("loom --json"));
+
+        let mut env = BTreeMap::from([
+            ("LOOM_TRIGGER_MESSAGE_ID".into(), "msg-hidden".into()),
+            ("LOOM_REPLY_TARGET".into(), "#chan:root".into()),
+            ("AGENTX_CHANNEL_ID".into(), "chan".into()),
+            ("PATH".into(), "/safe/bin".into()),
+        ]);
+        hide_runtime_environment(&mut env);
+        assert_eq!(
+            env.get("RUNTIME_TRIGGER_MESSAGE_ID").map(String::as_str),
+            Some("msg-hidden")
+        );
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/safe/bin"));
+        assert!(!env
+            .keys()
+            .any(|key| key.starts_with("LOOM_") || key.starts_with("AGENTX_")));
     }
 
     #[cfg(unix)]
@@ -9722,6 +10032,7 @@ mod tests {
                 &scope,
                 Some(&custom_workspace),
                 &agents_md_context,
+                RuntimeAwareness::Native,
             )
             .expect("ensure scope");
 
@@ -10775,6 +11086,14 @@ mod tests {
         let mut active = sample_active_turn("actor_agent_requester");
         active.trigger_batch = vec![AgentTrigger::Message(ask)];
         assert!(turn_requires_visible_outcome(&active));
+        assert!(runtime_requires_visible_outcome(
+            RuntimeAwareness::Native,
+            &active
+        ));
+        assert!(!runtime_requires_visible_outcome(
+            RuntimeAwareness::Hidden,
+            &active
+        ));
 
         active.trigger_batch = vec![AgentTrigger::Message(notify)];
         assert!(!turn_requires_visible_outcome(&active));
@@ -10923,6 +11242,81 @@ mod tests {
         assert!(context.contains(
             "Coordinator (@actor_agent_coordinator) [private to Recipient (@actor_agent_recipient)]: 私密说明：审批码 alpha"
         ));
+    }
+
+    #[test]
+    fn hidden_visible_history_includes_public_and_recipient_private_messages() {
+        let scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: "thread_demo".into(),
+        };
+        let mut public = sample_message(
+            "msg_public",
+            scope.clone(),
+            "#chan_demo:msg_root",
+            None,
+            None,
+        );
+        public.author_actor_id = "actor_agent_a".into();
+        public.body = "public result".into();
+        let mut private = sample_message("msg_private", scope, "#chan_demo:msg_root", None, None);
+        private.author_actor_id = "actor_agent_b".into();
+        private.body = "private result".into();
+        private
+            .metadata
+            .insert("privateTo".into(), json!(["actor_agent_c"]));
+        let mut names = HashMap::new();
+        names.insert("actor_agent_a".into(), "A".into());
+        names.insert("actor_agent_b".into(), "B".into());
+        names.insert("actor_agent_c".into(), "C".into());
+        let excludes = HashSet::from(["msg_current"]);
+
+        let context = format_hidden_visible_history(
+            &[public, private],
+            &excludes,
+            "actor_agent_c",
+            &names,
+            10_000,
+            false,
+        );
+
+        assert!(context.contains("Visible collaboration history"));
+        assert!(context.contains("A (@actor_agent_a): public result"));
+        assert!(
+            context.contains("B (@actor_agent_b) [private to C (@actor_agent_c)]: private result")
+        );
+        assert!(!context.contains("loom-message"));
+        assert!(!context.contains("message read"));
+    }
+
+    #[test]
+    fn hidden_visible_history_budget_keeps_recent_messages() {
+        let scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: "thread_demo".into(),
+        };
+        let mut old = sample_message("msg_old", scope.clone(), "#chan_demo:msg_root", None, None);
+        old.author_actor_id = "actor_agent_a".into();
+        old.body = "old context ".repeat(300);
+        let mut latest = sample_message("msg_latest", scope, "#chan_demo:msg_root", None, None);
+        latest.author_actor_id = "actor_agent_b".into();
+        latest.body = "latest handoff result".into();
+        let mut names = HashMap::new();
+        names.insert("actor_agent_a".into(), "A".into());
+        names.insert("actor_agent_b".into(), "B".into());
+
+        let context = format_hidden_visible_history(
+            &[old, latest],
+            &HashSet::new(),
+            "actor_agent_b",
+            &names,
+            120,
+            false,
+        );
+
+        assert!(context.contains("latest handoff result"));
+        assert!(!context.contains("old context"));
+        assert!(context.contains("History gap"));
     }
 
     #[test]

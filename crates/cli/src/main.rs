@@ -1594,6 +1594,12 @@ enum MachineAgentCmd {
         model: Option<String>,
         #[arg(long = "reasoning-effort")]
         reasoning_effort: Option<String>,
+        /// Coalesce compatible pending wake messages into one provider turn.
+        #[arg(long = "wake-coalesce")]
+        wake_coalesce: Option<bool>,
+        /// Provider-facing Loom runtime awareness: native or hidden.
+        #[arg(long = "runtime-awareness")]
+        runtime_awareness: Option<String>,
         #[arg(long = "no-autostart")]
         no_autostart: bool,
     },
@@ -1616,6 +1622,12 @@ enum MachineAgentCmd {
         model: Option<String>,
         #[arg(long = "reasoning-effort")]
         reasoning_effort: Option<String>,
+        /// Coalesce compatible pending wake messages into one provider turn.
+        #[arg(long = "wake-coalesce")]
+        wake_coalesce: Option<bool>,
+        /// Provider-facing Loom runtime awareness: native or hidden.
+        #[arg(long = "runtime-awareness")]
+        runtime_awareness: Option<String>,
     },
     /// Remove an AgentSpec from the target daemon via machine/command.
     Remove {
@@ -2722,6 +2734,8 @@ async fn async_main() -> Result<()> {
                     source_root,
                     model,
                     reasoning_effort,
+                    wake_coalesce,
+                    runtime_awareness,
                     no_autostart,
                 } => {
                     cmd::machine::agent_create(
@@ -2735,6 +2749,8 @@ async fn async_main() -> Result<()> {
                         source_root,
                         model,
                         reasoning_effort,
+                        wake_coalesce,
+                        runtime_awareness,
                         !no_autostart,
                     )
                     .await?
@@ -2748,6 +2764,8 @@ async fn async_main() -> Result<()> {
                     source_root,
                     model,
                     reasoning_effort,
+                    wake_coalesce,
+                    runtime_awareness,
                 } => {
                     cmd::machine::agent_update(
                         client,
@@ -2759,6 +2777,8 @@ async fn async_main() -> Result<()> {
                         source_root,
                         model,
                         reasoning_effort,
+                        wake_coalesce,
+                        runtime_awareness,
                     )
                     .await?
                 }
@@ -3608,6 +3628,10 @@ mod tests {
             "gpt-5",
             "--reasoning-effort",
             "high",
+            "--wake-coalesce",
+            "false",
+            "--runtime-awareness",
+            "hidden",
         ])
         .expect("parse machine agent update");
 
@@ -3625,6 +3649,8 @@ mod tests {
                                 source_root,
                                 model,
                                 reasoning_effort,
+                                wake_coalesce,
+                                runtime_awareness,
                             },
                     },
             } => {
@@ -3636,6 +3662,8 @@ mod tests {
                 assert_eq!(source_root, Some(PathBuf::from("/repo/qca")));
                 assert_eq!(model.as_deref(), Some("gpt-5"));
                 assert_eq!(reasoning_effort.as_deref(), Some("high"));
+                assert_eq!(wake_coalesce, Some(false));
+                assert_eq!(runtime_awareness.as_deref(), Some("hidden"));
             }
             other => panic!("unexpected command: {other:?}"),
         }

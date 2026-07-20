@@ -191,9 +191,19 @@ export function resolveAgentProvider(
 
 export function machineCanCreateAgent(machine: MachineInfo) {
   return (
+    machine.connectionStatus === "online" &&
     !machine.readOnly &&
     (machine.capabilities.includes("agent.create") ||
       (machine.canCommand && machine.capabilities.includes("machine.command")))
+  );
+}
+
+export function machineCanRunCommands(machine: MachineInfo) {
+  return (
+    machine.connectionStatus === "online" &&
+    !machine.readOnly &&
+    machine.canCommand &&
+    machine.capabilities.includes("machine.command")
   );
 }
 

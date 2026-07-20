@@ -1,4 +1,4 @@
-import { errorText } from "@/lib/format-utils";
+import { errorText, machineCanRunCommands } from "@/lib/format-utils";
 import {
   useEffect,
   useRef,
@@ -43,8 +43,9 @@ export function AgentPromptStudio({
   const [assemblySaving, setAssemblySaving] = useState(false);
   const [promptError, setPromptError] = useState<string | null>(null);
   const handledPromptStudioKeyRef = useRef(promptStudioKey);
-  const canPreview = machine.canCommand && machine.capabilities.includes("agent.prompt.preview");
-  const canReadFiles = machine.canCommand && machine.capabilities.includes("agent.file.read");
+  const canRunCommands = machineCanRunCommands(machine);
+  const canPreview = canRunCommands && machine.capabilities.includes("agent.prompt.preview");
+  const canReadFiles = canRunCommands && machine.capabilities.includes("agent.file.read");
   const canWriteFiles = canEdit && machine.capabilities.includes("agent.file.write");
   const canSaveAssembly = canEdit && machine.capabilities.includes("agent.update");
   const selectedFile = files.find((file) => file.path === filePath) ?? null;
@@ -699,5 +700,4 @@ export function PromptVariableInspector({
     </div>
   );
 }
-
 

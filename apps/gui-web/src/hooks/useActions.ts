@@ -16,6 +16,7 @@ import {
   displayName,
   filterEmptyEnvKeys,
   machineCanCreateAgent,
+  machineCanRunCommands,
   mentionAudience,
   normalizeAgentForm,
   resolveAgentMachine,
@@ -395,7 +396,13 @@ export function useActions(deps: ActionDeps) {
       return false;
     }
     if (!machineCanCreateAgent(machine)) {
-      d.setError(`Host ${machine.name} is read-only or does not support agent creation.`);
+      d.setError(
+        machine.connectionStatus !== "online"
+          ? `Start the daemon on ${machine.name} before creating an agent.`
+          : !machineCanRunCommands(machine)
+            ? `Host ${machine.name} cannot run agent commands for the current account.`
+            : `Host ${machine.name} does not support agent creation.`,
+      );
       return false;
     }
     if (!provider) {

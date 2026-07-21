@@ -174,7 +174,7 @@ export function Composer({
               e.target.value = "";
             }}
           />
-          <div className={`composer-box relative flex-1${isManual ? " composer-box-manual" : ""}`}>
+          <div className={`composer-box relative flex flex-1 items-end gap-1${isManual ? " composer-box-manual" : ""}`}>
             {showMentions && (
               <MentionMenu
                 options={mentionOptions}
@@ -182,6 +182,15 @@ export function Composer({
                 onSelect={chooseMention}
               />
             )}
+            <button
+              type="button"
+              onClick={openFilePicker}
+              disabled={disabled}
+              title="Attach files"
+              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md text-[#667085] transition-colors hover:bg-[#f0f2f7] hover:text-[#1d2939] disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <Paperclip size={17} />
+            </button>
             <AutoGrowTextarea
               ref={textareaRef}
               value={draft}
@@ -229,17 +238,8 @@ export function Composer({
               }}
               disabled={disabled}
               placeholder={disabled ? disabledPlaceholder : placeholder}
-              className="max-h-full min-h-[44px] flex-1 px-0 pl-9 pr-3 mr-9"
+              className="max-h-full min-h-[44px] flex-1 px-0 pr-3 mr-9"
             />
-            <button
-              type="button"
-              onClick={openFilePicker}
-              disabled={disabled}
-              title="Attach files"
-              className="absolute bottom-3.5 left-2 flex h-7 w-7 items-center justify-center rounded-md text-[#667085] transition-colors hover:bg-[#f0f2f7] hover:text-[#1d2939] disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              <Paperclip size={17} />
-            </button>
             <Button
               size="icon"
               onClick={handleSend}

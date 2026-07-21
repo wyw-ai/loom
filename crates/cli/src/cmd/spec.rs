@@ -198,12 +198,9 @@ pub fn bundle_get(actor_id: String, file: Option<String>, list: bool) -> Result<
 }
 
 fn resolve_bundle_dir(actor_id: &str) -> Result<PathBuf> {
-    // Match `agent_serve.rs`'s default_data_root semantics so a teacher
-    // sees the same bundle the runtime will pick on this host.
-    let data_root = std::env::var_os("LOOM_AGENT_DATA_ROOT")
-        .map(PathBuf::from)
-        .or_else(|| dirs::data_dir().map(|d| d.join("loom").join("agents")))
-        .unwrap_or_else(|| PathBuf::from(".loom").join("agents-data"));
+    // Route through the unified agent_data_root() to guarantee a single
+    // source of truth (and correctly handle empty LOOM_AGENT_DATA_ROOT).
+    let data_root = super::paths::agent_data_root();
     let candidate = data_root
         .join("agents")
         .join(actor_id)

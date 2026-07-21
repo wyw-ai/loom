@@ -76,6 +76,12 @@ pub async fn run(
     // Windows. `data_root` is absolute (abs_path), so UNC prefixing is safe.
     loom_platform::path::create_dir_all(&data_root)
         .with_context(|| format!("create data root {}", data_root.display()))?;
+    // BRIDGE CONTRACT: This set_var is the implicit B→A bridge that makes
+    // the daemon's machine_data_root (Class B, default ~/.agentx) visible
+    // to all Class-A callers (agent_serve, spec, workspace, thread, GUI).
+    // Without it, independent CLI invocations would resolve a different
+    // data root (dirs::data_dir()/loom/agents) and fail to see daemon data.
+    // See ARCH design review art_90293d88ca12 for full analysis.
     std::env::set_var("LOOM_AGENT_DATA_ROOT", &data_root);
 
     let mut initial_specs = load_config_agent_specs()?;
@@ -2707,6 +2713,10 @@ fn fill_missing_machine_context(machine: &mut MachineConfig, fallback: &MachineC
     changed
 }
 
+// TODO(legacy): ~/.agentx is a legacy default from the old "agentx" name.
+// Migrating to dirs::data_dir()/loom/agents (consistent with Class-A callers)
+// requires a data migration script and is a breaking change — deferred to a
+// separate task (P2 in ARCH design review art_90293d88ca12).
 fn machine_data_root(machine: &MachineConfig) -> PathBuf {
     let raw = if machine.data_root.trim().is_empty() {
         expand_home(&default_agent_data_root_expr())
@@ -2732,6 +2742,8 @@ fn machine_connection_actor_id(machine: &MachineConfig) -> String {
     format!("actor_service_{}", machine.id)
 }
 
+// TODO(legacy): "~/.agentx" is the old product name's data root. Should be
+// migrated to dirs::data_dir()/loom/agents in a future breaking-change task.
 fn default_agent_data_root_expr() -> String {
     "~/.agentx".into()
 }

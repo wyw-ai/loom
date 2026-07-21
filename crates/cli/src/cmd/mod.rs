@@ -17,6 +17,7 @@ pub mod mcp_announcement;
 pub mod mcp_memory;
 pub mod memory;
 pub mod message;
+pub mod paths;
 pub mod provider;
 pub mod reload;
 pub mod reminder;

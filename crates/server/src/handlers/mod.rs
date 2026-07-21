@@ -85,6 +85,11 @@ pub async fn dispatch(
         method::CHANNEL_MEMBER_CONFIG_CLEAR => {
             channel_member_config_clear(state, connection_id, params)
         }
+        method::CHANNEL_SET_INSTRUCTION => channel_set_instruction(state, connection_id, params),
+        method::CHANNEL_GET_INSTRUCTION => channel_get_instruction(state, connection_id, params),
+        method::CHANNEL_CLEAR_INSTRUCTION => {
+            channel_clear_instruction(state, connection_id, params)
+        }
         method::THREAD_CREATE => thread_create(state, connection_id, params),
         method::THREAD_LIST => thread_list(state, connection_id, params),
         method::THREAD_UPDATE => thread_update(state, connection_id, params),
@@ -92,6 +97,9 @@ pub async fn dispatch(
         method::THREAD_DELETE => thread_delete(state, connection_id, params),
         method::THREAD_FOLLOW => thread_follow(state, connection_id, params),
         method::THREAD_UNFOLLOW => thread_unfollow(state, connection_id, params),
+        method::THREAD_SET_INSTRUCTION => thread_set_instruction(state, connection_id, params),
+        method::THREAD_GET_INSTRUCTION => thread_get_instruction(state, connection_id, params),
+        method::THREAD_CLEAR_INSTRUCTION => thread_clear_instruction(state, connection_id, params),
         method::TASK_CREATE => task_create(state, connection_id, params),
         method::TASK_GET => task_get(state, connection_id, params),
         method::TASK_LIST => task_list(state, connection_id, params),
@@ -615,6 +623,82 @@ fn channel_update(state: &AppState, params: Option<Value>) -> HandlerResult {
     ok(ChannelUpdateResult { channel })
 }
 
+fn channel_set_instruction(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: ChannelSetInstructionParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    if !state.store.is_channel_member(&p.channel_id, &caller) {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!(
+                "actor {caller} cannot set instructions for channel {}",
+                p.channel_id
+            ),
+        ));
+    }
+    let channel = state
+        .store
+        .set_channel_instructions(&p.channel_id, Some(p.instructions), &caller)
+        .map_err(map_store_err)?;
+    ok(ChannelSetInstructionResult { channel })
+}
+
+fn channel_get_instruction(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: ChannelGetInstructionParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    if !state.store.is_channel_member(&p.channel_id, &caller) {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!(
+                "actor {caller} cannot read instructions for channel {}",
+                p.channel_id
+            ),
+        ));
+    }
+    let instructions = state
+        .store
+        .get_channel(&p.channel_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "channel"))?
+        .instructions;
+    ok(ChannelGetInstructionResult { instructions })
+}
+
+fn channel_clear_instruction(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: ChannelClearInstructionParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    if !state.store.is_channel_member(&p.channel_id, &caller) {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!(
+                "actor {caller} cannot clear instructions for channel {}",
+                p.channel_id
+            ),
+        ));
+    }
+    let existing = state
+        .store
+        .get_channel(&p.channel_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "channel"))?
+        .instructions
+        .is_some();
+    let _ = state
+        .store
+        .set_channel_instructions(&p.channel_id, None, &caller)
+        .map_err(map_store_err)?;
+    ok(ChannelClearInstructionResult { cleared: existing })
+}
+
 fn channel_delete(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
     let p: ChannelDeleteParams = parse_params(params)?;
     let caller = caller_actor(state, connection_id)?;
@@ -738,6 +822,102 @@ fn thread_update(state: &AppState, connection_id: &str, params: Option<Value>) -
         .pop()
         .expect("one thread");
     ok(ThreadUpdateResult { thread })
+}
+
+fn thread_set_instruction(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: ThreadSetInstructionParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let channel_id = state
+        .store
+        .get_thread(&p.thread_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "thread"))?
+        .channel_id;
+    if !state.store.is_channel_member(&channel_id, &caller) {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!(
+                "actor {caller} cannot set instructions for thread {} in channel {channel_id}",
+                p.thread_id
+            ),
+        ));
+    }
+    let thread = state
+        .store
+        .set_thread_instructions(&p.thread_id, Some(p.instructions), &caller)
+        .map_err(map_store_err)?;
+    let thread = state
+        .store
+        .attach_thread_activity_meta(vec![thread])
+        .pop()
+        .expect("one thread");
+    ok(ThreadSetInstructionResult { thread })
+}
+
+fn thread_get_instruction(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: ThreadGetInstructionParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let channel_id = state
+        .store
+        .get_thread(&p.thread_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "thread"))?
+        .channel_id;
+    if !state.store.is_channel_member(&channel_id, &caller) {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!(
+                "actor {caller} cannot read instructions for thread {} in channel {channel_id}",
+                p.thread_id
+            ),
+        ));
+    }
+    let instructions = state
+        .store
+        .get_thread(&p.thread_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "thread"))?
+        .instructions;
+    ok(ThreadGetInstructionResult { instructions })
+}
+
+fn thread_clear_instruction(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: ThreadClearInstructionParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let channel_id = state
+        .store
+        .get_thread(&p.thread_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "thread"))?
+        .channel_id;
+    if !state.store.is_channel_member(&channel_id, &caller) {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!(
+                "actor {caller} cannot clear instructions for thread {} in channel {channel_id}",
+                p.thread_id
+            ),
+        ));
+    }
+    let existing = state
+        .store
+        .get_thread(&p.thread_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "thread"))?
+        .instructions
+        .is_some();
+    let _ = state
+        .store
+        .set_thread_instructions(&p.thread_id, None, &caller)
+        .map_err(map_store_err)?;
+    ok(ThreadClearInstructionResult { cleared: existing })
 }
 
 fn thread_archive(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {

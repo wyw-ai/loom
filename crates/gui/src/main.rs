@@ -124,6 +124,18 @@ fn main() {
             ipc::machine_remove,
             ipc::machine_agent_create,
             ipc::machine_agent_remove,
+            ipc::channel_set_instruction,
+            ipc::channel_get_instruction,
+            ipc::channel_clear_instruction,
+            ipc::thread_set_instruction,
+            ipc::thread_get_instruction,
+            ipc::thread_clear_instruction,
+            ipc::channel_skill_list,
+            ipc::channel_skill_add,
+            ipc::channel_skill_remove,
+            ipc::thread_skill_list,
+            ipc::thread_skill_add,
+            ipc::thread_skill_remove,
         ])
         .setup(|app| {
             if let Some(win) = app.get_webview_window("main") {

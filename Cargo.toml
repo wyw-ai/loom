@@ -51,6 +51,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 rusqlite = { version = "0.31", features = ["bundled"] }
 tempfile = "3"
 interprocess = { version = "2.2", features = ["tokio"] }
+fs2 = "0.4"
 
 # P0-Lint: Workspace-wide clippy lints. Crates opt in via
 # `[lints] workspace = true` in their own Cargo.toml.

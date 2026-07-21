@@ -3148,6 +3148,310 @@ fn slugify(value: &str) -> String {
     }
 }
 
+// ---- channel/thread instructions (JSON-RPC server handler passthrough) ----
+
+#[tauri::command]
+pub async fn channel_set_instruction(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::CHANNEL_SET_INSTRUCTION, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn channel_get_instruction(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::CHANNEL_GET_INSTRUCTION, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn channel_clear_instruction(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::CHANNEL_CLEAR_INSTRUCTION, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn thread_set_instruction(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::THREAD_SET_INSTRUCTION, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn thread_get_instruction(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::THREAD_GET_INSTRUCTION, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn thread_clear_instruction(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::THREAD_CLEAR_INSTRUCTION, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+// ---- channel/thread skills (local file I/O, same path/format as CLI) ----
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillEntryDto {
+    pub id: String,
+    pub source: String,
+    pub added_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SkillRegistryDto {
+    pub skills: Vec<SkillEntryDto>,
+}
+
+/// Resolve the agent data root using the same logic as the CLI
+/// `default_data_root()` (crates/cli/src/cmd/agent_serve.rs): honor
+/// `LOOM_AGENT_DATA_ROOT` if set, otherwise fall back to
+/// `<data_dir>/loom/agents`, and finally `.loom/agents-data` as a
+/// last-resort relative path so the GUI and CLI read/write the same
+/// skill registry file.
+///
+/// Deployment model: the GUI is a frontend over the CLI/daemon via IPC.
+/// The GUI launches per-machine daemons with
+/// `LOOM_AGENT_DATA_ROOT=<machine data_root>`. In the common single-host
+/// case (no env override), the GUI and CLI both resolve to
+/// `<data_dir>/loom/agents`, so the GUI-written skill registry is visible
+/// to agents. The multi-host case (per-machine data roots) requires the
+/// skill IPC commands to carry a machineId so they can target the right
+/// machine's data root; that is a larger IPC signature change tracked
+/// separately and out of scope for this fix.
+fn agent_data_root() -> Result<PathBuf, String> {
+    if let Ok(s) = std::env::var("LOOM_AGENT_DATA_ROOT") {
+        if !s.is_empty() {
+            return Ok(PathBuf::from(s));
+        }
+    }
+    Ok(dirs::data_dir()
+        .map(|d| d.join("loom").join("agents"))
+        .unwrap_or_else(|| PathBuf::from(".loom").join("agents-data")))
+}
+
+fn read_skill_registry(path: &Path) -> Result<SkillRegistryDto, String> {
+    match fs::read_to_string(path) {
+        Ok(text) => {
+            let reg: SkillRegistryDto =
+                serde_json::from_str(&text).map_err(|e| format!("parse skill registry: {e}"))?;
+            Ok(reg)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(SkillRegistryDto { skills: vec![] })
+        }
+        Err(e) => Err(format!("read skill registry: {e}")),
+    }
+}
+
+fn write_skill_registry(path: &Path, reg: &SkillRegistryDto) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create skill registry dir: {e}"))?;
+    }
+    let text =
+        serde_json::to_string_pretty(reg).map_err(|e| format!("serialize skill registry: {e}"))?;
+    fs::write(path, text).map_err(|e| format!("write skill registry: {e}"))
+}
+
+fn now_iso() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+fn derive_skill_id(source: &str) -> String {
+    Path::new(source)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("skill")
+        .to_string()
+}
+
+// --- Channel skills ---
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelSkillListArgs {
+    pub channel_id: String,
+}
+
+#[tauri::command]
+pub async fn channel_skill_list(args: ChannelSkillListArgs) -> Result<SkillRegistryDto, String> {
+    let data_root = agent_data_root()?;
+    let path = data_root
+        .join("channels")
+        .join(&args.channel_id)
+        .join("channel-skills.json");
+    read_skill_registry(&path)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelSkillAddArgs {
+    pub channel_id: String,
+    pub source: String,
+    #[serde(default)]
+    pub skill_id: Option<String>,
+}
+
+#[tauri::command]
+pub async fn channel_skill_add(args: ChannelSkillAddArgs) -> Result<SkillRegistryDto, String> {
+    let data_root = agent_data_root()?;
+    let path = data_root
+        .join("channels")
+        .join(&args.channel_id)
+        .join("channel-skills.json");
+    let id = args
+        .skill_id
+        .unwrap_or_else(|| derive_skill_id(&args.source));
+    let mut reg = read_skill_registry(&path)?;
+    reg.skills.retain(|s| s.id != id);
+    reg.skills.push(SkillEntryDto {
+        id: id.clone(),
+        source: args.source,
+        added_at: now_iso(),
+    });
+    write_skill_registry(&path, &reg)?;
+    Ok(reg)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelSkillRemoveArgs {
+    pub channel_id: String,
+    pub skill_id: String,
+}
+
+#[tauri::command]
+pub async fn channel_skill_remove(
+    args: ChannelSkillRemoveArgs,
+) -> Result<SkillRegistryDto, String> {
+    let data_root = agent_data_root()?;
+    let path = data_root
+        .join("channels")
+        .join(&args.channel_id)
+        .join("channel-skills.json");
+    let mut reg = read_skill_registry(&path)?;
+    reg.skills.retain(|s| s.id != args.skill_id);
+    write_skill_registry(&path, &reg)?;
+    Ok(reg)
+}
+
+// --- Thread skills ---
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadSkillListArgs {
+    pub channel_id: String,
+    pub thread_id: String,
+}
+
+#[tauri::command]
+pub async fn thread_skill_list(args: ThreadSkillListArgs) -> Result<SkillRegistryDto, String> {
+    let data_root = agent_data_root()?;
+    let path = data_root
+        .join("channels")
+        .join(&args.channel_id)
+        .join("threads")
+        .join(&args.thread_id)
+        .join("thread-skills.json");
+    read_skill_registry(&path)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadSkillAddArgs {
+    pub channel_id: String,
+    pub thread_id: String,
+    pub source: String,
+    #[serde(default)]
+    pub skill_id: Option<String>,
+}
+
+#[tauri::command]
+pub async fn thread_skill_add(args: ThreadSkillAddArgs) -> Result<SkillRegistryDto, String> {
+    let data_root = agent_data_root()?;
+    let path = data_root
+        .join("channels")
+        .join(&args.channel_id)
+        .join("threads")
+        .join(&args.thread_id)
+        .join("thread-skills.json");
+    let id = args
+        .skill_id
+        .unwrap_or_else(|| derive_skill_id(&args.source));
+    let mut reg = read_skill_registry(&path)?;
+    reg.skills.retain(|s| s.id != id);
+    reg.skills.push(SkillEntryDto {
+        id: id.clone(),
+        source: args.source,
+        added_at: now_iso(),
+    });
+    write_skill_registry(&path, &reg)?;
+    Ok(reg)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadSkillRemoveArgs {
+    pub channel_id: String,
+    pub thread_id: String,
+    pub skill_id: String,
+}
+
+#[tauri::command]
+pub async fn thread_skill_remove(args: ThreadSkillRemoveArgs) -> Result<SkillRegistryDto, String> {
+    let data_root = agent_data_root()?;
+    let path = data_root
+        .join("channels")
+        .join(&args.channel_id)
+        .join("threads")
+        .join(&args.thread_id)
+        .join("thread-skills.json");
+    let mut reg = read_skill_registry(&path)?;
+    reg.skills.retain(|s| s.id != args.skill_id);
+    write_skill_registry(&path, &reg)?;
+    Ok(reg)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3831,5 +4135,42 @@ mod tests {
         });
 
         assert!(server_machine_info_from_actor(&actor, &cfg, "ws://example/rpc").is_none());
+    }
+
+    #[test]
+    fn agent_data_root_honors_env_override() {
+        // Env override takes precedence over the default data_dir path.
+        // SAFETY: env var mutation is process-local; this test owns
+        // LOOM_AGENT_DATA_ROOT for its duration and restores it after.
+        let key = "LOOM_AGENT_DATA_ROOT";
+        let saved = std::env::var(key).ok();
+        std::env::set_var(key, "/tmp/loom-gui-test-data-root");
+        let root = agent_data_root().expect("agent data root with env override");
+        assert_eq!(root, PathBuf::from("/tmp/loom-gui-test-data-root"));
+        // Restore so we do not leak the override into other tests.
+        match saved {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    #[test]
+    fn agent_data_root_env_override_ignores_empty_value() {
+        // An empty LOOM_AGENT_DATA_ROOT must not short-circuit; the resolver
+        // must fall through to the data_dir default. This mirrors the CLI's
+        // default_data_root() semantics.
+        let key = "LOOM_AGENT_DATA_ROOT";
+        let saved = std::env::var(key).ok();
+        std::env::set_var(key, "");
+        let root = agent_data_root().expect("agent data root falls through empty env");
+        // We cannot assert the exact path (depends on the host's data_dir),
+        // but it must NOT be the empty PathBuf and must end with the
+        // default `loom/agents` suffix.
+        assert_ne!(root, PathBuf::from(""));
+        assert!(root.ends_with("agents"), "expected <data_dir>/loom/agents, got {}", root.display());
+        match saved {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
     }
 }

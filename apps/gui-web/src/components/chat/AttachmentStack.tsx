@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { CheckCircle, Cloud, Download, ExternalLink, Eye, FileText, FolderOpen, Loader2, X } from "lucide-react";
+import { CheckCircle, Download, ExternalLink, Eye, FileText, FolderOpen, Loader2, X } from "lucide-react";
 
 import * as ipc from "@/ipc/bridge";
 import type { Artifact, ArtifactReadResult } from "@/ipc/types";
@@ -24,19 +24,16 @@ const artifactReadChunkBytes = 1024 * 1024;
 const artifactPreviewTextBytes = 256 * 1024;
 const artifactPreviewBinaryBytes = 25 * 1024 * 1024;
 
-type AttachmentAvailability = "local" | "remote" | "checking";
-
 function AttachmentCard({ attachment }: { attachment: string }) {
   const [artifact, setArtifact] = useState<Artifact | null>(null);
   const [loading, setLoading] = useState(() => Boolean(artifactLookupParams(attachment)));
   const [busy, setBusy] = useState<"preview" | "download" | "open" | "reveal" | "save" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<ArtifactPreviewState | null>(null);
-  const [availability, setAvailability] = useState<AttachmentAvailability>("checking");
+  const [localTempPath, setLocalTempPath] = useState<string | null>(null);
   const previewObjectUrlRef = useRef<string | null>(null);
 
   const title = artifact?.name || attachmentTitle(attachment);
-  const workspacePath = artifact ? artifactWorkspacePath(artifact) : null;
   const previewMode = artifact ? artifactPreviewMode(artifact) : null;
   const detail = loading
     ? "Loading artifact..."
@@ -86,20 +83,16 @@ function AttachmentCard({ attachment }: { attachment: string }) {
 
   useEffect(() => {
     if (!artifact) return;
-    const wsPath = artifactWorkspacePath(artifact);
-    if (!wsPath) {
-      setAvailability("remote");
-      return;
-    }
-    setAvailability("checking");
     let cancelled = false;
+    setLocalTempPath(null);
     ipc
-      .pathExists(wsPath)
-      .then((exists) => {
-        if (!cancelled) setAvailability(exists ? "local" : "remote");
+      .artifactExists({ artifactId: artifact.id })
+      .then(() => {
+        // Server confirms artifact is accessible; localTempPath stays null
+        // until user explicitly downloads to temp.
       })
       .catch(() => {
-        if (!cancelled) setAvailability("remote");
+        if (!cancelled) setError("Artifact not available on server");
       });
     return () => {
       cancelled = true;
@@ -164,11 +157,11 @@ function AttachmentCard({ attachment }: { attachment: string }) {
   }
 
   async function openFile() {
-    if (!workspacePath) return;
+    if (!localTempPath) return;
     setBusy("open");
     setError(null);
     try {
-      await ipc.openFileDefault(workspacePath);
+      await ipc.openFileDefault(localTempPath);
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -177,11 +170,11 @@ function AttachmentCard({ attachment }: { attachment: string }) {
   }
 
   async function revealFile() {
-    if (!workspacePath) return;
+    if (!localTempPath) return;
     setBusy("reveal");
     setError(null);
     try {
-      await ipc.revealInFolder(workspacePath);
+      await ipc.revealInFolder(localTempPath);
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -190,19 +183,17 @@ function AttachmentCard({ attachment }: { attachment: string }) {
   }
 
   async function downloadArtifact() {
-    if (!artifact || !workspacePath) return;
+    if (!artifact) return;
     setBusy("download");
     setError(null);
     try {
-      const blob = await readArtifactBlob(artifact);
-      const bytes = new Uint8Array(await blob.arrayBuffer());
-      await ipc.writeLocalFile(workspacePath, bytes);
-      const exists = await ipc.pathExists(workspacePath);
-      setAvailability(exists ? "local" : "remote");
-      if (!exists) throw new Error("File write verification failed");
+      const tempPath = await ipc.downloadToTemp({
+        artifactId: artifact.id,
+        suggestedName: artifact.name || `${artifact.id}.bin`,
+      });
+      setLocalTempPath(tempPath);
     } catch (err) {
       setError(errorText(err));
-      setAvailability("remote");
     } finally {
       setBusy(null);
     }
@@ -217,11 +208,8 @@ function AttachmentCard({ attachment }: { attachment: string }) {
         <div className="min-w-0 flex-1">
           <div className="truncate text-sm font-bold text-[#303849]" title={title}>
             {title}
-            {artifact && availability === "local" && (
-              <CheckCircle size={13} className="ml-1 inline-block shrink-0 text-emerald-500" aria-label="Local file" />
-            )}
-            {artifact && availability === "remote" && (
-              <Cloud size={13} className="ml-1 inline-block shrink-0 text-sky-500" aria-label="Remote only" />
+            {artifact && localTempPath && (
+              <CheckCircle size={13} className="ml-1 inline-block shrink-0 text-emerald-500" aria-label="Downloaded to local temp" />
             )}
           </div>
           <div className={`mt-0.5 truncate text-xs font-medium ${error ? "text-red-700" : "text-[#667085]"}`}>
@@ -245,11 +233,11 @@ function AttachmentCard({ attachment }: { attachment: string }) {
                 {busy === "preview" ? <Loader2 className="animate-spin" size={14} /> : <Eye size={14} />}
               </button>
             )}
-            {availability === "remote" && workspacePath && (
+            {!localTempPath && (
               <button
                 type="button"
                 className="attachment-action"
-                title="Download to workspace"
+                title="Download to local temp"
                 aria-label={`Download ${title}`}
                 disabled={Boolean(busy)}
                 onClick={downloadArtifact}
@@ -257,7 +245,7 @@ function AttachmentCard({ attachment }: { attachment: string }) {
                 {busy === "download" ? <Loader2 className="animate-spin" size={14} /> : <Download size={14} />}
               </button>
             )}
-            {availability === "local" && workspacePath && (
+            {localTempPath && (
               <button
                 type="button"
                 className="attachment-action"
@@ -269,7 +257,7 @@ function AttachmentCard({ attachment }: { attachment: string }) {
                 {busy === "open" ? <Loader2 className="animate-spin" size={14} /> : <ExternalLink size={14} />}
               </button>
             )}
-            {availability === "local" && workspacePath && (
+            {localTempPath && (
               <button
                 type="button"
                 className="attachment-action"
@@ -410,10 +398,6 @@ function artifactLookupParams(value: string) {
   if (clean.startsWith("artifact://")) return { artifactUri: clean };
   if (/^art_[A-Za-z0-9_-]+$/.test(clean)) return { artifactId: clean };
   return null;
-}
-
-function artifactWorkspacePath(artifact: Artifact) {
-  return metadataString(artifact._meta, ["workspacePath", "workspace_path"]);
 }
 
 function artifactKindLabel(artifact: Artifact) {

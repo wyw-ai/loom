@@ -3,7 +3,6 @@ import { createPortal } from "react-dom";
 import {
   ArrowLeft,
   CheckCircle,
-  Cloud,
   Download,
   ExternalLink,
   FileText,
@@ -20,10 +19,11 @@ interface RemoteFilePanelProps {
   channelId: string;
   machineId: string;
   dataRoot: string;
+  threadId?: string;
   onClose: () => void;
 }
 
-type FileAvailability = "checking" | "local" | "remote";
+type ScopeKind = "channel" | "thread";
 
 function FileEntry({
   name,
@@ -31,41 +31,20 @@ function FileEntry({
 }: {
   name: string;
   path: string;
-  machineId: string;
 }) {
-  const [availability, setAvailability] = useState<FileAvailability>("checking");
+  const [localTempPath, setLocalTempPath] = useState<string | null>(null);
   const [busy, setBusy] = useState<"download" | "open" | null>(null);
   const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    setAvailability("checking");
-    ipc
-      .pathExists(path)
-      .then((exists) => {
-        if (!cancelled) setAvailability(exists ? "local" : "remote");
-      })
-      .catch(() => {
-        if (!cancelled) setAvailability("remote");
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [path]);
 
   async function downloadFile() {
     setBusy("download");
     setError(null);
     try {
-      const blob = await ipc.artifactRead({ artifactId: path, maxBytes: 1024 * 1024 * 100 });
-      const bytes = new Uint8Array(
-        Array.isArray(blob.content)
-          ? (blob.content as number[])
-          : Array.from(new TextEncoder().encode(String(blob.content))),
-      );
-      await ipc.writeLocalFile(path, bytes);
-      const exists = await ipc.pathExists(path);
-      setAvailability(exists ? "local" : "remote");
+      const tempPath = await ipc.downloadToTemp({
+        artifactId: path,
+        suggestedName: name,
+      });
+      setLocalTempPath(tempPath);
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -74,10 +53,11 @@ function FileEntry({
   }
 
   async function openFile() {
+    if (!localTempPath) return;
     setBusy("open");
     setError(null);
     try {
-      await ipc.openFileDefault(path);
+      await ipc.openFileDefault(localTempPath);
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -91,21 +71,19 @@ function FileEntry({
       <span className="min-w-0 flex-1 truncate text-sm text-[#303849]" title={name}>
         {name}
       </span>
-      {availability === "local" && <CheckCircle size={14} className="shrink-0 text-emerald-500" />}
-      {availability === "remote" && <Cloud size={14} className="shrink-0 text-sky-500" />}
-      {availability === "checking" && <Loader2 size={14} className="shrink-0 animate-spin text-[#667085]" />}
-      {availability === "remote" && (
+      {localTempPath && <CheckCircle size={14} className="shrink-0 text-emerald-500" />}
+      {!localTempPath && (
         <button
           type="button"
           className="rounded p-1 text-[#667085] hover:bg-[#e4e7ef] hover:text-[#1d2939] disabled:opacity-40"
-          title="Download to workspace"
+          title="Download to local temp"
           disabled={Boolean(busy)}
           onClick={downloadFile}
         >
           {busy === "download" ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
         </button>
       )}
-      {availability === "local" && (
+      {localTempPath && (
         <button
           type="button"
           className="rounded p-1 text-[#667085] hover:bg-[#e4e7ef] hover:text-[#1d2939] disabled:opacity-40"
@@ -121,7 +99,9 @@ function FileEntry({
   );
 }
 
-export function RemoteFilePanel({ channelId, machineId, dataRoot, onClose }: RemoteFilePanelProps) {
+export function RemoteFilePanel({ channelId, machineId, dataRoot, threadId, onClose }: RemoteFilePanelProps) {
+  const hasThread = Boolean(threadId);
+  const [scope, setScope] = useState<ScopeKind>(hasThread ? "thread" : "channel");
   const [dirList, setDirList] = useState<MachineDirListResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -129,16 +109,22 @@ export function RemoteFilePanel({ channelId, machineId, dataRoot, onClose }: Rem
 
   const sep = dataRoot.includes("\\") && !dataRoot.includes("/") ? "\\" : "/";
   const channelRoot = `${dataRoot}${sep}channels${sep}${channelId}${sep}`;
+  const threadRoot = threadId
+    ? `${channelRoot}threads${sep}${threadId}${sep}`
+    : null;
+
+  const scopeRoot = scope === "thread" && threadRoot ? threadRoot : channelRoot;
 
   useEffect(() => {
-    loadDir(channelRoot);
-  }, [channelRoot]);
+    loadDir(scopeRoot);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scopeRoot]);
 
   async function loadDir(path: string) {
     setLoading(true);
     setError(null);
     try {
-      const result = await ipc.machineDirList({ machineId, path });
+      const result = await ipc.machineDirList({ machineId, path, includeFiles: true });
       setDirList(result);
       setCurrentPath(result.path);
     } catch (err) {
@@ -148,14 +134,14 @@ export function RemoteFilePanel({ channelId, machineId, dataRoot, onClose }: Rem
     }
   }
 
-  const breadcrumbs = currentPath ? buildBreadcrumbs(currentPath, channelRoot, sep) : [];
+  const breadcrumbs = currentPath ? buildBreadcrumbs(currentPath, scopeRoot, sep) : [];
 
   return createPortal(
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-[#111827]/35 px-4 py-6 backdrop-blur-sm"
       role="dialog"
       aria-modal="true"
-      aria-label="Channel files"
+      aria-label="Shared files"
       onMouseDown={onClose}
     >
       <div
@@ -165,7 +151,7 @@ export function RemoteFilePanel({ channelId, machineId, dataRoot, onClose }: Rem
         {/* Header */}
         <div className="flex items-center justify-between border-b border-[#e4e7ef] px-4 py-3">
           <div className="min-w-0">
-            <div className="text-sm font-bold text-[#111827]">Channel Files</div>
+            <div className="text-sm font-bold text-[#111827]">Shared Files</div>
             <div className="mt-0.5 truncate text-xs text-[#667085]">#{channelId}</div>
           </div>
           <button
@@ -177,6 +163,34 @@ export function RemoteFilePanel({ channelId, machineId, dataRoot, onClose }: Rem
             <X size={13} />
           </button>
         </div>
+
+        {/* Scope Tabs */}
+        {hasThread && (
+          <div className="flex gap-1 border-b border-[#e4e7ef] px-4 py-2">
+            <button
+              type="button"
+              className={`rounded-md px-3 py-1 text-xs font-medium transition-colors ${
+                scope === "channel"
+                  ? "bg-[#503ed4] text-white"
+                  : "text-[#667085] hover:bg-[#f0f2f7]"
+              }`}
+              onClick={() => setScope("channel")}
+            >
+              Channel
+            </button>
+            <button
+              type="button"
+              className={`rounded-md px-3 py-1 text-xs font-medium transition-colors ${
+                scope === "thread"
+                  ? "bg-[#503ed4] text-white"
+                  : "text-[#667085] hover:bg-[#f0f2f7]"
+              }`}
+              onClick={() => setScope("thread")}
+            >
+              Thread
+            </button>
+          </div>
+        )}
 
         {/* Breadcrumbs */}
         {breadcrumbs.length > 0 && (
@@ -211,7 +225,7 @@ export function RemoteFilePanel({ channelId, machineId, dataRoot, onClose }: Rem
               <button
                 type="button"
                 className="ml-2 text-xs text-[#667085] hover:underline"
-                onClick={() => loadDir(currentPath || channelRoot)}
+                onClick={() => loadDir(currentPath || scopeRoot)}
               >
                 Retry
               </button>
@@ -231,7 +245,9 @@ export function RemoteFilePanel({ channelId, machineId, dataRoot, onClose }: Rem
                 </button>
               )}
               {dirList.entries.length === 0 && (
-                <div className="py-8 text-center text-sm text-[#667085]">No items in this directory.</div>
+                <div className="py-8 text-center text-sm text-[#667085]">
+                  No items in this directory.
+                </div>
               )}
               {dirList.entries.map((entry) => {
                 if (entry.kind === "directory") {
@@ -255,7 +271,6 @@ export function RemoteFilePanel({ channelId, machineId, dataRoot, onClose }: Rem
                     key={entry.path}
                     name={entry.name}
                     path={entry.path}
-                    machineId={machineId}
                   />
                 );
               })}
@@ -275,12 +290,10 @@ function buildBreadcrumbs(currentPath: string, rootPath: string, sep: string) {
   const rootParts = rootPath.split(sep).filter(Boolean);
   const crumbs: { label: string; path: string }[] = [];
 
-  // Show root label (data root)
   if (rootParts.length > 0) {
     crumbs.push({ label: rootParts[rootParts.length - 1] || "root", path: rootPath });
   }
 
-  // Show subdirectories after root
   const normalizedCurrent = currentPath.replace(/[/\\]+$/, "");
   const normalizedRoot = rootPath.replace(/[/\\]+$/, "");
   if (normalizedCurrent.length > normalizedRoot.length) {

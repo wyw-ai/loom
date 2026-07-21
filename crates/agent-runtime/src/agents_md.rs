@@ -77,6 +77,36 @@ pub fn ensure_agents_md(workspace: &Path, context: &AgentsMdContext) -> io::Resu
     std::fs::write(&path, new_content)
 }
 
+/// Remove only Loom's generated block, preserving project-owned instructions.
+pub fn remove_agents_md(workspace: &Path) -> io::Result<()> {
+    let path = workspace.join("AGENTS.md");
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let Some((begin, end_past)) = marker_span(&existing) else {
+        return Ok(());
+    };
+    let mut after = &existing[end_past..];
+    if begin == 0 {
+        after = after
+            .strip_prefix("\r\n\r\n")
+            .or_else(|| after.strip_prefix("\n\n"))
+            .or_else(|| after.strip_prefix("\r\n"))
+            .or_else(|| after.strip_prefix('\n'))
+            .unwrap_or(after);
+    }
+    let mut content = String::with_capacity(existing.len());
+    content.push_str(&existing[..begin]);
+    content.push_str(after);
+    if content.is_empty() {
+        std::fs::remove_file(path)
+    } else {
+        std::fs::write(path, content)
+    }
+}
+
 fn update_block(existing: &str, new_block: &str) -> String {
     if let Some((begin, end_past)) = marker_span(existing) {
         let mut out = String::with_capacity(existing.len() + new_block.len());
@@ -476,6 +506,24 @@ mod tests {
         let once = update_block("", &loom_block(&context("actor_z", "chan_z")));
         let twice = update_block(&once, &loom_block(&context("actor_z", "chan_z")));
         assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn remove_preserves_project_owned_instructions() {
+        let root =
+            std::env::temp_dir().join(format!("loom-agents-md-remove-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("workspace");
+        let path = root.join("AGENTS.md");
+        std::fs::write(&path, "project before\n\nproject after\n").expect("project agents");
+        ensure_agents_md(&root, &context("actor_z", "chan_z")).expect("inject loom block");
+
+        remove_agents_md(&root).expect("remove loom block");
+
+        let content = std::fs::read_to_string(path).expect("preserved agents");
+        assert!(content.contains("project before"));
+        assert!(content.contains("project after"));
+        assert!(!content.contains(BEGIN_MARKER));
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

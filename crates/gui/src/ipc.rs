@@ -1754,6 +1754,108 @@ pub async fn open_local_path(args: OpenLocalPathArgs) -> Result<(), String> {
     open_path_with_system(&path).map_err(stringify)
 }
 
+/// B1: Native "Save As" dialog — replaces the unreliable `downloadBlob`
+/// in the Tauri webview. Uses the `rfd` crate (pure Rust, no Tauri
+/// capabilities change). Returns the chosen path on success, or `None`
+/// when the user cancels the dialog.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveFileDialogArgs {
+    pub file_name: String,
+    pub bytes: Vec<u8>,
+}
+
+#[tauri::command]
+pub async fn save_file_dialog(args: SaveFileDialogArgs) -> Result<Option<String>, String> {
+    let file_name = if args.file_name.trim().is_empty() {
+        "download"
+    } else {
+        args.file_name.trim()
+    };
+
+    let dialog = rfd::AsyncFileDialog::new().set_file_name(file_name);
+
+    let result = dialog.save_file().await;
+
+    match result {
+        Some(handle) => {
+            let path = handle.path();
+            let path_str = path.to_string_lossy().to_string();
+            std::fs::write(path, &args.bytes)
+                .map_err(|e| format!("Failed to write file: {e}"))?;
+            Ok(Some(path_str))
+        }
+        None => Ok(None),
+    }
+}
+
+/// B1: Open a file with the system default application. Reuses
+/// `open_path_with_system` (which already opens files via the default
+/// handler on all three platforms) but does NOT create directories —
+/// it is strictly a "launch existing file" command.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenPathArgs {
+    pub path: String,
+}
+
+#[tauri::command]
+pub async fn open_file_default(args: OpenPathArgs) -> Result<(), String> {
+    let raw = args.path.trim();
+    if raw.is_empty() {
+        return Err("path is required".into());
+    }
+    let path = normalize_local_path(config::expand_home(raw)).map_err(stringify)?;
+    if !path.exists() {
+        return Err(format!("File not found: {}", path.display()));
+    }
+    open_path_with_system(&path).map_err(stringify)
+}
+
+/// B1: Reveal a file in the platform file manager, selecting it.
+/// - Windows: `explorer /select,"<path>"`
+/// - macOS: `open -R "<path>"`
+/// - Linux: best-effort — opens the parent directory via `xdg-open`.
+#[allow(clippy::disallowed_methods)] // G1 OS shell — same exemption as open_path_with_system
+#[tauri::command]
+pub async fn reveal_in_folder(args: OpenPathArgs) -> Result<(), String> {
+    let raw = args.path.trim();
+    if raw.is_empty() {
+        return Err("path is required".into());
+    }
+    let path = normalize_local_path(config::expand_home(raw)).map_err(stringify)?;
+    if !path.exists() {
+        return Err(format!("Path not found: {}", path.display()));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .args(["/select,", &path.to_string_lossy()])
+            .spawn()
+            .map_err(|e| format!("Failed to reveal: {e}"))?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .args(["-R", &path.to_string_lossy()])
+            .spawn()
+            .map_err(|e| format!("Failed to reveal: {e}"))?;
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        std::process::Command::new("xdg-open")
+            .arg(parent)
+            .spawn()
+            .map_err(|e| format!("Failed to reveal: {e}"))?;
+    }
+
+    Ok(())
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MachineCreateArgs {

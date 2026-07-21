@@ -126,6 +126,7 @@ export interface MainContentProps {
   addAgentSkill: (machineId: string, actorId: string, source: string) => Promise<boolean>;
   removeAgent: (machineId: string, actorId: string) => Promise<void>;
   openLocalPath: (path: string) => Promise<void>;
+  setError: (error: string | null) => void;
 }
 
 export function MainContent(props: MainContentProps) {
@@ -149,10 +150,20 @@ export function MainContent(props: MainContentProps) {
           actors={p.actors}
           onOpenFolder={() => {
             const ch = p.activeChannel;
-            if (!ch) return;
+            if (!ch) {
+              p.setError("No active channel");
+              return;
+            }
             const machine = p.machines.find((m) => m.canOpenLocalPath);
-            const root = machine?.dataRoot;
-            if (!root) return;
+            if (!machine) {
+              p.setError("No local machine available. Start a local machine first.");
+              return;
+            }
+            const root = machine.dataRoot;
+            if (!root) {
+              p.setError("Local machine has no data root configured.");
+              return;
+            }
             const sep = root.includes("\\") && !root.includes("/") ? "\\" : "/";
             const path = `${root}${sep}channels${sep}${ch.id}${sep}`;
             p.openLocalPath(path);

@@ -130,6 +130,7 @@ export interface WorkspaceShellProps {
   addAgentSkill: (machineId: string, actorId: string, source: string) => Promise<boolean>;
   removeAgent: (machineId: string, actorId: string) => Promise<void>;
   openLocalPath: (path: string) => Promise<void>;
+  setError: (error: string | null) => void;
   // Detail panel
   activeChannel: Channel | null;
   memberCandidates: Actor[];
@@ -301,6 +302,7 @@ export function WorkspaceShell(props: WorkspaceShellProps) {
           addAgentSkill={p.addAgentSkill}
           removeAgent={p.removeAgent}
           openLocalPath={p.openLocalPath}
+          setError={p.setError}
         />
       </main>
       {p.showChatDetail && (

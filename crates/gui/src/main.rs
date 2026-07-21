@@ -122,6 +122,8 @@ fn main() {
             ipc::save_file_dialog,
             ipc::open_file_default,
             ipc::reveal_in_folder,
+            ipc::path_exists,
+            ipc::write_local_file,
             ipc::machine_create,
             ipc::machine_start,
             ipc::machine_remove,

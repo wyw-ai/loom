@@ -124,6 +124,8 @@ fn main() {
             ipc::reveal_in_folder,
             ipc::path_exists,
             ipc::write_local_file,
+            ipc::artifact_exists,
+            ipc::download_to_temp,
             ipc::machine_create,
             ipc::machine_start,
             ipc::machine_remove,

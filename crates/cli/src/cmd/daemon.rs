@@ -1987,6 +1987,13 @@ fn list_machine_directory(command: &Value, machine: &MachineConfig) -> Result<Va
         return Err(anyhow!("{} is not a directory", path.display()));
     }
 
+    // E2: When includeFiles is true, file entries are included alongside
+    // directories. Defaults to false for backward compatibility.
+    let include_files = command
+        .get("includeFiles")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(&path).with_context(|| format!("read {}", path.display()))? {
         let entry = match entry {
@@ -2003,15 +2010,26 @@ fn list_machine_directory(command: &Value, machine: &MachineConfig) -> Result<Va
             Err(_) => continue,
         };
         let file_type = metadata.file_type();
-        if file_type.is_symlink() || !metadata.is_dir() {
+        if file_type.is_symlink() {
             continue;
         }
-        entries.push(json!({
-            "name": name,
-            "path": entry_path.display().to_string(),
-            "kind": "directory",
-            "modified": metadata.modified().ok().and_then(system_time_rfc3339),
-        }));
+        if metadata.is_dir() {
+            entries.push(json!({
+                "name": name,
+                "path": entry_path.display().to_string(),
+                "kind": "directory",
+                "modified": metadata.modified().ok().and_then(system_time_rfc3339),
+            }));
+        } else if include_files {
+            // E2: Include file entries with size and modification time.
+            entries.push(json!({
+                "name": name,
+                "path": entry_path.display().to_string(),
+                "kind": "file",
+                "size": metadata.len(),
+                "modified": metadata.modified().ok().and_then(system_time_rfc3339),
+            }));
+        }
     }
     entries.sort_by(|a, b| {
         let left = a

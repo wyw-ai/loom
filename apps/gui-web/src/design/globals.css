@@ -878,8 +878,6 @@
     align-items: center;
     justify-content: space-between;
     padding: 4px 12px;
-    border: 1px solid #dfe3ec;
-    border-bottom: none;
     border-radius: 10px 10px 0 0;
     background: #edeff5;
     font-size: 0.75rem;
@@ -887,7 +885,7 @@
 
   .code-block-header + pre {
     border-radius: 0 0 10px 10px;
-    border-top: 1px solid #dfe3ec;
+    border: none;
   }
 
   .code-lang-label {

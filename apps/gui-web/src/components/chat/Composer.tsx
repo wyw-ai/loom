@@ -150,6 +150,17 @@ export function Composer({
               </button>
             </div>
           )}
+          <div className="flex shrink-0 items-center gap-1 px-1 pt-1">
+            <button
+              type="button"
+              onClick={openFilePicker}
+              disabled={disabled}
+              title="Attach files"
+              className="flex h-8 w-8 items-center justify-center rounded-md text-[#667085] transition-colors hover:bg-[#f0f2f7] hover:text-[#1d2939] disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <Paperclip size={16} />
+            </button>
+          </div>
           <AttachmentPreviewBar attachments={attachments} onRemove={removeAttachment} />
           {(showLongTextWarning || willConvertLongText) && (
             <div className="mb-2 flex shrink-0 items-center gap-1.5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-700">
@@ -174,7 +185,7 @@ export function Composer({
               e.target.value = "";
             }}
           />
-          <div className={`composer-box relative flex flex-1 items-end gap-1${isManual ? " composer-box-manual" : ""}`}>
+          <div className={`composer-box relative flex-1${isManual ? " composer-box-manual" : ""}`}>
             {showMentions && (
               <MentionMenu
                 options={mentionOptions}
@@ -182,15 +193,6 @@ export function Composer({
                 onSelect={chooseMention}
               />
             )}
-            <button
-              type="button"
-              onClick={openFilePicker}
-              disabled={disabled}
-              title="Attach files"
-              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md text-[#667085] transition-colors hover:bg-[#f0f2f7] hover:text-[#1d2939] disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              <Paperclip size={17} />
-            </button>
             <AutoGrowTextarea
               ref={textareaRef}
               value={draft}
@@ -238,7 +240,7 @@ export function Composer({
               }}
               disabled={disabled}
               placeholder={disabled ? disabledPlaceholder : placeholder}
-              className="max-h-full min-h-[44px] flex-1 px-0 pr-3 mr-9"
+              className="max-h-full min-h-[44px] w-full flex-1 px-3 pr-12"
             />
             <Button
               size="icon"

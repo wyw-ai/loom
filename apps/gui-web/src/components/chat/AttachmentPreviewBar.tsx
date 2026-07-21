@@ -10,7 +10,7 @@ interface AttachmentPreviewBarProps {
 export function AttachmentPreviewBar({ attachments, onRemove }: AttachmentPreviewBarProps) {
   if (attachments.length === 0) return null;
   return (
-    <div className="composer-attachment-bar mb-2 flex shrink-0 flex-wrap gap-2">
+    <div className="composer-attachment-bar mb-2 flex shrink-0 gap-2 overflow-x-auto">
       {attachments.map((attachment) => (
         <div
           key={attachment.id}

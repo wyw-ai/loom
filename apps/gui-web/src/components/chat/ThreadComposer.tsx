@@ -133,6 +133,17 @@ export function ThreadComposer({
         }}
       >
         <div className="flex h-full flex-col">
+          <div className="flex shrink-0 items-center gap-1 px-1 pt-1">
+            <button
+              type="button"
+              onClick={openFilePicker}
+              disabled={disabled}
+              title="Attach files"
+              className="flex h-7 w-7 items-center justify-center rounded-md text-[#667085] transition-colors hover:bg-[#f0f2f7] hover:text-[#1d2939] disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <Paperclip size={14} />
+            </button>
+          </div>
           <AttachmentPreviewBar attachments={attachments} onRemove={removeAttachment} />
           {(showLongTextWarning || willConvertLongText) && (
             <div className="mb-1.5 flex shrink-0 items-center gap-1.5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-1 text-xs font-medium text-amber-700">
@@ -157,7 +168,7 @@ export function ThreadComposer({
               e.target.value = "";
             }}
           />
-          <div className={`composer-box composer-box-compact relative flex h-full items-end gap-2${isManual ? " composer-box-manual" : ""}`}>
+          <div className={`composer-box composer-box-compact relative flex-1${isManual ? " composer-box-manual" : ""}`}>
             {showMentions && (
               <MentionMenu
                 options={mentionOptions}
@@ -165,15 +176,6 @@ export function ThreadComposer({
                 onSelect={chooseMention}
               />
             )}
-            <button
-              type="button"
-              onClick={openFilePicker}
-              disabled={disabled}
-              title="Attach files"
-              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-[#667085] transition-colors hover:bg-[#f0f2f7] hover:text-[#1d2939] disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              <Paperclip size={15} />
-            </button>
             <AutoGrowTextarea
             ref={textareaRef}
             value={draft}
@@ -221,7 +223,7 @@ export function ThreadComposer({
             }}
             disabled={disabled}
             placeholder={disabled ? "Select a thread" : "Reply in thread..."}
-            className="max-h-full min-h-[42px] flex-1 px-0 pr-3 mr-9 text-sm"
+            className="max-h-full min-h-[42px] w-full flex-1 px-3 pr-12 text-sm"
           />
           <Button
             size="icon"

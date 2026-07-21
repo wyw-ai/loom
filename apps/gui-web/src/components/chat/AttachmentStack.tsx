@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { Download, ExternalLink, Eye, FileText, Loader2, X } from "lucide-react";
+import { Download, ExternalLink, Eye, FileText, FolderOpen, Loader2, X } from "lucide-react";
 
 import * as ipc from "@/ipc/bridge";
 import type { Artifact, ArtifactReadResult } from "@/ipc/types";
@@ -27,7 +27,7 @@ const artifactPreviewBinaryBytes = 25 * 1024 * 1024;
 function AttachmentCard({ attachment }: { attachment: string }) {
   const [artifact, setArtifact] = useState<Artifact | null>(null);
   const [loading, setLoading] = useState(() => Boolean(artifactLookupParams(attachment)));
-  const [busy, setBusy] = useState<"preview" | "download" | "open" | null>(null);
+  const [busy, setBusy] = useState<"preview" | "download" | "open" | "reveal" | "save" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<ArtifactPreviewState | null>(null);
   const previewObjectUrlRef = useRef<string | null>(null);
@@ -122,13 +122,15 @@ function AttachmentCard({ attachment }: { attachment: string }) {
     }
   }
 
-  async function downloadArtifact() {
+  async function saveAsFile() {
     if (!artifact) return;
-    setBusy("download");
+    setBusy("save");
     setError(null);
     try {
       const blob = await readArtifactBlob(artifact);
-      downloadBlob(blob, artifact.name || `${artifact.id}.bin`);
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      const result = await ipc.saveFileDialog(artifact.name || `${artifact.id}.bin`, bytes);
+      if (!result) return; // user cancelled
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -136,12 +138,25 @@ function AttachmentCard({ attachment }: { attachment: string }) {
     }
   }
 
-  async function openWorkspaceCopy() {
+  async function openFile() {
     if (!workspacePath) return;
     setBusy("open");
     setError(null);
     try {
-      await ipc.openLocalPath(workspacePath);
+      await ipc.openFileDefault(workspacePath);
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function revealFile() {
+    if (!workspacePath) return;
+    setBusy("reveal");
+    setError(null);
+    try {
+      await ipc.revealInFolder(workspacePath);
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -184,23 +199,35 @@ function AttachmentCard({ attachment }: { attachment: string }) {
               <button
                 type="button"
                 className="attachment-action"
-                title="Open workspace copy"
+                title="Open with default app"
                 aria-label={`Open ${title}`}
                 disabled={Boolean(busy)}
-                onClick={openWorkspaceCopy}
+                onClick={openFile}
               >
                 {busy === "open" ? <Loader2 className="animate-spin" size={14} /> : <ExternalLink size={14} />}
+              </button>
+            )}
+            {workspacePath && (
+              <button
+                type="button"
+                className="attachment-action"
+                title="Reveal in folder"
+                aria-label={`Reveal ${title} in folder`}
+                disabled={Boolean(busy)}
+                onClick={revealFile}
+              >
+                {busy === "reveal" ? <Loader2 className="animate-spin" size={14} /> : <FolderOpen size={14} />}
               </button>
             )}
             <button
               type="button"
               className="attachment-action"
-              title="Download artifact"
-              aria-label={`Download ${title}`}
+              title="Save as..."
+              aria-label={`Save ${title} as`}
               disabled={Boolean(busy)}
-              onClick={downloadArtifact}
+              onClick={saveAsFile}
             >
-              {busy === "download" ? <Loader2 className="animate-spin" size={14} /> : <Download size={14} />}
+              {busy === "save" ? <Loader2 className="animate-spin" size={14} /> : <Download size={14} />}
             </button>
           </div>
         )}
@@ -209,7 +236,7 @@ function AttachmentCard({ attachment }: { attachment: string }) {
         <AttachmentPreviewModal
           preview={preview}
           onClose={closePreview}
-          onDownload={downloadArtifact}
+          onDownload={saveAsFile}
         />
       )}
     </>
@@ -434,15 +461,4 @@ async function readArtifactBlob(artifact: Artifact) {
     offset = nextOffset;
   }
   throw new Error("Artifact is too large to download in one operation.");
-}
-
-function downloadBlob(blob: Blob, filename: string) {
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = filename || "artifact";
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }

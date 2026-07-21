@@ -584,6 +584,20 @@ export async function openLocalPath(path: string): Promise<void> {
   await invoke("open_local_path", { args: { path } });
 }
 
+export async function saveFileDialog(fileName: string, bytes: Uint8Array): Promise<string | null> {
+  return invoke<string | null>("save_file_dialog", {
+    args: { fileName, bytes: Array.from(bytes) },
+  });
+}
+
+export async function openFileDefault(path: string): Promise<void> {
+  await invoke("open_file_default", { args: { path } });
+}
+
+export async function revealInFolder(path: string): Promise<void> {
+  await invoke("reveal_in_folder", { args: { path } });
+}
+
 export function onStream(cb: (u: StreamUpdate) => void): Promise<UnlistenFn> {
   return listen<StreamUpdate>("loom://stream", (e) => cb(e.payload));
 }

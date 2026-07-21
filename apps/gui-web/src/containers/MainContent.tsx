@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type {
   Channel,
   MachineInfo,
@@ -24,6 +25,7 @@ import { ErrorBanner, NoSpaceConnectionGuide } from "@/components/shared/PageCom
 import { ChatHeader } from "@/components/layout/ChatHeader";
 import { MessageFeed } from "@/components/chat/MessageFeed";
 import { Composer } from "@/components/chat/Composer";
+import { RemoteFilePanel } from "@/components/chat/RemoteFilePanel";
 import { ThreadsView } from "@/components/views/ThreadsView";
 import { ChannelsView } from "@/components/views/ChannelsView";
 import { DirectMessagesView } from "@/components/views/DirectMessagesView";
@@ -131,6 +133,11 @@ export interface MainContentProps {
 
 export function MainContent(props: MainContentProps) {
   const p = props;
+  const [remoteFilePanel, setRemoteFilePanel] = useState<{
+    channelId: string;
+    machineId: string;
+    dataRoot: string;
+  } | null>(null);
 
   if (p.view === "chat") {
     return (
@@ -154,19 +161,21 @@ export function MainContent(props: MainContentProps) {
               p.setError("No active channel");
               return;
             }
-            const machine = p.machines.find((m) => m.canOpenLocalPath);
-            if (!machine) {
-              p.setError("No local machine available. Start a local machine first.");
-              return;
+            const localMachine = p.machines.find((m) => m.canOpenLocalPath);
+            if (localMachine?.dataRoot) {
+              const sep = localMachine.dataRoot.includes("\\") && !localMachine.dataRoot.includes("/") ? "\\" : "/";
+              const path = `${localMachine.dataRoot}${sep}channels${sep}${ch.id}${sep}`;
+              p.openLocalPath(path);
+            } else {
+              const remoteMachine =
+                p.machines.find((m) => m.connectionStatus === "connected") ?? p.machines[0];
+              if (!remoteMachine) {
+                p.setError("No machine available for file browsing.");
+                return;
+              }
+              const root = remoteMachine.dataRoot || ".";
+              setRemoteFilePanel({ channelId: ch.id, machineId: remoteMachine.id, dataRoot: root });
             }
-            const root = machine.dataRoot;
-            if (!root) {
-              p.setError("Local machine has no data root configured.");
-              return;
-            }
-            const sep = root.includes("\\") && !root.includes("/") ? "\\" : "/";
-            const path = `${root}${sep}channels${sep}${ch.id}${sep}`;
-            p.openLocalPath(path);
           }}
         />
         {p.error && (
@@ -208,6 +217,14 @@ export function MainContent(props: MainContentProps) {
           mentionAgents={p.channelAgentActors}
           busy={p.busy === "message:send"}
         />
+        {remoteFilePanel && (
+          <RemoteFilePanel
+            channelId={remoteFilePanel.channelId}
+            machineId={remoteFilePanel.machineId}
+            dataRoot={remoteFilePanel.dataRoot}
+            onClose={() => setRemoteFilePanel(null)}
+          />
+        )}
       </>
     );
   }

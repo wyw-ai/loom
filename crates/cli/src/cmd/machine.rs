@@ -79,6 +79,8 @@ pub async fn agent_create(
     source_root: Option<PathBuf>,
     model: Option<String>,
     reasoning_effort: Option<String>,
+    wake_coalesce: Option<bool>,
+    runtime_awareness: Option<String>,
     autostart: bool,
 ) -> Result<()> {
     let machine = require_machine(&client, &machine_id).await?;
@@ -94,6 +96,8 @@ pub async fn agent_create(
     insert_source_root(&mut command, source_root)?;
     insert_if_nonempty(&mut command, "model", model);
     insert_if_nonempty(&mut command, "reasoningEffort", reasoning_effort);
+    insert_wake_coalesce(&mut command, wake_coalesce);
+    insert_if_nonempty(&mut command, "runtimeAwareness", runtime_awareness);
 
     let output = run_machine_command(client, machine, command).await?;
     if render::is_json() {
@@ -124,6 +128,8 @@ pub async fn agent_update(
     source_root: Option<PathBuf>,
     model: Option<String>,
     reasoning_effort: Option<String>,
+    wake_coalesce: Option<bool>,
+    runtime_awareness: Option<String>,
 ) -> Result<()> {
     let machine = require_machine(&client, &machine_id).await?;
     let command = agent_update_command(
@@ -134,6 +140,8 @@ pub async fn agent_update(
         source_root,
         model,
         reasoning_effort,
+        wake_coalesce,
+        runtime_awareness,
     )?;
     let output = run_machine_command(client, machine, command).await?;
     if render::is_json() {
@@ -161,6 +169,8 @@ fn agent_update_command(
     source_root: Option<PathBuf>,
     model: Option<String>,
     reasoning_effort: Option<String>,
+    wake_coalesce: Option<bool>,
+    runtime_awareness: Option<String>,
 ) -> Result<Value> {
     let instructions = read_instructions(instructions, instructions_file)?;
     let mut command = json!({
@@ -175,6 +185,8 @@ fn agent_update_command(
     insert_source_root(&mut command, source_root)?;
     insert_if_nonempty(&mut command, "model", model);
     insert_if_nonempty(&mut command, "reasoningEffort", reasoning_effort);
+    insert_wake_coalesce(&mut command, wake_coalesce);
+    insert_if_nonempty(&mut command, "runtimeAwareness", runtime_awareness);
     Ok(command)
 }
 
@@ -428,6 +440,12 @@ fn insert_if_nonempty(target: &mut Value, key: &str, value: Option<String>) {
     target[key] = json!(value);
 }
 
+fn insert_wake_coalesce(target: &mut Value, value: Option<bool>) {
+    if let Some(coalesce) = value {
+        target["wake"] = json!({ "coalesce": coalesce });
+    }
+}
+
 fn insert_source_root(target: &mut Value, value: Option<PathBuf>) -> Result<()> {
     let Some(path) = value else {
         return Ok(());
@@ -477,6 +495,8 @@ mod tests {
             Some(PathBuf::from(".")),
             None,
             Some("high".into()),
+            Some(false),
+            Some("hidden".into()),
         )
         .expect("build agent update command");
 
@@ -489,6 +509,8 @@ mod tests {
                 "displayName": "Implementation Agent",
                 "sourceRoot": source_root,
                 "reasoningEffort": "high",
+                "wake": { "coalesce": false },
+                "runtimeAwareness": "hidden",
             })
         );
     }
@@ -500,6 +522,8 @@ mod tests {
             None,
             Some("inline".into()),
             Some(PathBuf::from("AGENTS.md")),
+            None,
+            None,
             None,
             None,
             None,

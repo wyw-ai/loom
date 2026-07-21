@@ -18,7 +18,7 @@ use agent_runtime::provider::{
 use anyhow::{anyhow, Context, Result};
 use proto::methods::{
     AgentBundleSkillSpec, AgentBundleSpec, AgentModelSpec, AgentPromptAssemblySpec,
-    AgentProviderRef, AgentSpec, ProviderManifest, ServiceSpec, WakeSpec,
+    AgentProviderRef, AgentSpec, ProviderManifest, RuntimeAwareness, ServiceSpec, WakeSpec,
 };
 use proto::types::{Actor, ActorKind};
 use serde::{Deserialize, Serialize};
@@ -604,6 +604,15 @@ fn agent_spec_from_command(
         .filter(|value| !value.is_null())
         .map(|value| serde_json::from_value::<WakeSpec>(value.clone()).context("parse wake"))
         .transpose()?;
+    let runtime_awareness = command
+        .get("runtimeAwareness")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            serde_json::from_value::<RuntimeAwareness>(value.clone())
+                .context("parse runtimeAwareness")
+        })
+        .transpose()?
+        .unwrap_or_default();
 
     let env: BTreeMap<String, String> = command
         .get("env")
@@ -653,6 +662,7 @@ fn agent_spec_from_command(
             .get("autostart")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        runtime_awareness,
         models: Some(AgentModelSpec {
             default: model.or_else(|| provider.default_model.clone()),
             choices: provider.model_choices.clone(),
@@ -780,6 +790,10 @@ fn update_agent_spec_from_command(
         } else {
             Some(serde_json::from_value::<WakeSpec>(value.clone()).context("parse wake")?)
         };
+    }
+    if let Some(value) = command.get("runtimeAwareness") {
+        spec.runtime_awareness = serde_json::from_value::<RuntimeAwareness>(value.clone())
+            .context("parse runtimeAwareness")?;
     }
     if let Some(env_value) = command.get("env") {
         if env_value.is_null() {
@@ -2876,6 +2890,7 @@ mod tests {
                 ..Default::default()
             },
             autostart: false,
+            runtime_awareness: RuntimeAwareness::Native,
             models: Some(AgentModelSpec {
                 default: Some("gpt-5.5".into()),
                 choices: Vec::new(),
@@ -2921,6 +2936,7 @@ mod tests {
                 "instructions": "Writes concise updates",
                 "model": "opus",
                 "reasoningEffort": "high",
+                "runtimeAwareness": "hidden",
                 "autostart": true
             }),
             "machine_test",
@@ -2931,6 +2947,7 @@ mod tests {
         assert_eq!(spec.provider_ref.id.as_str(), "claude");
         assert_eq!(spec.provider_ref.model.as_deref(), Some("opus"));
         assert_eq!(spec.instructions.as_deref(), Some("Writes concise updates"));
+        assert_eq!(spec.runtime_awareness, RuntimeAwareness::Hidden);
         let value = serde_json::to_value(&spec).expect("json");
         assert!(value.get("providerRef").is_some());
         assert!(value.get("transport").is_none());
@@ -2960,6 +2977,7 @@ mod tests {
                 ..Default::default()
             },
             autostart: false,
+            runtime_awareness: RuntimeAwareness::Native,
             models: None,
             bundle: None,
             memory: None,
@@ -3188,6 +3206,7 @@ mod tests {
                 ..Default::default()
             },
             autostart: true,
+            runtime_awareness: RuntimeAwareness::Native,
             models: None,
             bundle: None,
             memory: None,

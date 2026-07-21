@@ -150,17 +150,6 @@ export function Composer({
               </button>
             </div>
           )}
-          <div className="flex shrink-0 items-center gap-1 px-1 pt-1">
-            <button
-              type="button"
-              onClick={openFilePicker}
-              disabled={disabled}
-              title="Attach files"
-              className="flex h-8 w-8 items-center justify-center rounded-md text-[#667085] transition-colors hover:bg-[#f0f2f7] hover:text-[#1d2939] disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              <Paperclip size={16} />
-            </button>
-          </div>
           <AttachmentPreviewBar attachments={attachments} onRemove={removeAttachment} />
           {(showLongTextWarning || willConvertLongText) && (
             <div className="mb-2 flex shrink-0 items-center gap-1.5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-700">
@@ -250,6 +239,15 @@ export function Composer({
             >
               {busy ? <Loader2 className="animate-spin" size={17} /> : <Send size={17} />}
             </Button>
+            <button
+              type="button"
+              onClick={openFilePicker}
+              disabled={disabled}
+              title="Attach files"
+              className="absolute bottom-12 right-3 z-10 flex h-9 w-9 items-center justify-center rounded-lg text-[#667085] transition-colors hover:bg-[#f0f2f7] hover:text-[#1d2939] disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <Paperclip size={16} />
+            </button>
           </div>
         </div>
       </Resizable>

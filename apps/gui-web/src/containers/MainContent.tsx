@@ -137,6 +137,7 @@ export function MainContent(props: MainContentProps) {
     channelId: string;
     machineId: string;
     dataRoot: string;
+    threadId?: string;
   } | null>(null);
 
   if (p.view === "chat") {
@@ -174,7 +175,12 @@ export function MainContent(props: MainContentProps) {
                 return;
               }
               const root = remoteMachine.dataRoot || ".";
-              setRemoteFilePanel({ channelId: ch.id, machineId: remoteMachine.id, dataRoot: root });
+              setRemoteFilePanel({
+                channelId: ch.id,
+                machineId: remoteMachine.id,
+                dataRoot: root,
+                threadId: p.activeThread?.id,
+              });
             }
           }}
         />
@@ -222,6 +228,7 @@ export function MainContent(props: MainContentProps) {
             channelId={remoteFilePanel.channelId}
             machineId={remoteFilePanel.machineId}
             dataRoot={remoteFilePanel.dataRoot}
+            threadId={remoteFilePanel.threadId}
             onClose={() => setRemoteFilePanel(null)}
           />
         )}

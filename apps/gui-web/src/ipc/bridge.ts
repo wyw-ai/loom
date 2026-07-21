@@ -440,8 +440,15 @@ export async function machineCheck(): Promise<MachineListResult> {
 export async function machineDirList(args: {
   machineId: string;
   path?: string;
+  includeFiles?: boolean;
 }): Promise<MachineDirListResult> {
-  return invoke("machine_dir_list", { args });
+  return invoke("machine_dir_list", {
+    args: {
+      machineId: args.machineId,
+      ...(args.path ? { path: args.path } : {}),
+      ...(args.includeFiles ? { includeFiles: true } : {}),
+    },
+  });
 }
 
 export async function localProviderCheck(): Promise<{
@@ -604,6 +611,22 @@ export async function pathExists(path: string): Promise<boolean> {
 
 export async function writeLocalFile(path: string, bytes: Uint8Array): Promise<void> {
   await invoke("write_local_file", { args: { path, bytes: Array.from(bytes) } });
+}
+
+export async function artifactExists(args: { artifactId: string }): Promise<boolean> {
+  return invoke<boolean>("artifact_exists", { args: { artifactId: args.artifactId } });
+}
+
+export async function downloadToTemp(args: {
+  artifactId: string;
+  suggestedName?: string;
+}): Promise<string> {
+  return invoke<string>("download_to_temp", {
+    args: {
+      artifactId: args.artifactId,
+      ...(args.suggestedName ? { suggestedName: args.suggestedName } : {}),
+    },
+  });
 }
 
 export function onStream(cb: (u: StreamUpdate) => void): Promise<UnlistenFn> {

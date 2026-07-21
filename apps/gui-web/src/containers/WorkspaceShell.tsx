@@ -109,8 +109,8 @@ export interface WorkspaceShellProps {
   setReplyTo: (replyTo: Message | null) => void;
   setWorkspaceForm: (form: WorkspaceFormState) => void;
   setAgentForm: (updater: AgentFormState | ((current: AgentFormState) => AgentFormState)) => void;
-  sendMessage: () => Promise<void>;
-  sendThreadMessage: () => Promise<void>;
+  sendMessage: (attachments?: import("@/lib/attachment-utils").PendingAttachment[]) => Promise<void>;
+  sendThreadMessage: (attachments?: import("@/lib/attachment-utils").PendingAttachment[]) => Promise<void>;
   sendDirectMessage: () => Promise<void>;
   startThread: (message: Message) => Promise<void>;
   toggleMessageReaction: (message: Message, emoji: string) => Promise<void>;

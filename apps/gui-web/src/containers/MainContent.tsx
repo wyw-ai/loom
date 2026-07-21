@@ -101,8 +101,8 @@ export interface MainContentProps {
   setReplyTo: (replyTo: Message | null) => void;
   setWorkspaceForm: (form: WorkspaceFormState) => void;
   setAgentForm: (updater: AgentFormState | ((current: AgentFormState) => AgentFormState)) => void;
-  sendMessage: () => Promise<void>;
-  sendThreadMessage: () => Promise<void>;
+  sendMessage: (attachments?: import("@/lib/attachment-utils").PendingAttachment[]) => Promise<void>;
+  sendThreadMessage: (attachments?: import("@/lib/attachment-utils").PendingAttachment[]) => Promise<void>;
   sendDirectMessage: () => Promise<void>;
   startThread: (message: Message) => Promise<void>;
   toggleMessageReaction: (message: Message, emoji: string) => Promise<void>;
@@ -147,6 +147,16 @@ export function MainContent(props: MainContentProps) {
           agentActors={p.agentActors}
           scopeId={p.activeScope?.id}
           actors={p.actors}
+          onOpenFolder={() => {
+            const ch = p.activeChannel;
+            if (!ch) return;
+            const machine = p.machines.find((m) => m.canOpenLocalPath);
+            const root = machine?.dataRoot;
+            if (!root) return;
+            const sep = root.includes("\\") && !root.includes("/") ? "\\" : "/";
+            const path = `${root}${sep}channels${sep}${ch.id}${sep}`;
+            p.openLocalPath(path);
+          }}
         />
         {p.error && (
           <div className="border-b border-red-200 bg-red-50 px-4 py-2 text-sm font-medium text-red-700">

@@ -6,11 +6,14 @@ import { activeMentionQuery, mentionCandidates } from "@/lib/format-utils";
 import { isComposingKeyEvent, shouldSendOnEnter } from "@/lib/format-utils";
 import { COMPOSER_AUTO_MAX_ROWS, THREAD_COMPOSER_MIN_HEIGHT } from "@/lib/composer-utils";
 import { useComposerResize } from "@/hooks/useComposerResize";
+import { useAttachments } from "@/hooks/useAttachments";
+import { shouldWarnLongText, LONG_TEXT_THRESHOLD } from "@/lib/attachment-utils";
 import { AutoGrowTextarea } from "@/components/ui/AutoGrowTextarea";
 import { Button } from "@/components/ui/button";
-import { Send, Loader2 } from "lucide-react";
+import { Send, Loader2, Paperclip, AlertTriangle } from "lucide-react";
 import { MentionMenu } from "@/components/chat/MentionMenu";
 import { ComposerResizeHandle } from "@/components/chat/ComposerResizeHandle";
+import { AttachmentPreviewBar } from "@/components/chat/AttachmentPreviewBar";
 
 export function ThreadComposer({
   draft,
@@ -25,12 +28,21 @@ export function ThreadComposer({
   disabled: boolean;
   busy: boolean;
   mentionAgents: Actor[];
-  onSend: () => void;
+  onSend: (attachments?: import("@/lib/attachment-utils").PendingAttachment[]) => void;
 }) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [caretIndex, setCaretIndex] = useState(draft.length);
   const [selectedMentionIndex, setSelectedMentionIndex] = useState(0);
   const [dismissedMentionKey, setDismissedMentionKey] = useState<string | null>(null);
+  const {
+    attachments,
+    error: attachmentError,
+    fileInputRef,
+    addFiles,
+    removeAttachment,
+    clearAttachments,
+    openFilePicker,
+  } = useAttachments();
 
   // --- Resize state ---
   const {
@@ -68,6 +80,14 @@ export function ThreadComposer({
   function syncCaret(element: HTMLTextAreaElement) {
     setCaretIndex(element.selectionStart ?? element.value.length);
   }
+
+  function handleSend() {
+    onSend(attachments.length > 0 ? attachments : undefined);
+    clearAttachments();
+  }
+
+  const showLongTextWarning = shouldWarnLongText(draft.length);
+  const willConvertLongText = draft.length >= LONG_TEXT_THRESHOLD;
 
   function chooseMention(option: MentionOption) {
     const before = draft.slice(0, option.start);
@@ -112,15 +132,40 @@ export function ThreadComposer({
           ),
         }}
       >
-        <div className={`composer-box composer-box-compact relative flex h-full items-start gap-2${isManual ? " composer-box-manual" : ""}`}>
-          {showMentions && (
-            <MentionMenu
-              options={mentionOptions}
-              selectedIndex={effectiveMentionIndex}
-              onSelect={chooseMention}
-            />
+        <div className="flex h-full flex-col">
+          <AttachmentPreviewBar attachments={attachments} onRemove={removeAttachment} />
+          {(showLongTextWarning || willConvertLongText) && (
+            <div className="mb-1.5 flex shrink-0 items-center gap-1.5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-1 text-xs font-medium text-amber-700">
+              <AlertTriangle size={12} className="shrink-0" />
+              {willConvertLongText
+                ? `Message exceeds ${LONG_TEXT_THRESHOLD} characters and will be sent as a .txt attachment.`
+                : `Message is approaching the ${LONG_TEXT_THRESHOLD} character limit.`}
+            </div>
           )}
-          <AutoGrowTextarea
+          {attachmentError && (
+            <div className="mb-1.5 shrink-0 rounded-lg border border-red-200 bg-red-50 px-3 py-1 text-xs font-medium text-red-700">
+              {attachmentError}
+            </div>
+          )}
+          <input
+            ref={fileInputRef as React.RefObject<HTMLInputElement>}
+            type="file"
+            multiple
+            className="hidden"
+            onChange={(e) => {
+              if (e.target.files) addFiles(e.target.files);
+              e.target.value = "";
+            }}
+          />
+          <div className={`composer-box composer-box-compact relative flex h-full items-start gap-2${isManual ? " composer-box-manual" : ""}`}>
+            {showMentions && (
+              <MentionMenu
+                options={mentionOptions}
+                selectedIndex={effectiveMentionIndex}
+                onSelect={chooseMention}
+              />
+            )}
+            <AutoGrowTextarea
             ref={textareaRef}
             value={draft}
             maxRows={COMPOSER_AUTO_MAX_ROWS}
@@ -162,21 +207,31 @@ export function ThreadComposer({
               }
               if (shouldSendOnEnter(event)) {
                 event.preventDefault();
-                onSend();
+                handleSend();
               }
             }}
             disabled={disabled}
             placeholder={disabled ? "Select a thread" : "Reply in thread..."}
             className="max-h-full min-h-[42px] flex-1 px-0 pr-3 mr-9 text-sm"
           />
+          <button
+            type="button"
+            onClick={openFilePicker}
+            disabled={disabled}
+            title="Attach files"
+            className="absolute bottom-3 left-1 flex h-6 w-6 items-center justify-center rounded-md text-[#667085] transition-colors hover:bg-[#f0f2f7] hover:text-[#1d2939] disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            <Paperclip size={15} />
+          </button>
           <Button
             size="icon"
-            onClick={onSend}
-            disabled={disabled || !draft.trim() || busy}
+            onClick={handleSend}
+            disabled={disabled || (!draft.trim() && attachments.length === 0) || busy}
             className="absolute bottom-2 right-3 h-9 w-9 shrink-0 rounded-lg bg-[#503ed4] text-white hover:bg-[#4635c5]"
           >
             {busy ? <Loader2 className="animate-spin" size={17} /> : <Send size={17} />}
           </Button>
+        </div>
         </div>
       </Resizable>
     </footer>

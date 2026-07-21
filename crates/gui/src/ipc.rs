@@ -2274,12 +2274,15 @@ async fn merge_server_machine_inventory(
     Ok(())
 }
 
-fn upsert_server_machine_info(machines: &mut Vec<MachineInfo>, machine: MachineInfo) {
+fn upsert_server_machine_info(machines: &mut Vec<MachineInfo>, mut machine: MachineInfo) {
     if let Some(existing) = machines.iter_mut().find(|m| m.id == machine.id) {
         if machine.inventory_revision > existing.inventory_revision
             || (machine.inventory_revision == existing.inventory_revision
                 && machine.inventory_observed_at > existing.inventory_observed_at)
         {
+            // Preserve local can_open_local_path — the server inventory has no
+            // authority over whether a local daemon can open paths on this host.
+            machine.can_open_local_path = existing.can_open_local_path;
             *existing = machine;
         }
     } else {
@@ -2996,17 +2999,13 @@ fn open_path_with_system(path: &Path) -> anyhow::Result<()> {
         command
     };
 
-    let status = command
-        .status()
+    // Spawn without waiting for exit code — Windows explorer.exe commonly
+    // returns non-zero even on success. We only care whether the process
+    // launched successfully.
+    command
+        .spawn()
         .map_err(|e| anyhow::anyhow!("open {}: {e}", path.display()))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!(
-            "open {} exited with status {status}",
-            path.display()
-        ))
-    }
+    Ok(())
 }
 
 fn shell_arg(value: &str) -> String {

@@ -167,7 +167,7 @@ export function ThreadComposer({
             }}
             disabled={disabled}
             placeholder={disabled ? "Select a thread" : "Reply in thread..."}
-            className="max-h-full min-h-[42px] flex-1 px-0 pr-12 text-sm"
+            className="max-h-full min-h-[42px] flex-1 px-0 pr-3 mr-9 text-sm"
           />
           <Button
             size="icon"

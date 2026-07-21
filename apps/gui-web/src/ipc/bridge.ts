@@ -598,6 +598,14 @@ export async function revealInFolder(path: string): Promise<void> {
   await invoke("reveal_in_folder", { args: { path } });
 }
 
+export async function pathExists(path: string): Promise<boolean> {
+  return invoke<boolean>("path_exists", { args: { path } });
+}
+
+export async function writeLocalFile(path: string, bytes: Uint8Array): Promise<void> {
+  await invoke("write_local_file", { args: { path, bytes: Array.from(bytes) } });
+}
+
 export function onStream(cb: (u: StreamUpdate) => void): Promise<UnlistenFn> {
   return listen<StreamUpdate>("loom://stream", (e) => cb(e.payload));
 }

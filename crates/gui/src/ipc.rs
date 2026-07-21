@@ -3406,14 +3406,7 @@ pub struct SkillRegistryDto {
 /// machine's data root; that is a larger IPC signature change tracked
 /// separately and out of scope for this fix.
 fn agent_data_root() -> Result<PathBuf, String> {
-    if let Ok(s) = std::env::var("LOOM_AGENT_DATA_ROOT") {
-        if !s.is_empty() {
-            return Ok(PathBuf::from(s));
-        }
-    }
-    Ok(dirs::data_dir()
-        .map(|d| d.join("loom").join("agents"))
-        .unwrap_or_else(|| PathBuf::from(".loom").join("agents-data")))
+    Ok(loom_platform::agent_data_root())
 }
 
 fn read_skill_registry(path: &Path) -> Result<SkillRegistryDto, String> {

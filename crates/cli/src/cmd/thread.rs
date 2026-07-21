@@ -189,6 +189,163 @@ pub async fn unfollow(client: Arc<Client>, thread_id: String) -> Result<()> {
     Ok(())
 }
 
+pub async fn set_instruction(
+    client: Arc<Client>,
+    thread_id: String,
+    instructions: String,
+) -> Result<()> {
+    warn_thread_instructions_deprecated("set");
+    let res: ThreadSetInstructionResult = client
+        .call(
+            method::THREAD_SET_INSTRUCTION,
+            json!({ "threadId": thread_id, "instructions": instructions }),
+        )
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+    } else {
+        println!("instructions set for thread {}", res.thread.id);
+    }
+    Ok(())
+}
+
+pub async fn get_instruction(client: Arc<Client>, thread_id: String) -> Result<()> {
+    warn_thread_instructions_deprecated("get");
+    let res: ThreadGetInstructionResult = client
+        .call(
+            method::THREAD_GET_INSTRUCTION,
+            json!({ "threadId": thread_id }),
+        )
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+        return Ok(());
+    }
+    match res.instructions {
+        Some(instructions) => println!("{}", instructions),
+        None => println!("(none)"),
+    }
+    Ok(())
+}
+
+pub async fn clear_instruction(client: Arc<Client>, thread_id: String) -> Result<()> {
+    warn_thread_instructions_deprecated("clear");
+    let res: ThreadClearInstructionResult = client
+        .call(
+            method::THREAD_CLEAR_INSTRUCTION,
+            json!({ "threadId": thread_id }),
+        )
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+    } else if res.cleared {
+        println!("thread instructions cleared");
+    } else {
+        println!("thread instructions were already empty");
+    }
+    Ok(())
+}
+
+/// Emits a deprecation warning to stderr for the thread instruction CLI
+/// subcommands. Thread-scoped instructions are shelved at the runtime
+/// projection layer (issue #1+#9): the data model (Thread.instructions,
+/// journal Mutation::ThreadInstructionSet) is preserved and the CLI
+/// commands remain functional so existing scripts keep working and the
+/// feature can be re-enabled in a future per-Run provider-scope
+/// implementation, but values written here are NOT projected into the
+/// shared AGENTS.md block consumed by agent runs. The warning is sent to
+/// stderr (not stdout) so JSON output is unaffected.
+fn warn_thread_instructions_deprecated(action: &str) {
+    eprintln!(
+        "warning: thread instructions are not projected to agent runtime in this version \
+         (issue #1+#9, shelved). `loom thread instruction {action}` still reads/writes the \
+         stored value, but it will not affect agent behavior. The data model is preserved \
+         for a future per-Run provider-scope implementation."
+    );
+}
+
+// -----------------------------------------------------------------
+// Thread skill management (file-based registry, agent data root)
+// -----------------------------------------------------------------
+
+/// Resolve the channel_id for a thread via THREAD_LIST.
+async fn resolve_channel_id(client: &Arc<Client>, thread_id: &str) -> Result<String> {
+    let res: ThreadListResult = client
+        .call(method::THREAD_LIST, json!({}))
+        .await
+        .context("thread.list")?;
+    let thread = res
+        .threads
+        .into_iter()
+        .find(|t| t.id == thread_id)
+        .ok_or_else(|| anyhow!("thread {thread_id} not found"))?;
+    Ok(thread.channel_id)
+}
+
+pub async fn skill_add(
+    client: Arc<Client>,
+    thread_id: String,
+    source: String,
+    skill_id: Option<String>,
+) -> Result<()> {
+    let channel_id = resolve_channel_id(&client, &thread_id).await?;
+    let data_root = crate::cmd::agent_serve::default_data_root_pub();
+    let id = skill_id.unwrap_or_else(|| {
+        std::path::Path::new(&source)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("skill")
+            .to_string()
+    });
+    let registry = super::skill_registry::add_thread_skill(
+        &data_root,
+        &channel_id,
+        &thread_id,
+        id.clone(),
+        source.clone(),
+    )
+    .map_err(|err| anyhow!("write thread skill registry: {err}"))?;
+    if render::is_json() {
+        render::print_json(&registry);
+    } else {
+        println!("skill '{id}' added to thread {thread_id}");
+    }
+    Ok(())
+}
+
+pub async fn skill_remove(client: Arc<Client>, thread_id: String, skill_id: String) -> Result<()> {
+    let channel_id = resolve_channel_id(&client, &thread_id).await?;
+    let data_root = crate::cmd::agent_serve::default_data_root_pub();
+    let (registry, removed) =
+        super::skill_registry::remove_thread_skill(&data_root, &channel_id, &thread_id, &skill_id)
+            .map_err(|err| anyhow!("read/remove thread skill registry: {err}"))?;
+    if render::is_json() {
+        render::print_json(&registry);
+    } else if removed {
+        println!("skill '{skill_id}' removed from thread {thread_id}");
+    } else {
+        println!("skill '{skill_id}' was not registered in thread {thread_id}");
+    }
+    Ok(())
+}
+
+pub async fn skill_list(client: Arc<Client>, thread_id: String) -> Result<()> {
+    let channel_id = resolve_channel_id(&client, &thread_id).await?;
+    let data_root = crate::cmd::agent_serve::default_data_root_pub();
+    let registry = super::skill_registry::read_thread_skills(&data_root, &channel_id, &thread_id)
+        .map_err(|err| anyhow!("read thread skill registry: {err}"))?;
+    if render::is_json() {
+        render::print_json(&registry);
+    } else if registry.skills.is_empty() {
+        println!("(no skills registered for thread {thread_id})");
+    } else {
+        for entry in &registry.skills {
+            println!("{:<20} {}", entry.id, entry.source);
+        }
+    }
+    Ok(())
+}
+
 /// `loom thread bootstrap --in <thread_id> --channel <chan> --bootstrap-artifact <uri>`.
 ///
 /// Bootstrap an *existing* thread from a clone-manifest / mounts artifact.

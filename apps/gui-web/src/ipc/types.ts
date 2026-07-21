@@ -257,6 +257,12 @@ export interface AgentBundleSkillSpec {
   source: string;
 }
 
+export interface SkillEntry {
+  id: string;
+  source: string;
+  addedAt: string;
+}
+
 export interface AgentBundleSpec {
   source?: string;
   version?: string;

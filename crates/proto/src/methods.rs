@@ -23,6 +23,9 @@ pub mod method {
     pub const CHANNEL_MEMBER_CONFIG_LIST: &str = "channel/member_config.list";
     pub const CHANNEL_MEMBER_CONFIG_SET: &str = "channel/member_config.set";
     pub const CHANNEL_MEMBER_CONFIG_CLEAR: &str = "channel/member_config.clear";
+    pub const CHANNEL_SET_INSTRUCTION: &str = "channel/set_instruction";
+    pub const CHANNEL_GET_INSTRUCTION: &str = "channel/get_instruction";
+    pub const CHANNEL_CLEAR_INSTRUCTION: &str = "channel/clear_instruction";
     pub const THREAD_CREATE: &str = "thread/create";
     pub const THREAD_LIST: &str = "thread/list";
     pub const THREAD_UPDATE: &str = "thread/update";
@@ -30,6 +33,9 @@ pub mod method {
     pub const THREAD_DELETE: &str = "thread/delete";
     pub const THREAD_FOLLOW: &str = "thread.follow";
     pub const THREAD_UNFOLLOW: &str = "thread.unfollow";
+    pub const THREAD_SET_INSTRUCTION: &str = "thread/set_instruction";
+    pub const THREAD_GET_INSTRUCTION: &str = "thread/get_instruction";
+    pub const THREAD_CLEAR_INSTRUCTION: &str = "thread/clear_instruction";
     pub const TASK_CREATE: &str = "task.create";
     pub const TASK_GET: &str = "task.get";
     pub const TASK_LIST: &str = "task.list";
@@ -383,6 +389,43 @@ pub struct ChannelDeleteResult {
     pub deleted_threads: u32,
 }
 
+// ---- channel/set_instruction / get_instruction / clear_instruction ----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelSetInstructionParams {
+    pub channel_id: String,
+    pub instructions: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelSetInstructionResult {
+    pub channel: Channel,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelGetInstructionParams {
+    pub channel_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelGetInstructionResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelClearInstructionParams {
+    pub channel_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelClearInstructionResult {
+    pub cleared: bool,
+}
+
 // ---- thread/create / list ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -452,6 +495,43 @@ pub struct ThreadDeleteParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadDeleteResult {
     pub deleted: bool,
+}
+
+// ---- thread/set_instruction / get_instruction / clear_instruction ----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadSetInstructionParams {
+    pub thread_id: String,
+    pub instructions: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadSetInstructionResult {
+    pub thread: Thread,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadGetInstructionParams {
+    pub thread_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadGetInstructionResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadClearInstructionParams {
+    pub thread_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadClearInstructionResult {
+    pub cleared: bool,
 }
 
 // ---- thread.follow / thread.unfollow ----

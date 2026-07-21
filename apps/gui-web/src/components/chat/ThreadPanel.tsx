@@ -177,7 +177,7 @@ export function ThreadPanel({
             )}
           </div>
           <div className="flex items-center gap-1">
-            {/* L1/L2 thread token summary (AC-T2) — silent-hidden when null */}
+            {/* L1/L2 thread token summary (AC-T2) - silent-hidden when null */}
             <ScopeTokenSummary scopeId={scopeId} actors={actors} />
             <button className="composer-icon" type="button" title="Close" onClick={onClose}>
               <X size={16} />
@@ -186,7 +186,7 @@ export function ThreadPanel({
         </div>
       </div>
 
-      {/* Body — root message header + virtualized replies via FeedScrollManager */}
+      {/* Body - root message header + virtualized replies via FeedScrollManager */}
       {!thread ? (
         <div className="flex min-h-0 flex-1 items-center justify-center p-4">
           <EmptyState icon={Split} text="Select a thread." />

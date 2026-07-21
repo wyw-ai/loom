@@ -9,12 +9,13 @@ import { MutedLine } from "@/components/shared/MutedLine";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { ChannelConfigurePanel } from "@/components/panels/ChannelConfigurePanel";
 import { actorKindLabel, channelPanelDetail, channelPanelTitle, getActorRunContext, memberPresence, runStatusDotClass, runStatusFullLabel } from "@/lib/agent-utils";
 import { canAddChannelMember, canRemoveChannelMember, channelTaskGroups, taskProgressPercent } from "@/lib/channel-utils";
 import { displayName, errorText, fallbackActor, findAgentMemberEntry, formatShortDateTime, machineCanRunCommands, shortActorAlias, statusDotClass, taskStatusBadgeClass } from "@/lib/format-utils";
 import { metadataString, metadataText, threadLastReplyLabel, threadParticipants, threadReplyCount } from "@/lib/message-utils";
 import { cn, formatTime, shortId } from "@/lib/utils";
-import { Check, ChevronLeft, Clock, Folder, FolderCog, HardDrive, Hash, Loader2, Plus, RefreshCw, Search, Split, UserPlus, Users, X } from "lucide-react";
+import { Check, ChevronLeft, Clock, Folder, FolderCog, HardDrive, Hash, Loader2, Plus, RefreshCw, Search, Settings, Split, UserPlus, Users, X } from "lucide-react";
 import type { Actor, Channel, ChannelMemberConfig, MachineDirListResult, MachineInfo, Message, Run, Task, Thread } from "@/ipc/types";
 import type { ChannelMemberPanelItem, ChannelMemberPresence, ChannelPanelTab, ThreadActivityStats } from "@/lib/types";
 import * as ipc from "@/ipc/bridge";
@@ -162,6 +163,7 @@ export function ChannelDetailPanel({
     { id: "threads", label: "Threads", count: channelThreads.length },
     { id: "members", label: "Members", count: members.length },
     { id: "tasks", label: "Tasks", count: channelTasks.length },
+    { id: "configure", label: "Configure", count: 0 },
   ];
   return (
     <aside className={cn("min-h-0 min-w-0 flex-col bg-[#fbfbfd]", className ?? "flex")}>
@@ -173,6 +175,8 @@ export function ChannelDetailPanel({
                 <Split size={24} />
               ) : tab === "members" ? (
                 <Users size={24} />
+              ) : tab === "configure" ? (
+                <Settings size={24} />
               ) : (
                 <Check size={24} />
               )}
@@ -194,7 +198,7 @@ export function ChannelDetailPanel({
         </div>
       </div>
 
-      <div className="grid h-12 shrink-0 grid-cols-3 border-b border-[#edf0f5] bg-white px-5">
+      <div className="grid h-12 shrink-0 grid-cols-4 border-b border-[#edf0f5] bg-white px-5">
         {tabs.map((item) => (
           <button
             key={item.id}
@@ -247,6 +251,8 @@ export function ChannelDetailPanel({
             onSaveMemberWorkspace={onSaveMemberWorkspace}
             onClearMemberWorkspace={onClearMemberWorkspace}
           />
+        ) : tab === "configure" ? (
+          <ChannelConfigurePanel channel={channel} />
         ) : (
           <ChannelTasksPanel actors={actors} tasks={channelTasks} />
         )}

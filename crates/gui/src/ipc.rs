@@ -1856,6 +1856,51 @@ pub async fn reveal_in_folder(args: OpenPathArgs) -> Result<(), String> {
     Ok(())
 }
 
+/// D1: Check whether a local path exists. Used by the FE to determine
+/// whether an attachment's `workspacePath` is locally reachable (local
+/// daemon) or remote-only.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PathExistsArgs {
+    pub path: String,
+}
+
+#[tauri::command]
+pub async fn path_exists(args: PathExistsArgs) -> Result<bool, String> {
+    let raw = args.path.trim();
+    if raw.is_empty() {
+        return Ok(false);
+    }
+    let path = normalize_local_path(config::expand_home(raw)).map_err(stringify)?;
+    Ok(path.exists())
+}
+
+/// D1: Write bytes to a local path. Used by the attachment download flow
+/// to persist `artifactRead` bytes to `workspacePath`, switching the
+/// attachment from remote to local state. Creates parent directories as
+/// needed.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WriteLocalFileArgs {
+    pub path: String,
+    pub bytes: Vec<u8>,
+}
+
+#[tauri::command]
+pub async fn write_local_file(args: WriteLocalFileArgs) -> Result<(), String> {
+    let raw = args.path.trim();
+    if raw.is_empty() {
+        return Err("path is required".into());
+    }
+    let path = normalize_local_path(config::expand_home(raw)).map_err(stringify)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create directory: {e}"))?;
+    }
+    std::fs::write(&path, &args.bytes).map_err(|e| format!("Failed to write file: {e}"))?;
+    Ok(())
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MachineCreateArgs {

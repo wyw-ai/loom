@@ -157,7 +157,7 @@ export function ThreadComposer({
               e.target.value = "";
             }}
           />
-          <div className={`composer-box composer-box-compact relative flex h-full items-start gap-2${isManual ? " composer-box-manual" : ""}`}>
+          <div className={`composer-box composer-box-compact relative flex h-full items-end gap-2${isManual ? " composer-box-manual" : ""}`}>
             {showMentions && (
               <MentionMenu
                 options={mentionOptions}
@@ -165,6 +165,15 @@ export function ThreadComposer({
                 onSelect={chooseMention}
               />
             )}
+            <button
+              type="button"
+              onClick={openFilePicker}
+              disabled={disabled}
+              title="Attach files"
+              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-[#667085] transition-colors hover:bg-[#f0f2f7] hover:text-[#1d2939] disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <Paperclip size={15} />
+            </button>
             <AutoGrowTextarea
             ref={textareaRef}
             value={draft}
@@ -212,17 +221,8 @@ export function ThreadComposer({
             }}
             disabled={disabled}
             placeholder={disabled ? "Select a thread" : "Reply in thread..."}
-            className="max-h-full min-h-[42px] flex-1 px-0 pl-8 pr-3 mr-9 text-sm"
+            className="max-h-full min-h-[42px] flex-1 px-0 pr-3 mr-9 text-sm"
           />
-          <button
-            type="button"
-            onClick={openFilePicker}
-            disabled={disabled}
-            title="Attach files"
-            className="absolute bottom-3 left-1 flex h-6 w-6 items-center justify-center rounded-md text-[#667085] transition-colors hover:bg-[#f0f2f7] hover:text-[#1d2939] disabled:cursor-not-allowed disabled:opacity-40"
-          >
-            <Paperclip size={15} />
-          </button>
           <Button
             size="icon"
             onClick={handleSend}

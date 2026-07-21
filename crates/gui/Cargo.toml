@@ -30,6 +30,7 @@ dirs = { workspace = true }
 toml = { workspace = true }
 url = { workspace = true }
 chrono = { workspace = true }
+rfd = "0.15"
 
 [features]
 # Tauri 2 capability to open devtools, opt-in in dev builds.

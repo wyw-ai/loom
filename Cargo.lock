@@ -2608,6 +2608,7 @@ dependencies = [
 name = "loom-platform"
 version = "0.1.0"
 dependencies = [
+ "dirs 5.0.1",
  "dunce",
  "interprocess",
  "libc",

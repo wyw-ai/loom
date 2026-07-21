@@ -38,7 +38,7 @@ pub async fn create(
         .await?;
     let thread_id = res.thread.id.clone();
 
-    let data_root = data_root();
+    let data_root = super::paths::agent_data_root();
     if let Some(role) = resident_as.as_deref() {
         write_resident_thread(&data_root, &channel_id, role, &thread_id)?;
     }
@@ -376,7 +376,7 @@ pub async fn bootstrap(
     }
     let mounts = fetch_bootstrap_mounts(client.clone(), &bootstrap_artifact).await?;
     let count = mounts.len();
-    let data_root = data_root();
+    let data_root = super::paths::agent_data_root();
     write_thread_mounts(&data_root, &channel_id, &thread_id, &mounts)?;
     if render::is_json() {
         render::print_json(&json!({
@@ -389,17 +389,6 @@ pub async fn bootstrap(
         println!("bootstrapped thread {thread_id}  channel={channel_id}  mounts={count}  artifact={bootstrap_artifact}");
     }
     Ok(())
-}
-
-fn data_root() -> PathBuf {
-    if let Some(v) = std::env::var_os("LOOM_AGENT_DATA_ROOT") {
-        if !v.is_empty() {
-            return PathBuf::from(v);
-        }
-    }
-    dirs::data_dir()
-        .map(|d| d.join("loom").join("agents"))
-        .unwrap_or_else(|| PathBuf::from(".loom").join("agents-data"))
 }
 
 fn channel_shared_scope_json(data_root: &Path, channel_id: &str) -> PathBuf {

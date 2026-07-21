@@ -1130,6 +1130,177 @@ pub async fn artifact_read(state: State<'_, AppState>, params: Value) -> Result<
         .map_err(stringify)
 }
 
+/// E1: Check whether an artifact exists on the server. Replaces the
+/// deprecated `path_exists` for attachment state detection — works
+/// correctly in distributed deployments (server/daemon/gui on
+/// different machines) because it queries the Server API rather than
+/// the local filesystem.
+#[tauri::command]
+pub async fn artifact_exists(state: State<'_, AppState>, params: Value) -> Result<bool, String> {
+    let result = state
+        .client()
+        .await?
+        .call_raw(method::ARTIFACT_GET, Some(params))
+        .await
+        .map_err(stringify)?;
+    // artifact_get returns the artifact metadata if it exists, or an
+    // error/null if not. Treat a successful non-null response as "exists".
+    Ok(!result.is_null())
+}
+
+/// Maximum payload size for `download_to_temp` (100 MB).
+const DOWNLOAD_TO_TEMP_MAX_BYTES: usize = 100 * 1024 * 1024;
+
+/// E1: Download an artifact to the system temp directory. Uses the
+/// Server API `artifact_read` to fetch bytes, then writes them to
+/// `std::env::temp_dir()/loom-downloads/<suggestedName>`. Returns the
+/// full path of the downloaded file. This replaces the deprecated
+/// `write_local_file` for the attachment download flow — it does not
+/// write to `workspacePath` (which may point to a remote machine).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadToTempArgs {
+    pub artifact_id: String,
+    #[serde(default)]
+    pub suggested_name: Option<String>,
+}
+
+#[tauri::command]
+pub async fn download_to_temp(
+    state: State<'_, AppState>,
+    args: DownloadToTempArgs,
+) -> Result<String, String> {
+    // Fetch artifact metadata to determine media type and validate existence.
+    let meta = state
+        .client()
+        .await?
+        .call_raw(
+            method::ARTIFACT_GET,
+            Some(json!({ "artifactId": args.artifact_id })),
+        )
+        .await
+        .map_err(stringify)?;
+    if meta.is_null() {
+        return Err(format!("artifact not found: {}", args.artifact_id));
+    }
+
+    // Determine the filename: explicit suggestion > artifact name > fallback.
+    let artifact_name = meta
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("download")
+        .to_string();
+    let file_name = args
+        .suggested_name
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or(artifact_name);
+    // Sanitize the filename — strip path separators to prevent directory traversal.
+    let safe_name = sanitize_filename(&file_name);
+
+    let download_dir = std::env::temp_dir().join("loom-downloads");
+    std::fs::create_dir_all(&download_dir)
+        .map_err(|e| format!("Failed to create temp download directory: {e}"))?;
+    let dest_path = download_dir.join(&safe_name);
+
+    // Stream artifact_read in chunks until complete or limit exceeded.
+    let mut file = std::fs::File::create(&dest_path)
+        .map_err(|e| format!("Failed to create temp file: {e}"))?;
+    let mut offset = 0u64;
+    let mut total_written = 0usize;
+    let chunk_size = 65_536u64;
+    loop {
+        let chunk = state
+            .client()
+            .await?
+            .call_raw(
+                method::ARTIFACT_READ,
+                Some(json!({
+                    "artifactId": args.artifact_id,
+                    "offset": offset,
+                    "maxBytes": chunk_size,
+                })),
+            )
+            .await
+            .map_err(stringify)?;
+
+        let bytes = extract_artifact_bytes(&chunk)?;
+        let written = bytes.len();
+        if written == 0 {
+            break;
+        }
+        total_written += written;
+        if total_written > DOWNLOAD_TO_TEMP_MAX_BYTES {
+            // Clean up partial file before returning error.
+            let _ = std::fs::remove_file(&dest_path);
+            return Err(format!(
+                "file exceeds {} byte download limit",
+                DOWNLOAD_TO_TEMP_MAX_BYTES
+            ));
+        }
+        std::io::Write::write_all(&mut file, &bytes)
+            .map_err(|e| format!("Failed to write temp file: {e}"))?;
+
+        let truncated = chunk
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !truncated {
+            break;
+        }
+        match chunk.get("nextOffset").and_then(Value::as_u64) {
+            Some(next) if next > offset => offset = next,
+            _ => break,
+        }
+    }
+
+    Ok(dest_path.display().to_string())
+}
+
+/// Extract raw bytes from an `artifact_read` response. The server
+/// populates both `bytes` (as a JSON number array) and `content` (as a
+/// lossy UTF-8 string). We prefer `bytes` for binary correctness; fall
+/// back to `content`'s raw bytes only if `bytes` is absent.
+fn extract_artifact_bytes(response: &Value) -> Result<Vec<u8>, String> {
+    if let Some(bytes) = response.get("bytes").and_then(Value::as_array) {
+        if !bytes.is_empty() {
+            return Ok(bytes
+                .iter()
+                .filter_map(|v| v.as_u64().map(|n| n as u8))
+                .collect());
+        }
+    }
+    if let Some(content) = response.get("content").and_then(Value::as_str) {
+        return Ok(content.as_bytes().to_vec());
+    }
+    Ok(Vec::new())
+}
+
+/// Sanitize a filename by removing path separators and other dangerous
+/// characters. Keeps Unicode letters/digits, dots, dashes, underscores,
+/// and spaces.
+fn sanitize_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | ' ') {
+                c
+            } else if c == '/' || c == '\\' {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        "loom-download".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 #[tauri::command]
 pub async fn run_cancel(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
     state
@@ -1566,6 +1737,10 @@ pub struct MachineDirListArgs {
     pub machine_id: String,
     #[serde(default)]
     pub path: Option<String>,
+    /// E1: When true, include file entries (not just directories) in the
+    /// response. Defaults to false for backward compatibility.
+    #[serde(default)]
+    pub include_files: bool,
 }
 
 #[tauri::command]
@@ -1582,6 +1757,7 @@ pub async fn machine_dir_list(
         json!({
             "op": "fs.dir.list",
             "path": args.path,
+            "includeFiles": args.include_files,
         }),
     )
     .await
@@ -1856,6 +2032,11 @@ pub async fn reveal_in_folder(args: OpenPathArgs) -> Result<(), String> {
     Ok(())
 }
 
+/// **[DEPRECATED — E1]** Use `artifact_exists` instead. This command
+/// checks the local filesystem, which is incorrect in distributed
+/// deployments (server/daemon/gui on different machines). Retained for
+/// backward compatibility but no longer used by the attachment logic.
+///
 /// D1: Check whether a local path exists. Used by the FE to determine
 /// whether an attachment's `workspacePath` is locally reachable (local
 /// daemon) or remote-only.
@@ -1875,6 +2056,11 @@ pub async fn path_exists(args: PathExistsArgs) -> Result<bool, String> {
     Ok(path.exists())
 }
 
+/// **[DEPRECATED — E1]** Use `download_to_temp` instead. This command
+/// writes to `workspacePath`, which may point to a remote machine in
+/// distributed deployments. Retained for backward compatibility but no
+/// longer used by the attachment download flow.
+///
 /// D1: Write bytes to a local path. Used by the attachment download flow
 /// to persist `artifactRead` bytes to `workspacePath`, switching the
 /// attachment from remote to local state. Creates parent directories as

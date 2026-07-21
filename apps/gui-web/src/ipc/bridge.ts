@@ -282,6 +282,7 @@ export async function messageSend(params: {
   intent?: MessageIntent;
   deliveryPolicy?: DeliveryPolicy;
   metadata?: Record<string, unknown>;
+  attachments?: string[];
 }): Promise<{ message: Message }> {
   return invoke("message_send", {
     params: {
@@ -300,6 +301,7 @@ export async function messageSend(params: {
       intent: params.intent ?? "chat",
       deliveryPolicy: params.deliveryPolicy ?? "notify_only",
       metadata: params.metadata ?? {},
+      attachments: params.attachments ?? [],
     },
   });
 }
@@ -357,6 +359,33 @@ export async function artifactRead(params: {
       artifactId: params.artifactId,
       offset: params.offset ?? 0,
       maxBytes: params.maxBytes ?? 65536,
+    },
+  });
+}
+
+export async function artifactPublish(params: {
+  ingress:
+    | { kind: "inlineText"; name: string; mediaType?: string; text: string }
+    | { kind: "fileBytes"; name: string; mediaType?: string; bytes: number[] };
+  createdBy: string;
+  scope?: ScopeRef;
+}): Promise<{ artifact: Artifact }> {
+  const kind = params.ingress.kind === "inlineText" ? "inline_text" : "file_bytes";
+  const payload: Record<string, unknown> = {
+    kind,
+    name: params.ingress.name,
+    mediaType: params.ingress.mediaType ?? (params.ingress.kind === "inlineText" ? "text/markdown" : "application/octet-stream"),
+  };
+  if (params.ingress.kind === "inlineText") {
+    payload.text = params.ingress.text;
+  } else {
+    payload.bytes = params.ingress.bytes;
+  }
+  return invoke("artifact_publish", {
+    params: {
+      ingress: payload,
+      createdBy: params.createdBy,
+      ...(params.scope ? { scope: params.scope } : {}),
     },
   });
 }

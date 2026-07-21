@@ -54,7 +54,7 @@ export function ThreadPanel({
   busy: string | null;
   className?: string;
   onClose: () => void;
-  onSend: () => void;
+  onSend: (attachments?: import("@/lib/attachment-utils").PendingAttachment[]) => void;
   onToggleReaction: (message: Message, emoji: string) => void;
   onOpenAgentSettings: (actorId: string) => void;
   scopeId?: string | null;

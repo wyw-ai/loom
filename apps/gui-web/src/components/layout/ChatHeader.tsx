@@ -1,5 +1,5 @@
 import type { ComponentType } from "react";
-import { Check, Hash, Split, Users } from "lucide-react";
+import { Check, Hash, Settings, Split, Users } from "lucide-react";
 import type { Actor, Channel, Run } from "@/ipc/types";
 import type { ChannelPanelTab } from "@/lib/types";
 import type { ConnectionState } from "@/lib/types";
@@ -61,6 +61,7 @@ export function ChatHeader({
     { id: "threads", title: "Threads", icon: Split },
     { id: "members", title: "Members", icon: Users },
     { id: "tasks", title: "Tasks", icon: Check },
+    { id: "configure", title: "Configure", icon: Settings },
   ];
   return (
     <header className="flex h-[86px] shrink-0 items-center gap-4 border-b border-[#e2e6ef] bg-white px-6">

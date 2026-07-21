@@ -94,6 +94,21 @@ pub struct Channel {
     /// the ACL gate is skipped; for `Private` channels it is authoritative.
     #[serde(default)]
     pub members: Vec<String>,
+    /// Channel-level instructions projected into every member agent's
+    /// AGENTS.md. Use this to declare the channel's purpose, rules, and
+    /// shared context conventions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    /// Actor id of the member who last set/cleared the channel
+    /// instructions. `None` when the instructions have never been set, or
+    /// in journals predating this audit field (forward-compat via
+    /// `#[serde(default)]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions_modified_by: Option<String>,
+    /// Server-side UTC timestamp of the last instructions edit. `None`
+    /// when never set, or for legacy journals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions_modified_at: Option<Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
     pub _meta: Option<Meta>,
 }
@@ -156,6 +171,20 @@ pub struct Thread {
     pub channel_id: String,
     pub title: String,
     pub root_message_id: String,
+    /// Thread-level instructions. When present, these are appended after
+    /// channel instructions in the AGENTS.md block, giving the thread
+    /// scope-specific guidance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    /// Actor id of the member who last set/cleared the thread
+    /// instructions. `None` when never set, or in journals predating this
+    /// audit field (forward-compat via `#[serde(default)]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions_modified_by: Option<String>,
+    /// Server-side UTC timestamp of the last thread instructions edit.
+    /// `None` when never set, or for legacy journals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions_modified_at: Option<Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]

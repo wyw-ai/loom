@@ -74,6 +74,20 @@ pub enum Mutation {
     ChannelDelete {
         channel_id: String,
     },
+    /// Set or replace the channel-level `instructions`. Idempotent on replay.
+    ChannelInstructionSet {
+        channel_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instructions: Option<String>,
+        /// Actor id of the member who performed the edit. Forward-compat
+        /// default `None` so legacy journals replay cleanly.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        modified_by: Option<String>,
+        /// Server-side UTC timestamp of the edit. Forward-compat default
+        /// `None` for legacy journals.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        modified_at: Option<Timestamp>,
+    },
     ThreadUpdate {
         thread_id: String,
         title: String,
@@ -84,6 +98,16 @@ pub enum Mutation {
     },
     ThreadDelete {
         thread_id: String,
+    },
+    /// Set or replace the thread-level `instructions`. Idempotent on replay.
+    ThreadInstructionSet {
+        thread_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instructions: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        modified_by: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        modified_at: Option<Timestamp>,
     },
     /// Add `actor_id` to `channel_id`'s member set. Idempotent on replay.
     ChannelGrant {

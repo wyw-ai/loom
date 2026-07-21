@@ -2,7 +2,7 @@ import type { Actor, AgentBundleSkillSpec, Channel, MachineAgentProviderInfo, Ma
 
 export type ConnectionState = "idle" | "connecting" | "open" | "closed" | "error";
 export type View = "chat" | "threads" | "channels" | "direct" | "inbox" | "tasks" | "spaces" | "account" | "settings";
-export type ChannelPanelTab = "threads" | "members" | "tasks";
+export type ChannelPanelTab = "threads" | "members" | "tasks" | "configure";
 export type ChannelGroup = {
   id: string;
   title: string;

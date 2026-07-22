@@ -488,6 +488,37 @@ export function errorText(err: unknown) {
   return err instanceof Error ? err.message : String(err);
 }
 
+export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return "Unknown size";
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = bytes / 1024;
+  for (const unit of units) {
+    if (value < 1024) return `${value >= 10 ? value.toFixed(0) : value.toFixed(1)} ${unit}`;
+    value /= 1024;
+  }
+  return `${value.toFixed(1)} PB`;
+}
+
+export function formatFileTimestamp(value: string | null | undefined): string {
+  if (!value) return "";
+  try {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "";
+    const now = new Date();
+    const sameDay =
+      date.getFullYear() === now.getFullYear() &&
+      date.getMonth() === now.getMonth() &&
+      date.getDate() === now.getDate();
+    if (sameDay) {
+      return date.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+    }
+    return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  } catch {
+    return "";
+  }
+}
+
 export function filterEmptyEnvKeys(env: Record<string, string>): Record<string, string> {
   const filtered: Record<string, string> = {};
   for (const [key, value] of Object.entries(env)) {

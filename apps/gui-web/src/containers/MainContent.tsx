@@ -264,9 +264,42 @@ export function MainContent(props: MainContentProps) {
           onSendThreadMessage={p.sendThreadMessage}
           onToggleReaction={p.toggleMessageReaction}
           onOpenAgentSettings={p.openAgentSettings}
+          onOpenThreadFolder={() => {
+            const thread = p.activeThread;
+            if (!thread) return;
+            const localMachine = p.machines.find((m) => m.canOpenLocalPath);
+            if (localMachine?.dataRoot) {
+              const sep = localMachine.dataRoot.includes("\\") && !localMachine.dataRoot.includes("/") ? "\\" : "/";
+              const path = `${localMachine.dataRoot}${sep}workspaces${sep}thread${sep}${thread.id}${sep}`;
+              p.openLocalPath(path);
+            } else {
+              const remoteMachine =
+                p.machines.find((m) => m.connectionStatus === "connected") ?? p.machines[0];
+              if (!remoteMachine) {
+                p.setError("No machine available for file browsing.");
+                return;
+              }
+              const root = remoteMachine.dataRoot || ".";
+              setRemoteFilePanel({
+                channelId: thread.channelId,
+                machineId: remoteMachine.id,
+                dataRoot: root,
+                threadId: thread.id,
+              });
+            }
+          }}
           busy={p.busy}
           disabled={p.connection !== "open" || !p.threadMessageTarget}
         />
+        {remoteFilePanel && (
+          <RemoteFilePanel
+            channelId={remoteFilePanel.channelId}
+            machineId={remoteFilePanel.machineId}
+            dataRoot={remoteFilePanel.dataRoot}
+            threadId={remoteFilePanel.threadId}
+            onClose={() => setRemoteFilePanel(null)}
+          />
+        )}
       </>
     );
   }

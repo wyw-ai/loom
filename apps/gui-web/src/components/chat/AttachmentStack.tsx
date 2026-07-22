@@ -4,7 +4,7 @@ import { CheckCircle, Download, ExternalLink, Eye, FileText, FolderOpen, Loader2
 
 import * as ipc from "@/ipc/bridge";
 import type { Artifact, ArtifactReadResult } from "@/ipc/types";
-import { errorText } from "@/lib/format-utils";
+import { errorText, formatBytes } from "@/lib/format-utils";
 import { attachmentKind, attachmentTitle, metadataString } from "@/lib/message-utils";
 import { useDownloadedArtifacts } from "@/hooks/useDownloadedArtifacts";
 
@@ -475,18 +475,6 @@ function titleCaseWords(value: string) {
     .filter(Boolean)
     .map((word) => word.slice(0, 1).toUpperCase() + word.slice(1))
     .join(" ");
-}
-
-function formatBytes(bytes: number) {
-  if (!Number.isFinite(bytes) || bytes < 0) return "Unknown size";
-  if (bytes < 1024) return `${bytes} B`;
-  const units = ["KB", "MB", "GB", "TB"];
-  let value = bytes / 1024;
-  for (const unit of units) {
-    if (value < 1024) return `${value >= 10 ? value.toFixed(0) : value.toFixed(1)} ${unit}`;
-    value /= 1024;
-  }
-  return `${value.toFixed(1)} PB`;
 }
 
 function artifactReadBytes(read: ArtifactReadResult) {

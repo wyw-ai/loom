@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { CheckCircle, Download, ExternalLink, Eye, FileText, FolderOpen, Loader2, X } from "lucide-react";
+import { CheckCircle, Download, ExternalLink, Eye, FileText, FolderOpen, Loader2, Save, X } from "lucide-react";
 
 import * as ipc from "@/ipc/bridge";
 import type { Artifact, ArtifactReadResult } from "@/ipc/types";
 import { errorText } from "@/lib/format-utils";
 import { attachmentKind, attachmentTitle, metadataString } from "@/lib/message-utils";
+import { useDownloadedArtifacts } from "@/hooks/useDownloadedArtifacts";
 
 type ArtifactPreviewState =
   | {
@@ -30,17 +31,18 @@ function AttachmentCard({ attachment }: { attachment: string }) {
   const [busy, setBusy] = useState<"preview" | "download" | "open" | "reveal" | "save" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<ArtifactPreviewState | null>(null);
-  const [localTempPath, setLocalTempPath] = useState<string | null>(null);
+  const { isDownloaded, setDownloaded, clearDownloaded } = useDownloadedArtifacts();
   const previewObjectUrlRef = useRef<string | null>(null);
 
   const title = artifact?.name || attachmentTitle(attachment);
+  const localTempPath = artifact ? isDownloaded(artifact.id) : null;
   const previewMode = artifact ? artifactPreviewMode(artifact) : null;
   const detail = loading
     ? "Loading artifact..."
-    : error
-      ? "Artifact unavailable"
-      : artifact
-        ? `${artifactKindLabel(artifact)} - ${formatBytes(artifact.size)}`
+    : artifact
+      ? `${artifactKindLabel(artifact)} - ${formatBytes(artifact.size)}`
+      : error
+        ? "Failed to load metadata"
         : attachmentKind(attachment);
 
   useEffect(() => {
@@ -84,15 +86,14 @@ function AttachmentCard({ attachment }: { attachment: string }) {
   useEffect(() => {
     if (!artifact) return;
     let cancelled = false;
-    setLocalTempPath(null);
     ipc
       .artifactExists({ artifactId: artifact.id })
       .then(() => {
-        // Server confirms artifact is accessible; localTempPath stays null
-        // until user explicitly downloads to temp.
+        // Server confirms artifact is accessible
       })
       .catch(() => {
-        if (!cancelled) setError("Artifact not available on server");
+        // Server API check failed — silent degradation, file still available via Download
+        if (!cancelled) console.warn("artifactExists check failed for", artifact.id);
       });
     return () => {
       cancelled = true;
@@ -157,10 +158,17 @@ function AttachmentCard({ attachment }: { attachment: string }) {
   }
 
   async function openFile() {
-    if (!localTempPath) return;
+    if (!artifact || !localTempPath) return;
     setBusy("open");
     setError(null);
     try {
+      const exists = await ipc.pathExists(localTempPath);
+      if (!exists) {
+        // Temp file was cleaned by system — re-download
+        clearDownloaded(artifact.id);
+        await downloadArtifact();
+        return;
+      }
       await ipc.openFileDefault(localTempPath);
     } catch (err) {
       setError(errorText(err));
@@ -170,10 +178,16 @@ function AttachmentCard({ attachment }: { attachment: string }) {
   }
 
   async function revealFile() {
-    if (!localTempPath) return;
+    if (!artifact || !localTempPath) return;
     setBusy("reveal");
     setError(null);
     try {
+      const exists = await ipc.pathExists(localTempPath);
+      if (!exists) {
+        clearDownloaded(artifact.id);
+        await downloadArtifact();
+        return;
+      }
       await ipc.revealInFolder(localTempPath);
     } catch (err) {
       setError(errorText(err));
@@ -191,7 +205,7 @@ function AttachmentCard({ attachment }: { attachment: string }) {
         artifactId: artifact.id,
         suggestedName: artifact.name || `${artifact.id}.bin`,
       });
-      setLocalTempPath(tempPath);
+      setDownloaded(artifact.id, tempPath);
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -221,7 +235,7 @@ function AttachmentCard({ attachment }: { attachment: string }) {
         </div>
         {artifact && (
           <div className="attachment-actions">
-            {previewMode && (
+            {previewMode && localTempPath && (
               <button
                 type="button"
                 className="attachment-action"
@@ -269,16 +283,18 @@ function AttachmentCard({ attachment }: { attachment: string }) {
                 {busy === "reveal" ? <Loader2 className="animate-spin" size={14} /> : <FolderOpen size={14} />}
               </button>
             )}
-            <button
-              type="button"
-              className="attachment-action"
-              title="Save as..."
-              aria-label={`Save ${title} as`}
-              disabled={Boolean(busy)}
-              onClick={saveAsFile}
-            >
-              {busy === "save" ? <Loader2 className="animate-spin" size={14} /> : <Download size={14} />}
-            </button>
+            {localTempPath && (
+              <button
+                type="button"
+                className="attachment-action"
+                title="Save as..."
+                aria-label={`Save ${title} as`}
+                disabled={Boolean(busy)}
+                onClick={saveAsFile}
+              >
+                {busy === "save" ? <Loader2 className="animate-spin" size={14} /> : <Save size={14} />}
+              </button>
+            )}
           </div>
         )}
       </div>

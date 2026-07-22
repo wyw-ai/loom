@@ -165,7 +165,7 @@ export function MainContent(props: MainContentProps) {
             const localMachine = p.machines.find((m) => m.canOpenLocalPath);
             if (localMachine?.dataRoot) {
               const sep = localMachine.dataRoot.includes("\\") && !localMachine.dataRoot.includes("/") ? "\\" : "/";
-              const path = `${localMachine.dataRoot}${sep}channels${sep}${ch.id}${sep}`;
+              const path = `${localMachine.dataRoot}${sep}workspaces${sep}channel${sep}${ch.id}${sep}`;
               p.openLocalPath(path);
             } else {
               const remoteMachine =

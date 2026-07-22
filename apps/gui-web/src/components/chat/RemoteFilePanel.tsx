@@ -149,7 +149,12 @@ export function RemoteFilePanel({ channelId, machineId, dataRoot, threadId, onCl
       setDirList(result);
       setCurrentPath(result.path);
     } catch (err) {
-      setError(errorText(err));
+      const msg = errorText(err);
+      if (/os error 2|not found|no such file/i.test(msg)) {
+        setDirList(null);
+      } else {
+        setError(msg);
+      }
     } finally {
       setLoading(false);
     }
@@ -250,6 +255,11 @@ export function RemoteFilePanel({ channelId, machineId, dataRoot, threadId, onCl
               >
                 Retry
               </button>
+            </div>
+          )}
+          {!loading && !error && !dirList && (
+            <div className="py-8 text-center text-sm text-[#667085]">
+              暂无附件
             </div>
           )}
           {!loading && !error && dirList && (

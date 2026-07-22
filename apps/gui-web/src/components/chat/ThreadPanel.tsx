@@ -185,7 +185,7 @@ export function ThreadPanel({
               <button
                 className="composer-icon"
                 type="button"
-                title="Open thread folder"
+                title="查看 thread 中的所有附件"
                 onClick={onOpenFolder}
               >
                 <FolderOpen size={15} />

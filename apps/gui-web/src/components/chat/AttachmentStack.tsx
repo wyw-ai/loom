@@ -165,6 +165,7 @@ function AttachmentCard({ attachment }: { attachment: string }) {
       const exists = await ipc.pathExists(localTempPath);
       if (!exists) {
         // Temp file was cleaned by system — re-download
+        setError("本地文件已被删除，正在重新下载...");
         clearDownloaded(artifact.id);
         await downloadArtifact();
         return;
@@ -184,6 +185,7 @@ function AttachmentCard({ attachment }: { attachment: string }) {
     try {
       const exists = await ipc.pathExists(localTempPath);
       if (!exists) {
+        setError("本地文件已被删除，正在重新下载...");
         clearDownloaded(artifact.id);
         await downloadArtifact();
         return;

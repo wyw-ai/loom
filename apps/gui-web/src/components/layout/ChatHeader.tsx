@@ -119,8 +119,8 @@ export function ChatHeader({
           <Button
             variant="outline"
             size="icon"
-            title="Open shared folder"
-            aria-label="Open shared folder"
+            title="查看 channel 中的所有附件"
+            aria-label="查看 channel 中的所有附件"
             disabled={!channel}
             onClick={onOpenFolder}
             className="relative h-9 w-9 shrink-0 rounded-lg"

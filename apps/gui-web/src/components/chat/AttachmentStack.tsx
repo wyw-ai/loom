@@ -4,7 +4,7 @@ import { CheckCircle, Download, ExternalLink, Eye, FileText, FolderOpen, Loader2
 
 import * as ipc from "@/ipc/bridge";
 import type { Artifact, ArtifactReadResult } from "@/ipc/types";
-import { errorText, formatBytes } from "@/lib/format-utils";
+import { errorText, formatBytes, formatFileTimestamp } from "@/lib/format-utils";
 import { attachmentKind, attachmentTitle, metadataString } from "@/lib/message-utils";
 import { useDownloadedArtifacts } from "@/hooks/useDownloadedArtifacts";
 
@@ -40,7 +40,7 @@ function AttachmentCard({ attachment }: { attachment: string }) {
   const detail = loading
     ? "Loading artifact..."
     : artifact
-      ? `${artifactKindLabel(artifact)} - ${formatBytes(artifact.size)}`
+      ? `${artifactKindLabel(artifact)} - ${formatBytes(artifact.size)}${artifact.createdAt ? ` · ${formatFileTimestamp(artifact.createdAt)}` : ""}`
       : error
         ? "Failed to load metadata"
         : attachmentKind(attachment);
@@ -164,10 +164,8 @@ function AttachmentCard({ attachment }: { attachment: string }) {
     try {
       const exists = await ipc.pathExists(localTempPath);
       if (!exists) {
-        // Temp file was cleaned by system — re-download
-        setError("Local file deleted, re-downloading...");
+        setError("Local file deleted");
         clearDownloaded(artifact.id);
-        await downloadArtifact();
         return;
       }
       await ipc.openFileDefault(localTempPath);
@@ -185,9 +183,8 @@ function AttachmentCard({ attachment }: { attachment: string }) {
     try {
       const exists = await ipc.pathExists(localTempPath);
       if (!exists) {
-        setError("Local file deleted, re-downloading...");
+        setError("Local file deleted");
         clearDownloaded(artifact.id);
-        await downloadArtifact();
         return;
       }
       await ipc.revealInFolder(localTempPath);
@@ -222,7 +219,7 @@ function AttachmentCard({ attachment }: { attachment: string }) {
           {busy || loading ? <Loader2 className="animate-spin" size={18} /> : <FileText size={18} />}
         </div>
         <div className="min-w-0 flex-1">
-          <div className="truncate text-sm font-bold text-[#303849]" title={title}>
+          <div className="truncate text-sm font-bold text-[#303849]" title={`${title}${artifact ? ` (${artifact.id.slice(-6)})` : ""}`}>
             {title}
             {artifact && localTempPath && (
               <CheckCircle size={13} className="ml-1 inline-block shrink-0 text-emerald-500" aria-label="Downloaded to local temp" />

@@ -32,6 +32,7 @@ export function ThreadsView({
   onSendThreadMessage,
   onToggleReaction,
   onOpenAgentSettings,
+  onOpenThreadFolder,
   busy,
   disabled,
 }: {
@@ -54,6 +55,7 @@ export function ThreadsView({
   onSendThreadMessage: () => void;
   onToggleReaction: (message: Message, emoji: string) => void;
   onOpenAgentSettings: (actorId: string) => void;
+  onOpenThreadFolder?: () => void;
   busy: string | null;
   disabled: boolean;
 }) {
@@ -135,6 +137,7 @@ export function ThreadsView({
           onSend={onSendThreadMessage}
           onToggleReaction={onToggleReaction}
           onOpenAgentSettings={onOpenAgentSettings}
+          onOpenFolder={onOpenThreadFolder}
           scopeId={activeThread?.id}
         />
       </div>

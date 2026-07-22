@@ -135,9 +135,6 @@ export function MainContent(props: MainContentProps) {
   const p = props;
   const [remoteFilePanel, setRemoteFilePanel] = useState<{
     channelId: string;
-    machineId: string;
-    dataRoot: string;
-    threadId?: string;
     target: string;
   } | null>(null);
 
@@ -169,18 +166,8 @@ export function MainContent(props: MainContentProps) {
               const path = `${localMachine.dataRoot}${sep}workspaces${sep}channel${sep}${ch.id}${sep}`;
               p.openLocalPath(path);
             } else {
-              const remoteMachine =
-                p.machines.find((m) => m.connectionStatus === "connected") ?? p.machines[0];
-              if (!remoteMachine) {
-                p.setError("No machine available for file browsing.");
-                return;
-              }
-              const root = remoteMachine.dataRoot || ".";
               setRemoteFilePanel({
                 channelId: ch.id,
-                machineId: remoteMachine.id,
-                dataRoot: root,
-                threadId: p.activeThread?.id,
                 target: p.target ?? `#${ch.id}`,
               });
             }
@@ -228,9 +215,6 @@ export function MainContent(props: MainContentProps) {
         {remoteFilePanel && (
           <RemoteFilePanel
             channelId={remoteFilePanel.channelId}
-            machineId={remoteFilePanel.machineId}
-            dataRoot={remoteFilePanel.dataRoot}
-            threadId={remoteFilePanel.threadId}
             target={remoteFilePanel.target}
             onClose={() => setRemoteFilePanel(null)}
           />
@@ -276,18 +260,8 @@ export function MainContent(props: MainContentProps) {
               const path = `${localMachine.dataRoot}${sep}workspaces${sep}thread${sep}${thread.id}${sep}`;
               p.openLocalPath(path);
             } else {
-              const remoteMachine =
-                p.machines.find((m) => m.connectionStatus === "connected") ?? p.machines[0];
-              if (!remoteMachine) {
-                p.setError("No machine available for file browsing.");
-                return;
-              }
-              const root = remoteMachine.dataRoot || ".";
               setRemoteFilePanel({
                 channelId: thread.channelId,
-                machineId: remoteMachine.id,
-                dataRoot: root,
-                threadId: thread.id,
                 target: p.threadMessageTarget ?? `#${thread.channelId}:${thread.rootMessageId}`,
               });
             }
@@ -298,9 +272,6 @@ export function MainContent(props: MainContentProps) {
         {remoteFilePanel && (
           <RemoteFilePanel
             channelId={remoteFilePanel.channelId}
-            machineId={remoteFilePanel.machineId}
-            dataRoot={remoteFilePanel.dataRoot}
-            threadId={remoteFilePanel.threadId}
             target={remoteFilePanel.target}
             onClose={() => setRemoteFilePanel(null)}
           />

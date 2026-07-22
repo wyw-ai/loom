@@ -25,7 +25,7 @@ const artifactReadChunkBytes = 1024 * 1024;
 const artifactPreviewTextBytes = 256 * 1024;
 const artifactPreviewBinaryBytes = 25 * 1024 * 1024;
 
-function AttachmentCard({ attachment }: { attachment: string }) {
+function AttachmentCard({ attachment, disambigSuffix }: { attachment: string; disambigSuffix?: string }) {
   const [artifact, setArtifact] = useState<Artifact | null>(null);
   const [loading, setLoading] = useState(() => Boolean(artifactLookupParams(attachment)));
   const [busy, setBusy] = useState<"preview" | "download" | "open" | "reveal" | "save" | null>(null);
@@ -165,7 +165,7 @@ function AttachmentCard({ attachment }: { attachment: string }) {
       const exists = await ipc.pathExists(localTempPath);
       if (!exists) {
         // Temp file was cleaned by system — re-download
-        setError("本地文件已被删除，正在重新下载...");
+        setError("Local file deleted, re-downloading...");
         clearDownloaded(artifact.id);
         await downloadArtifact();
         return;
@@ -185,7 +185,7 @@ function AttachmentCard({ attachment }: { attachment: string }) {
     try {
       const exists = await ipc.pathExists(localTempPath);
       if (!exists) {
-        setError("本地文件已被删除，正在重新下载...");
+        setError("Local file deleted, re-downloading...");
         clearDownloaded(artifact.id);
         await downloadArtifact();
         return;
@@ -224,6 +224,9 @@ function AttachmentCard({ attachment }: { attachment: string }) {
         <div className="min-w-0 flex-1">
           <div className="truncate text-sm font-bold text-[#303849]" title={title}>
             {title}
+            {disambigSuffix && (
+              <span className="ml-1 text-xs font-normal text-[#98a2b3]">{disambigSuffix}</span>
+            )}
             {artifact && localTempPath && (
               <CheckCircle size={13} className="ml-1 inline-block shrink-0 text-emerald-500" aria-label="Downloaded to local temp" />
             )}
@@ -312,11 +315,31 @@ function AttachmentCard({ attachment }: { attachment: string }) {
 }
 
 export function AttachmentStack({ attachments }: { attachments: string[] }) {
+  // Detect cross-message duplicates: same display name appears multiple times
+  const nameCount = new Map<string, number>();
+  const nameSeen = new Map<string, number>();
+  for (const att of attachments) {
+    const name = attachmentTitle(att).toLowerCase();
+    nameCount.set(name, (nameCount.get(name) ?? 0) + 1);
+  }
+
   return (
     <div className="mt-3 grid w-full max-w-[640px] min-w-0 gap-2">
-      {attachments.map((attachment, index) => (
-        <AttachmentCard key={`${attachment}:${index}`} attachment={attachment} />
-      ))}
+      {attachments.map((attachment, index) => {
+        const name = attachmentTitle(attachment).toLowerCase();
+        const dupCount = nameCount.get(name) ?? 1;
+        let disambigSuffix: string | undefined;
+        if (dupCount > 1) {
+          const seen = (nameSeen.get(name) ?? 0) + 1;
+          nameSeen.set(name, seen);
+          // Show last 6 chars of artifact id for disambiguation
+          const short = attachment.replace(/^.*[/:]/, "").slice(-6);
+          disambigSuffix = `#${short}`;
+        }
+        return (
+          <AttachmentCard key={`${attachment}:${index}`} attachment={attachment} disambigSuffix={disambigSuffix} />
+        );
+      })}
     </div>
   );
 }

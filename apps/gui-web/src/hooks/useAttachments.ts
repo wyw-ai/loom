@@ -57,7 +57,28 @@ export function useAttachments(): UseAttachmentsResult {
       // Convert files synchronously-ish; we'll update state once all are ready
       Promise.all(toAdd.map(fileToPendingAttachment))
         .then((newAttachments) => {
-          setAttachments((curr) => [...curr, ...newAttachments]);
+          setAttachments((curr) => {
+            const existingNames = new Set(curr.map((a) => a.name));
+            const deduped = newAttachments.map((att) => {
+              if (!existingNames.has(att.name)) {
+                existingNames.add(att.name);
+                return att;
+              }
+              // Auto-suffix: file.txt -> file(1).txt
+              const dot = att.name.lastIndexOf(".");
+              const base = dot > 0 ? att.name.slice(0, dot) : att.name;
+              const ext = dot > 0 ? att.name.slice(dot) : "";
+              let counter = 1;
+              let candidate: string;
+              do {
+                candidate = `${base}(${counter})${ext}`;
+                counter++;
+              } while (existingNames.has(candidate));
+              existingNames.add(candidate);
+              return { ...att, name: candidate };
+            });
+            return [...curr, ...deduped];
+          });
         })
         .catch((err) => {
           setError(`Failed to read file: ${err instanceof Error ? err.message : String(err)}`);

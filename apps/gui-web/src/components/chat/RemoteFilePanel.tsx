@@ -1,18 +1,16 @@
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import {
-  ArrowLeft,
   CheckCircle,
   Download,
   ExternalLink,
   FileText,
-  Folder,
   Loader2,
   X,
 } from "lucide-react";
 
 import * as ipc from "@/ipc/bridge";
-import type { MachineDirListResult } from "@/ipc/types";
+import type { Artifact } from "@/ipc/types";
 import { errorText, formatBytes, formatFileTimestamp } from "@/lib/format-utils";
 import { useDownloadedArtifacts } from "@/hooks/useDownloadedArtifacts";
 
@@ -21,24 +19,15 @@ interface RemoteFilePanelProps {
   machineId: string;
   dataRoot: string;
   threadId?: string;
+  target: string;
   onClose: () => void;
 }
 
 type ScopeKind = "channel" | "thread";
 
-function FileEntry({
-  name,
-  path,
-  size,
-  modified,
-}: {
-  name: string;
-  path: string;
-  size?: number | null;
-  modified?: string | null;
-}) {
+function ArtifactEntry({ artifact }: { artifact: Artifact }) {
   const { isDownloaded, setDownloaded, clearDownloaded } = useDownloadedArtifacts();
-  const localTempPath = isDownloaded(path);
+  const localTempPath = isDownloaded(artifact.id);
   const [busy, setBusy] = useState<"download" | "open" | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -47,10 +36,10 @@ function FileEntry({
     setError(null);
     try {
       const tempPath = await ipc.downloadToTemp({
-        artifactId: path,
-        suggestedName: name,
+        artifactId: artifact.id,
+        suggestedName: artifact.name || `${artifact.id}.bin`,
       });
-      setDownloaded(path, tempPath);
+      setDownloaded(artifact.id, tempPath);
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -65,7 +54,7 @@ function FileEntry({
     try {
       const exists = await ipc.pathExists(localTempPath);
       if (!exists) {
-        clearDownloaded(path);
+        clearDownloaded(artifact.id);
         await downloadFile();
         return;
       }
@@ -76,6 +65,10 @@ function FileEntry({
       setBusy(null);
     }
   }
+
+  const name = artifact.name || artifact.id;
+  const size = artifact.size;
+  const modified = artifact.createdAt;
 
   return (
     <div className="flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-[#f0f2f7]">
@@ -120,47 +113,38 @@ function FileEntry({
   );
 }
 
-export function RemoteFilePanel({ channelId, machineId, dataRoot, threadId, onClose }: RemoteFilePanelProps) {
+export function RemoteFilePanel({ channelId, threadId, target, onClose }: RemoteFilePanelProps) {
   const hasThread = Boolean(threadId);
   const [scope, setScope] = useState<ScopeKind>(hasThread ? "thread" : "channel");
-  const [dirList, setDirList] = useState<MachineDirListResult | null>(null);
+  const [artifacts, setArtifacts] = useState<Artifact[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [currentPath, setCurrentPath] = useState<string | null>(null);
 
-  const sep = dataRoot.includes("\\") && !dataRoot.includes("/") ? "\\" : "/";
-  const channelRoot = `${dataRoot}${sep}workspaces${sep}channel${sep}${channelId}${sep}`;
-  const threadRoot = threadId
-    ? `${dataRoot}${sep}workspaces${sep}thread${sep}${threadId}${sep}`
-    : null;
-
-  const scopeRoot = scope === "thread" && threadRoot ? threadRoot : channelRoot;
+  const activeTarget = scope === "thread" && threadId
+    ? target
+    : `#${channelId}`;
 
   useEffect(() => {
-    loadDir(scopeRoot);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scopeRoot]);
-
-  async function loadDir(path: string) {
+    let cancelled = false;
     setLoading(true);
     setError(null);
-    try {
-      const result = await ipc.machineDirList({ machineId, path, includeFiles: true });
-      setDirList(result);
-      setCurrentPath(result.path);
-    } catch (err) {
-      const msg = errorText(err);
-      if (/os error 2|not found|no such file/i.test(msg)) {
-        setDirList(null);
-      } else {
-        setError(msg);
-      }
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  const breadcrumbs = currentPath ? buildBreadcrumbs(currentPath, scopeRoot, sep) : [];
+    ipc
+      .listScopeAttachments({ target: activeTarget })
+      .then((results) => {
+        if (!cancelled) {
+          setArtifacts(results.map((r) => r.artifact));
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) setError(errorText(err));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTarget]);
 
   return createPortal(
     <div
@@ -177,8 +161,10 @@ export function RemoteFilePanel({ channelId, machineId, dataRoot, threadId, onCl
         {/* Header */}
         <div className="flex items-center justify-between border-b border-[#e4e7ef] px-4 py-3">
           <div className="min-w-0">
-            <div className="text-sm font-bold text-[#111827]">Shared Files</div>
-            <div className="mt-0.5 truncate text-xs text-[#667085]">#{channelId}</div>
+            <div className="text-sm font-bold text-[#111827]">Attachments</div>
+            <div className="mt-0.5 truncate text-xs text-[#667085]">
+              {scope === "thread" ? `Thread ${threadId?.slice(-8) ?? ""}` : `#${channelId}`}
+            </div>
           </div>
           <button
             className="composer-icon h-7 min-w-7"
@@ -218,25 +204,6 @@ export function RemoteFilePanel({ channelId, machineId, dataRoot, threadId, onCl
           </div>
         )}
 
-        {/* Breadcrumbs */}
-        {breadcrumbs.length > 0 && (
-          <div className="flex flex-wrap items-center gap-1 border-b border-[#e4e7ef] px-4 py-2">
-            {breadcrumbs.map((crumb, i) => (
-              <span key={i} className="flex items-center gap-1">
-                {i > 0 && <span className="text-xs text-[#667085]">{sep}</span>}
-                <button
-                  type="button"
-                  className={`text-xs hover:underline ${i === breadcrumbs.length - 1 ? "font-bold text-[#111827]" : "text-[#667085]"}`}
-                  onClick={() => loadDir(crumb.path)}
-                  disabled={loading}
-                >
-                  {crumb.label}
-                </button>
-              </span>
-            ))}
-          </div>
-        )}
-
         {/* Content */}
         <div className="min-h-0 flex-1 overflow-y-auto p-2">
           {loading && (
@@ -251,65 +218,30 @@ export function RemoteFilePanel({ channelId, machineId, dataRoot, threadId, onCl
               <button
                 type="button"
                 className="ml-2 text-xs text-[#667085] hover:underline"
-                onClick={() => loadDir(currentPath || scopeRoot)}
+                onClick={() => {
+                  setLoading(true);
+                  setError(null);
+                  ipc
+                    .listScopeAttachments({ target: activeTarget })
+                    .then((results) => setArtifacts(results.map((r) => r.artifact)))
+                    .catch((err) => setError(errorText(err)))
+                    .finally(() => setLoading(false));
+                }}
               >
                 Retry
               </button>
             </div>
           )}
-          {!loading && !error && !dirList && (
+          {!loading && !error && artifacts.length === 0 && (
             <div className="py-8 text-center text-sm text-[#667085]">
-              暂无附件
+              No attachments
             </div>
           )}
-          {!loading && !error && dirList && (
+          {!loading && !error && artifacts.length > 0 && (
             <>
-              {dirList.parent && (
-                <button
-                  type="button"
-                  className="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm text-[#667085] hover:bg-[#f0f2f7]"
-                  onClick={() => loadDir(dirList.parent!)}
-                  disabled={loading}
-                >
-                  <ArrowLeft size={16} />
-                  ..
-                </button>
-              )}
-              {dirList.entries.length === 0 && (
-                <div className="py-8 text-center text-sm text-[#667085]">
-                  No items in this directory.
-                </div>
-              )}
-              {dirList.entries.map((entry) => {
-                if (entry.kind === "directory") {
-                  return (
-                    <button
-                      key={entry.path}
-                      type="button"
-                      className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm text-[#303849] hover:bg-[#f0f2f7]"
-                      onClick={() => loadDir(entry.path)}
-                      disabled={loading}
-                    >
-                      <Folder size={16} className="shrink-0 text-[#f0a020]" />
-                      <span className="min-w-0 flex-1 truncate text-left" title={entry.name}>
-                        {entry.name}
-                      </span>
-                    </button>
-                  );
-                }
-                return (
-                  <FileEntry
-                    key={entry.path}
-                    name={entry.name}
-                    path={entry.path}
-                    size={entry.size}
-                    modified={entry.modified}
-                  />
-                );
-              })}
-              {dirList.truncated && (
-                <div className="px-2 py-2 text-xs text-[#667085]">List truncated — too many entries.</div>
-              )}
+              {artifacts.map((artifact) => (
+                <ArtifactEntry key={artifact.id} artifact={artifact} />
+              ))}
             </>
           )}
         </div>
@@ -317,27 +249,4 @@ export function RemoteFilePanel({ channelId, machineId, dataRoot, threadId, onCl
     </div>,
     document.body,
   );
-}
-
-function buildBreadcrumbs(currentPath: string, rootPath: string, sep: string) {
-  const rootParts = rootPath.split(sep).filter(Boolean);
-  const crumbs: { label: string; path: string }[] = [];
-
-  if (rootParts.length > 0) {
-    crumbs.push({ label: rootParts[rootParts.length - 1] || "root", path: rootPath });
-  }
-
-  const normalizedCurrent = currentPath.replace(/[/\\]+$/, "");
-  const normalizedRoot = rootPath.replace(/[/\\]+$/, "");
-  if (normalizedCurrent.length > normalizedRoot.length) {
-    const after = normalizedCurrent.slice(normalizedRoot.length).replace(/^[/\\]+/, "");
-    const subParts = after.split(sep).filter(Boolean);
-    let acc = normalizedRoot;
-    for (const part of subParts) {
-      acc = `${acc}${sep}${part}`;
-      crumbs.push({ label: part, path: `${acc}${sep}` });
-    }
-  }
-
-  return crumbs;
 }

@@ -138,6 +138,7 @@ export function MainContent(props: MainContentProps) {
     machineId: string;
     dataRoot: string;
     threadId?: string;
+    target: string;
   } | null>(null);
 
   if (p.view === "chat") {
@@ -180,6 +181,7 @@ export function MainContent(props: MainContentProps) {
                 machineId: remoteMachine.id,
                 dataRoot: root,
                 threadId: p.activeThread?.id,
+                target: p.target ?? `#${ch.id}`,
               });
             }
           }}
@@ -229,6 +231,7 @@ export function MainContent(props: MainContentProps) {
             machineId={remoteFilePanel.machineId}
             dataRoot={remoteFilePanel.dataRoot}
             threadId={remoteFilePanel.threadId}
+            target={remoteFilePanel.target}
             onClose={() => setRemoteFilePanel(null)}
           />
         )}
@@ -285,6 +288,7 @@ export function MainContent(props: MainContentProps) {
                 machineId: remoteMachine.id,
                 dataRoot: root,
                 threadId: thread.id,
+                target: p.threadMessageTarget ?? `#${thread.channelId}:${thread.rootMessageId}`,
               });
             }
           }}
@@ -297,6 +301,7 @@ export function MainContent(props: MainContentProps) {
             machineId={remoteFilePanel.machineId}
             dataRoot={remoteFilePanel.dataRoot}
             threadId={remoteFilePanel.threadId}
+            target={remoteFilePanel.target}
             onClose={() => setRemoteFilePanel(null)}
           />
         )}

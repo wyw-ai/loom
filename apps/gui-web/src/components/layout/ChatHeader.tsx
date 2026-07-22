@@ -119,8 +119,8 @@ export function ChatHeader({
           <Button
             variant="outline"
             size="icon"
-            title="查看 channel 中的所有附件"
-            aria-label="查看 channel 中的所有附件"
+            title="View channel attachments"
+            aria-label="View channel attachments"
             disabled={!channel}
             onClick={onOpenFolder}
             className="relative h-9 w-9 shrink-0 rounded-lg"

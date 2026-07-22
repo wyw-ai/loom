@@ -349,6 +349,61 @@ export async function artifactGet(params: {
   return invoke("artifact_get", { params });
 }
 
+export interface ScopeAttachment {
+  artifact: Artifact;
+  messageId: string;
+}
+
+/**
+ * List all attachments in a channel or thread scope by:
+ * 1. Fetching messages via messageList
+ * 2. Extracting attachment URIs from each message
+ * 3. Resolving artifact metadata via artifactGet
+ * Returns a flat list of artifacts (deduplicated by artifact id).
+ */
+export async function listScopeAttachments(params: {
+  target: string;
+  limit?: number;
+}): Promise<ScopeAttachment[]> {
+  const { messages } = await messageList({
+    target: params.target,
+    limit: params.limit ?? 500,
+  });
+
+  // Collect unique attachment URIs with their source message
+  const seen = new Map<string, string>(); // artifactUri -> messageId
+  for (const msg of messages) {
+    if (!msg.attachments || msg.attachments.length === 0) continue;
+    for (const att of msg.attachments) {
+      const clean = att.trim();
+      if (!clean) continue;
+      // Skip non-artifact attachments (e.g. .skill files, URLs)
+      if (!clean.startsWith("artifact://") && !/^art_[A-Za-z0-9_-]+$/.test(clean)) continue;
+      if (!seen.has(clean)) {
+        seen.set(clean, msg.id);
+      }
+    }
+  }
+
+  // Resolve artifact metadata for each unique attachment
+  const results: ScopeAttachment[] = [];
+  await Promise.all(
+    Array.from(seen.entries()).map(async ([uri, messageId]) => {
+      try {
+        const lookupParams = uri.startsWith("artifact://")
+          ? { artifactUri: uri }
+          : { artifactId: uri };
+        const { artifact } = await artifactGet(lookupParams);
+        results.push({ artifact, messageId });
+      } catch {
+        // Skip artifacts that fail to resolve
+      }
+    }),
+  );
+
+  return results;
+}
+
 export async function artifactRead(params: {
   artifactId: string;
   offset?: number;

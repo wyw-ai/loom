@@ -182,7 +182,7 @@ impl Store {
     }
 
     fn replay(&self) -> StoreResult<()> {
-        self.journal.replay_into(|m| {
+        self.journal.replay(|m| {
             self.apply_replay(m);
         })?;
         Ok(())

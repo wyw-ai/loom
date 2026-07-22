@@ -14,6 +14,7 @@ import {
 import * as ipc from "@/ipc/bridge";
 import type { MachineDirListResult } from "@/ipc/types";
 import { errorText } from "@/lib/format-utils";
+import { useDownloadedArtifacts } from "@/hooks/useDownloadedArtifacts";
 
 interface RemoteFilePanelProps {
   channelId: string;
@@ -32,7 +33,8 @@ function FileEntry({
   name: string;
   path: string;
 }) {
-  const [localTempPath, setLocalTempPath] = useState<string | null>(null);
+  const { isDownloaded, setDownloaded, clearDownloaded } = useDownloadedArtifacts();
+  const localTempPath = isDownloaded(path);
   const [busy, setBusy] = useState<"download" | "open" | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -44,7 +46,7 @@ function FileEntry({
         artifactId: path,
         suggestedName: name,
       });
-      setLocalTempPath(tempPath);
+      setDownloaded(path, tempPath);
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -57,6 +59,12 @@ function FileEntry({
     setBusy("open");
     setError(null);
     try {
+      const exists = await ipc.pathExists(localTempPath);
+      if (!exists) {
+        clearDownloaded(path);
+        await downloadFile();
+        return;
+      }
       await ipc.openFileDefault(localTempPath);
     } catch (err) {
       setError(errorText(err));
@@ -108,9 +116,9 @@ export function RemoteFilePanel({ channelId, machineId, dataRoot, threadId, onCl
   const [currentPath, setCurrentPath] = useState<string | null>(null);
 
   const sep = dataRoot.includes("\\") && !dataRoot.includes("/") ? "\\" : "/";
-  const channelRoot = `${dataRoot}${sep}channels${sep}${channelId}${sep}`;
+  const channelRoot = `${dataRoot}${sep}workspaces${sep}channel${sep}${channelId}${sep}`;
   const threadRoot = threadId
-    ? `${channelRoot}threads${sep}${threadId}${sep}`
+    ? `${dataRoot}${sep}workspaces${sep}thread${sep}${threadId}${sep}`
     : null;
 
   const scopeRoot = scope === "thread" && threadRoot ? threadRoot : channelRoot;

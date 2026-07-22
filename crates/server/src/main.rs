@@ -49,6 +49,7 @@ struct Args {
 async fn main() -> Result<()> {
     loom_platform::console::init();
     agent_runtime::tracing_setup::init_file_tracing("server", "info");
+    let startup_started = std::time::Instant::now();
 
     // Install a panic hook that logs panics to the tracing system.
     let default_hook = std::panic::take_hook();
@@ -74,21 +75,55 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     let data_dir = args.data_dir.unwrap_or_else(default_data_dir);
+    tracing::info!(
+        data_dir = %data_dir.display(),
+        bind = %args.bind,
+        unix_socket = %args.unix_socket.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+        file_rpc = %args.file_rpc.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+        "loom-server startup begin"
+    );
+    let stage_started = std::time::Instant::now();
     std::fs::create_dir_all(&data_dir)?;
+    tracing::info!(
+        elapsed_ms = stage_started.elapsed().as_millis(),
+        "loom-server data directory ready"
+    );
 
+    let stage_started = std::time::Instant::now();
+    tracing::info!("loom-server opening sqlite journal");
     let journal = Journal::open_sqlite(data_dir.join("loom.sqlite3"))?;
+    tracing::info!(
+        elapsed_ms = stage_started.elapsed().as_millis(),
+        "loom-server sqlite journal ready"
+    );
+    let stage_started = std::time::Instant::now();
+    tracing::info!("loom-server opening store");
     let store = Store::open(journal)?;
+    tracing::info!(
+        elapsed_ms = stage_started.elapsed().as_millis(),
+        "loom-server store ready"
+    );
     let subscriptions = Subscriptions::new();
+    let stage_started = std::time::Instant::now();
     let artifacts = Arc::new(ArtifactStore::new(
         data_dir.join("artifacts"),
         data_dir.join("workspaces"),
     )?);
+    tracing::info!(
+        elapsed_ms = stage_started.elapsed().as_millis(),
+        "loom-server artifact store ready"
+    );
+    let stage_started = std::time::Instant::now();
     let scope_skills = Arc::new(ScopeSkills::new(
         data_dir.join("workspaces"),
         data_dir.join("agents"),
     )?);
     let machine_commands = MachineCommandWaiters::new();
     scope_skills.reconcile(&store)?;
+    tracing::info!(
+        elapsed_ms = stage_started.elapsed().as_millis(),
+        "loom-server scope skills ready"
+    );
 
     let state = AppState {
         store: store.clone(),
@@ -113,8 +148,17 @@ async fn main() -> Result<()> {
         .route("/rpc", get(ws::ws_upgrade))
         .with_state(state);
     let addr: std::net::SocketAddr = args.bind.parse()?;
-    tracing::info!(%addr, "loom-server listening");
+    tracing::info!(
+        %addr,
+        startup_elapsed_ms = startup_started.elapsed().as_millis(),
+        "loom-server binding tcp listener"
+    );
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!(
+        %addr,
+        startup_elapsed_ms = startup_started.elapsed().as_millis(),
+        "loom-server listening"
+    );
     axum::serve(listener, app).await?;
     Ok(())
 }

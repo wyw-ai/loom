@@ -234,24 +234,38 @@ impl Journal {
         }
     }
 
+    #[allow(dead_code)] // used by tests and small maintenance tools
     pub fn replay(&self) -> std::io::Result<Vec<Mutation>> {
+        let mut out = Vec::new();
+        self.replay_into(|m| out.push(m))?;
+        Ok(out)
+    }
+
+    pub fn replay_into<F>(&self, mut apply: F) -> std::io::Result<usize>
+    where
+        F: FnMut(Mutation),
+    {
+        let started = std::time::Instant::now();
+        let mut count = 0usize;
         match &self.storage {
             JournalStorage::Jsonl { .. } => {
                 let file = OpenOptions::new().read(true).open(&self.path)?;
-                let mut out = Vec::new();
                 for (idx, line) in BufReader::new(file).lines().enumerate() {
                     let line = line?;
                     if line.trim().is_empty() {
                         continue;
                     }
                     match serde_json::from_str::<Mutation>(&line) {
-                        Ok(m) => out.push(m),
+                        Ok(m) => {
+                            apply(m);
+                            count += 1;
+                            log_replay_progress(count, started);
+                        }
                         Err(err) => {
                             tracing::warn!(line = idx + 1, %err, "skipping unreadable journal line");
                         }
                     }
                 }
-                Ok(out)
             }
             JournalStorage::Sqlite { conn } => {
                 let conn = conn.lock();
@@ -263,19 +277,37 @@ impl Journal {
                         Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
                     })
                     .map_err(sqlite_io)?;
-                let mut out = Vec::new();
                 for row in rows {
                     let (id, line) = row.map_err(sqlite_io)?;
                     match serde_json::from_str::<Mutation>(&line) {
-                        Ok(m) => out.push(m),
+                        Ok(m) => {
+                            apply(m);
+                            count += 1;
+                            log_replay_progress(count, started);
+                        }
                         Err(err) => {
                             tracing::warn!(rowid = id, %err, "skipping unreadable sqlite journal record");
                         }
                     }
                 }
-                Ok(out)
             }
         }
+        tracing::info!(
+            records = count,
+            elapsed_ms = started.elapsed().as_millis(),
+            "journal replay complete"
+        );
+        Ok(count)
+    }
+}
+
+fn log_replay_progress(count: usize, started: std::time::Instant) {
+    if count % 10_000 == 0 {
+        tracing::info!(
+            records = count,
+            elapsed_ms = started.elapsed().as_millis(),
+            "journal replay progress"
+        );
     }
 }
 

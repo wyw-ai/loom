@@ -1199,7 +1199,9 @@ pub async fn download_to_temp(
     // Sanitize the filename — strip path separators to prevent directory traversal.
     let safe_name = sanitize_filename(&file_name);
 
-    let download_dir = std::env::temp_dir().join("loom-downloads");
+    let download_dir = std::env::temp_dir()
+        .join("loom-downloads")
+        .join(&args.artifact_id);
     std::fs::create_dir_all(&download_dir)
         .map_err(|e| format!("Failed to create temp download directory: {e}"))?;
     let dest_path = download_dir.join(&safe_name);

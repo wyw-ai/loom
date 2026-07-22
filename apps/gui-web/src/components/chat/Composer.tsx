@@ -44,6 +44,7 @@ export function Composer({
   const [caretIndex, setCaretIndex] = useState(draft.length);
   const [selectedMentionIndex, setSelectedMentionIndex] = useState(0);
   const [dismissedMentionKey, setDismissedMentionKey] = useState<string | null>(null);
+  const [dragHover, setDragHover] = useState(false);
   const {
     attachments,
     error: attachmentError,
@@ -174,7 +175,21 @@ export function Composer({
               e.target.value = "";
             }}
           />
-          <div className={`composer-box relative flex-1${isManual ? " composer-box-manual" : ""}`}>
+          <div
+            className={`composer-box relative flex-1${isManual ? " composer-box-manual" : ""}${dragHover ? " ring-2 ring-blue-400" : ""}`}
+            onDrop={(e) => {
+              e.preventDefault();
+              setDragHover(false);
+              if (e.dataTransfer.files.length > 0) {
+                addFiles(e.dataTransfer.files);
+              }
+            }}
+            onDragOver={(e) => {
+              e.preventDefault();
+              setDragHover(true);
+            }}
+            onDragLeave={() => setDragHover(false)}
+          >
             {showMentions && (
               <MentionMenu
                 options={mentionOptions}
@@ -182,72 +197,76 @@ export function Composer({
                 onSelect={chooseMention}
               />
             )}
-            <AutoGrowTextarea
-              ref={textareaRef}
-              value={draft}
-              maxRows={COMPOSER_AUTO_MAX_ROWS}
-              fixedHeight={(isManual || liveHeight !== null) ? effectiveHeight - 20 : null}
-              onChange={(event) => {
-                setDraft(event.target.value);
-                syncCaret(event.currentTarget);
-                setDismissedMentionKey(null);
-              }}
-              onClick={(event) => syncCaret(event.currentTarget)}
-              onKeyUp={(event) => syncCaret(event.currentTarget)}
-              onKeyDown={(event) => {
-                if (isComposingKeyEvent(event)) return;
-                if (showMentions) {
-                  if (event.key === "ArrowDown") {
-                    event.preventDefault();
-                    setSelectedMentionIndex((index) =>
-                      (index + 1) % mentionOptions.length,
-                    );
-                    return;
+            <div className="flex h-full items-end gap-0.5">
+              <AutoGrowTextarea
+                ref={textareaRef}
+                value={draft}
+                maxRows={COMPOSER_AUTO_MAX_ROWS}
+                fixedHeight={(isManual || liveHeight !== null) ? effectiveHeight - 20 : null}
+                onChange={(event) => {
+                  setDraft(event.target.value);
+                  syncCaret(event.currentTarget);
+                  setDismissedMentionKey(null);
+                }}
+                onClick={(event) => syncCaret(event.currentTarget)}
+                onKeyUp={(event) => syncCaret(event.currentTarget)}
+                onKeyDown={(event) => {
+                  if (isComposingKeyEvent(event)) return;
+                  if (showMentions) {
+                    if (event.key === "ArrowDown") {
+                      event.preventDefault();
+                      setSelectedMentionIndex((index) =>
+                        (index + 1) % mentionOptions.length,
+                      );
+                      return;
+                    }
+                    if (event.key === "ArrowUp") {
+                      event.preventDefault();
+                      setSelectedMentionIndex((index) =>
+                        (index - 1 + mentionOptions.length) % mentionOptions.length,
+                      );
+                      return;
+                    }
+                    if ((event.key === "Enter" || event.key === "Tab") && selectedMention) {
+                      event.preventDefault();
+                      chooseMention(selectedMention);
+                      return;
+                    }
+                    if (event.key === "Escape") {
+                      event.preventDefault();
+                      setDismissedMentionKey(mentionKey);
+                      return;
+                    }
                   }
-                  if (event.key === "ArrowUp") {
+                  if (shouldSendOnEnter(event)) {
                     event.preventDefault();
-                    setSelectedMentionIndex((index) =>
-                      (index - 1 + mentionOptions.length) % mentionOptions.length,
-                    );
-                    return;
+                    handleSend();
                   }
-                  if ((event.key === "Enter" || event.key === "Tab") && selectedMention) {
-                    event.preventDefault();
-                    chooseMention(selectedMention);
-                    return;
-                  }
-                  if (event.key === "Escape") {
-                    event.preventDefault();
-                    setDismissedMentionKey(mentionKey);
-                    return;
-                  }
-                }
-                if (shouldSendOnEnter(event)) {
-                  event.preventDefault();
-                  handleSend();
-                }
-              }}
-              disabled={disabled}
-              placeholder={disabled ? disabledPlaceholder : placeholder}
-              className="max-h-full min-h-[44px] w-full flex-1 px-3 pr-12"
-            />
-            <Button
-              size="icon"
-              onClick={handleSend}
-              disabled={disabled || (!draft.trim() && attachments.length === 0) || busy}
-              className="absolute bottom-2 right-3 h-9 w-9 shrink-0 rounded-lg"
-            >
-              {busy ? <Loader2 className="animate-spin" size={17} /> : <Send size={17} />}
-            </Button>
-            <button
-              type="button"
-              onClick={openFilePicker}
-              disabled={disabled}
-              title="Attach files"
-              className="absolute bottom-12 right-3 z-10 flex h-9 w-9 items-center justify-center rounded-lg text-[#667085] transition-colors hover:bg-[#f0f2f7] hover:text-[#1d2939] disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              <Paperclip size={16} />
-            </button>
+                }}
+                disabled={disabled}
+                placeholder={disabled ? disabledPlaceholder : placeholder}
+                className="max-h-full min-h-[44px] w-full flex-1 px-3 pr-3"
+              />
+              <div className="flex shrink-0 flex-col items-center gap-0.5 pb-2">
+                <button
+                  type="button"
+                  onClick={openFilePicker}
+                  disabled={disabled}
+                  title="Attach files"
+                  className="flex h-9 w-9 items-center justify-center rounded-lg text-[#667085] transition-colors hover:bg-[#f0f2f7] hover:text-[#1d2939] disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  <Paperclip size={16} />
+                </button>
+                <Button
+                  size="icon"
+                  onClick={handleSend}
+                  disabled={disabled || (!draft.trim() && attachments.length === 0) || busy}
+                  className="h-9 w-9 shrink-0 rounded-lg"
+                >
+                  {busy ? <Loader2 className="animate-spin" size={17} /> : <Send size={17} />}
+                </Button>
+              </div>
+            </div>
           </div>
         </div>
       </Resizable>

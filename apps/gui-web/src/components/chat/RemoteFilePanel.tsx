@@ -13,7 +13,7 @@ import {
 
 import * as ipc from "@/ipc/bridge";
 import type { MachineDirListResult } from "@/ipc/types";
-import { errorText } from "@/lib/format-utils";
+import { errorText, formatBytes, formatFileTimestamp } from "@/lib/format-utils";
 import { useDownloadedArtifacts } from "@/hooks/useDownloadedArtifacts";
 
 interface RemoteFilePanelProps {
@@ -29,9 +29,13 @@ type ScopeKind = "channel" | "thread";
 function FileEntry({
   name,
   path,
+  size,
+  modified,
 }: {
   name: string;
   path: string;
+  size?: number | null;
+  modified?: string | null;
 }) {
   const { isDownloaded, setDownloaded, clearDownloaded } = useDownloadedArtifacts();
   const localTempPath = isDownloaded(path);
@@ -76,9 +80,18 @@ function FileEntry({
   return (
     <div className="flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-[#f0f2f7]">
       <FileText size={16} className="shrink-0 text-[#667085]" />
-      <span className="min-w-0 flex-1 truncate text-sm text-[#303849]" title={name}>
-        {name}
-      </span>
+      <div className="min-w-0 flex-1">
+        <div className="truncate text-sm text-[#303849]" title={name}>
+          {name}
+        </div>
+        {(size != null || modified) && (
+          <div className="truncate text-xs text-[#98a2b3]">
+            {size != null && <span>{formatBytes(size)}</span>}
+            {size != null && modified && <span className="mx-1">·</span>}
+            {modified && <span>{formatFileTimestamp(modified)}</span>}
+          </div>
+        )}
+      </div>
       {localTempPath && <CheckCircle size={14} className="shrink-0 text-emerald-500" />}
       {!localTempPath && (
         <button
@@ -279,6 +292,8 @@ export function RemoteFilePanel({ channelId, machineId, dataRoot, threadId, onCl
                     key={entry.path}
                     name={entry.name}
                     path={entry.path}
+                    size={entry.size}
+                    modified={entry.modified}
                   />
                 );
               })}

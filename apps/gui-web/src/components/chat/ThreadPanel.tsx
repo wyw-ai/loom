@@ -4,7 +4,7 @@ import { isHiddenProtocolMessage } from "@/lib/message-utils";
 import { groupMessagesByDate } from "@/lib/message-utils";
 import { displayName } from "@/lib/format-utils";
 import { cn } from "@/lib/utils";
-import { X, Split, MessageSquare } from "lucide-react";
+import { X, Split, MessageSquare, FolderOpen } from "lucide-react";
 import { EmptyState } from "@/components/shared/EmptyState";
 import { MutedLine } from "@/components/shared/MutedLine";
 import { TaskStateBadge } from "@/components/chat/TaskStateBadge";
@@ -36,6 +36,7 @@ export function ThreadPanel({
   onSend,
   onToggleReaction,
   onOpenAgentSettings,
+  onOpenFolder,
   scopeId,
 }: {
   actors: Record<string, Actor>;
@@ -57,6 +58,7 @@ export function ThreadPanel({
   onSend: (attachments?: import("@/lib/attachment-utils").PendingAttachment[]) => void;
   onToggleReaction: (message: Message, emoji: string) => void;
   onOpenAgentSettings: (actorId: string) => void;
+  onOpenFolder?: () => void;
   scopeId?: string | null;
 }) {
   const rootMessage = thread
@@ -179,6 +181,16 @@ export function ThreadPanel({
           <div className="flex items-center gap-1">
             {/* L1/L2 thread token summary (AC-T2) - silent-hidden when null */}
             <ScopeTokenSummary scopeId={scopeId} actors={actors} />
+            {onOpenFolder && thread && (
+              <button
+                className="composer-icon"
+                type="button"
+                title="Open thread folder"
+                onClick={onOpenFolder}
+              >
+                <FolderOpen size={15} />
+              </button>
+            )}
             <button className="composer-icon" type="button" title="Close" onClick={onClose}>
               <X size={16} />
             </button>

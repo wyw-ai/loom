@@ -8,7 +8,7 @@ import { errorText, formatBytes } from "@/lib/format-utils";
 import { attachmentKind, attachmentTitle, metadataString } from "@/lib/message-utils";
 import { useDownloadedArtifacts } from "@/hooks/useDownloadedArtifacts";
 
-type ArtifactPreviewState =
+export type ArtifactPreviewState =
   | {
       mode: "text";
       artifact: Artifact;
@@ -22,15 +22,23 @@ type ArtifactPreviewState =
     };
 
 const artifactReadChunkBytes = 1024 * 1024;
-const artifactPreviewTextBytes = 256 * 1024;
-const artifactPreviewBinaryBytes = 25 * 1024 * 1024;
+export const artifactPreviewTextBytes = 256 * 1024;
+export const artifactPreviewBinaryBytes = 25 * 1024 * 1024;
 
-function AttachmentCard({ attachment, disambigSuffix }: { attachment: string; disambigSuffix?: string }) {
+interface DuplicateInfo {
+  totalCount: number;
+  myIndex: number;
+  siblingUris: string[];
+}
+
+function AttachmentCard({ attachment, duplicateInfo }: { attachment: string; duplicateInfo?: DuplicateInfo }) {
   const [artifact, setArtifact] = useState<Artifact | null>(null);
   const [loading, setLoading] = useState(() => Boolean(artifactLookupParams(attachment)));
   const [busy, setBusy] = useState<"preview" | "download" | "open" | "reveal" | "save" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<ArtifactPreviewState | null>(null);
+  const [siblingChecksums, setSiblingChecksums] = useState<string[]>([]);
+  const [disambigSuffix, setDisambigSuffix] = useState<string | undefined>();
   const { isDownloaded, setDownloaded, clearDownloaded } = useDownloadedArtifacts();
   const previewObjectUrlRef = useRef<string | null>(null);
 
@@ -100,6 +108,65 @@ function AttachmentCard({ attachment, disambigSuffix }: { attachment: string; di
     };
   }, [artifact]);
 
+  // I3: Load sibling checksums for cross-message duplicate disambiguation
+  useEffect(() => {
+    if (!artifact || !duplicateInfo) {
+      setSiblingChecksums([]);
+      return;
+    }
+    let cancelled = false;
+    async function loadSiblingChecksums() {
+      const checksums: string[] = [];
+      for (const uri of duplicateInfo!.siblingUris) {
+        if (uri === attachment) {
+          checksums.push(artifact!.checksum);
+          continue;
+        }
+        try {
+          const params = artifactLookupParams(uri);
+          if (!params) {
+            checksums.push("");
+            continue;
+          }
+          const result = await ipc.artifactGet(params);
+          checksums.push(result.artifact.checksum);
+        } catch {
+          checksums.push("");
+        }
+      }
+      if (!cancelled) setSiblingChecksums(checksums);
+    }
+    loadSiblingChecksums();
+    return () => {
+      cancelled = true;
+    };
+  }, [artifact, duplicateInfo, attachment]);
+
+  // I3: Compute disambiguation suffix based on checksum comparison
+  useEffect(() => {
+    if (!duplicateInfo || siblingChecksums.length === 0) {
+      setDisambigSuffix(undefined);
+      return;
+    }
+    const uniqueChecksums = new Set(siblingChecksums.filter(Boolean));
+    if (uniqueChecksums.size <= 1) {
+      // All same content (or all empty) — no suffix needed
+      setDisambigSuffix(undefined);
+      return;
+    }
+    // Different content exists — assign index per unique checksum
+    const checksumOrder = new Map<string, number>();
+    let nextIndex = 1;
+    for (const c of siblingChecksums) {
+      if (!checksumOrder.has(c)) {
+        checksumOrder.set(c, nextIndex++);
+      }
+    }
+    const myChecksum = siblingChecksums[duplicateInfo.myIndex] ?? "";
+    const idx = checksumOrder.get(myChecksum) ?? 1;
+    setDisambigSuffix(idx > 1 ? `(${idx})` : undefined);
+  }, [duplicateInfo, siblingChecksums]);
+
   function closePreview() {
     if (previewObjectUrlRef.current) {
       URL.revokeObjectURL(previewObjectUrlRef.current);
@@ -148,7 +215,9 @@ function AttachmentCard({ attachment, disambigSuffix }: { attachment: string; di
     try {
       const blob = await readArtifactBlob(artifact);
       const bytes = new Uint8Array(await blob.arrayBuffer());
-      const result = await ipc.saveFileDialog(artifact.name || `${artifact.id}.bin`, bytes);
+      const baseName = artifact.name || `${artifact.id}.bin`;
+      const saveName = disambigSuffix ? insertSuffix(baseName, disambigSuffix) : baseName;
+      const result = await ipc.saveFileDialog(saveName, bytes);
       if (!result) return; // user cancelled
     } catch (err) {
       setError(errorText(err));
@@ -203,9 +272,11 @@ function AttachmentCard({ attachment, disambigSuffix }: { attachment: string; di
     setBusy("download");
     setError(null);
     try {
+      const baseName = artifact.name || `${artifact.id}.bin`;
+      const downloadName = disambigSuffix ? insertSuffix(baseName, disambigSuffix) : baseName;
       const tempPath = await ipc.downloadToTemp({
         artifactId: artifact.id,
-        suggestedName: artifact.name || `${artifact.id}.bin`,
+        suggestedName: downloadName,
       });
       setDownloaded(artifact.id, tempPath);
     } catch (err) {
@@ -315,36 +386,41 @@ function AttachmentCard({ attachment, disambigSuffix }: { attachment: string; di
 }
 
 export function AttachmentStack({ attachments }: { attachments: string[] }) {
-  // Detect cross-message duplicates: same display name appears multiple times
-  const nameCount = new Map<string, number>();
-  const nameSeen = new Map<string, number>();
-  for (const att of attachments) {
-    const name = attachmentTitle(att).toLowerCase();
-    nameCount.set(name, (nameCount.get(name) ?? 0) + 1);
-  }
+  // I3: Detect cross-message duplicates by name, pass sibling info for checksum comparison
+  const nameMap = new Map<string, { uri: string; index: number }[]>();
+  attachments.forEach((uri, index) => {
+    const name = attachmentTitle(uri).toLowerCase();
+    if (!nameMap.has(name)) nameMap.set(name, []);
+    nameMap.get(name)!.push({ uri, index });
+  });
 
   return (
     <div className="mt-3 grid w-full max-w-[640px] min-w-0 gap-2">
       {attachments.map((attachment, index) => {
         const name = attachmentTitle(attachment).toLowerCase();
-        const dupCount = nameCount.get(name) ?? 1;
-        let disambigSuffix: string | undefined;
-        if (dupCount > 1) {
-          const seen = (nameSeen.get(name) ?? 0) + 1;
-          nameSeen.set(name, seen);
-          // Show last 6 chars of artifact id for disambiguation
-          const short = attachment.replace(/^.*[/:]/, "").slice(-6);
-          disambigSuffix = `#${short}`;
-        }
+        const dups = nameMap.get(name) ?? [];
+        const dupIndex = dups.findIndex((d) => d.uri === attachment && d.index === index);
+        const hasDuplicates = dups.length > 1;
+        const duplicateInfo = hasDuplicates
+          ? {
+              totalCount: dups.length,
+              myIndex: dupIndex,
+              siblingUris: dups.map((d) => d.uri),
+            }
+          : undefined;
         return (
-          <AttachmentCard key={`${attachment}:${index}`} attachment={attachment} disambigSuffix={disambigSuffix} />
+          <AttachmentCard
+            key={`${attachment}:${index}`}
+            attachment={attachment}
+            duplicateInfo={duplicateInfo}
+          />
         );
       })}
     </div>
   );
 }
 
-function AttachmentPreviewModal({
+export function AttachmentPreviewModal({
   preview,
   onClose,
   onDownload,
@@ -441,6 +517,14 @@ function artifactLookupParams(value: string) {
   return null;
 }
 
+function insertSuffix(filename: string, suffix: string): string {
+  const dotIndex = filename.lastIndexOf(".");
+  if (dotIndex > 0) {
+    return `${filename.slice(0, dotIndex)}${suffix}${filename.slice(dotIndex)}`;
+  }
+  return `${filename}${suffix}`;
+}
+
 function artifactKindLabel(artifact: Artifact) {
   const metaKind = metadataString(artifact._meta, ["attachmentKind", "attachment_kind"]);
   if (metaKind) return titleCaseWords(metaKind.replace(/[_-]+/g, " "));
@@ -455,7 +539,7 @@ function artifactKindLabel(artifact: Artifact) {
   return attachmentKind(artifact.name);
 }
 
-function artifactPreviewMode(artifact: Artifact): ArtifactPreviewState["mode"] | null {
+export function artifactPreviewMode(artifact: Artifact): ArtifactPreviewState["mode"] | null {
   const media = artifact.mediaType.toLowerCase();
   if (media.startsWith("image/")) return "image";
   if (media === "application/pdf") return "pdf";
@@ -508,7 +592,7 @@ function artifactReadBytes(read: ArtifactReadResult) {
   return new Uint8Array();
 }
 
-async function readArtifactBlob(artifact: Artifact) {
+export async function readArtifactBlob(artifact: Artifact) {
   const chunks: Uint8Array[] = [];
   let offset = 0;
   let mediaType = artifact.mediaType;

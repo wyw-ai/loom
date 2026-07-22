@@ -25,20 +25,12 @@ const artifactReadChunkBytes = 1024 * 1024;
 export const artifactPreviewTextBytes = 256 * 1024;
 export const artifactPreviewBinaryBytes = 25 * 1024 * 1024;
 
-interface DuplicateInfo {
-  totalCount: number;
-  myIndex: number;
-  siblingUris: string[];
-}
-
-function AttachmentCard({ attachment, duplicateInfo }: { attachment: string; duplicateInfo?: DuplicateInfo }) {
+function AttachmentCard({ attachment }: { attachment: string }) {
   const [artifact, setArtifact] = useState<Artifact | null>(null);
   const [loading, setLoading] = useState(() => Boolean(artifactLookupParams(attachment)));
   const [busy, setBusy] = useState<"preview" | "download" | "open" | "reveal" | "save" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<ArtifactPreviewState | null>(null);
-  const [siblingChecksums, setSiblingChecksums] = useState<string[]>([]);
-  const [disambigSuffix, setDisambigSuffix] = useState<string | undefined>();
   const { isDownloaded, setDownloaded, clearDownloaded } = useDownloadedArtifacts();
   const previewObjectUrlRef = useRef<string | null>(null);
 
@@ -108,65 +100,6 @@ function AttachmentCard({ attachment, duplicateInfo }: { attachment: string; dup
     };
   }, [artifact]);
 
-  // I3: Load sibling checksums for cross-message duplicate disambiguation
-  useEffect(() => {
-    if (!artifact || !duplicateInfo) {
-      setSiblingChecksums([]);
-      return;
-    }
-    let cancelled = false;
-    async function loadSiblingChecksums() {
-      const checksums: string[] = [];
-      for (const uri of duplicateInfo!.siblingUris) {
-        if (uri === attachment) {
-          checksums.push(artifact!.checksum);
-          continue;
-        }
-        try {
-          const params = artifactLookupParams(uri);
-          if (!params) {
-            checksums.push("");
-            continue;
-          }
-          const result = await ipc.artifactGet(params);
-          checksums.push(result.artifact.checksum);
-        } catch {
-          checksums.push("");
-        }
-      }
-      if (!cancelled) setSiblingChecksums(checksums);
-    }
-    loadSiblingChecksums();
-    return () => {
-      cancelled = true;
-    };
-  }, [artifact, duplicateInfo, attachment]);
-
-  // I3: Compute disambiguation suffix based on checksum comparison
-  useEffect(() => {
-    if (!duplicateInfo || siblingChecksums.length === 0) {
-      setDisambigSuffix(undefined);
-      return;
-    }
-    const uniqueChecksums = new Set(siblingChecksums.filter(Boolean));
-    if (uniqueChecksums.size <= 1) {
-      // All same content (or all empty) — no suffix needed
-      setDisambigSuffix(undefined);
-      return;
-    }
-    // Different content exists — assign index per unique checksum
-    const checksumOrder = new Map<string, number>();
-    let nextIndex = 1;
-    for (const c of siblingChecksums) {
-      if (!checksumOrder.has(c)) {
-        checksumOrder.set(c, nextIndex++);
-      }
-    }
-    const myChecksum = siblingChecksums[duplicateInfo.myIndex] ?? "";
-    const idx = checksumOrder.get(myChecksum) ?? 1;
-    setDisambigSuffix(idx > 1 ? `(${idx})` : undefined);
-  }, [duplicateInfo, siblingChecksums]);
-
   function closePreview() {
     if (previewObjectUrlRef.current) {
       URL.revokeObjectURL(previewObjectUrlRef.current);
@@ -215,9 +148,7 @@ function AttachmentCard({ attachment, duplicateInfo }: { attachment: string; dup
     try {
       const blob = await readArtifactBlob(artifact);
       const bytes = new Uint8Array(await blob.arrayBuffer());
-      const baseName = artifact.name || `${artifact.id}.bin`;
-      const saveName = disambigSuffix ? insertSuffix(baseName, disambigSuffix) : baseName;
-      const result = await ipc.saveFileDialog(saveName, bytes);
+      const result = await ipc.saveFileDialog(artifact.name || `${artifact.id}.bin`, bytes);
       if (!result) return; // user cancelled
     } catch (err) {
       setError(errorText(err));
@@ -272,11 +203,9 @@ function AttachmentCard({ attachment, duplicateInfo }: { attachment: string; dup
     setBusy("download");
     setError(null);
     try {
-      const baseName = artifact.name || `${artifact.id}.bin`;
-      const downloadName = disambigSuffix ? insertSuffix(baseName, disambigSuffix) : baseName;
       const tempPath = await ipc.downloadToTemp({
         artifactId: artifact.id,
-        suggestedName: downloadName,
+        suggestedName: artifact.name || `${artifact.id}.bin`,
       });
       setDownloaded(artifact.id, tempPath);
     } catch (err) {
@@ -295,9 +224,6 @@ function AttachmentCard({ attachment, duplicateInfo }: { attachment: string; dup
         <div className="min-w-0 flex-1">
           <div className="truncate text-sm font-bold text-[#303849]" title={title}>
             {title}
-            {disambigSuffix && (
-              <span className="ml-1 text-xs font-normal text-[#98a2b3]">{disambigSuffix}</span>
-            )}
             {artifact && localTempPath && (
               <CheckCircle size={13} className="ml-1 inline-block shrink-0 text-emerald-500" aria-label="Downloaded to local temp" />
             )}
@@ -386,36 +312,11 @@ function AttachmentCard({ attachment, duplicateInfo }: { attachment: string; dup
 }
 
 export function AttachmentStack({ attachments }: { attachments: string[] }) {
-  // I3: Detect cross-message duplicates by name, pass sibling info for checksum comparison
-  const nameMap = new Map<string, { uri: string; index: number }[]>();
-  attachments.forEach((uri, index) => {
-    const name = attachmentTitle(uri).toLowerCase();
-    if (!nameMap.has(name)) nameMap.set(name, []);
-    nameMap.get(name)!.push({ uri, index });
-  });
-
   return (
     <div className="mt-3 grid w-full max-w-[640px] min-w-0 gap-2">
-      {attachments.map((attachment, index) => {
-        const name = attachmentTitle(attachment).toLowerCase();
-        const dups = nameMap.get(name) ?? [];
-        const dupIndex = dups.findIndex((d) => d.uri === attachment && d.index === index);
-        const hasDuplicates = dups.length > 1;
-        const duplicateInfo = hasDuplicates
-          ? {
-              totalCount: dups.length,
-              myIndex: dupIndex,
-              siblingUris: dups.map((d) => d.uri),
-            }
-          : undefined;
-        return (
-          <AttachmentCard
-            key={`${attachment}:${index}`}
-            attachment={attachment}
-            duplicateInfo={duplicateInfo}
-          />
-        );
-      })}
+      {attachments.map((attachment, index) => (
+        <AttachmentCard key={`${attachment}:${index}`} attachment={attachment} />
+      ))}
     </div>
   );
 }
@@ -515,14 +416,6 @@ function artifactLookupParams(value: string) {
   if (clean.startsWith("artifact://")) return { artifactUri: clean };
   if (/^art_[A-Za-z0-9_-]+$/.test(clean)) return { artifactId: clean };
   return null;
-}
-
-function insertSuffix(filename: string, suffix: string): string {
-  const dotIndex = filename.lastIndexOf(".");
-  if (dotIndex > 0) {
-    return `${filename.slice(0, dotIndex)}${suffix}${filename.slice(dotIndex)}`;
-  }
-  return `${filename}${suffix}`;
 }
 
 function artifactKindLabel(artifact: Artifact) {

@@ -31,15 +31,8 @@ interface RemoteFilePanelProps {
   onClose: () => void;
 }
 
-function insertSuffix(filename: string, suffix: string): string {
-  const dotIndex = filename.lastIndexOf(".");
-  if (dotIndex > 0) {
-    return `${filename.slice(0, dotIndex)}${suffix}${filename.slice(dotIndex)}`;
-  }
-  return `${filename}${suffix}`;
-}
 
-function ArtifactEntry({ artifact, disambigSuffix }: { artifact: Artifact; disambigSuffix?: string }) {
+function ArtifactEntry({ artifact }: { artifact: Artifact }) {
   const { isDownloaded, setDownloaded, clearDownloaded } = useDownloadedArtifacts();
   const localTempPath = isDownloaded(artifact.id);
   const [busy, setBusy] = useState<"download" | "open" | "reveal" | "save" | "preview" | null>(null);
@@ -51,11 +44,9 @@ function ArtifactEntry({ artifact, disambigSuffix }: { artifact: Artifact; disam
     setBusy("download");
     setError(null);
     try {
-      const baseName = artifact.name || `${artifact.id}.bin`;
-      const downloadName = disambigSuffix ? insertSuffix(baseName, disambigSuffix) : baseName;
       const tempPath = await ipc.downloadToTemp({
         artifactId: artifact.id,
-        suggestedName: downloadName,
+        suggestedName: artifact.name || `${artifact.id}.bin`,
       });
       setDownloaded(artifact.id, tempPath);
     } catch (err) {
@@ -111,9 +102,7 @@ function ArtifactEntry({ artifact, disambigSuffix }: { artifact: Artifact; disam
     try {
       const blob = await readArtifactBlob(artifact);
       const bytes = new Uint8Array(await blob.arrayBuffer());
-      const baseName = artifact.name || `${artifact.id}.bin`;
-      const saveName = disambigSuffix ? insertSuffix(baseName, disambigSuffix) : baseName;
-      const result = await ipc.saveFileDialog(saveName, bytes);
+      const result = await ipc.saveFileDialog(artifact.name || `${artifact.id}.bin`, bytes);
       if (!result) return; // user cancelled
     } catch (err) {
       setError(errorText(err));
@@ -160,8 +149,7 @@ function ArtifactEntry({ artifact, disambigSuffix }: { artifact: Artifact; disam
     setPreview(null);
   }
 
-  const baseName = artifact.name || artifact.id;
-  const displayName = disambigSuffix ? insertSuffix(baseName, disambigSuffix) : baseName;
+  const displayName = artifact.name || artifact.id;
   const size = artifact.size;
   const modified = artifact.createdAt;
 
@@ -171,7 +159,6 @@ function ArtifactEntry({ artifact, disambigSuffix }: { artifact: Artifact; disam
       <div className="min-w-0 flex-1">
         <div className="truncate text-sm text-[#303849]" title={displayName}>
           {displayName}
-          {disambigSuffix && <span className="ml-1 text-xs text-[#98a2b3]">{disambigSuffix}</span>}
         </div>
         {(size != null || modified) && (
           <div className="truncate text-xs text-[#98a2b3]">
@@ -243,43 +230,6 @@ function ArtifactEntry({ artifact, disambigSuffix }: { artifact: Artifact; disam
       )}
     </div>
   );
-}
-
-// I3: Compute disambiguation suffixes based on checksum comparison
-function computeDisambiguation(artifacts: Artifact[]): Map<string, string | undefined> {
-  const nameGroups = new Map<string, Artifact[]>();
-  for (const art of artifacts) {
-    const name = (art.name || art.id).toLowerCase();
-    if (!nameGroups.has(name)) nameGroups.set(name, []);
-    nameGroups.get(name)!.push(art);
-  }
-
-  const result = new Map<string, string | undefined>();
-  for (const [, group] of nameGroups) {
-    if (group.length === 1) {
-      result.set(group[0].id, undefined);
-      continue;
-    }
-    const uniqueChecksums = new Set(group.map((g) => g.checksum).filter(Boolean));
-    if (uniqueChecksums.size <= 1) {
-      // All same content — no suffix needed
-      for (const art of group) result.set(art.id, undefined);
-      continue;
-    }
-    // Different content — assign index per unique checksum
-    const checksumOrder = new Map<string, number>();
-    let nextIndex = 1;
-    for (const art of group) {
-      if (!checksumOrder.has(art.checksum)) {
-        checksumOrder.set(art.checksum, nextIndex++);
-      }
-    }
-    for (const art of group) {
-      const idx = checksumOrder.get(art.checksum) ?? 1;
-      result.set(art.id, idx > 1 ? `(${idx})` : undefined);
-    }
-  }
-  return result;
 }
 
 export function RemoteFilePanel({ target, onClose }: RemoteFilePanelProps) {
@@ -372,20 +322,13 @@ export function RemoteFilePanel({ target, onClose }: RemoteFilePanelProps) {
               No attachments
             </div>
           )}
-          {!loading && !error && artifacts.length > 0 && (() => {
-            const disambig = computeDisambiguation(artifacts);
-            return (
-              <>
-                {artifacts.map((artifact) => (
-                  <ArtifactEntry
-                    key={artifact.id}
-                    artifact={artifact}
-                    disambigSuffix={disambig.get(artifact.id)}
-                  />
-                ))}
-              </>
-            );
-          })()}
+          {!loading && !error && artifacts.length > 0 && (
+            <>
+              {artifacts.map((artifact) => (
+                <ArtifactEntry key={artifact.id} artifact={artifact} />
+              ))}
+            </>
+          )}
         </div>
       </div>
     </div>,

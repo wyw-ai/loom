@@ -63,9 +63,8 @@ function ArtifactEntry({ artifact }: { artifact: Artifact }) {
     try {
       const exists = await ipc.pathExists(localTempPath);
       if (!exists) {
-        setError("Local file deleted, re-downloading...");
+        setError("Local file deleted");
         clearDownloaded(artifact.id);
-        await downloadFile();
         return;
       }
       await ipc.openFileDefault(localTempPath);
@@ -83,9 +82,8 @@ function ArtifactEntry({ artifact }: { artifact: Artifact }) {
     try {
       const exists = await ipc.pathExists(localTempPath);
       if (!exists) {
-        setError("Local file deleted, re-downloading...");
+        setError("Local file deleted");
         clearDownloaded(artifact.id);
-        await downloadFile();
         return;
       }
       await ipc.revealInFolder(localTempPath);
@@ -157,7 +155,7 @@ function ArtifactEntry({ artifact }: { artifact: Artifact }) {
     <div className="flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-[#f0f2f7]">
       <FileText size={16} className="shrink-0 text-[#667085]" />
       <div className="min-w-0 flex-1">
-        <div className="truncate text-sm text-[#303849]" title={displayName}>
+        <div className="truncate text-sm text-[#303849]" title={`${displayName} (${artifact.id.slice(-6)})`}>
           {displayName}
         </div>
         {(size != null || modified) && (

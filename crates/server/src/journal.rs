@@ -234,14 +234,12 @@ impl Journal {
         }
     }
 
-    #[allow(dead_code)] // used by tests and small maintenance tools
-    pub fn replay(&self) -> std::io::Result<Vec<Mutation>> {
-        let mut out = Vec::new();
-        self.replay_into(|m| out.push(m))?;
-        Ok(out)
-    }
-
-    pub fn replay_into<F>(&self, mut apply: F) -> std::io::Result<usize>
+    /// Replay persisted mutations in order without retaining the full journal
+    /// in memory. The visitor receives one owned mutation at a time.
+    ///
+    /// For SQLite storage the visitor runs while the journal connection is
+    /// locked, so it must not call back into this journal.
+    pub fn replay<F>(&self, mut apply: F) -> std::io::Result<usize>
     where
         F: FnMut(Mutation),
     {
@@ -583,7 +581,11 @@ mod tests {
             })
             .expect("append");
 
-        let replayed = journal.replay().expect("replay");
+        let mut replayed = Vec::new();
+        let count = journal
+            .replay(|mutation| replayed.push(mutation))
+            .expect("replay");
+        assert_eq!(count, replayed.len());
         assert!(matches!(
             replayed.as_slice(),
             [Mutation::ActorDelete { actor_id }] if actor_id == "actor_old"

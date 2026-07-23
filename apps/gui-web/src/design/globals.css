@@ -676,6 +676,31 @@
     max-height: none !important;
   }
 
+  /* L1: Thin scrollbar for composer textarea — prevents overlap with absolute-positioned buttons.
+     Scoped to .composer-box textarea only; does not affect message list or other scroll areas.
+     macOS uses overlay scrollbars natively (unaffected). Windows/Linux get thin custom scrollbar. */
+  .composer-box textarea {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(105 114 132 / 0.35) transparent;
+  }
+
+  .composer-box textarea::-webkit-scrollbar {
+    width: 6px;
+  }
+
+  .composer-box textarea::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .composer-box textarea::-webkit-scrollbar-thumb {
+    background: rgb(105 114 132 / 0.35);
+    border-radius: 999px;
+  }
+
+  .composer-box textarea::-webkit-scrollbar-thumb:hover {
+    background: rgb(105 114 132 / 0.5);
+  }
+
   .composer-icon {
     display: inline-flex;
     height: 28px;

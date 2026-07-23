@@ -376,9 +376,13 @@ fn channel_create(state: &AppState, connection_id: &str, params: Option<Value>) 
     // a private channel on behalf of the operator); fall back to the
     // connection's bound actor. Only when both are absent (legacy v0
     // callers) do we fall through to a Public channel.
-    let creator = match p.actor_id {
-        Some(id) => Some(id),
-        None => state.subscriptions.actor_for_connection(connection_id),
+    let creator = if p.public {
+        None
+    } else {
+        match p.actor_id {
+            Some(id) => Some(id),
+            None => state.subscriptions.actor_for_connection(connection_id),
+        }
     };
     let channel = if p.topic.trim().is_empty() {
         state.store.create_channel(p.title, creator)
@@ -618,7 +622,7 @@ fn channel_update(state: &AppState, params: Option<Value>) -> HandlerResult {
     let p: ChannelUpdateParams = parse_params(params)?;
     let channel = state
         .store
-        .update_channel(&p.channel_id, p.title, p.topic)
+        .update_channel(&p.channel_id, p.title, p.topic, p.visibility)
         .map_err(map_store_err)?;
     ok(ChannelUpdateResult { channel })
 }

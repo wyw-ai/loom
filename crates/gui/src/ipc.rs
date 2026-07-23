@@ -1216,8 +1216,10 @@ pub async fn download_to_temp(
         .map_err(stringify)?;
 
     // Determine the filename: explicit suggestion > artifact name > fallback.
+    // artifact/get nests fields under "artifact".
     let artifact_name = meta
-        .get("name")
+        .get("artifact")
+        .and_then(|a| a.get("name"))
         .and_then(Value::as_str)
         .unwrap_or("download")
         .to_string();
@@ -1511,13 +1513,16 @@ pub async fn download_to_cache(
         .await
         .map_err(stringify)?;
 
-    let artifact_name = meta
-        .get("name")
+    // artifact/get returns { artifact: { name, mediaType, ... } } — the
+    // fields are nested under "artifact", not at the top level.
+    let artifact_obj = meta.get("artifact");
+    let artifact_name = artifact_obj
+        .and_then(|a| a.get("name"))
         .and_then(Value::as_str)
         .unwrap_or("download")
         .to_string();
-    let media_type = meta
-        .get("mediaType")
+    let media_type = artifact_obj
+        .and_then(|a| a.get("mediaType"))
         .and_then(Value::as_str)
         .unwrap_or("application/octet-stream")
         .to_string();

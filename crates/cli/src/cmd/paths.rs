@@ -48,8 +48,8 @@ mod tests {
         let root = agent_data_root();
         assert_ne!(root, PathBuf::from(""));
         assert!(
-            root.ends_with("agents"),
-            "expected <data_dir>/loom/agents, got {}",
+            root.ends_with("loom"),
+            "expected <data_dir>/loom, got {}",
             root.display()
         );
         match saved {
@@ -60,14 +60,14 @@ mod tests {
 
     #[test]
     fn agent_data_root_falls_back_to_data_dir() {
-        // With no env var set, the result should end with loom/agents.
+        // With no env var set, the result should end with loom.
         let key = "LOOM_AGENT_DATA_ROOT";
         let saved = std::env::var_os(key);
         std::env::remove_var(key);
         let root = agent_data_root();
         assert!(
-            root.ends_with("agents"),
-            "expected <data_dir>/loom/agents, got {}",
+            root.ends_with("loom"),
+            "expected <data_dir>/loom, got {}",
             root.display()
         );
         match saved {

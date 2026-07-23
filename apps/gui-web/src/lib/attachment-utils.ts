@@ -93,6 +93,17 @@ export interface PendingAttachment {
   bytes: Uint8Array;
 }
 
+/**
+ * Metadata for an attachment that has been uploaded to the server.
+ * Used to build the attachment summary block in message bodies.
+ */
+export interface UploadedAttachment {
+  name: string;
+  mediaType: string;
+  size: number;
+  artifactId: string;
+}
+
 export interface AttachmentValidationError {
   file: File;
   reason: string;
@@ -228,4 +239,86 @@ export function formatFileSize(bytes: number): string {
     value /= 1024;
   }
   return `${value.toFixed(1)} TB`;
+}
+
+// ---------------------------------------------------------------------------
+// Paste / clipboard support (ARCH D3 design)
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract files from a clipboard DataTransfer object (paste event).
+ * Returns an empty array when the clipboard contains no files (pure text paste).
+ */
+export function extractFilesFromClipboard(clipboardData: DataTransfer): File[] {
+  const files: File[] = [];
+  if (!clipboardData || !clipboardData.items) return files;
+  for (let i = 0; i < clipboardData.items.length; i++) {
+    const item = clipboardData.items[i];
+    if (item.kind === "file") {
+      const file = item.getAsFile();
+      if (file) files.push(file);
+    }
+  }
+  return files;
+}
+
+/**
+ * Ensure a pasted file has a reasonable name.
+ * Screenshots often arrive with empty or generic names — auto-generate
+ * `paste-<timestamp>.png` in that case.
+ */
+export function ensurePasteFileName(file: File): File {
+  if (file.name && file.name.trim().length > 0 && file.name !== "image.png") {
+    return file;
+  }
+  const ext = fileExtension(file.name || "image.png") || ".png";
+  const timestamp = Date.now();
+  const newName = `paste-${timestamp}${ext}`;
+  // File objects are read-only — wrap in a new File with the corrected name
+  return new File([file], newName, { type: file.type });
+}
+
+/**
+ * Build the `[附件]` summary block appended to message bodies so that
+ * AI actors can perceive attachments from the text alone.
+ *
+ * Format:
+ * ```
+ * {user text}
+ *
+ * [附件]
+ * - report.pdf (application/pdf, 100KB) [artifact: art_xxx]
+ * ```
+ *
+ * Returns an empty string when there are no attachments (backward compatible).
+ */
+export function buildAttachmentSummaryBlock(attachments: UploadedAttachment[]): string {
+  if (attachments.length === 0) return "";
+  const lines = attachments.map(
+    (att) => `- ${att.name} (${att.mediaType}, ${formatFileSize(att.size)}) [artifact: ${att.artifactId}]`,
+  );
+  return `\n\n[附件]\n${lines.join("\n")}`;
+}
+
+/**
+ * Copy an attachment blob to the system clipboard via the async Clipboard API.
+ * Uses ClipboardItem when available; silently degrades on unsupported browsers
+ * or non-image MIME types that ClipboardItem cannot handle.
+ */
+export async function copyAttachmentToClipboard(
+  blob: Blob,
+  mediaType: string,
+): Promise<void> {
+  const w = window as typeof window & {
+    ClipboardItem?: typeof ClipboardItem;
+  };
+  if (!w.ClipboardItem || !navigator.clipboard?.write) {
+    return; // silent degradation
+  }
+  try {
+    const item = new w.ClipboardItem({ [mediaType]: blob });
+    await navigator.clipboard.write([item]);
+  } catch {
+    // ClipboardItem may reject unsupported MIME types — silent degradation
+  }
 }

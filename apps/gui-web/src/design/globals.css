@@ -1118,6 +1118,24 @@
   animation: chat-header-pulse 2s ease-in-out infinite;
 }
 
+/* Paste highlight animation for newly added attachment chips */
+@keyframes paste-highlight {
+  0% {
+    background-color: rgb(59 130 246 / 0.25);
+    border-color: rgb(59 130 246 / 0.6);
+    box-shadow: 0 0 0 3px rgb(59 130 246 / 0.15);
+  }
+  100% {
+    background-color: rgb(247 248 251);
+    border-color: rgb(223 227 236);
+    box-shadow: none;
+  }
+}
+
+.animate-paste-highlight {
+  animation: paste-highlight 1.5s ease-out forwards;
+}
+
 
   /* highlight.js github theme — scoped under .message-markdown pre code
      so it only applies to code blocks inside messages. */

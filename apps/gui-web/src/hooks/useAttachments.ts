@@ -14,11 +14,16 @@ export interface UseAttachmentsResult {
   removeAttachment: (id: string) => void;
   clearAttachments: () => void;
   openFilePicker: () => void;
+  /** IDs of attachments added most recently (for paste highlight animation). */
+  recentlyAddedIds: string[];
+  /** Clear the highlight state after the animation completes. */
+  clearHighlight: () => void;
 }
 
 export function useAttachments(): UseAttachmentsResult {
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [recentlyAddedIds, setRecentlyAddedIds] = useState<string[]>([]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const addFiles = useCallback(async (files: FileList | File[]) => {
@@ -77,6 +82,8 @@ export function useAttachments(): UseAttachmentsResult {
               existingNames.add(candidate);
               return { ...att, name: candidate };
             });
+            // Track newly added IDs for paste highlight animation
+            setRecentlyAddedIds(deduped.map((a) => a.id));
             return [...curr, ...deduped];
           });
         })
@@ -95,6 +102,11 @@ export function useAttachments(): UseAttachmentsResult {
   const clearAttachments = useCallback(() => {
     setAttachments([]);
     setError(null);
+    setRecentlyAddedIds([]);
+  }, []);
+
+  const clearHighlight = useCallback(() => {
+    setRecentlyAddedIds([]);
   }, []);
 
   const openFilePicker = useCallback(() => {
@@ -109,5 +121,7 @@ export function useAttachments(): UseAttachmentsResult {
     removeAttachment,
     clearAttachments,
     openFilePicker,
+    recentlyAddedIds,
+    clearHighlight,
   };
 }

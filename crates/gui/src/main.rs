@@ -119,6 +119,12 @@ fn main() {
             ipc::machine_list,
             ipc::machine_check,
             ipc::open_local_path,
+            ipc::save_file_dialog,
+            ipc::open_file_default,
+            ipc::reveal_in_folder,
+            ipc::path_exists,
+            ipc::artifact_exists,
+            ipc::download_to_temp,
             ipc::machine_create,
             ipc::machine_start,
             ipc::machine_remove,
@@ -138,6 +144,8 @@ fn main() {
             ipc::thread_skill_remove,
         ])
         .setup(|app| {
+            // Best-effort cleanup of stale temp downloads (>24h old).
+            ipc::cleanup_downloads();
             if let Some(win) = app.get_webview_window("main") {
                 let _ = win.show();
                 let _ = win.set_focus();

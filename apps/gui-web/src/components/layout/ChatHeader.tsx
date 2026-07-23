@@ -1,5 +1,5 @@
 import type { ComponentType } from "react";
-import { Check, Hash, Settings, Split, Users } from "lucide-react";
+import { Check, FolderOpen, Hash, Settings, Split, Users } from "lucide-react";
 import type { Actor, Channel, Run } from "@/ipc/types";
 import type { ChannelPanelTab } from "@/lib/types";
 import type { ConnectionState } from "@/lib/types";
@@ -37,6 +37,7 @@ export function ChatHeader({
   agentActors,
   scopeId,
   actors,
+  onOpenFolder,
 }: {
   channel: Channel | null;
   target: string | null;
@@ -47,6 +48,7 @@ export function ChatHeader({
   agentActors: Actor[];
   scopeId?: string | null;
   actors?: Record<string, Actor>;
+  onOpenFolder?: () => void;
 }) {
   const topic = channelTopic(channel);
   const activity = useMemo(
@@ -113,6 +115,19 @@ export function ChatHeader({
             </Button>
           );
         })}
+        {onOpenFolder && (
+          <Button
+            variant="outline"
+            size="icon"
+            title="View channel attachments"
+            aria-label="View channel attachments"
+            disabled={!channel}
+            onClick={onOpenFolder}
+            className="relative h-9 w-9 shrink-0 rounded-lg"
+          >
+            <FolderOpen size={15} />
+          </Button>
+        )}
       </div>
     </header>
   );

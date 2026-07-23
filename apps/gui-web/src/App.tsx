@@ -452,7 +452,7 @@ export function App() {
     answerDirectAction, openAgentSettings, consumeSettingsAgentTarget,
     addWorkspace, removeWorkspace, logout, updateAccountAvatar, checkMachines,
     createMachine, removeMachine, createAgent, updateAgent, addAgentSkill,
-    removeAgent, openLocalPath, activeChannel, memberCandidates,
+    removeAgent, openLocalPath, setError, activeChannel, memberCandidates,
     activeChannelMemberConfigs, channelTasks, inviteMemberToChannel,
     removeMemberFromChannel, saveMemberWorkspace, clearMemberWorkspace,
   };

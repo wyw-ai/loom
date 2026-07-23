@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type {
   Channel,
   MachineInfo,
@@ -24,6 +25,7 @@ import { ErrorBanner, NoSpaceConnectionGuide } from "@/components/shared/PageCom
 import { ChatHeader } from "@/components/layout/ChatHeader";
 import { MessageFeed } from "@/components/chat/MessageFeed";
 import { Composer } from "@/components/chat/Composer";
+import { RemoteFilePanel } from "@/components/chat/RemoteFilePanel";
 import { ThreadsView } from "@/components/views/ThreadsView";
 import { ChannelsView } from "@/components/views/ChannelsView";
 import { DirectMessagesView } from "@/components/views/DirectMessagesView";
@@ -101,8 +103,8 @@ export interface MainContentProps {
   setReplyTo: (replyTo: Message | null) => void;
   setWorkspaceForm: (form: WorkspaceFormState) => void;
   setAgentForm: (updater: AgentFormState | ((current: AgentFormState) => AgentFormState)) => void;
-  sendMessage: () => Promise<void>;
-  sendThreadMessage: () => Promise<void>;
+  sendMessage: (attachments?: import("@/lib/attachment-utils").PendingAttachment[]) => Promise<void>;
+  sendThreadMessage: (attachments?: import("@/lib/attachment-utils").PendingAttachment[]) => Promise<void>;
   sendDirectMessage: () => Promise<void>;
   startThread: (message: Message) => Promise<void>;
   toggleMessageReaction: (message: Message, emoji: string) => Promise<void>;
@@ -126,10 +128,15 @@ export interface MainContentProps {
   addAgentSkill: (machineId: string, actorId: string, source: string) => Promise<boolean>;
   removeAgent: (machineId: string, actorId: string) => Promise<void>;
   openLocalPath: (path: string) => Promise<void>;
+  setError: (error: string | null) => void;
 }
 
 export function MainContent(props: MainContentProps) {
   const p = props;
+  const [remoteFilePanel, setRemoteFilePanel] = useState<{
+    channelId: string;
+    target: string;
+  } | null>(null);
 
   if (p.view === "chat") {
     return (
@@ -147,6 +154,24 @@ export function MainContent(props: MainContentProps) {
           agentActors={p.agentActors}
           scopeId={p.activeScope?.id}
           actors={p.actors}
+          onOpenFolder={() => {
+            const ch = p.activeChannel;
+            if (!ch) {
+              p.setError("No active channel");
+              return;
+            }
+            const localMachine = p.machines.find((m) => m.canOpenLocalPath);
+            if (localMachine?.dataRoot) {
+              const sep = localMachine.dataRoot.includes("\\") && !localMachine.dataRoot.includes("/") ? "\\" : "/";
+              const path = `${localMachine.dataRoot}${sep}workspaces${sep}channel${sep}${ch.id}${sep}`;
+              p.openLocalPath(path);
+            } else {
+              setRemoteFilePanel({
+                channelId: ch.id,
+                target: p.target ?? `#${ch.id}`,
+              });
+            }
+          }}
         />
         {p.error && (
           <div className="border-b border-red-200 bg-red-50 px-4 py-2 text-sm font-medium text-red-700">
@@ -187,6 +212,13 @@ export function MainContent(props: MainContentProps) {
           mentionAgents={p.channelAgentActors}
           busy={p.busy === "message:send"}
         />
+        {remoteFilePanel && (
+          <RemoteFilePanel
+            channelId={remoteFilePanel.channelId}
+            target={remoteFilePanel.target}
+            onClose={() => setRemoteFilePanel(null)}
+          />
+        )}
       </>
     );
   }
@@ -219,9 +251,31 @@ export function MainContent(props: MainContentProps) {
           onSendThreadMessage={p.sendThreadMessage}
           onToggleReaction={p.toggleMessageReaction}
           onOpenAgentSettings={p.openAgentSettings}
+          onOpenThreadFolder={() => {
+            const thread = p.activeThread;
+            if (!thread) return;
+            const localMachine = p.machines.find((m) => m.canOpenLocalPath);
+            if (localMachine?.dataRoot) {
+              const sep = localMachine.dataRoot.includes("\\") && !localMachine.dataRoot.includes("/") ? "\\" : "/";
+              const path = `${localMachine.dataRoot}${sep}workspaces${sep}thread${sep}${thread.id}${sep}`;
+              p.openLocalPath(path);
+            } else {
+              setRemoteFilePanel({
+                channelId: thread.channelId,
+                target: p.threadMessageTarget ?? `#${thread.channelId}:${thread.rootMessageId}`,
+              });
+            }
+          }}
           busy={p.busy}
           disabled={p.connection !== "open" || !p.threadMessageTarget}
         />
+        {remoteFilePanel && (
+          <RemoteFilePanel
+            channelId={remoteFilePanel.channelId}
+            target={remoteFilePanel.target}
+            onClose={() => setRemoteFilePanel(null)}
+          />
+        )}
       </>
     );
   }

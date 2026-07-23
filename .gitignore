@@ -45,3 +45,10 @@ data
 # In-repo checkouts of official runtime content (CI checks these out here)
 /loom-guide/
 /loom-skills/
+
+# Loom runtime artifacts (not source)
+/.loom-art.txt
+/.loom-thread.txt
+
+# Understand-Anything knowledge graph output
+/.understand-anything/

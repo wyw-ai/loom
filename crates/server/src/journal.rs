@@ -67,9 +67,12 @@ pub enum Mutation {
     TraceAppend(proto::types::trace::TraceFrame),
     ChannelUpdate {
         channel_id: String,
-        title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         topic: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        visibility: Option<ChannelVisibility>,
     },
     ChannelDelete {
         channel_id: String,

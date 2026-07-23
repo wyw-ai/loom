@@ -238,18 +238,11 @@ fn reconnect_delay(attempt: u32) -> Duration {
 }
 
 pub(crate) fn default_data_root_pub() -> PathBuf {
-    default_data_root()
+    super::paths::agent_data_root()
 }
 
 fn default_data_root() -> PathBuf {
-    if let Ok(s) = std::env::var("LOOM_AGENT_DATA_ROOT") {
-        if !s.is_empty() {
-            return PathBuf::from(s);
-        }
-    }
-    dirs::data_dir()
-        .map(|d| d.join("loom").join("agents"))
-        .unwrap_or_else(|| PathBuf::from(".loom").join("agents-data"))
+    super::paths::agent_data_root()
 }
 
 fn default_specs_dir() -> PathBuf {

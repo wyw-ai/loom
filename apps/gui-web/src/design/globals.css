@@ -676,6 +676,31 @@
     max-height: none !important;
   }
 
+  /* L1: Thin scrollbar for composer textarea — prevents overlap with absolute-positioned buttons.
+     Scoped to .composer-box textarea only; does not affect message list or other scroll areas.
+     macOS uses overlay scrollbars natively (unaffected). Windows/Linux get thin custom scrollbar. */
+  .composer-box textarea {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(105 114 132 / 0.35) transparent;
+  }
+
+  .composer-box textarea::-webkit-scrollbar {
+    width: 6px;
+  }
+
+  .composer-box textarea::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .composer-box textarea::-webkit-scrollbar-thumb {
+    background: rgb(105 114 132 / 0.35);
+    border-radius: 999px;
+  }
+
+  .composer-box textarea::-webkit-scrollbar-thumb:hover {
+    background: rgb(105 114 132 / 0.5);
+  }
+
   .composer-icon {
     display: inline-flex;
     height: 28px;
@@ -878,8 +903,6 @@
     align-items: center;
     justify-content: space-between;
     padding: 4px 12px;
-    border: 1px solid #dfe3ec;
-    border-bottom: none;
     border-radius: 10px 10px 0 0;
     background: #edeff5;
     font-size: 0.75rem;
@@ -887,7 +910,7 @@
 
   .code-block-header + pre {
     border-radius: 0 0 10px 10px;
-    border-top: 1px solid #dfe3ec;
+    border: none;
   }
 
   .code-lang-label {
@@ -1093,6 +1116,24 @@
 
 .chat-header-activity-running {
   animation: chat-header-pulse 2s ease-in-out infinite;
+}
+
+/* Paste highlight animation for newly added attachment chips */
+@keyframes paste-highlight {
+  0% {
+    background-color: rgb(59 130 246 / 0.25);
+    border-color: rgb(59 130 246 / 0.6);
+    box-shadow: 0 0 0 3px rgb(59 130 246 / 0.15);
+  }
+  100% {
+    background-color: rgb(247 248 251);
+    border-color: rgb(223 227 236);
+    box-shadow: none;
+  }
+}
+
+.animate-paste-highlight {
+  animation: paste-highlight 1.5s ease-out forwards;
 }
 
 

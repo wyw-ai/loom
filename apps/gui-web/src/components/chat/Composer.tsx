@@ -6,11 +6,19 @@ import { activeMentionQuery, mentionCandidates } from "@/lib/format-utils";
 import { isComposingKeyEvent, shouldSendOnEnter } from "@/lib/format-utils";
 import { COMPOSER_AUTO_MAX_ROWS, COMPOSER_MIN_HEIGHT } from "@/lib/composer-utils";
 import { useComposerResize } from "@/hooks/useComposerResize";
+import { useAttachments } from "@/hooks/useAttachments";
+import {
+  shouldWarnLongText,
+  LONG_TEXT_THRESHOLD,
+  extractFilesFromClipboard,
+  ensurePasteFileName,
+} from "@/lib/attachment-utils";
 import { AutoGrowTextarea } from "@/components/ui/AutoGrowTextarea";
 import { Button } from "@/components/ui/button";
-import { Send, Loader2, X } from "lucide-react";
+import { Send, Loader2, X, Paperclip, AlertTriangle } from "lucide-react";
 import { MentionMenu } from "@/components/chat/MentionMenu";
 import { ComposerResizeHandle } from "@/components/chat/ComposerResizeHandle";
+import { AttachmentPreviewBar } from "@/components/chat/AttachmentPreviewBar";
 
 export function Composer({
   draft,
@@ -31,7 +39,7 @@ export function Composer({
   replyTo: Message | null;
   actorName: string;
   onClearReply: () => void;
-  onSend: () => void;
+  onSend: (attachments?: import("@/lib/attachment-utils").PendingAttachment[]) => void;
   mentionAgents: Actor[];
   placeholder?: string;
   disabledPlaceholder?: string;
@@ -41,6 +49,18 @@ export function Composer({
   const [caretIndex, setCaretIndex] = useState(draft.length);
   const [selectedMentionIndex, setSelectedMentionIndex] = useState(0);
   const [dismissedMentionKey, setDismissedMentionKey] = useState<string | null>(null);
+  const [dragHover, setDragHover] = useState(false);
+  const {
+    attachments,
+    error: attachmentError,
+    fileInputRef,
+    addFiles,
+    removeAttachment,
+    clearAttachments,
+    openFilePicker,
+    recentlyAddedIds,
+    clearHighlight,
+  } = useAttachments();
 
   // --- Resize state ---
   const {
@@ -79,6 +99,24 @@ export function Composer({
     setCaretIndex(element.selectionStart ?? element.value.length);
   }
 
+  function handleSend() {
+    onSend(attachments.length > 0 ? attachments : undefined);
+    clearAttachments();
+  }
+
+  function handlePaste(event: React.ClipboardEvent<HTMLTextAreaElement>) {
+    const files = extractFilesFromClipboard(event.clipboardData);
+    if (files.length === 0) return; // pure text paste — don't interfere
+    event.preventDefault();
+    const named = files.map(ensurePasteFileName);
+    addFiles(named);
+    // Clear highlight after animation completes
+    setTimeout(() => clearHighlight(), 1600);
+  }
+
+  const showLongTextWarning = shouldWarnLongText(draft.length);
+  const willConvertLongText = draft.length >= LONG_TEXT_THRESHOLD;
+
   function chooseMention(option: MentionOption) {
     const before = draft.slice(0, option.start);
     const after = draft.slice(option.end).replace(/^\s*/, "");
@@ -95,6 +133,13 @@ export function Composer({
 
   return (
     <footer className="border-t border-[#e2e6ef] bg-white px-5 py-4">
+      <div className="mx-auto max-w-4xl">
+        <AttachmentPreviewBar
+          attachments={attachments}
+          onRemove={removeAttachment}
+          recentlyAddedIds={recentlyAddedIds}
+        />
+      </div>
       <Resizable
         className="mx-auto max-w-4xl"
         enable={{ top: true, right: false, bottom: false, left: false, topRight: false, bottomRight: false, bottomLeft: false, topLeft: false }}
@@ -130,7 +175,44 @@ export function Composer({
               </button>
             </div>
           )}
-          <div className={`composer-box relative flex-1${isManual ? " composer-box-manual" : ""}`}>
+          {(showLongTextWarning || willConvertLongText) && (
+            <div className="mb-2 flex shrink-0 items-center gap-1.5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-700">
+              <AlertTriangle size={13} className="shrink-0" />
+              {willConvertLongText
+                ? `Message exceeds ${LONG_TEXT_THRESHOLD} characters and will be sent as a .txt attachment.`
+                : `Message is approaching the ${LONG_TEXT_THRESHOLD} character limit.`}
+            </div>
+          )}
+          {attachmentError && (
+            <div className="mb-2 shrink-0 rounded-lg border border-red-200 bg-red-50 px-3 py-1.5 text-xs font-medium text-red-700">
+              {attachmentError}
+            </div>
+          )}
+          <input
+            ref={fileInputRef as React.RefObject<HTMLInputElement>}
+            type="file"
+            multiple
+            className="hidden"
+            onChange={(e) => {
+              if (e.target.files) addFiles(e.target.files);
+              e.target.value = "";
+            }}
+          />
+          <div
+            className={`composer-box relative flex-1${isManual ? " composer-box-manual" : ""}${dragHover ? " ring-2 ring-blue-400" : ""}`}
+            onDrop={(e) => {
+              e.preventDefault();
+              setDragHover(false);
+              if (e.dataTransfer.files.length > 0) {
+                addFiles(e.dataTransfer.files);
+              }
+            }}
+            onDragOver={(e) => {
+              e.preventDefault();
+              setDragHover(true);
+            }}
+            onDragLeave={() => setDragHover(false)}
+          >
             {showMentions && (
               <MentionMenu
                 options={mentionOptions}
@@ -148,6 +230,7 @@ export function Composer({
                 syncCaret(event.currentTarget);
                 setDismissedMentionKey(null);
               }}
+              onPaste={handlePaste}
               onClick={(event) => syncCaret(event.currentTarget)}
               onKeyUp={(event) => syncCaret(event.currentTarget)}
               onKeyDown={(event) => {
@@ -180,21 +263,30 @@ export function Composer({
                 }
                 if (shouldSendOnEnter(event)) {
                   event.preventDefault();
-                  onSend();
+                  handleSend();
                 }
               }}
               disabled={disabled}
               placeholder={disabled ? disabledPlaceholder : placeholder}
-              className="max-h-full min-h-[44px] flex-1 px-0 pr-12"
+              className="max-h-full min-h-[44px] w-full flex-1 px-3 mr-12"
             />
             <Button
               size="icon"
-              onClick={onSend}
-              disabled={disabled || !draft.trim() || busy}
+              onClick={handleSend}
+              disabled={disabled || (!draft.trim() && attachments.length === 0) || busy}
               className="absolute bottom-2 right-3 h-9 w-9 shrink-0 rounded-lg"
             >
               {busy ? <Loader2 className="animate-spin" size={17} /> : <Send size={17} />}
             </Button>
+            <button
+              type="button"
+              onClick={openFilePicker}
+              disabled={disabled}
+              title="Attach files"
+              className="absolute bottom-[46px] right-3 z-10 flex h-9 w-9 items-center justify-center rounded-lg text-[#667085] transition-colors hover:bg-[#f0f2f7] hover:text-[#1d2939] disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <Paperclip size={16} />
+            </button>
           </div>
         </div>
       </Resizable>

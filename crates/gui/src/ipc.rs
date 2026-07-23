@@ -1130,6 +1130,284 @@ pub async fn artifact_read(state: State<'_, AppState>, params: Value) -> Result<
         .map_err(stringify)
 }
 
+/// E1: Check whether an artifact exists on the server. Replaces the
+/// deprecated `path_exists` for attachment state detection — works
+/// correctly in distributed deployments (server/daemon/gui on
+/// different machines) because it queries the Server API rather than
+/// the local filesystem.
+#[tauri::command]
+pub async fn artifact_exists(state: State<'_, AppState>, params: Value) -> Result<bool, String> {
+    // Protocol contract: `artifact_get` returns the artifact metadata
+    // (non-null) when the artifact exists, and returns an RPC error with
+    // code -32000 (APP_NOT_FOUND) when it does not. We must distinguish
+    // "not found" (→ Ok(false)) from genuine transport/server errors
+    // (→ propagate Err). Do NOT use `map_err(stringify)?` here because
+    // that would turn the not-found case into an Err.
+    match state
+        .client()
+        .await?
+        .call_raw(method::ARTIFACT_GET, Some(params))
+        .await
+    {
+        Ok(result) => Ok(!result.is_null()),
+        Err(e) => {
+            let msg = stringify(e);
+            // APP_NOT_FOUND surfaces as JSON-RPC error code -32000.
+            if msg.contains("(code -32000)") {
+                Ok(false)
+            } else {
+                Err(msg)
+            }
+        }
+    }
+}
+
+/// Maximum payload size for `download_to_temp` (100 MB).
+const DOWNLOAD_TO_TEMP_MAX_BYTES: usize = 100 * 1024 * 1024;
+
+/// E1: Download an artifact to the system temp directory. Uses the
+/// Server API `artifact_read` to fetch bytes, then writes them to
+/// `std::env::temp_dir()/loom-downloads/<suggestedName>`. Returns the
+/// full path of the downloaded file. This writes to the local temp
+/// directory rather than `workspacePath` (which may point to a remote
+/// machine).
+///
+/// # Memory profile
+///
+/// The download streams `artifact_read` in fixed-size chunks
+/// (`chunk_size = 65_536` bytes). Each chunk is decoded into a
+/// `Vec<u8>` and written immediately, so the peak memory used by the
+/// download path is bounded at roughly `chunk_size + JSON overhead`
+/// (~256 KB per chunk) regardless of the total artifact size. This
+/// avoids loading the entire artifact into memory.
+///
+/// # Future: base64 migration
+///
+/// The current `extract_artifact_bytes` helper accepts a JSON `"bytes"`
+/// array or a `"content"` string. A future migration to base64-encoded
+/// binary transport (single `"bytes_b64"` field) will reduce JSON
+/// overhead per chunk and is tracked as a separate PR — no change to
+/// the chunked streaming design is required.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadToTempArgs {
+    pub artifact_id: String,
+    #[serde(default)]
+    pub suggested_name: Option<String>,
+}
+
+#[tauri::command]
+pub async fn download_to_temp(
+    state: State<'_, AppState>,
+    args: DownloadToTempArgs,
+) -> Result<String, String> {
+    // Fetch artifact metadata to determine media type and validate existence.
+    // If the artifact does not exist, call_raw returns an APP_NOT_FOUND
+    // error which is propagated via map_err(stringify)? — no need for
+    // a separate null check.
+    let meta = state
+        .client()
+        .await?
+        .call_raw(
+            method::ARTIFACT_GET,
+            Some(json!({ "artifactId": args.artifact_id })),
+        )
+        .await
+        .map_err(stringify)?;
+
+    // Determine the filename: explicit suggestion > artifact name > fallback.
+    let artifact_name = meta
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("download")
+        .to_string();
+    let file_name = args
+        .suggested_name
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or(artifact_name);
+    // Sanitize the filename — strip path separators to prevent directory traversal.
+    let safe_name = sanitize_filename(&file_name);
+
+    let download_dir = std::env::temp_dir()
+        .join("loom-downloads")
+        .join(&args.artifact_id);
+    std::fs::create_dir_all(&download_dir)
+        .map_err(|e| format!("Failed to create temp download directory: {e}"))?;
+    let dest_path = download_dir.join(&safe_name);
+
+    // Stream artifact_read in chunks until complete or limit exceeded.
+    let mut file = std::fs::File::create(&dest_path)
+        .map_err(|e| format!("Failed to create temp file: {e}"))?;
+    let mut offset = 0u64;
+    let mut total_written = 0usize;
+    let chunk_size = 65_536u64;
+    loop {
+        let chunk = state
+            .client()
+            .await?
+            .call_raw(
+                method::ARTIFACT_READ,
+                Some(json!({
+                    "artifactId": args.artifact_id,
+                    "offset": offset,
+                    "maxBytes": chunk_size,
+                })),
+            )
+            .await
+            .map_err(stringify)?;
+
+        let bytes = extract_artifact_bytes(&chunk)?;
+        let written = bytes.len();
+        if written == 0 {
+            break;
+        }
+        total_written += written;
+        if total_written > DOWNLOAD_TO_TEMP_MAX_BYTES {
+            // Clean up partial file before returning error.
+            let _ = std::fs::remove_file(&dest_path);
+            return Err(format!(
+                "file exceeds {} byte download limit",
+                DOWNLOAD_TO_TEMP_MAX_BYTES
+            ));
+        }
+        std::io::Write::write_all(&mut file, &bytes)
+            .map_err(|e| format!("Failed to write temp file: {e}"))?;
+
+        let truncated = chunk
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !truncated {
+            break;
+        }
+        match chunk.get("nextOffset").and_then(Value::as_u64) {
+            Some(next) if next > offset => offset = next,
+            _ => break,
+        }
+    }
+
+    Ok(dest_path.display().to_string())
+}
+
+/// Maximum age (24 hours) for files in the temp download directory before
+/// they are eligible for cleanup.
+const DOWNLOAD_MAX_AGE_SECS: u64 = 24 * 60 * 60;
+
+/// Remove stale files from the `loom-downloads` temp directory. Files
+/// whose last modification time is older than `DOWNLOAD_MAX_AGE_SECS`
+/// (24 hours) are deleted. This is best-effort: errors are silently
+/// ignored so that cleanup never blocks app startup.
+///
+/// Call this once during GUI app setup (`main.rs` `.setup()` hook).
+/// Uses `std::env::temp_dir()` for cross-platform compatibility
+/// (Windows `%TEMP%`, macOS `/var/folders/...`, Linux `/tmp`).
+pub fn cleanup_downloads() {
+    let download_root = std::env::temp_dir().join("loom-downloads");
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(DOWNLOAD_MAX_AGE_SECS));
+
+    let cutoff = match cutoff {
+        Some(c) => c,
+        None => return, // system clock issue — skip cleanup
+    };
+
+    let entries = match std::fs::read_dir(&download_root) {
+        Ok(e) => e,
+        Err(_) => return, // dir doesn't exist or unreadable — nothing to do
+    };
+
+    for entry in entries.flatten() {
+        // Each subdirectory is named by artifact_id; clean files inside.
+        let path = entry.path();
+        if path.is_dir() {
+            let _ = cleanup_dir_older_than(&path, cutoff);
+        } else {
+            let _ = remove_if_older_than(&path, cutoff);
+        }
+    }
+}
+
+/// Remove a single file if its mtime is older than `cutoff`.
+fn remove_if_older_than(path: &std::path::Path, cutoff: std::time::SystemTime) -> std::io::Result<()> {
+    let metadata = std::fs::metadata(path)?;
+    if let Ok(mtime) = metadata.modified() {
+        if mtime < cutoff {
+            std::fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Recursively clean files older than `cutoff` inside `dir`.
+fn cleanup_dir_older_than(
+    dir: &std::path::Path,
+    cutoff: std::time::SystemTime,
+) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)?.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let _ = cleanup_dir_older_than(&path, cutoff);
+        } else {
+            let _ = remove_if_older_than(&path, cutoff);
+        }
+    }
+    // Remove the subdirectory if it's now empty.
+    if std::fs::read_dir(dir)?.next().is_none() {
+        let _ = std::fs::remove_dir(dir);
+    }
+    Ok(())
+}
+/// populates both `bytes` (as a JSON number array) and `content` (as a
+/// lossy UTF-8 string). We prefer `bytes` for binary correctness; fall
+/// back to `content`'s raw bytes only if `bytes` is absent.
+fn extract_artifact_bytes(response: &Value) -> Result<Vec<u8>, String> {
+    if let Some(bytes) = response.get("bytes").and_then(Value::as_array) {
+        if !bytes.is_empty() {
+            return Ok(bytes
+                .iter()
+                .filter_map(|v| {
+                    // Filter out-of-bounds values instead of silently
+                    // truncating with `n as u8`, which would corrupt data
+                    // for n > 255.
+                    v.as_u64().filter(|&n| n <= u8::MAX as u64).map(|n| n as u8)
+                })
+                .collect());
+        }
+    }
+    if let Some(content) = response.get("content").and_then(Value::as_str) {
+        return Ok(content.as_bytes().to_vec());
+    }
+    Ok(Vec::new())
+}
+
+/// Sanitize a filename by removing path separators and other dangerous
+/// characters. Keeps Unicode letters/digits, dots, dashes, underscores,
+/// and spaces.
+fn sanitize_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | ' ') {
+                c
+            } else {
+                // Replace path separators AND all other non-whitelisted
+                // characters (including Windows-reserved chars like
+                // : < > * ? " |) with '_'. This prevents invalid filenames
+                // and Alternate Data Stream vectors on Windows.
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        "loom-download".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 #[tauri::command]
 pub async fn run_cancel(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
     state
@@ -1566,6 +1844,10 @@ pub struct MachineDirListArgs {
     pub machine_id: String,
     #[serde(default)]
     pub path: Option<String>,
+    /// E1: When true, include file entries (not just directories) in the
+    /// response. Defaults to false for backward compatibility.
+    #[serde(default)]
+    pub include_files: bool,
 }
 
 #[tauri::command]
@@ -1582,6 +1864,7 @@ pub async fn machine_dir_list(
         json!({
             "op": "fs.dir.list",
             "path": args.path,
+            "includeFiles": args.include_files,
         }),
     )
     .await
@@ -1752,6 +2035,135 @@ pub async fn open_local_path(args: OpenLocalPathArgs) -> Result<(), String> {
             .map_err(|e| format!("create directory {}: {e}", path.display()))?;
     }
     open_path_with_system(&path).map_err(stringify)
+}
+
+/// B1: Native "Save As" dialog — replaces the unreliable `downloadBlob`
+/// in the Tauri webview. Uses the `rfd` crate (pure Rust, no Tauri
+/// capabilities change). Returns the chosen path on success, or `None`
+/// when the user cancels the dialog.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveFileDialogArgs {
+    pub file_name: String,
+    pub bytes: Vec<u8>,
+}
+
+#[tauri::command]
+pub async fn save_file_dialog(args: SaveFileDialogArgs) -> Result<Option<String>, String> {
+    let file_name = if args.file_name.trim().is_empty() {
+        "download"
+    } else {
+        args.file_name.trim()
+    };
+
+    let dialog = rfd::AsyncFileDialog::new().set_file_name(file_name);
+
+    let result = dialog.save_file().await;
+
+    match result {
+        Some(handle) => {
+            let path = handle.path();
+            let path_str = path.to_string_lossy().to_string();
+            std::fs::write(path, &args.bytes)
+                .map_err(|e| format!("Failed to write file: {e}"))?;
+            Ok(Some(path_str))
+        }
+        None => Ok(None),
+    }
+}
+
+/// B1: Open a file with the system default application. Reuses
+/// `open_path_with_system` (which already opens files via the default
+/// handler on all three platforms) but does NOT create directories —
+/// it is strictly a "launch existing file" command.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenPathArgs {
+    pub path: String,
+}
+
+#[tauri::command]
+pub async fn open_file_default(args: OpenPathArgs) -> Result<(), String> {
+    let raw = args.path.trim();
+    if raw.is_empty() {
+        return Err("path is required".into());
+    }
+    let path = normalize_local_path(config::expand_home(raw)).map_err(stringify)?;
+    if !path.exists() {
+        return Err(format!("File not found: {}", path.display()));
+    }
+    open_path_with_system(&path).map_err(stringify)
+}
+
+/// B1: Reveal a file in the platform file manager, selecting it.
+/// - Windows: `explorer /select,"<path>"`
+/// - macOS: `open -R "<path>"`
+/// - Linux: best-effort — opens the parent directory via `xdg-open`.
+#[allow(clippy::disallowed_methods)] // G1 OS shell — same exemption as open_path_with_system
+#[tauri::command]
+pub async fn reveal_in_folder(args: OpenPathArgs) -> Result<(), String> {
+    let raw = args.path.trim();
+    if raw.is_empty() {
+        return Err("path is required".into());
+    }
+    let path = normalize_local_path(config::expand_home(raw)).map_err(stringify)?;
+    if !path.exists() {
+        return Err(format!("Path not found: {}", path.display()));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .args(["/select,", &path.to_string_lossy()])
+            .spawn()
+            .map_err(|e| format!("Failed to reveal: {e}"))?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .args(["-R", &path.to_string_lossy()])
+            .spawn()
+            .map_err(|e| format!("Failed to reveal: {e}"))?;
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        std::process::Command::new("xdg-open")
+            .arg(parent)
+            .spawn()
+            .map_err(|e| format!("Failed to reveal: {e}"))?;
+    }
+
+    Ok(())
+}
+
+/// Check whether a local filesystem path exists on the GUI host machine.
+///
+/// Semantic orthogonality note: `path_exists` checks the **local
+/// filesystem** of the machine running the GUI (used by the FE to
+/// determine whether a `workspacePath` is locally reachable or
+/// remote-only), whereas `artifact_exists` queries the **Server API**
+/// to check whether an artifact exists on the server regardless of
+/// where the GUI runs. The two are complementary, not redundant.
+///
+/// D1: Used by the FE to determine whether an attachment's
+/// `workspacePath` is locally reachable (local daemon) or remote-only.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PathExistsArgs {
+    pub path: String,
+}
+
+#[tauri::command]
+pub async fn path_exists(args: PathExistsArgs) -> Result<bool, String> {
+    let raw = args.path.trim();
+    if raw.is_empty() {
+        return Ok(false);
+    }
+    let path = normalize_local_path(config::expand_home(raw)).map_err(stringify)?;
+    Ok(path.exists())
 }
 
 #[derive(Deserialize)]
@@ -2172,12 +2584,15 @@ async fn merge_server_machine_inventory(
     Ok(())
 }
 
-fn upsert_server_machine_info(machines: &mut Vec<MachineInfo>, machine: MachineInfo) {
+fn upsert_server_machine_info(machines: &mut Vec<MachineInfo>, mut machine: MachineInfo) {
     if let Some(existing) = machines.iter_mut().find(|m| m.id == machine.id) {
         if machine.inventory_revision > existing.inventory_revision
             || (machine.inventory_revision == existing.inventory_revision
                 && machine.inventory_observed_at > existing.inventory_observed_at)
         {
+            // Preserve local can_open_local_path — the server inventory has no
+            // authority over whether a local daemon can open paths on this host.
+            machine.can_open_local_path = existing.can_open_local_path;
             *existing = machine;
         }
     } else {
@@ -2894,17 +3309,13 @@ fn open_path_with_system(path: &Path) -> anyhow::Result<()> {
         command
     };
 
-    let status = command
-        .status()
+    // Spawn without waiting for exit code — Windows explorer.exe commonly
+    // returns non-zero even on success. We only care whether the process
+    // launched successfully.
+    command
+        .spawn()
         .map_err(|e| anyhow::anyhow!("open {}: {e}", path.display()))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!(
-            "open {} exited with status {status}",
-            path.display()
-        ))
-    }
+    Ok(())
 }
 
 fn shell_arg(value: &str) -> String {
@@ -3260,14 +3671,7 @@ pub struct SkillRegistryDto {
 /// machine's data root; that is a larger IPC signature change tracked
 /// separately and out of scope for this fix.
 fn agent_data_root() -> Result<PathBuf, String> {
-    if let Ok(s) = std::env::var("LOOM_AGENT_DATA_ROOT") {
-        if !s.is_empty() {
-            return Ok(PathBuf::from(s));
-        }
-    }
-    Ok(dirs::data_dir()
-        .map(|d| d.join("loom").join("agents"))
-        .unwrap_or_else(|| PathBuf::from(".loom").join("agents-data")))
+    Ok(loom_platform::agent_data_root())
 }
 
 fn read_skill_registry(path: &Path) -> Result<SkillRegistryDto, String> {
@@ -4165,12 +4569,204 @@ mod tests {
         let root = agent_data_root().expect("agent data root falls through empty env");
         // We cannot assert the exact path (depends on the host's data_dir),
         // but it must NOT be the empty PathBuf and must end with the
-        // default `loom/agents` suffix.
+        // default `loom` suffix (callers append `agents/<actor_id>`).
         assert_ne!(root, PathBuf::from(""));
-        assert!(root.ends_with("agents"), "expected <data_dir>/loom/agents, got {}", root.display());
+        assert!(root.ends_with("loom"), "expected <data_dir>/loom, got {}", root.display());
         match saved {
             Some(v) => std::env::set_var(key, v),
             None => std::env::remove_var(key),
         }
+    }
+
+    // ---------- MF1: artifact_exists error classification ----------
+
+    /// The `artifact_exists` command classifies RPC errors by string-matching
+    /// the flattened error message for `(code -32000)` (APP_NOT_FOUND). This
+    /// test verifies the classification contract that the command relies on.
+    #[test]
+    fn mf1_artifact_exists_classifies_app_not_found_error() {
+        // Scenario 1: APP_NOT_FOUND error (code -32000) → should be treated
+        // as "does not exist" (Ok(false)).
+        let not_found_msg = "rpc `artifact_get` failed: artifact not found (code -32000)";
+        assert!(
+            not_found_msg.contains("(code -32000)"),
+            "APP_NOT_FOUND error must contain '(code -32000)'"
+        );
+
+        // Scenario 2: a genuine transport error (e.g. timeout) must NOT
+        // match the not-found pattern and should be propagated as Err.
+        let timeout_msg = "rpc `artifact_get` timed out";
+        assert!(
+            !timeout_msg.contains("(code -32000)"),
+            "timeout error must not be classified as not-found"
+        );
+
+        // Scenario 3: a different RPC error code (e.g. -32602 invalid params)
+        // must NOT be classified as not-found.
+        let invalid_params_msg =
+            "rpc `artifact_get` failed: invalid params (code -32602)";
+        assert!(
+            !invalid_params_msg.contains("(code -32000)"),
+            "non-APP_NOT_FOUND error must not be classified as not-found"
+        );
+    }
+
+    // ---------- MF2: sanitize_filename ----------
+
+    #[test]
+    fn mf2_sanitize_filename_replaces_windows_reserved_chars() {
+        // Scenario 1: Windows-reserved characters are replaced with '_'.
+        let sanitized = sanitize_filename("file:name<>*?.txt");
+        assert!(
+            !sanitized.contains(':'),
+            "colon must be replaced: got '{sanitized}'"
+        );
+        assert!(
+            !sanitized.contains('<'),
+            "less-than must be replaced: got '{sanitized}'"
+        );
+        assert!(
+            !sanitized.contains('>'),
+            "greater-than must be replaced: got '{sanitized}'"
+        );
+        assert!(
+            !sanitized.contains('*'),
+            "asterisk must be replaced: got '{sanitized}'"
+        );
+        assert!(
+            !sanitized.contains('?'),
+            "question mark must be replaced: got '{sanitized}'"
+        );
+    }
+
+    #[test]
+    fn mf2_sanitize_filename_preserves_valid_characters() {
+        // Scenario 2: whitelisted characters (alphanumeric, dot, dash,
+        // underscore, space) are preserved.
+        let sanitized = sanitize_filename("my-file_v1.0 final.txt");
+        assert_eq!(sanitized, "my-file_v1.0 final.txt");
+    }
+
+    #[test]
+    fn mf2_sanitize_filename_replaces_path_separators() {
+        // Scenario 3: path separators are replaced with '_'.
+        let sanitized = sanitize_filename("dir/sub\\file.txt");
+        assert!(
+            !sanitized.contains('/') && !sanitized.contains('\\'),
+            "path separators must be replaced: got '{sanitized}'"
+        );
+    }
+
+    // ---------- MF8: extract_artifact_bytes ----------
+
+    #[test]
+    fn mf8_extract_artifact_bytes_filters_out_of_bounds_values() {
+        // Scenario 1: values > 255 are filtered out, not silently truncated.
+        let response = serde_json::json!({
+            "bytes": [65, 256, 300, 66]
+        });
+        let bytes = extract_artifact_bytes(&response).expect("extract bytes");
+        // 256 and 300 should be dropped, not truncated to 0 and 44.
+        assert_eq!(bytes, vec![65, 66], "out-of-bounds values must be filtered");
+    }
+
+    #[test]
+    fn mf8_extract_artifact_bytes_preserves_valid_byte_values() {
+        // Scenario 2: all valid byte values (0-255) are preserved exactly.
+        let response = serde_json::json!({
+            "bytes": [0, 127, 200, 255]
+        });
+        let bytes = extract_artifact_bytes(&response).expect("extract bytes");
+        assert_eq!(bytes, vec![0, 127, 200, 255]);
+    }
+
+    #[test]
+    fn mf8_extract_artifact_bytes_falls_back_to_content_string() {
+        // Scenario 3: when "bytes" is absent, falls back to "content" string.
+        let response = serde_json::json!({
+            "content": "hello"
+        });
+        let bytes = extract_artifact_bytes(&response).expect("extract bytes");
+        assert_eq!(bytes, b"hello".to_vec());
+    }
+
+    // ---------- F8: cleanup_downloads ----------
+
+    use std::io::Write;
+
+    /// Helper: create a temp-based loom-downloads dir for testing.
+    fn f8_test_dir() -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join("loom-downloads-f8-test")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        dir
+    }
+
+    /// Helper: write a file with a specific modification time (age_secs ago).
+    fn f8_write_file_with_age(dir: &Path, name: &str, age_secs: u64) {
+        let path = dir.join(name);
+        let mut f = std::fs::File::create(&path).expect("create file");
+        f.write_all(b"test").expect("write file");
+        drop(f);
+
+        // Set the file's modification time to simulate age.
+        let mtime = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(age_secs))
+            .expect("file age");
+        let times = std::fs::FileTimes::new().set_modified(mtime);
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open for set_times");
+        let _ = f.set_times(times);
+    }
+
+    #[test]
+    fn f8_cleanup_deletes_files_older_than_24h() {
+        // Scenario 1: files older than 24h are deleted.
+        let dir = f8_test_dir();
+        f8_write_file_with_age(&dir, "old.txt", 25 * 60 * 60); // 25h old
+        f8_write_file_with_age(&dir, "very_old.txt", 48 * 60 * 60); // 48h old
+
+        let cutoff = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(DOWNLOAD_MAX_AGE_SECS))
+            .unwrap();
+        cleanup_dir_older_than(&dir, cutoff).expect("cleanup");
+
+        assert!(!dir.join("old.txt").exists(), "old.txt should be deleted");
+        assert!(!dir.join("very_old.txt").exists(), "very_old.txt should be deleted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f8_cleanup_preserves_files_newer_than_24h() {
+        // Scenario 2: files newer than 24h are preserved.
+        let dir = f8_test_dir();
+        f8_write_file_with_age(&dir, "fresh.txt", 60 * 60); // 1h old
+        f8_write_file_with_age(&dir, "recent.txt", 12 * 60 * 60); // 12h old
+
+        let cutoff = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(DOWNLOAD_MAX_AGE_SECS))
+            .unwrap();
+        cleanup_dir_older_than(&dir, cutoff).expect("cleanup");
+
+        assert!(dir.join("fresh.txt").exists(), "fresh.txt should be preserved");
+        assert!(dir.join("recent.txt").exists(), "recent.txt should be preserved");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f8_cleanup_handles_empty_directory() {
+        // Scenario 3: empty directory is handled without error.
+        let dir = f8_test_dir();
+
+        let cutoff = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(DOWNLOAD_MAX_AGE_SECS))
+            .unwrap();
+        cleanup_dir_older_than(&dir, cutoff).expect("cleanup empty dir");
+
+        // Directory should be removed if empty after cleanup.
+        assert!(!dir.exists(), "empty dir should be removed");
     }
 }

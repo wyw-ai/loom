@@ -46,6 +46,12 @@ import {
 } from "@/lib/server-url";
 import { sortThreads, upsert } from "@/lib/format-utils";
 import type { ScopeRef } from "@/ipc/types";
+import {
+  shouldConvertLongText,
+  buildAttachmentSummaryBlock,
+  type PendingAttachment,
+  type UploadedAttachment,
+} from "@/lib/attachment-utils";
 
 export interface ActionDeps {
   // State setters
@@ -706,10 +712,69 @@ export function useActions(deps: ActionDeps) {
     }
   }, []);
 
-  const sendMessage = useCallback(async () => {
+  const uploadAttachments = useCallback(
+    async (
+      pending: PendingAttachment[],
+      scope: ScopeRef | null,
+      actorId: string,
+    ): Promise<UploadedAttachment[]> => {
+      if (pending.length === 0) return [];
+      const results: UploadedAttachment[] = [];
+      for (const attachment of pending) {
+        const result = await ipc.artifactPublish({
+          ingress: {
+            kind: "fileBytes",
+            name: attachment.name,
+            mediaType: attachment.mediaType,
+            bytes: Array.from(attachment.bytes),
+          },
+          createdBy: actorId,
+          ...(scope ? { scope } : {}),
+        });
+        results.push({
+          name: attachment.name,
+          mediaType: attachment.mediaType,
+          size: attachment.size,
+          artifactId: result.artifact.id,
+        });
+      }
+      return results;
+    },
+    [],
+  );
+
+  const convertLongTextToAttachment = useCallback(
+    async (
+      text: string,
+      scope: ScopeRef | null,
+      actorId: string,
+    ): Promise<UploadedAttachment> => {
+      const name = `message-${Date.now()}.txt`;
+      const result = await ipc.artifactPublish({
+        ingress: {
+          kind: "inlineText",
+          name,
+          mediaType: "text/plain",
+          text,
+        },
+        createdBy: actorId,
+        ...(scope ? { scope } : {}),
+      });
+      return {
+        name,
+        mediaType: "text/plain",
+        size: new TextEncoder().encode(text).length,
+        artifactId: result.artifact.id,
+      };
+    },
+    [],
+  );
+
+  const sendMessage = useCallback(async (attachments?: PendingAttachment[]) => {
     const d = depsRef.current;
     const body = d.draft.trim();
-    if (!body || !d.target) return;
+    const hasAttachments = (attachments?.length ?? 0) > 0;
+    if ((!body && !hasAttachments) || !d.target) return;
     d.setBusy("message:send");
     try {
       const parentMessageId = d.replyTo?.id;
@@ -745,13 +810,33 @@ export function useActions(deps: ActionDeps) {
       const wakesAgent = directedTo.some((audience) =>
         audienceWakesAgent(audience, d.actors),
       );
+
+      // Upload pending attachments + handle long text conversion
+      const actorId = d.workspace?.actorId ?? d.actorIdRef.current ?? "";
+      const scope = d.activeScopeRef.current;
+      let uploadedAttachments: UploadedAttachment[] = [];
+      let messageBody = body;
+
+      if (shouldConvertLongText(body.length)) {
+        const textAttachment = await convertLongTextToAttachment(body, scope, actorId);
+        uploadedAttachments = [textAttachment, ...await uploadAttachments(attachments ?? [], scope, actorId)];
+        messageBody = body.slice(0, 500) + "\n\n[... full text attached as .txt ...]";
+      } else {
+        uploadedAttachments = await uploadAttachments(attachments ?? [], scope, actorId);
+      }
+
+      // Append attachment summary block so AI actors can perceive attachments from text
+      const attachmentIds = uploadedAttachments.map((a) => a.artifactId);
+      messageBody = messageBody + buildAttachmentSummaryBlock(uploadedAttachments);
+
       const result = await ipc.messageSend({
         target: d.target,
-        body,
+        body: messageBody,
         parentMessageId,
         audience: directedTo,
         deliveryPolicy: wakesAgent ? "wake_agent" : "notify_only",
         intent: wakesAgent ? "request_action" : "chat",
+        ...(attachmentIds.length > 0 ? { attachments: attachmentIds } : {}),
       });
       d.setMessages((current) => sortMessages(upsertMessage(current, result.message)));
       d.setDraft("");
@@ -763,10 +848,11 @@ export function useActions(deps: ActionDeps) {
     }
   }, []);
 
-  const sendThreadMessage = useCallback(async () => {
+  const sendThreadMessage = useCallback(async (attachments?: PendingAttachment[]) => {
     const d = depsRef.current;
     const body = d.threadDraft.trim();
-    if (!body || !d.threadMessageTarget) return;
+    const hasAttachments = (attachments?.length ?? 0) > 0;
+    if ((!body && !hasAttachments) || !d.threadMessageTarget) return;
     d.setBusy("thread:message:send");
     try {
       const mentionableActors = d.activeChannel
@@ -795,12 +881,32 @@ export function useActions(deps: ActionDeps) {
       const wakesAgent = mentionedAudience.some((audience) =>
         audienceWakesAgent(audience, d.actors),
       );
+
+      // Upload pending attachments + handle long text conversion
+      const actorId = d.workspace?.actorId ?? d.actorIdRef.current ?? "";
+      const scope = d.activeThreadScopeRef.current;
+      let uploadedAttachments: UploadedAttachment[] = [];
+      let messageBody = body;
+
+      if (shouldConvertLongText(body.length)) {
+        const textAttachment = await convertLongTextToAttachment(body, scope, actorId);
+        uploadedAttachments = [textAttachment, ...await uploadAttachments(attachments ?? [], scope, actorId)];
+        messageBody = body.slice(0, 500) + "\n\n[... full text attached as .txt ...]";
+      } else {
+        uploadedAttachments = await uploadAttachments(attachments ?? [], scope, actorId);
+      }
+
+      // Append attachment summary block so AI actors can perceive attachments from text
+      const attachmentIds = uploadedAttachments.map((a) => a.artifactId);
+      messageBody = messageBody + buildAttachmentSummaryBlock(uploadedAttachments);
+
       const result = await ipc.messageSend({
         target: d.threadMessageTarget,
-        body,
+        body: messageBody,
         audience: mentionedAudience,
         deliveryPolicy: wakesAgent ? "wake_agent" : "notify_only",
         intent: wakesAgent ? "request_action" : "chat",
+        ...(attachmentIds.length > 0 ? { attachments: attachmentIds } : {}),
       });
       d.setThreadMessages((current) => sortMessages(upsertMessage(current, result.message)));
       d.setThreadStatsById((current) => upsertThreadStatsMessage(current, result.message));

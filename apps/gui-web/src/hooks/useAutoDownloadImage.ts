@@ -3,7 +3,6 @@ import { useEffect, useRef, useState } from "react";
 import * as ipc from "@/ipc/bridge";
 import type { Artifact } from "@/ipc/types";
 import { errorText } from "@/lib/format-utils";
-import { readArtifactBlob } from "@/lib/artifact-blob";
 import { useDownloadedArtifacts } from "@/hooks/useDownloadedArtifacts";
 
 /**
@@ -56,6 +55,18 @@ function releaseObjectUrl(artifactId: string): void {
 }
 
 /**
+ * Clear all ObjectURLs from the memory cache.
+ * ARCH D3-r1: called by ClearCacheSection after clearing disk cache,
+ * so components re-render and re-download visible images.
+ */
+export function clearAllObjectUrls(): void {
+  for (const [, entry] of objectUrlCache) {
+    URL.revokeObjectURL(entry.objectUrl);
+  }
+  objectUrlCache.clear();
+}
+
+/**
  * In-flight download deduplication.
  * If two components request the same artifact simultaneously, only one
  * network download runs; both receive the result.
@@ -74,18 +85,24 @@ export interface AutoDownloadImageState {
 
 /**
  * Auto-downloads an image artifact on mount and provides an ObjectURL
- * for inline display. Uses two-level caching:
- * 1. localStorage (via useDownloadedArtifacts) — tracks local temp path
- * 2. ObjectURL memory cache — shared blob URLs with reference counting
+ * for inline display. Uses three-level caching (ARCH D3-r1):
+ * 1. ObjectURL memory cache — shared blob URLs with reference counting
+ * 2. localStorage (via useDownloadedArtifacts) — tracks local cache path
+ * 3. Disk cache (data_dir/loom/cache/attachments/) — persistent across restarts
  *
- * ARCH D3 design: inFlightDownloads Map deduplicates concurrent requests.
+ * Cache-hit path: if localStorage has a path and the file exists on disk,
+ * read from local file (readLocalFileBytes) instead of network download.
+ *
+ * ARCH D3-r1: uses downloadToCache (not downloadToTemp) for persistence.
  */
 export function useAutoDownloadImage(artifact: Artifact | null): AutoDownloadImageState {
-  const { isDownloaded } = useDownloadedArtifacts();
+  const { isDownloaded, setDownloaded } = useDownloadedArtifacts();
   const [objectUrl, setObjectUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const heldArtifactIdRef = useRef<string | null>(null);
+
+  const localPath = artifact ? isDownloaded(artifact.id) : null;
 
   useEffect(() => {
     if (!artifact) {
@@ -97,6 +114,7 @@ export function useAutoDownloadImage(artifact: Artifact | null): AutoDownloadIma
 
     const artifactId = artifact.id;
     const artifactSnapshot = artifact;
+    const cachedLocalPath = isDownloaded(artifactId);
     let cancelled = false;
 
     // Release previously held ObjectURL reference
@@ -106,50 +124,61 @@ export function useAutoDownloadImage(artifact: Artifact | null): AutoDownloadIma
     }
 
     // Check memory cache first
-    const cached = objectUrlCache.get(artifactId);
-    if (cached) {
-      cached.refCount += 1;
+    const memCached = objectUrlCache.get(artifactId);
+    if (memCached) {
+      memCached.refCount += 1;
       heldArtifactIdRef.current = artifactId;
-      setObjectUrl(cached.objectUrl);
+      setObjectUrl(memCached.objectUrl);
       setLoading(false);
       setError(null);
       return;
     }
 
-    // Need to download
+    // Need to load
     setLoading(true);
     setError(null);
 
-    async function download() {
+    async function load() {
       try {
         let promise = inFlightDownloads.get(artifactId);
         if (!promise) {
           promise = (async () => {
-            const blob = await readArtifactBlob(artifactSnapshot);
+            // Cache-hit path: try reading from local disk first (ARCH D3-r1)
+            if (cachedLocalPath) {
+              try {
+                const exists = await ipc.pathExists(cachedLocalPath);
+                if (exists) {
+                  const blob = await readLocalFileAsBlob(cachedLocalPath, artifactSnapshot.mediaType);
+                  const url = acquireObjectUrl(artifactId, blob);
+                  return { blob, objectUrl: url };
+                }
+              } catch {
+                // Local file read failed — fall through to network download
+              }
+            }
+
+            // Network download via downloadToCache (ARCH D3-r1: persistent cache)
+            const cachePath = await ipc.downloadToCache({
+              artifactId,
+              suggestedName: artifactSnapshot.name || `${artifactId}.bin`,
+            });
+            setDownloaded(artifactId, cachePath);
+
+            // Read the cached file to create ObjectURL
+            const blob = await readLocalFileAsBlob(cachePath, artifactSnapshot.mediaType);
             const url = acquireObjectUrl(artifactId, blob);
             return { blob, objectUrl: url };
           })();
           inFlightDownloads.set(artifactId, promise);
         }
 
-        const result = await promise;
+        const result = await promise!;
         inFlightDownloads.delete(artifactId);
 
         if (cancelled) {
-          // Component unmounted or artifact changed before download completed.
-          // The acquireObjectUrl inside the promise already incremented refCount,
-          // so release our share.
           releaseObjectUrl(artifactId);
           return;
         }
-
-        // Persist to localStorage cache (local temp path tracking).
-        // We don't have a real temp path here (ObjectURL is in-memory),
-        // but we mark it as "downloaded" so context-menu actions that
-        // need a local file can trigger a real downloadToTemp.
-        // Actually — per ARCH design, context menu items that need a local
-        // file path should call downloadToTemp separately. The ObjectURL
-        // is for display only. So we do NOT setDownloaded here.
 
         heldArtifactIdRef.current = artifactId;
         setObjectUrl(result.objectUrl);
@@ -163,7 +192,7 @@ export function useAutoDownloadImage(artifact: Artifact | null): AutoDownloadIma
       }
     }
 
-    void download();
+    void load();
 
     return () => {
       cancelled = true;
@@ -172,26 +201,52 @@ export function useAutoDownloadImage(artifact: Artifact | null): AutoDownloadIma
         heldArtifactIdRef.current = null;
       }
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [artifact]);
-
-  const localPath = artifact ? isDownloaded(artifact.id) : null;
 
   return { objectUrl, loading, error, localPath };
 }
 
 /**
- * Download an artifact to a local temp file (for Open/Reveal operations).
+ * Download an artifact to the persistent cache directory (for Open/Reveal operations).
+ * ARCH D3-r1: uses downloadToCache (not downloadToTemp) for images.
  * Returns the local path. Uses the shared useDownloadedArtifacts cache.
  */
 export function useDownloadToLocal() {
   const { setDownloaded } = useDownloadedArtifacts();
 
   return async function downloadToLocal(artifact: Artifact): Promise<string> {
-    const tempPath = await ipc.downloadToTemp({
+    const cachePath = await ipc.downloadToCache({
       artifactId: artifact.id,
       suggestedName: artifact.name || `${artifact.id}.bin`,
     });
-    setDownloaded(artifact.id, tempPath);
-    return tempPath;
+    setDownloaded(artifact.id, cachePath);
+    return cachePath;
   };
+}
+
+/**
+ * Read a local file as a Blob by paginating through readLocalFileBytes.
+ * ARCH D3-r1: cache-hit path — reads from disk instead of network.
+ */
+async function readLocalFileAsBlob(path: string, mediaType: string): Promise<Blob> {
+  const chunkSize = 1024 * 1024;
+  const chunks: Uint8Array[] = [];
+  let offset = 0;
+  for (let i = 0; i < 512; i++) {
+    const result = await ipc.readLocalFileBytes({ path, offset, maxBytes: chunkSize });
+    const bytes = new Uint8Array(result.bytes);
+    chunks.push(bytes);
+    if (!result.truncated) {
+      const parts = chunks.map((chunk) => {
+        const copy = new Uint8Array(chunk.byteLength);
+        copy.set(chunk);
+        return copy.buffer;
+      });
+      return new Blob(parts, { type: mediaType || "application/octet-stream" });
+    }
+    offset = result.nextOffset ?? offset + bytes.byteLength;
+    if (offset <= (result.nextOffset ?? 0) - bytes.byteLength) break;
+  }
+  throw new Error("Local file is too large to read in one operation.");
 }

@@ -1,6 +1,7 @@
 import { FileText, X } from "lucide-react";
 import type { PendingAttachment } from "@/lib/attachment-utils";
-import { formatFileSize, copyAttachmentToClipboard } from "@/lib/attachment-utils";
+import { copyAttachmentToClipboard } from "@/lib/attachment-utils";
+import { formatBytes } from "@/lib/format-utils";
 
 interface AttachmentPreviewBarProps {
   attachments: PendingAttachment[];
@@ -36,7 +37,7 @@ export function AttachmentPreviewBar({ attachments, onRemove, recentlyAddedIds }
                 {attachment.name}
               </div>
               <div className="text-[10px] font-medium text-[#667085]">
-                {formatFileSize(attachment.size)}
+                {formatBytes(attachment.size)}
               </div>
             </div>
             <button

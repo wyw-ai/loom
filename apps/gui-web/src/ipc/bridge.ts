@@ -355,15 +355,53 @@ export interface ScopeAttachment {
 }
 
 /**
+ * Run async tasks in bounded batches to limit concurrency.
+ *
+ * Preserves input order in the output array. Items that reject produce
+ * `undefined` entries (callers decide how to handle). This keeps memory
+ * and simultaneous IPC pressure bounded when resolving many artifacts.
+ *
+ * @param items Source items.
+ * @param batchSize Max number of in-flight tasks per batch.
+ * @param task Async function applied to each item.
+ */
+export async function mapBatched<T, R>(
+  items: readonly T[],
+  batchSize: number,
+  task: (item: T, index: number) => Promise<R>,
+): Promise<(R | undefined)[]> {
+  const results: (R | undefined)[] = new Array(items.length).fill(undefined);
+  for (let start = 0; start < items.length; start += batchSize) {
+    const end = Math.min(start + batchSize, items.length);
+    const batch = await Promise.all(
+      items.slice(start, end).map((item, i) =>
+        task(item, start + i).catch(() => undefined),
+      ),
+    );
+    for (let i = 0; i < batch.length; i++) {
+      results[start + i] = batch[i];
+    }
+  }
+  return results;
+}
+
+/**
  * List all attachments in a channel or thread scope by:
  * 1. Fetching messages via messageList
  * 2. Extracting attachment URIs from each message
  * 3. Resolving artifact metadata via artifactGet
  * Returns a flat list of artifacts (deduplicated by artifact id).
+ *
+ * Artifact metadata resolution runs in bounded batches (default 8) to
+ * cap concurrent IPC pressure. Functionally equivalent to unbounded
+ * Promise.all: all attachments are still fetched, only concurrency is
+ * limited.
  */
 export async function listScopeAttachments(params: {
   target: string;
   limit?: number;
+  /** Max concurrent artifactGet calls per batch. Defaults to 8. */
+  resolveBatchSize?: number;
 }): Promise<ScopeAttachment[]> {
   const { messages } = await messageList({
     target: params.target,
@@ -385,21 +423,21 @@ export async function listScopeAttachments(params: {
     }
   }
 
-  // Resolve artifact metadata for each unique attachment
+  // Resolve artifact metadata in bounded batches to limit concurrency.
+  const entries = Array.from(seen.entries());
+  const resolved = await mapBatched(entries, params.resolveBatchSize ?? 8, async ([uri, messageId]) => {
+    const lookupParams = uri.startsWith("artifact://")
+      ? { artifactUri: uri }
+      : { artifactId: uri };
+    const { artifact } = await artifactGet(lookupParams);
+    return { artifact, messageId };
+  });
+
+  // Filter out failed resolutions (undefined entries from mapBatched).
   const results: ScopeAttachment[] = [];
-  await Promise.all(
-    Array.from(seen.entries()).map(async ([uri, messageId]) => {
-      try {
-        const lookupParams = uri.startsWith("artifact://")
-          ? { artifactUri: uri }
-          : { artifactId: uri };
-        const { artifact } = await artifactGet(lookupParams);
-        results.push({ artifact, messageId });
-      } catch {
-        // Skip artifacts that fail to resolve
-      }
-    }),
-  );
+  for (const item of resolved) {
+    if (item) results.push(item);
+  }
 
   return results;
 }

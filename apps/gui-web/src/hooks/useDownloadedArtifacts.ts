@@ -70,5 +70,14 @@ export function useDownloadedArtifacts() {
     notifyAll();
   }, []);
 
-  return { isDownloaded, setDownloaded, clearDownloaded };
+  /**
+   * Clear all downloaded artifact mappings (localStorage).
+   * ARCH D3-r1: used by ClearCacheSection after clearing disk cache.
+   */
+  const clearAllDownloaded = useCallback(() => {
+    saveMap({});
+    notifyAll();
+  }, []);
+
+  return { isDownloaded, setDownloaded, clearDownloaded, clearAllDownloaded };
 }

@@ -10,6 +10,7 @@ import { HostListItem, RegisteredHostsEmpty, HostRegisterDialog, MachineCard } f
 import { MemberListItem, AgentRosterOverview, AgentCreateDialog, AgentMemberDetail } from "@/components/settings/AgentComponents";
 import { ServiceListItem, ServiceMemberDetail, ServiceRosterOverview } from "@/components/settings/ServiceComponents";
 import { HumanListItem, HumanRosterOverview } from "@/components/settings/HumanComponents";
+import { ClearCacheSection } from "@/components/settings/ClearCacheSection";
 import { Button } from "@/components/ui/button";
 import { agentMemberEntries, serviceMemberEntries } from "@/lib/agent-utils";
 import { agentFormForMachine, displayName, findAgentMemberEntry, machineCanCreateAgent } from "@/lib/format-utils";
@@ -588,6 +589,9 @@ export function SettingsView({
 
           <div className="min-h-0 overflow-y-auto bg-white soft-scrollbar">
             {detailContent}
+            <div className="border-t border-[#eef0f5] p-4">
+              <ClearCacheSection />
+            </div>
           </div>
         </div>
       </div>

@@ -718,6 +718,59 @@ export async function downloadToTemp(args: {
   });
 }
 
+/**
+ * Download an artifact to the persistent cache directory
+ * (data_dir/loom/cache/attachments/<artifactId>/).
+ *
+ * ARCH D3-r1: replaces downloadToTemp for image auto-download.
+ * Returns the local file path. Persists across restarts.
+ */
+export async function downloadToCache(args: {
+  artifactId: string;
+  suggestedName?: string;
+}): Promise<string> {
+  return invoke<string>("download_to_cache", {
+    args: {
+      artifactId: args.artifactId,
+      ...(args.suggestedName ? { suggestedName: args.suggestedName } : {}),
+    },
+  });
+}
+
+/**
+ * Clear the entire attachment cache directory (disk files).
+ * ARCH D3-r1: used by ClearCacheSection in settings.
+ */
+export async function clearAttachmentCache(): Promise<void> {
+  await invoke("clear_attachment_cache", { args: {} });
+}
+
+/**
+ * Get the total size of the attachment cache directory in bytes.
+ * ARCH D3-r1: used by ClearCacheSection to display size before clearing.
+ */
+export async function getAttachmentCacheSize(): Promise<number> {
+  return invoke<number>("get_attachment_cache_size", { args: {} });
+}
+
+/**
+ * Read bytes from a local cached file (cache-hit path).
+ * ARCH D3-r1: skips network download when file is already cached.
+ */
+export async function readLocalFileBytes(args: {
+  path: string;
+  offset?: number;
+  maxBytes?: number;
+}): Promise<{ bytes: number[]; truncated: boolean; nextOffset?: number }> {
+  return invoke("read_local_file_bytes", {
+    args: {
+      path: args.path,
+      ...(args.offset !== undefined ? { offset: args.offset } : {}),
+      ...(args.maxBytes !== undefined ? { maxBytes: args.maxBytes } : {}),
+    },
+  });
+}
+
 export function onStream(cb: (u: StreamUpdate) => void): Promise<UnlistenFn> {
   return listen<StreamUpdate>("loom://stream", (e) => cb(e.payload));
 }

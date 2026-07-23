@@ -244,7 +244,7 @@ export function Composer({
               }}
               disabled={disabled}
               placeholder={disabled ? disabledPlaceholder : placeholder}
-              className="max-h-full min-h-[44px] w-full flex-1 px-3 pr-14"
+              className="max-h-full min-h-[44px] w-full flex-1 px-3 mr-12"
             />
             <Button
               size="icon"

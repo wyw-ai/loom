@@ -7,13 +7,18 @@ use serde_json::json;
 use crate::client::Client;
 use crate::render;
 
-pub async fn create(client: Arc<Client>, actor_id: String, title: String) -> Result<()> {
-    let res: ChannelCreateResult = client
-        .call(
-            method::CHANNEL_CREATE,
-            json!({ "title": title, "actorId": actor_id }),
-        )
-        .await?;
+pub async fn create(
+    client: Arc<Client>,
+    actor_id: String,
+    title: String,
+    public: bool,
+) -> Result<()> {
+    let params = if public {
+        json!({ "title": title, "public": true })
+    } else {
+        json!({ "title": title, "actorId": actor_id })
+    };
+    let res: ChannelCreateResult = client.call(method::CHANNEL_CREATE, params).await?;
     if render::is_json() {
         render::print_json(&res);
     } else {
@@ -33,6 +38,28 @@ pub async fn list(client: Arc<Client>) -> Result<()> {
     }
     for c in res.channels {
         println!("{}\t{}", c.id, c.title);
+    }
+    Ok(())
+}
+
+pub async fn update(
+    client: Arc<Client>,
+    channel_id: String,
+    title: Option<String>,
+    public: bool,
+) -> Result<()> {
+    let mut params = json!({ "channelId": channel_id });
+    if let Some(title) = title {
+        params["title"] = json!(title);
+    }
+    if public {
+        params["visibility"] = json!("public");
+    }
+    let res: ChannelUpdateResult = client.call(method::CHANNEL_UPDATE, params).await?;
+    if render::is_json() {
+        render::print_json(&res);
+    } else {
+        println!("channel {}\t{}", res.channel.id, res.channel.title);
     }
     Ok(())
 }

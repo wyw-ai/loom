@@ -245,6 +245,11 @@ pub struct ChannelCreateParams {
     pub title: String,
     #[serde(default)]
     pub topic: String,
+    /// Force a public channel even when the connection is bound to an actor.
+    /// This is useful for product-level shared spaces where membership is
+    /// tracked for discovery but should not gate visibility.
+    #[serde(default)]
+    pub public: bool,
     /// When provided, the new channel is created `Private` and the creator
     /// is its sole initial member. When omitted, the channel is created
     /// `Public`.
@@ -358,9 +363,12 @@ pub struct ChannelMemberConfigClearResult {
 #[serde(rename_all = "camelCase")]
 pub struct ChannelUpdateParams {
     pub channel_id: String,
-    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<ChannelVisibility>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

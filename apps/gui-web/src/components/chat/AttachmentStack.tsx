@@ -84,23 +84,6 @@ function AttachmentCard({ attachment }: { attachment: string }) {
     };
   }, []);
 
-  useEffect(() => {
-    if (!artifact) return;
-    let cancelled = false;
-    ipc
-      .artifactExists({ artifactId: artifact.id })
-      .then(() => {
-        // Server confirms artifact is accessible
-      })
-      .catch(() => {
-        // Server API check failed — silent degradation, file still available via Download
-        if (!cancelled) console.warn("artifactExists check failed for", artifact.id);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [artifact]);
-
   function closePreview() {
     if (previewObjectUrlRef.current) {
       URL.revokeObjectURL(previewObjectUrlRef.current);

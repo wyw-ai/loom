@@ -10,6 +10,8 @@
  * - Blocklist: executables (.exe/.bat/.cmd/.msi/.dll/.so/.dylib)
  */
 
+import { formatBytes } from "@/lib/format-utils";
+
 export const LONG_TEXT_THRESHOLD = 4000;
 export const LONG_TEXT_WARN_THRESHOLD = 3500;
 export const MAX_FILE_SIZE_BYTES = 25 * 1024 * 1024; // 25 MB
@@ -230,17 +232,6 @@ export function shouldWarnLongText(draftLength: number): boolean {
   return draftLength >= LONG_TEXT_WARN_THRESHOLD && draftLength < LONG_TEXT_THRESHOLD;
 }
 
-export function formatFileSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  const units = ["KB", "MB", "GB"];
-  let value = bytes / 1024;
-  for (const unit of units) {
-    if (value < 1024) return `${value >= 10 ? value.toFixed(0) : value.toFixed(1)} ${unit}`;
-    value /= 1024;
-  }
-  return `${value.toFixed(1)} TB`;
-}
-
 // ---------------------------------------------------------------------------
 // Paste / clipboard support (ARCH D3 design)
 // ---------------------------------------------------------------------------
@@ -295,7 +286,7 @@ export function ensurePasteFileName(file: File): File {
 export function buildAttachmentSummaryBlock(attachments: UploadedAttachment[]): string {
   if (attachments.length === 0) return "";
   const lines = attachments.map(
-    (att) => `- ${att.name} (${att.mediaType}, ${formatFileSize(att.size)}) [artifact: ${att.artifactId}]`,
+    (att) => `- ${att.name} (${att.mediaType}, ${formatBytes(att.size)}) [artifact: ${att.artifactId}]`,
   );
   return `\n\n[附件]\n${lines.join("\n")}`;
 }

@@ -122,6 +122,11 @@ export function ThreadComposer({
 
   return (
     <footer className="shrink-0 border-t border-[#edf0f5] bg-white p-4">
+      <AttachmentPreviewBar
+        attachments={attachments}
+        onRemove={removeAttachment}
+        recentlyAddedIds={recentlyAddedIds}
+      />
       <Resizable
         className="w-full"
         enable={{ top: true, right: false, bottom: false, left: false, topRight: false, bottomRight: false, bottomLeft: false, topLeft: false }}
@@ -150,11 +155,6 @@ export function ThreadComposer({
         }}
       >
         <div className="flex h-full flex-col">
-          <AttachmentPreviewBar
-            attachments={attachments}
-            onRemove={removeAttachment}
-            recentlyAddedIds={recentlyAddedIds}
-          />
           {(showLongTextWarning || willConvertLongText) && (
             <div className="mb-1.5 flex shrink-0 items-center gap-1.5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-1 text-xs font-medium text-amber-700">
               <AlertTriangle size={12} className="shrink-0" />

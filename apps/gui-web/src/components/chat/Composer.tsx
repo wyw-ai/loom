@@ -133,6 +133,13 @@ export function Composer({
 
   return (
     <footer className="border-t border-[#e2e6ef] bg-white px-5 py-4">
+      <div className="mx-auto max-w-4xl">
+        <AttachmentPreviewBar
+          attachments={attachments}
+          onRemove={removeAttachment}
+          recentlyAddedIds={recentlyAddedIds}
+        />
+      </div>
       <Resizable
         className="mx-auto max-w-4xl"
         enable={{ top: true, right: false, bottom: false, left: false, topRight: false, bottomRight: false, bottomLeft: false, topLeft: false }}
@@ -168,11 +175,6 @@ export function Composer({
               </button>
             </div>
           )}
-          <AttachmentPreviewBar
-            attachments={attachments}
-            onRemove={removeAttachment}
-            recentlyAddedIds={recentlyAddedIds}
-          />
           {(showLongTextWarning || willConvertLongText) && (
             <div className="mb-2 flex shrink-0 items-center gap-1.5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-700">
               <AlertTriangle size={13} className="shrink-0" />

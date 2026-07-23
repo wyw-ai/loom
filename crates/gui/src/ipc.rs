@@ -1137,15 +1137,29 @@ pub async fn artifact_read(state: State<'_, AppState>, params: Value) -> Result<
 /// the local filesystem.
 #[tauri::command]
 pub async fn artifact_exists(state: State<'_, AppState>, params: Value) -> Result<bool, String> {
+    // Protocol contract: `artifact_get` returns the artifact metadata
+    // (non-null) when the artifact exists, and returns an RPC error with
+    // code -32000 (APP_NOT_FOUND) when it does not. We must distinguish
+    // "not found" (→ Ok(false)) from genuine transport/server errors
+    // (→ propagate Err). Do NOT use `map_err(stringify)?` here because
+    // that would turn the not-found case into an Err.
     let result = state
         .client()
         .await?
         .call_raw(method::ARTIFACT_GET, Some(params))
-        .await
-        .map_err(stringify)?;
-    // artifact_get returns the artifact metadata if it exists, or an
-    // error/null if not. Treat a successful non-null response as "exists".
-    Ok(!result.is_null())
+        .await;
+    match result {
+        Ok(value) => Ok(!value.is_null()),
+        Err(e) => {
+            let msg = format!("{:#}", e);
+            // APP_NOT_FOUND surfaces as JSON-RPC error code -32000.
+            if msg.contains("code -32000") {
+                Ok(false)
+            } else {
+                Err(msg)
+            }
+        }
+    }
 }
 
 /// Maximum payload size for `download_to_temp` (100 MB).
@@ -1154,9 +1168,9 @@ const DOWNLOAD_TO_TEMP_MAX_BYTES: usize = 100 * 1024 * 1024;
 /// E1: Download an artifact to the system temp directory. Uses the
 /// Server API `artifact_read` to fetch bytes, then writes them to
 /// `std::env::temp_dir()/loom-downloads/<suggestedName>`. Returns the
-/// full path of the downloaded file. This replaces the deprecated
-/// `write_local_file` for the attachment download flow — it does not
-/// write to `workspacePath` (which may point to a remote machine).
+/// full path of the downloaded file. This writes to the local temp
+/// directory rather than `workspacePath` (which may point to a remote
+/// machine).
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadToTempArgs {
@@ -1269,7 +1283,12 @@ fn extract_artifact_bytes(response: &Value) -> Result<Vec<u8>, String> {
         if !bytes.is_empty() {
             return Ok(bytes
                 .iter()
-                .filter_map(|v| v.as_u64().map(|n| n as u8))
+                .filter_map(|v| {
+                    // Filter out-of-bounds values instead of silently
+                    // truncating with `n as u8`, which would corrupt data
+                    // for n > 255.
+                    v.as_u64().filter(|&n| n <= u8::MAX as u64).map(|n| n as u8)
+                })
                 .collect());
         }
     }
@@ -1288,10 +1307,12 @@ fn sanitize_filename(name: &str) -> String {
         .map(|c| {
             if c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | ' ') {
                 c
-            } else if c == '/' || c == '\\' {
-                '_'
             } else {
-                c
+                // Replace path separators AND all other non-whitelisted
+                // characters (including Windows-reserved chars like
+                // : < > * ? " |) with '_'. This prevents invalid filenames
+                // and Alternate Data Stream vectors on Windows.
+                '_'
             }
         })
         .collect();
@@ -2034,14 +2055,17 @@ pub async fn reveal_in_folder(args: OpenPathArgs) -> Result<(), String> {
     Ok(())
 }
 
-/// **[DEPRECATED — E1]** Use `artifact_exists` instead. This command
-/// checks the local filesystem, which is incorrect in distributed
-/// deployments (server/daemon/gui on different machines). Retained for
-/// backward compatibility but no longer used by the attachment logic.
+/// Check whether a local filesystem path exists on the GUI host machine.
 ///
-/// D1: Check whether a local path exists. Used by the FE to determine
-/// whether an attachment's `workspacePath` is locally reachable (local
-/// daemon) or remote-only.
+/// Semantic orthogonality note: `path_exists` checks the **local
+/// filesystem** of the machine running the GUI (used by the FE to
+/// determine whether a `workspacePath` is locally reachable or
+/// remote-only), whereas `artifact_exists` queries the **Server API**
+/// to check whether an artifact exists on the server regardless of
+/// where the GUI runs. The two are complementary, not redundant.
+///
+/// D1: Used by the FE to determine whether an attachment's
+/// `workspacePath` is locally reachable (local daemon) or remote-only.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PathExistsArgs {
@@ -2056,37 +2080,6 @@ pub async fn path_exists(args: PathExistsArgs) -> Result<bool, String> {
     }
     let path = normalize_local_path(config::expand_home(raw)).map_err(stringify)?;
     Ok(path.exists())
-}
-
-/// **[DEPRECATED — E1]** Use `download_to_temp` instead. This command
-/// writes to `workspacePath`, which may point to a remote machine in
-/// distributed deployments. Retained for backward compatibility but no
-/// longer used by the attachment download flow.
-///
-/// D1: Write bytes to a local path. Used by the attachment download flow
-/// to persist `artifactRead` bytes to `workspacePath`, switching the
-/// attachment from remote to local state. Creates parent directories as
-/// needed.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WriteLocalFileArgs {
-    pub path: String,
-    pub bytes: Vec<u8>,
-}
-
-#[tauri::command]
-pub async fn write_local_file(args: WriteLocalFileArgs) -> Result<(), String> {
-    let raw = args.path.trim();
-    if raw.is_empty() {
-        return Err("path is required".into());
-    }
-    let path = normalize_local_path(config::expand_home(raw)).map_err(stringify)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create directory: {e}"))?;
-    }
-    std::fs::write(&path, &args.bytes).map_err(|e| format!("Failed to write file: {e}"))?;
-    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -4499,5 +4492,117 @@ mod tests {
             Some(v) => std::env::set_var(key, v),
             None => std::env::remove_var(key),
         }
+    }
+
+    // ---------- MF1: artifact_exists error classification ----------
+
+    /// The `artifact_exists` command classifies RPC errors by string-matching
+    /// the flattened error message for `code -32000` (APP_NOT_FOUND). This
+    /// test verifies the classification contract that the command relies on.
+    #[test]
+    fn mf1_artifact_exists_classifies_app_not_found_error() {
+        // Scenario 1: APP_NOT_FOUND error (code -32000) → should be treated
+        // as "does not exist" (Ok(false)).
+        let not_found_msg = "rpc `artifact_get` failed: artifact not found (code -32000)";
+        assert!(
+            not_found_msg.contains("code -32000"),
+            "APP_NOT_FOUND error must contain 'code -32000'"
+        );
+
+        // Scenario 2: a genuine transport error (e.g. timeout) must NOT
+        // match the not-found pattern and should be propagated as Err.
+        let timeout_msg = "rpc `artifact_get` timed out";
+        assert!(
+            !timeout_msg.contains("code -32000"),
+            "timeout error must not be classified as not-found"
+        );
+
+        // Scenario 3: a different RPC error code (e.g. -32602 invalid params)
+        // must NOT be classified as not-found.
+        let invalid_params_msg =
+            "rpc `artifact_get` failed: invalid params (code -32602)";
+        assert!(
+            !invalid_params_msg.contains("code -32000"),
+            "non-APP_NOT_FOUND error must not be classified as not-found"
+        );
+    }
+
+    // ---------- MF2: sanitize_filename ----------
+
+    #[test]
+    fn mf2_sanitize_filename_replaces_windows_reserved_chars() {
+        // Scenario 1: Windows-reserved characters are replaced with '_'.
+        let sanitized = sanitize_filename("file:name<>*?.txt");
+        assert!(
+            !sanitized.contains(':'),
+            "colon must be replaced: got '{sanitized}'"
+        );
+        assert!(
+            !sanitized.contains('<'),
+            "less-than must be replaced: got '{sanitized}'"
+        );
+        assert!(
+            !sanitized.contains('>'),
+            "greater-than must be replaced: got '{sanitized}'"
+        );
+        assert!(
+            !sanitized.contains('*'),
+            "asterisk must be replaced: got '{sanitized}'"
+        );
+        assert!(
+            !sanitized.contains('?'),
+            "question mark must be replaced: got '{sanitized}'"
+        );
+    }
+
+    #[test]
+    fn mf2_sanitize_filename_preserves_valid_characters() {
+        // Scenario 2: whitelisted characters (alphanumeric, dot, dash,
+        // underscore, space) are preserved.
+        let sanitized = sanitize_filename("my-file_v1.0 final.txt");
+        assert_eq!(sanitized, "my-file_v1.0 final.txt");
+    }
+
+    #[test]
+    fn mf2_sanitize_filename_replaces_path_separators() {
+        // Scenario 3: path separators are replaced with '_'.
+        let sanitized = sanitize_filename("dir/sub\\file.txt");
+        assert!(
+            !sanitized.contains('/') && !sanitized.contains('\\'),
+            "path separators must be replaced: got '{sanitized}'"
+        );
+    }
+
+    // ---------- MF8: extract_artifact_bytes ----------
+
+    #[test]
+    fn mf8_extract_artifact_bytes_filters_out_of_bounds_values() {
+        // Scenario 1: values > 255 are filtered out, not silently truncated.
+        let response = serde_json::json!({
+            "bytes": [65, 256, 300, 66]
+        });
+        let bytes = extract_artifact_bytes(&response).expect("extract bytes");
+        // 256 and 300 should be dropped, not truncated to 0 and 44.
+        assert_eq!(bytes, vec![65, 66], "out-of-bounds values must be filtered");
+    }
+
+    #[test]
+    fn mf8_extract_artifact_bytes_preserves_valid_byte_values() {
+        // Scenario 2: all valid byte values (0-255) are preserved exactly.
+        let response = serde_json::json!({
+            "bytes": [0, 127, 200, 255]
+        });
+        let bytes = extract_artifact_bytes(&response).expect("extract bytes");
+        assert_eq!(bytes, vec![0, 127, 200, 255]);
+    }
+
+    #[test]
+    fn mf8_extract_artifact_bytes_falls_back_to_content_string() {
+        // Scenario 3: when "bytes" is absent, falls back to "content" string.
+        let response = serde_json::json!({
+            "content": "hello"
+        });
+        let bytes = extract_artifact_bytes(&response).expect("extract bytes");
+        assert_eq!(bytes, b"hello".to_vec());
     }
 }

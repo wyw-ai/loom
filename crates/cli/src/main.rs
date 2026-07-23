@@ -575,10 +575,21 @@ enum ChannelCmd {
     Create {
         #[arg(long)]
         title: String,
+        /// Create a public channel visible to every actor.
+        #[arg(long)]
+        public: bool,
     },
     /// List channels visible to this caller (public channels + private
     /// channels the caller is a member of).
     List,
+    /// Update channel metadata or visibility.
+    Update {
+        channel_id: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        public: bool,
+    },
     /// Delete a channel and its child threads.
     Delete {
         channel_id: String,
@@ -2151,10 +2162,15 @@ async fn async_main() -> Result<()> {
     match args.cmd {
         Cmd::Who => unreachable!(),
         Cmd::Channel { sub } => match sub {
-            ChannelCmd::Create { title } => {
-                cmd::channel::create(client, cfg.actor_id.clone(), title).await?
+            ChannelCmd::Create { title, public } => {
+                cmd::channel::create(client, cfg.actor_id.clone(), title, public).await?
             }
             ChannelCmd::List => cmd::channel::list(client).await?,
+            ChannelCmd::Update {
+                channel_id,
+                title,
+                public,
+            } => cmd::channel::update(client, channel_id, title, public).await?,
             ChannelCmd::Delete {
                 channel_id,
                 cascade: _,

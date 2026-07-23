@@ -692,8 +692,9 @@ impl Store {
     pub fn update_channel(
         &self,
         id: &str,
-        title: String,
+        title: Option<String>,
         topic: Option<String>,
+        visibility: Option<ChannelVisibility>,
     ) -> StoreResult<Channel> {
         if self.get_channel(id).is_none() {
             return Err(StoreError::NotFound(format!("channel {id}")));
@@ -702,15 +703,21 @@ impl Store {
             channel_id: id.to_string(),
             title: title.clone(),
             topic: topic.clone(),
+            visibility,
         })?;
         let mut inner = self.inner.write();
         let ch = inner
             .channels
             .get_mut(id)
             .ok_or_else(|| StoreError::NotFound(format!("channel {id}")))?;
-        ch.title = title;
+        if let Some(title) = title {
+            ch.title = title;
+        }
         if let Some(topic) = topic {
             ch.topic = topic;
+        }
+        if let Some(visibility) = visibility {
+            ch.visibility = visibility;
         }
         let updated = ch.clone();
         drop(inner);
@@ -5428,11 +5435,17 @@ fn apply(inner: &mut Inner, m: Mutation) {
             channel_id,
             title,
             topic,
+            visibility,
         } => {
             if let Some(c) = inner.channels.get_mut(&channel_id) {
-                c.title = title;
+                if let Some(title) = title {
+                    c.title = title;
+                }
                 if let Some(topic) = topic {
                     c.topic = topic;
+                }
+                if let Some(visibility) = visibility {
+                    c.visibility = visibility;
                 }
             }
         }
@@ -7712,18 +7725,32 @@ mod tests {
             .create_channel("orig title".into(), None)
             .expect("create channel");
         let updated = store
-            .update_channel(&ch.id, "renamed".into(), Some("project notes".into()))
+            .update_channel(
+                &ch.id,
+                Some("renamed".into()),
+                Some("project notes".into()),
+                Some(ChannelVisibility::Private),
+            )
             .expect("update channel");
         assert_eq!(updated.title, "renamed");
         assert_eq!(updated.topic, "project notes");
+        assert!(matches!(updated.visibility, ChannelVisibility::Private));
         assert_eq!(store.get_channel(&ch.id).unwrap().title, "renamed");
         assert_eq!(store.get_channel(&ch.id).unwrap().topic, "project notes");
+        assert!(matches!(
+            store.get_channel(&ch.id).unwrap().visibility,
+            ChannelVisibility::Private
+        ));
 
         // Re-open from the same journal: the rename must replay.
         let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
         let store2 = Store::open(journal).unwrap();
         assert_eq!(store2.get_channel(&ch.id).unwrap().title, "renamed");
         assert_eq!(store2.get_channel(&ch.id).unwrap().topic, "project notes");
+        assert!(matches!(
+            store2.get_channel(&ch.id).unwrap().visibility,
+            ChannelVisibility::Private
+        ));
     }
 
     #[test]
@@ -10035,7 +10062,7 @@ mod tests {
     fn update_or_delete_missing_channel_returns_not_found() {
         let store = fresh_store();
         let err = store
-            .update_channel("chan_missing", "x".into(), None)
+            .update_channel("chan_missing", Some("x".into()), None, None)
             .expect_err("must be NotFound");
         assert!(matches!(err, StoreError::NotFound(_)));
         let err = store

@@ -1408,6 +1408,346 @@ fn sanitize_filename(name: &str) -> String {
     }
 }
 
+// =========================================================================
+// Persistent attachment cache (ARCH D3-r1)
+//
+// Image and other "special" attachments are downloaded to a persistent
+// cache directory under `<data_dir>/loom/cache/attachments/<artifactId>/`
+// rather than the OS temp directory used by `download_to_temp`. This
+// satisfies AC-P0-8 (independent cache dir), AC-P0-9 (no auto-expiry;
+// survives restarts), and AC-P0-10 (clear-cache UI).
+//
+// `download_to_temp` and `cleanup_downloads` (24h temp cleanup) are left
+// untouched — they continue to serve non-image manual downloads.
+// =========================================================================
+
+/// Maximum payload size for `download_to_cache` (100 MB). Mirrors
+/// `DOWNLOAD_TO_TEMP_MAX_BYTES` to keep the cache bounded per file.
+const DOWNLOAD_TO_CACHE_MAX_BYTES: usize = 100 * 1024 * 1024;
+
+/// Default chunk size for streaming `artifact_read` while populating the
+/// cache. Kept identical to `download_to_temp` for a consistent memory
+/// profile (~256 KB peak per chunk).
+const CACHE_CHUNK_SIZE: u64 = 65_536;
+
+/// Resolve the persistent attachment cache root:
+/// `<data_dir>/loom/cache/attachments/`.
+///
+/// Uses `dirs::data_dir()` (NOT `cache_dir()`) because the macOS/Linux
+/// cache dir may be purged by the OS, violating AC-P0-9 (persistence).
+/// Three-platform layout:
+/// - Windows: `%APPDATA%\Local\loom\cache\attachments` (AppData\Local)
+/// - macOS:   `~/Library/Application Support/loom/cache/attachments`
+/// - Linux:   `~/.local/share/loom/cache/attachments`
+///
+/// Returns `None` if `data_dir()` cannot be determined (no home directory
+/// on the host). Callers surface this as an error string.
+fn attachment_cache_root() -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join("loom").join("cache").join("attachments"))
+}
+
+/// Metadata record persisted alongside each cached artifact as
+/// `<artifactId>/.meta.json`. Stores the original artifact name, media
+/// type, total byte size, and the ISO-8601 timestamp of the download.
+/// This lets the UI render size/type without re-fetching from the server
+/// and lets `get_attachment_cache_size` avoid re-statting every file.
+#[derive(Serialize, Deserialize)]
+struct CachedArtifactMeta {
+    artifact_id: String,
+    name: String,
+    media_type: String,
+    size: u64,
+    downloaded_at: String,
+}
+
+/// Write the `.meta.json` sidecar for a cached artifact. Best-effort:
+/// a failure to write metadata does not invalidate the cached bytes
+/// (the file is still usable); the error is only logged via the
+/// returned `Result` so callers can decide whether to surface it.
+fn write_cache_meta(cache_dir: &Path, meta: &CachedArtifactMeta) -> std::io::Result<()> {
+    let meta_path = cache_dir.join(".meta.json");
+    let json = serde_json::to_string_pretty(meta)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    std::fs::write(&meta_path, json)
+}
+
+/// E1-cache: Download an artifact to the persistent cache directory
+/// (`<data_dir>/loom/cache/attachments/<artifactId>/`), replacing
+/// `download_to_temp` for image auto-download (ARCH D3-r1).
+///
+/// If the artifact is already cached (file exists and `.meta.json` is
+/// present), the existing path is returned without re-downloading — this
+/// is the cache-hit fast path. Otherwise the artifact is streamed from
+/// the server in chunks (same memory-bounded streaming as
+/// `download_to_temp`) and a `.meta.json` sidecar is written.
+///
+/// Returns the full local path of the cached file. Persists across app
+/// restarts; not subject to the 24h temp cleanup.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadToCacheArgs {
+    pub artifact_id: String,
+    #[serde(default)]
+    pub suggested_name: Option<String>,
+}
+
+#[tauri::command]
+pub async fn download_to_cache(
+    state: State<'_, AppState>,
+    args: DownloadToCacheArgs,
+) -> Result<String, String> {
+    let cache_root = attachment_cache_root()
+        .ok_or_else(|| "Cannot determine persistent data directory for cache".to_string())?;
+    let artifact_dir = cache_root.join(&args.artifact_id);
+
+    // Fetch artifact metadata to determine media type and validate existence.
+    let meta = state
+        .client()
+        .await?
+        .call_raw(
+            method::ARTIFACT_GET,
+            Some(json!({ "artifactId": args.artifact_id })),
+        )
+        .await
+        .map_err(stringify)?;
+
+    let artifact_name = meta
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("download")
+        .to_string();
+    let media_type = meta
+        .get("mediaType")
+        .and_then(Value::as_str)
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let file_name = args
+        .suggested_name
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| artifact_name.clone());
+    let safe_name = sanitize_filename(&file_name);
+
+    std::fs::create_dir_all(&artifact_dir)
+        .map_err(|e| format!("Failed to create cache directory: {e}"))?;
+    let dest_path = artifact_dir.join(&safe_name);
+
+    // Cache-hit fast path: if the file and .meta.json already exist, skip
+    // the network download entirely (AC-P0-9 persistence + read_local_file_bytes).
+    let meta_path = artifact_dir.join(".meta.json");
+    if dest_path.exists() && meta_path.exists() {
+        return Ok(dest_path.display().to_string());
+    }
+
+    // Stream artifact_read in chunks until complete or limit exceeded.
+    let mut file = std::fs::File::create(&dest_path)
+        .map_err(|e| format!("Failed to create cache file: {e}"))?;
+    let mut offset = 0u64;
+    let mut total_written = 0u64;
+    loop {
+        let chunk = state
+            .client()
+            .await?
+            .call_raw(
+                method::ARTIFACT_READ,
+                Some(json!({
+                    "artifactId": args.artifact_id,
+                    "offset": offset,
+                    "maxBytes": CACHE_CHUNK_SIZE,
+                })),
+            )
+            .await
+            .map_err(stringify)?;
+
+        let bytes = extract_artifact_bytes(&chunk)?;
+        let written = bytes.len();
+        if written == 0 {
+            break;
+        }
+        total_written += written as u64;
+        if total_written > DOWNLOAD_TO_CACHE_MAX_BYTES as u64 {
+            let _ = std::fs::remove_file(&dest_path);
+            return Err(format!(
+                "file exceeds {} byte cache download limit",
+                DOWNLOAD_TO_CACHE_MAX_BYTES
+            ));
+        }
+        std::io::Write::write_all(&mut file, &bytes)
+            .map_err(|e| format!("Failed to write cache file: {e}"))?;
+
+        let truncated = chunk
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !truncated {
+            break;
+        }
+        match chunk.get("nextOffset").and_then(Value::as_u64) {
+            Some(next) if next > offset => offset = next,
+            _ => break,
+        }
+    }
+
+    // Write metadata sidecar (best-effort — failure does not invalidate bytes).
+    let cache_meta = CachedArtifactMeta {
+        artifact_id: args.artifact_id.clone(),
+        name: artifact_name,
+        media_type,
+        size: total_written,
+        downloaded_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let _ = write_cache_meta(&artifact_dir, &cache_meta);
+
+    Ok(dest_path.display().to_string())
+}
+
+/// Recursively compute the total size in bytes of a directory tree.
+/// Used by `get_attachment_cache_size`. Symlinks are not followed.
+fn dir_size_bytes(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if metadata.is_file() {
+            total += metadata.len();
+        } else if metadata.is_dir() {
+            total += dir_size_bytes(&path);
+        }
+    }
+    total
+}
+
+/// E2-cache: Clear the entire attachment cache directory, deleting all
+/// cached artifact files on disk (ARCH D3-r1, AC-P0-10). The FE is
+/// responsible for also clearing the localStorage mapping and in-memory
+/// Object URLs after this returns. Returns the number of bytes freed
+/// so the UI can confirm what was removed.
+#[tauri::command]
+pub fn clear_attachment_cache() -> Result<u64, String> {
+    let cache_root = attachment_cache_root()
+        .ok_or_else(|| "Cannot determine persistent data directory for cache".to_string())?;
+
+    if !cache_root.exists() {
+        return Ok(0);
+    }
+
+    let size = dir_size_bytes(&cache_root);
+    std::fs::remove_dir_all(&cache_root)
+        .map_err(|e| format!("Failed to clear attachment cache: {e}"))?;
+    Ok(size)
+}
+
+/// E3-cache: Get the total size of the attachment cache directory in
+/// bytes (ARCH D3-r1, AC-P0-10). Used by the settings UI to display
+/// the cache size before the user confirms clearing. Returns 0 if the
+/// cache directory does not exist yet.
+#[tauri::command]
+pub fn get_attachment_cache_size() -> Result<u64, String> {
+    let cache_root = attachment_cache_root()
+        .ok_or_else(|| "Cannot determine persistent data directory for cache".to_string())?;
+    if !cache_root.exists() {
+        return Ok(0);
+    }
+    Ok(dir_size_bytes(&cache_root))
+}
+
+/// E4-cache: Read bytes from a local cached file (ARCH D3-r1). This is
+/// the cache-hit path: when an artifact is already on disk, the FE reads
+/// its bytes directly instead of re-downloading over the network.
+///
+/// Reads up to `maxBytes` (default 65_536) starting at `offset`. Returns
+/// the raw byte array, whether the read was truncated, and the next
+/// offset (if truncated) — mirroring the `artifact_read` server response
+/// shape so the FE can reuse its chunked-decode logic.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadLocalFileBytesArgs {
+    pub path: String,
+    #[serde(default)]
+    pub offset: Option<u64>,
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadLocalFileBytesResult {
+    bytes: Vec<u8>,
+    truncated: bool,
+    next_offset: Option<u64>,
+}
+
+#[tauri::command]
+pub fn read_local_file_bytes(args: ReadLocalFileBytesArgs) -> Result<Value, String> {
+    let path = PathBuf::from(&args.path);
+
+    // Guard against directory traversal outside the cache: only allow
+    // reads of files that live under the attachment cache root. This
+    // prevents the FE from arbitrary file reads via this command.
+    let cache_root = attachment_cache_root()
+        .ok_or_else(|| "Cannot determine persistent data directory for cache".to_string())?;
+    // canonicalize the cache root, creating it if missing so the prefix
+    // check works even on a fresh install where no artifact has been
+    // cached yet. (A read of a non-existent file under a non-existent
+    // cache root still fails at the open() step below.)
+    let canonical_root = match std::fs::canonicalize(&cache_root) {
+        Ok(c) => c,
+        Err(_) => match std::fs::create_dir_all(&cache_root)
+            .and_then(|_| std::fs::canonicalize(&cache_root))
+        {
+            Ok(c) => c,
+            Err(e) => return Err(format!("Failed to resolve cache root: {e}")),
+        },
+    };
+    let canonical_target = std::fs::canonicalize(&path)
+        .map_err(|e| format!("Failed to resolve path: {e}"))?;
+    if !canonical_target.starts_with(&canonical_root) {
+        return Err("Path is outside the attachment cache directory".to_string());
+    }
+
+    let mut file = std::fs::File::open(&canonical_target)
+        .map_err(|e| format!("Failed to open cached file: {e}"))?;
+
+    let offset = args.offset.unwrap_or(0);
+    let max_bytes = args.max_bytes.unwrap_or(CACHE_CHUNK_SIZE);
+
+    use std::io::{Read, Seek, SeekFrom};
+    if offset > 0 {
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| format!("Failed to seek cached file: {e}"))?;
+    }
+
+    let mut buf = vec![0u8; max_bytes as usize];
+    let read = file
+        .read(&mut buf)
+        .map_err(|e| format!("Failed to read cached file: {e}"))?;
+    buf.truncate(read);
+
+    let truncated = read as u64 == max_bytes;
+    let next_offset = if truncated {
+        Some(offset + read as u64)
+    } else {
+        None
+    };
+
+    // Return as a JSON number array to match the server's artifact_read
+    // response shape (consumed by the same FE decode path).
+    let result = ReadLocalFileBytesResult {
+        bytes: buf,
+        truncated,
+        next_offset,
+    };
+    serde_json::to_value(result).map_err(|e| format!("Failed to serialize result: {e}"))
+}
+
 #[tauri::command]
 pub async fn run_cancel(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
     state
@@ -4768,5 +5108,80 @@ mod tests {
 
         // Directory should be removed if empty after cleanup.
         assert!(!dir.exists(), "empty dir should be removed");
+    }
+
+    // ---------- Cache: dir_size_bytes ----------
+
+    #[test]
+    fn cache_dir_size_sums_files_recursively() {
+        let root = std::env::temp_dir()
+            .join("loom-cache-size-test")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(root.join("sub")).expect("create dirs");
+        std::fs::write(root.join("a.bin"), vec![0u8; 100]).expect("write a");
+        std::fs::write(root.join("sub").join("b.bin"), vec![0u8; 50]).expect("write b");
+
+        let size = dir_size_bytes(&root);
+        assert_eq!(size, 150, "dir_size_bytes should sum all files recursively");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cache_dir_size_missing_dir_returns_zero() {
+        let missing = std::env::temp_dir()
+            .join("loom-cache-missing")
+            .join(uuid::Uuid::new_v4().to_string());
+        assert_eq!(dir_size_bytes(&missing), 0, "missing dir should report 0 bytes");
+    }
+
+    // ---------- Cache: write_cache_meta ----------
+
+    #[test]
+    fn cache_write_meta_roundtrips_json() {
+        let dir = std::env::temp_dir()
+            .join("loom-cache-meta-test")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let meta = CachedArtifactMeta {
+            artifact_id: "art_123".to_string(),
+            name: "photo.png".to_string(),
+            media_type: "image/png".to_string(),
+            size: 4096,
+            downloaded_at: "2026-07-24T00:00:00+00:00".to_string(),
+        };
+        write_cache_meta(&dir, &meta).expect("write meta");
+
+        let loaded: CachedArtifactMeta =
+            serde_json::from_str(&std::fs::read_to_string(dir.join(".meta.json")).expect("read meta"))
+                .expect("parse meta");
+        assert_eq!(loaded.artifact_id, "art_123");
+        assert_eq!(loaded.media_type, "image/png");
+        assert_eq!(loaded.size, 4096);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------- Cache: read_local_file_bytes traversal guard ----------
+
+    #[test]
+    fn cache_read_local_file_bytes_rejects_outside_cache() {
+        // A path outside the cache root must be rejected, even if it exists.
+        let outside = std::env::temp_dir()
+            .join("loom-cache-outside-test")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&outside).expect("create dir");
+        let secret = outside.join("secret.txt");
+        std::fs::write(&secret, b"sensitive").expect("write secret");
+
+        let args = ReadLocalFileBytesArgs {
+            path: secret.display().to_string(),
+            offset: None,
+            max_bytes: None,
+        };
+        let err = read_local_file_bytes(args).unwrap_err();
+        assert!(
+            err.contains("outside the attachment cache"),
+            "expected traversal rejection, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }

@@ -144,6 +144,8 @@ fn main() {
             ipc::thread_skill_remove,
         ])
         .setup(|app| {
+            // Best-effort cleanup of stale temp downloads (>24h old).
+            ipc::cleanup_downloads();
             if let Some(win) = app.get_webview_window("main") {
                 let _ = win.show();
                 let _ = win.set_focus();

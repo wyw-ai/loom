@@ -1171,6 +1171,23 @@ const DOWNLOAD_TO_TEMP_MAX_BYTES: usize = 100 * 1024 * 1024;
 /// full path of the downloaded file. This writes to the local temp
 /// directory rather than `workspacePath` (which may point to a remote
 /// machine).
+///
+/// # Memory profile
+///
+/// The download streams `artifact_read` in fixed-size chunks
+/// (`chunk_size = 65_536` bytes). Each chunk is decoded into a
+/// `Vec<u8>` and written immediately, so the peak memory used by the
+/// download path is bounded at roughly `chunk_size + JSON overhead`
+/// (~256 KB per chunk) regardless of the total artifact size. This
+/// avoids loading the entire artifact into memory.
+///
+/// # Future: base64 migration
+///
+/// The current `extract_artifact_bytes` helper accepts a JSON `"bytes"`
+/// array or a `"content"` string. A future migration to base64-encoded
+/// binary transport (single `"bytes_b64"` field) will reduce JSON
+/// overhead per chunk and is tracked as a separate PR — no change to
+/// the chunked streaming design is required.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadToTempArgs {
@@ -1185,6 +1202,9 @@ pub async fn download_to_temp(
     args: DownloadToTempArgs,
 ) -> Result<String, String> {
     // Fetch artifact metadata to determine media type and validate existence.
+    // If the artifact does not exist, call_raw returns an APP_NOT_FOUND
+    // error which is propagated via map_err(stringify)? — no need for
+    // a separate null check.
     let meta = state
         .client()
         .await?
@@ -1194,9 +1214,6 @@ pub async fn download_to_temp(
         )
         .await
         .map_err(stringify)?;
-    if meta.is_null() {
-        return Err(format!("artifact not found: {}", args.artifact_id));
-    }
 
     // Determine the filename: explicit suggestion > artifact name > fallback.
     let artifact_name = meta
@@ -1274,7 +1291,74 @@ pub async fn download_to_temp(
     Ok(dest_path.display().to_string())
 }
 
-/// Extract raw bytes from an `artifact_read` response. The server
+/// Maximum age (24 hours) for files in the temp download directory before
+/// they are eligible for cleanup.
+const DOWNLOAD_MAX_AGE_SECS: u64 = 24 * 60 * 60;
+
+/// Remove stale files from the `loom-downloads` temp directory. Files
+/// whose last modification time is older than `DOWNLOAD_MAX_AGE_SECS`
+/// (24 hours) are deleted. This is best-effort: errors are silently
+/// ignored so that cleanup never blocks app startup.
+///
+/// Call this once during GUI app setup (`main.rs` `.setup()` hook).
+/// Uses `std::env::temp_dir()` for cross-platform compatibility
+/// (Windows `%TEMP%`, macOS `/var/folders/...`, Linux `/tmp`).
+pub fn cleanup_downloads() {
+    let download_root = std::env::temp_dir().join("loom-downloads");
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(DOWNLOAD_MAX_AGE_SECS));
+
+    let cutoff = match cutoff {
+        Some(c) => c,
+        None => return, // system clock issue — skip cleanup
+    };
+
+    let entries = match std::fs::read_dir(&download_root) {
+        Ok(e) => e,
+        Err(_) => return, // dir doesn't exist or unreadable — nothing to do
+    };
+
+    for entry in entries.flatten() {
+        // Each subdirectory is named by artifact_id; clean files inside.
+        let path = entry.path();
+        if path.is_dir() {
+            let _ = cleanup_dir_older_than(&path, cutoff);
+        } else {
+            let _ = remove_if_older_than(&path, cutoff);
+        }
+    }
+}
+
+/// Remove a single file if its mtime is older than `cutoff`.
+fn remove_if_older_than(path: &std::path::Path, cutoff: std::time::SystemTime) -> std::io::Result<()> {
+    let metadata = std::fs::metadata(path)?;
+    if let Ok(mtime) = metadata.modified() {
+        if mtime < cutoff {
+            std::fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Recursively clean files older than `cutoff` inside `dir`.
+fn cleanup_dir_older_than(
+    dir: &std::path::Path,
+    cutoff: std::time::SystemTime,
+) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)?.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let _ = cleanup_dir_older_than(&path, cutoff);
+        } else {
+            let _ = remove_if_older_than(&path, cutoff);
+        }
+    }
+    // Remove the subdirectory if it's now empty.
+    if std::fs::read_dir(dir)?.next().is_none() {
+        let _ = std::fs::remove_dir(dir);
+    }
+    Ok(())
+}
 /// populates both `bytes` (as a JSON number array) and `content` (as a
 /// lossy UTF-8 string). We prefer `bytes` for binary correctness; fall
 /// back to `content`'s raw bytes only if `bytes` is absent.
@@ -4604,5 +4688,85 @@ mod tests {
         });
         let bytes = extract_artifact_bytes(&response).expect("extract bytes");
         assert_eq!(bytes, b"hello".to_vec());
+    }
+
+    // ---------- F8: cleanup_downloads ----------
+
+    use std::io::Write;
+
+    /// Helper: create a temp-based loom-downloads dir for testing.
+    fn f8_test_dir() -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join("loom-downloads-f8-test")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        dir
+    }
+
+    /// Helper: write a file with a specific modification time (age_secs ago).
+    fn f8_write_file_with_age(dir: &Path, name: &str, age_secs: u64) {
+        let path = dir.join(name);
+        let mut f = std::fs::File::create(&path).expect("create file");
+        f.write_all(b"test").expect("write file");
+        drop(f);
+
+        // Set the file's modification time to simulate age.
+        let mtime = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(age_secs))
+            .expect("file age");
+        let times = std::fs::FileTimes::new().set_modified(mtime);
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open for set_times");
+        let _ = f.set_times(times);
+    }
+
+    #[test]
+    fn f8_cleanup_deletes_files_older_than_24h() {
+        // Scenario 1: files older than 24h are deleted.
+        let dir = f8_test_dir();
+        f8_write_file_with_age(&dir, "old.txt", 25 * 60 * 60); // 25h old
+        f8_write_file_with_age(&dir, "very_old.txt", 48 * 60 * 60); // 48h old
+
+        let cutoff = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(DOWNLOAD_MAX_AGE_SECS))
+            .unwrap();
+        cleanup_dir_older_than(&dir, cutoff).expect("cleanup");
+
+        assert!(!dir.join("old.txt").exists(), "old.txt should be deleted");
+        assert!(!dir.join("very_old.txt").exists(), "very_old.txt should be deleted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f8_cleanup_preserves_files_newer_than_24h() {
+        // Scenario 2: files newer than 24h are preserved.
+        let dir = f8_test_dir();
+        f8_write_file_with_age(&dir, "fresh.txt", 60 * 60); // 1h old
+        f8_write_file_with_age(&dir, "recent.txt", 12 * 60 * 60); // 12h old
+
+        let cutoff = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(DOWNLOAD_MAX_AGE_SECS))
+            .unwrap();
+        cleanup_dir_older_than(&dir, cutoff).expect("cleanup");
+
+        assert!(dir.join("fresh.txt").exists(), "fresh.txt should be preserved");
+        assert!(dir.join("recent.txt").exists(), "recent.txt should be preserved");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f8_cleanup_handles_empty_directory() {
+        // Scenario 3: empty directory is handled without error.
+        let dir = f8_test_dir();
+
+        let cutoff = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(DOWNLOAD_MAX_AGE_SECS))
+            .unwrap();
+        cleanup_dir_older_than(&dir, cutoff).expect("cleanup empty dir");
+
+        // Directory should be removed if empty after cleanup.
+        assert!(!dir.exists(), "empty dir should be removed");
     }
 }

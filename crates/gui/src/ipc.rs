@@ -1143,17 +1143,17 @@ pub async fn artifact_exists(state: State<'_, AppState>, params: Value) -> Resul
     // "not found" (→ Ok(false)) from genuine transport/server errors
     // (→ propagate Err). Do NOT use `map_err(stringify)?` here because
     // that would turn the not-found case into an Err.
-    let result = state
+    match state
         .client()
         .await?
         .call_raw(method::ARTIFACT_GET, Some(params))
-        .await;
-    match result {
-        Ok(value) => Ok(!value.is_null()),
+        .await
+    {
+        Ok(result) => Ok(!result.is_null()),
         Err(e) => {
-            let msg = format!("{:#}", e);
+            let msg = stringify(e);
             // APP_NOT_FOUND surfaces as JSON-RPC error code -32000.
-            if msg.contains("code -32000") {
+            if msg.contains("(code -32000)") {
                 Ok(false)
             } else {
                 Err(msg)
@@ -4497,7 +4497,7 @@ mod tests {
     // ---------- MF1: artifact_exists error classification ----------
 
     /// The `artifact_exists` command classifies RPC errors by string-matching
-    /// the flattened error message for `code -32000` (APP_NOT_FOUND). This
+    /// the flattened error message for `(code -32000)` (APP_NOT_FOUND). This
     /// test verifies the classification contract that the command relies on.
     #[test]
     fn mf1_artifact_exists_classifies_app_not_found_error() {
@@ -4505,15 +4505,15 @@ mod tests {
         // as "does not exist" (Ok(false)).
         let not_found_msg = "rpc `artifact_get` failed: artifact not found (code -32000)";
         assert!(
-            not_found_msg.contains("code -32000"),
-            "APP_NOT_FOUND error must contain 'code -32000'"
+            not_found_msg.contains("(code -32000)"),
+            "APP_NOT_FOUND error must contain '(code -32000)'"
         );
 
         // Scenario 2: a genuine transport error (e.g. timeout) must NOT
         // match the not-found pattern and should be propagated as Err.
         let timeout_msg = "rpc `artifact_get` timed out";
         assert!(
-            !timeout_msg.contains("code -32000"),
+            !timeout_msg.contains("(code -32000)"),
             "timeout error must not be classified as not-found"
         );
 
@@ -4522,7 +4522,7 @@ mod tests {
         let invalid_params_msg =
             "rpc `artifact_get` failed: invalid params (code -32602)";
         assert!(
-            !invalid_params_msg.contains("code -32000"),
+            !invalid_params_msg.contains("(code -32000)"),
             "non-APP_NOT_FOUND error must not be classified as not-found"
         );
     }

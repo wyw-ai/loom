@@ -7,7 +7,12 @@ import { isComposingKeyEvent, shouldSendOnEnter } from "@/lib/format-utils";
 import { COMPOSER_AUTO_MAX_ROWS, COMPOSER_MIN_HEIGHT } from "@/lib/composer-utils";
 import { useComposerResize } from "@/hooks/useComposerResize";
 import { useAttachments } from "@/hooks/useAttachments";
-import { shouldWarnLongText, LONG_TEXT_THRESHOLD } from "@/lib/attachment-utils";
+import {
+  shouldWarnLongText,
+  LONG_TEXT_THRESHOLD,
+  extractFilesFromClipboard,
+  ensurePasteFileName,
+} from "@/lib/attachment-utils";
 import { AutoGrowTextarea } from "@/components/ui/AutoGrowTextarea";
 import { Button } from "@/components/ui/button";
 import { Send, Loader2, X, Paperclip, AlertTriangle } from "lucide-react";
@@ -53,6 +58,8 @@ export function Composer({
     removeAttachment,
     clearAttachments,
     openFilePicker,
+    recentlyAddedIds,
+    clearHighlight,
   } = useAttachments();
 
   // --- Resize state ---
@@ -95,6 +102,16 @@ export function Composer({
   function handleSend() {
     onSend(attachments.length > 0 ? attachments : undefined);
     clearAttachments();
+  }
+
+  function handlePaste(event: React.ClipboardEvent<HTMLTextAreaElement>) {
+    const files = extractFilesFromClipboard(event.clipboardData);
+    if (files.length === 0) return; // pure text paste — don't interfere
+    event.preventDefault();
+    const named = files.map(ensurePasteFileName);
+    addFiles(named);
+    // Clear highlight after animation completes
+    setTimeout(() => clearHighlight(), 1600);
   }
 
   const showLongTextWarning = shouldWarnLongText(draft.length);
@@ -151,7 +168,11 @@ export function Composer({
               </button>
             </div>
           )}
-          <AttachmentPreviewBar attachments={attachments} onRemove={removeAttachment} />
+          <AttachmentPreviewBar
+            attachments={attachments}
+            onRemove={removeAttachment}
+            recentlyAddedIds={recentlyAddedIds}
+          />
           {(showLongTextWarning || willConvertLongText) && (
             <div className="mb-2 flex shrink-0 items-center gap-1.5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-700">
               <AlertTriangle size={13} className="shrink-0" />
@@ -207,6 +228,7 @@ export function Composer({
                 syncCaret(event.currentTarget);
                 setDismissedMentionKey(null);
               }}
+              onPaste={handlePaste}
               onClick={(event) => syncCaret(event.currentTarget)}
               onKeyUp={(event) => syncCaret(event.currentTarget)}
               onKeyDown={(event) => {

@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { CheckCircle, Download, ExternalLink, Eye, FileText, FolderOpen, Loader2, Save, X } from "lucide-react";
+import { CheckCircle, Copy, Download, ExternalLink, Eye, FileText, FolderOpen, Loader2, Save, X } from "lucide-react";
 
 import * as ipc from "@/ipc/bridge";
 import type { Artifact, ArtifactReadResult } from "@/ipc/types";
 import { errorText, formatBytes, formatFileTimestamp } from "@/lib/format-utils";
 import { attachmentKind, attachmentTitle, metadataString } from "@/lib/message-utils";
+import { copyAttachmentToClipboard } from "@/lib/attachment-utils";
 import { useDownloadedArtifacts } from "@/hooks/useDownloadedArtifacts";
 
 export type ArtifactPreviewState =
@@ -28,7 +29,7 @@ export const artifactPreviewBinaryBytes = 25 * 1024 * 1024;
 function AttachmentCard({ attachment }: { attachment: string }) {
   const [artifact, setArtifact] = useState<Artifact | null>(null);
   const [loading, setLoading] = useState(() => Boolean(artifactLookupParams(attachment)));
-  const [busy, setBusy] = useState<"preview" | "download" | "open" | "reveal" | "save" | null>(null);
+  const [busy, setBusy] = useState<"preview" | "download" | "open" | "reveal" | "save" | "copy" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<ArtifactPreviewState | null>(null);
   const { isDownloaded, setDownloaded, clearDownloaded } = useDownloadedArtifacts();
@@ -212,6 +213,20 @@ function AttachmentCard({ attachment }: { attachment: string }) {
     }
   }
 
+  async function copyArtifact() {
+    if (!artifact) return;
+    setBusy("copy");
+    setError(null);
+    try {
+      const blob = await readArtifactBlob(artifact);
+      await copyAttachmentToClipboard(blob, artifact.mediaType);
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   return (
     <>
       <div className={`attachment-card ${error ? "border-red-200 bg-red-50" : ""}`}>
@@ -258,6 +273,16 @@ function AttachmentCard({ attachment }: { attachment: string }) {
                 {busy === "download" ? <Loader2 className="animate-spin" size={14} /> : <Download size={14} />}
               </button>
             )}
+            <button
+              type="button"
+              className="attachment-action"
+              title="Copy to clipboard"
+              aria-label={`Copy ${title} to clipboard`}
+              disabled={Boolean(busy)}
+              onClick={copyArtifact}
+            >
+              {busy === "copy" ? <Loader2 className="animate-spin" size={14} /> : <Copy size={14} />}
+            </button>
             {localTempPath && (
               <button
                 type="button"

@@ -48,7 +48,9 @@ import { sortThreads, upsert } from "@/lib/format-utils";
 import type { ScopeRef } from "@/ipc/types";
 import {
   shouldConvertLongText,
+  buildAttachmentSummaryBlock,
   type PendingAttachment,
+  type UploadedAttachment,
 } from "@/lib/attachment-utils";
 
 export interface ActionDeps {
@@ -715,9 +717,9 @@ export function useActions(deps: ActionDeps) {
       pending: PendingAttachment[],
       scope: ScopeRef | null,
       actorId: string,
-    ): Promise<string[]> => {
+    ): Promise<UploadedAttachment[]> => {
       if (pending.length === 0) return [];
-      const ids: string[] = [];
+      const results: UploadedAttachment[] = [];
       for (const attachment of pending) {
         const result = await ipc.artifactPublish({
           ingress: {
@@ -729,9 +731,14 @@ export function useActions(deps: ActionDeps) {
           createdBy: actorId,
           ...(scope ? { scope } : {}),
         });
-        ids.push(result.artifact.id);
+        results.push({
+          name: attachment.name,
+          mediaType: attachment.mediaType,
+          size: attachment.size,
+          artifactId: result.artifact.id,
+        });
       }
-      return ids;
+      return results;
     },
     [],
   );
@@ -741,18 +748,24 @@ export function useActions(deps: ActionDeps) {
       text: string,
       scope: ScopeRef | null,
       actorId: string,
-    ): Promise<string> => {
+    ): Promise<UploadedAttachment> => {
+      const name = `message-${Date.now()}.txt`;
       const result = await ipc.artifactPublish({
         ingress: {
           kind: "inlineText",
-          name: `message-${Date.now()}.txt`,
+          name,
           mediaType: "text/plain",
           text,
         },
         createdBy: actorId,
         ...(scope ? { scope } : {}),
       });
-      return result.artifact.id;
+      return {
+        name,
+        mediaType: "text/plain",
+        size: new TextEncoder().encode(text).length,
+        artifactId: result.artifact.id,
+      };
     },
     [],
   );
@@ -760,7 +773,8 @@ export function useActions(deps: ActionDeps) {
   const sendMessage = useCallback(async (attachments?: PendingAttachment[]) => {
     const d = depsRef.current;
     const body = d.draft.trim();
-    if (!body || !d.target) return;
+    const hasAttachments = (attachments?.length ?? 0) > 0;
+    if ((!body && !hasAttachments) || !d.target) return;
     d.setBusy("message:send");
     try {
       const parentMessageId = d.replyTo?.id;
@@ -800,16 +814,20 @@ export function useActions(deps: ActionDeps) {
       // Upload pending attachments + handle long text conversion
       const actorId = d.workspace?.actorId ?? d.actorIdRef.current ?? "";
       const scope = d.activeScopeRef.current;
-      let attachmentIds: string[] = [];
+      let uploadedAttachments: UploadedAttachment[] = [];
       let messageBody = body;
 
       if (shouldConvertLongText(body.length)) {
-        const textArtifactId = await convertLongTextToAttachment(body, scope, actorId);
-        attachmentIds = [textArtifactId, ...await uploadAttachments(attachments ?? [], scope, actorId)];
+        const textAttachment = await convertLongTextToAttachment(body, scope, actorId);
+        uploadedAttachments = [textAttachment, ...await uploadAttachments(attachments ?? [], scope, actorId)];
         messageBody = body.slice(0, 500) + "\n\n[... full text attached as .txt ...]";
       } else {
-        attachmentIds = await uploadAttachments(attachments ?? [], scope, actorId);
+        uploadedAttachments = await uploadAttachments(attachments ?? [], scope, actorId);
       }
+
+      // Append attachment summary block so AI actors can perceive attachments from text
+      const attachmentIds = uploadedAttachments.map((a) => a.artifactId);
+      messageBody = messageBody + buildAttachmentSummaryBlock(uploadedAttachments);
 
       const result = await ipc.messageSend({
         target: d.target,
@@ -833,7 +851,8 @@ export function useActions(deps: ActionDeps) {
   const sendThreadMessage = useCallback(async (attachments?: PendingAttachment[]) => {
     const d = depsRef.current;
     const body = d.threadDraft.trim();
-    if (!body || !d.threadMessageTarget) return;
+    const hasAttachments = (attachments?.length ?? 0) > 0;
+    if ((!body && !hasAttachments) || !d.threadMessageTarget) return;
     d.setBusy("thread:message:send");
     try {
       const mentionableActors = d.activeChannel
@@ -866,16 +885,20 @@ export function useActions(deps: ActionDeps) {
       // Upload pending attachments + handle long text conversion
       const actorId = d.workspace?.actorId ?? d.actorIdRef.current ?? "";
       const scope = d.activeThreadScopeRef.current;
-      let attachmentIds: string[] = [];
+      let uploadedAttachments: UploadedAttachment[] = [];
       let messageBody = body;
 
       if (shouldConvertLongText(body.length)) {
-        const textArtifactId = await convertLongTextToAttachment(body, scope, actorId);
-        attachmentIds = [textArtifactId, ...await uploadAttachments(attachments ?? [], scope, actorId)];
+        const textAttachment = await convertLongTextToAttachment(body, scope, actorId);
+        uploadedAttachments = [textAttachment, ...await uploadAttachments(attachments ?? [], scope, actorId)];
         messageBody = body.slice(0, 500) + "\n\n[... full text attached as .txt ...]";
       } else {
-        attachmentIds = await uploadAttachments(attachments ?? [], scope, actorId);
+        uploadedAttachments = await uploadAttachments(attachments ?? [], scope, actorId);
       }
+
+      // Append attachment summary block so AI actors can perceive attachments from text
+      const attachmentIds = uploadedAttachments.map((a) => a.artifactId);
+      messageBody = messageBody + buildAttachmentSummaryBlock(uploadedAttachments);
 
       const result = await ipc.messageSend({
         target: d.threadMessageTarget,

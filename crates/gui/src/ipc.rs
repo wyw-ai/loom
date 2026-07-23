@@ -4569,9 +4569,9 @@ mod tests {
         let root = agent_data_root().expect("agent data root falls through empty env");
         // We cannot assert the exact path (depends on the host's data_dir),
         // but it must NOT be the empty PathBuf and must end with the
-        // default `loom/agents` suffix.
+        // default `loom` suffix (callers append `agents/<actor_id>`).
         assert_ne!(root, PathBuf::from(""));
-        assert!(root.ends_with("agents"), "expected <data_dir>/loom/agents, got {}", root.display());
+        assert!(root.ends_with("loom"), "expected <data_dir>/loom, got {}", root.display());
         match saved {
             Some(v) => std::env::set_var(key, v),
             None => std::env::remove_var(key),

@@ -664,10 +664,6 @@ export async function pathExists(path: string): Promise<boolean> {
   return invoke<boolean>("path_exists", { args: { path } });
 }
 
-export async function writeLocalFile(path: string, bytes: Uint8Array): Promise<void> {
-  await invoke("write_local_file", { args: { path, bytes: Array.from(bytes) } });
-}
-
 export async function artifactExists(args: { artifactId: string }): Promise<boolean> {
   return invoke<boolean>("artifact_exists", { args: { artifactId: args.artifactId } });
 }

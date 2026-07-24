@@ -293,6 +293,109 @@ download metadata.
 - `pages` — download portal source for the GitHub Pages site.
 - `scripts/e2e` — local end-to-end smoke scripts.
 
+## Contributors
+
+Thanks to everyone who has been building Loom:
+
+<table>
+  <tr>
+    <td align="center">
+      <a href="https://github.com/0xd219b">
+        <img src="https://github.com/0xd219b.png" width="64" alt="0xd219b"><br>
+        <sub><b>Boyd</b></sub>
+      </a>
+    </td>
+    <td align="center">
+      <a href="https://github.com/canfuu">
+        <img src="https://github.com/canfuu.png" width="64" alt="canfuu"><br>
+        <sub><b>canfuu</b></sub>
+      </a>
+    </td>
+    <td align="center">
+      <a href="https://github.com/flyTiger168">
+        <img src="https://github.com/flyTiger168.png" width="64" alt="flyTiger168"><br>
+        <sub><b>flyTiger168</b></sub>
+      </a>
+    </td>
+    <td align="center">
+      <a href="https://github.com/zhouzhih">
+        <img src="https://github.com/zhouzhih.png" width="64" alt="zhouzhih"><br>
+        <sub><b>zhouzhihao</b></sub>
+      </a>
+    </td>
+    <td align="center">
+      <a href="https://github.com/wujianchi">
+        <img src="https://github.com/wujianchi.png" width="64" alt="wujianchi"><br>
+        <sub><b>wujianchi</b></sub>
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <a href="https://github.com/wutongshenqiu">
+        <img src="https://github.com/wutongshenqiu.png" width="64" alt="wutongshenqiu"><br>
+        <sub><b>qiufeng</b></sub>
+      </a>
+    </td>
+    <td align="center">
+      <a href="https://github.com/a458269373">
+        <img src="https://github.com/a458269373.png" width="64" alt="a458269373"><br>
+        <sub><b>我上去就是一拳0o0</b></sub>
+      </a>
+    </td>
+    <td align="center">
+      <a href="https://github.com/AQing-527">
+        <img src="https://github.com/AQing-527.png" width="64" alt="AQing-527"><br>
+        <sub><b>AQing-527</b></sub>
+      </a>
+    </td>
+    <td align="center">
+      <a href="https://github.com/adlternative">
+        <img src="https://github.com/adlternative.png" width="64" alt="adlternative"><br>
+        <sub><b>ZheNing Hu</b></sub>
+      </a>
+    </td>
+    <td align="center">
+      <a href="https://github.com/Fishlyn400">
+        <img src="https://github.com/Fishlyn400.png" width="64" alt="Fishlyn400"><br>
+        <sub><b>Fishlyn400</b></sub>
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <a href="https://github.com/plumeink">
+        <img src="https://github.com/plumeink.png" width="64" alt="plumeink"><br>
+        <sub><b>PlumeInk</b></sub>
+      </a>
+    </td>
+    <td align="center">
+      <a href="https://github.com/Ryze-Wong">
+        <img src="https://github.com/Ryze-Wong.png" width="64" alt="Ryze-Wong"><br>
+        <sub><b>Ruizhi Wang</b></sub>
+      </a>
+    </td>
+    <td align="center">
+      <a href="https://github.com/blue199288">
+        <img src="https://github.com/blue199288.png" width="64" alt="blue199288"><br>
+        <sub><b>blue199288</b></sub>
+      </a>
+    </td>
+    <td align="center">
+      <a href="https://github.com/ziqi-cloud">
+        <img src="https://github.com/ziqi-cloud.png" width="64" alt="ziqi-cloud"><br>
+        <sub><b>ziqi-cloud</b></sub>
+      </a>
+    </td>
+    <td align="center">
+      <a href="https://github.com/Rhosmarie">
+        <img src="https://github.com/Rhosmarie.png" width="64" alt="Rhosmarie"><br>
+        <sub><b>Shelley</b></sub>
+      </a>
+    </td>
+  </tr>
+</table>
+
 ## License
 
 Loom is licensed under the [Apache License 2.0](LICENSE).

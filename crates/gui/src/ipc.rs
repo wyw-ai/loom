@@ -1748,21 +1748,65 @@ fn dir_size_bytes(dir: &Path) -> u64 {
 /// E2-cache: Clear the entire attachment cache directory, deleting all
 /// cached artifact files on disk (ARCH D3-r1, AC-P0-10). The FE is
 /// responsible for also clearing the localStorage mapping and in-memory
-/// Object URLs after this returns. Returns the number of bytes freed
-/// so the UI can confirm what was removed.
+/// Object URLs after this returns. Returns `{ freedBytes, clearedIds }`
+/// so the FE can batch-clear the corresponding localStorage entries,
+/// mirroring the `clear_attachment_cache_by_type` contract (AC-A6).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClearAttachmentCacheResult {
+    freed_bytes: u64,
+    cleared_ids: Vec<String>,
+}
+
+/// Core clear-all logic parameterized by cache root, so it can be unit
+/// tested with an isolated temp dir. Walks the cache root, removes each
+/// artifact subdirectory, and accumulates the freed bytes plus the list
+/// of cleared artifact ids (the subdirectory names). Best-effort: a
+/// failure to remove one dir is logged and skipped so a single
+/// unreadable entry does not abort the whole clear.
+fn clear_attachment_cache_at_root(cache_root: &Path) -> (u64, Vec<String>) {
+    let mut freed_bytes = 0u64;
+    let mut cleared_ids = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(cache_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let size = artifact_dir_size(&path);
+            let artifact_id = entry.file_name().to_string_lossy().to_string();
+
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => {
+                    freed_bytes += size;
+                    cleared_ids.push(artifact_id);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "failed to remove cache dir during clear-all"
+                    );
+                }
+            }
+        }
+    }
+
+    (freed_bytes, cleared_ids)
+}
+
 #[tauri::command]
-pub fn clear_attachment_cache() -> Result<u64, String> {
+pub fn clear_attachment_cache() -> Result<Value, String> {
     let cache_root = attachment_cache_root()
         .ok_or_else(|| "Cannot determine persistent data directory for cache".to_string())?;
 
-    if !cache_root.exists() {
-        return Ok(0);
-    }
-
-    let size = dir_size_bytes(&cache_root);
-    std::fs::remove_dir_all(&cache_root)
-        .map_err(|e| format!("Failed to clear attachment cache: {e}"))?;
-    Ok(size)
+    let (freed_bytes, cleared_ids) = clear_attachment_cache_at_root(&cache_root);
+    let result = ClearAttachmentCacheResult {
+        freed_bytes,
+        cleared_ids,
+    };
+    serde_json::to_value(result).map_err(|e| format!("Failed to serialize result: {e}"))
 }
 
 /// E4-cache: Read bytes from a local cached file (ARCH D3-r1). This is
@@ -5678,6 +5722,65 @@ mod tests {
         };
         let err = clear_attachment_cache_by_type(args).unwrap_err();
         assert!(err.contains("Invalid category"), "expected invalid category error, got: {err}");
+    }
+
+    #[test]
+    fn cache_clear_total_shape_returns_freed_bytes_and_cleared_ids() {
+        // AC-A6: clear_attachment_cache must return { freedBytes, clearedIds },
+        // symmetric with clear_attachment_cache_by_type. clearedIds must list
+        // the artifact ids (subdirectory names) actually removed.
+        let root = std::env::temp_dir()
+            .join("loom-cache-clearall-shape-test")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&root).expect("create test root");
+
+        cache_make_artifact_dir(&root, "art-1", "image/png", &[0u8; 100]);
+        cache_make_artifact_dir(&root, "art-2", "application/pdf", &[0u8; 200]);
+
+        let (freed, cleared) = clear_attachment_cache_at_root(&root);
+        assert!(freed >= 300, "freed bytes should cover both blobs, got {freed}");
+        assert_eq!(cleared.len(), 2, "cleared both artifact ids");
+        assert!(
+            cleared.iter().any(|id| id == "art-1"),
+            "clearedIds should contain art-1, got {cleared:?}"
+        );
+        assert!(
+            cleared.iter().any(|id| id == "art-2"),
+            "clearedIds should contain art-2, got {cleared:?}"
+        );
+        assert!(!root.join("art-1").exists(), "art-1 removed");
+        assert!(!root.join("art-2").exists(), "art-2 removed");
+
+        // Serialize the result shape exactly as the command does.
+        let result = ClearAttachmentCacheResult {
+            freed_bytes: freed,
+            cleared_ids: cleared.clone(),
+        };
+        let value = serde_json::to_value(&result).expect("serialize result");
+        assert!(
+            value.get("freedBytes").is_some(),
+            "result must have freedBytes field, got: {value}"
+        );
+        assert!(
+            value.get("clearedIds").and_then(|v| v.as_array()).is_some(),
+            "result must have clearedIds array, got: {value}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cache_clear_total_shape_missing_root_is_noop_empty_arrays() {
+        // AC-A6: clearing a non-existent cache root is a no-op that
+        // returns { freedBytes: 0, clearedIds: [] } without error.
+        let root = std::env::temp_dir()
+            .join("loom-cache-clearall-missing-test")
+            .join(uuid::Uuid::new_v4().to_string());
+        // root intentionally NOT created.
+        let (freed, cleared) = clear_attachment_cache_at_root(&root);
+        assert_eq!(freed, 0, "no bytes freed for missing root");
+        assert!(cleared.is_empty(), "no ids cleared for missing root");
+        assert!(!root.exists(), "missing root must not be created");
     }
 
     #[test]

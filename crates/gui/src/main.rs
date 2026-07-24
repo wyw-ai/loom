@@ -152,6 +152,8 @@ fn main() {
         .setup(|app| {
             // Best-effort cleanup of stale temp downloads (>24h old).
             ipc::cleanup_downloads();
+            // SF-1B: best-effort cache consistency self-check at startup.
+            ipc::cache_self_check();
             if let Some(win) = app.get_webview_window("main") {
                 let _ = win.show();
                 let _ = win.set_focus();

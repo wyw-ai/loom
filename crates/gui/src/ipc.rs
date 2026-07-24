@@ -1165,6 +1165,83 @@ pub async fn artifact_exists(state: State<'_, AppState>, params: Value) -> Resul
 /// Maximum payload size for `download_to_temp` (100 MB).
 const DOWNLOAD_TO_TEMP_MAX_BYTES: usize = 100 * 1024 * 1024;
 
+/// Chunk size for streaming `artifact_read` while downloading to temp.
+/// Kept identical to `CACHE_CHUNK_SIZE` for a consistent memory profile.
+const TEMP_CHUNK_SIZE: u64 = 65_536;
+
+/// Stream an artifact from the server to a local file in fixed-size
+/// chunks via `artifact_read`. This is the shared streaming core used by
+/// both `download_to_temp` and `download_to_cache` (BLK-1 refactor).
+///
+/// The caller is responsible for:
+/// - Creating/opening the destination `file` before calling.
+/// - Deciding the `max_bytes` limit (temp vs cache may differ).
+/// - Any post-stream work (`.meta.json` sidecar, partial cleanup, etc.).
+///
+/// Returns the total number of bytes written. If the artifact exceeds
+/// `max_bytes`, the caller's `on_overflow` closure is invoked (it should
+/// remove the partial file and return the error string).
+///
+/// # Memory profile
+///
+/// Each chunk is decoded into a `Vec<u8>` and written immediately, so
+/// peak memory is bounded at roughly `chunk_size + JSON overhead`
+/// (~256 KB per chunk) regardless of total artifact size.
+async fn stream_artifact_to_file<F>(
+    state: &State<'_, AppState>,
+    artifact_id: &str,
+    file: &mut std::fs::File,
+    max_bytes: usize,
+    chunk_size: u64,
+    on_overflow: F,
+) -> Result<usize, String>
+where
+    F: FnOnce(usize) -> String,
+{
+    let mut offset = 0u64;
+    let mut total_written = 0usize;
+    loop {
+        let chunk = state
+            .client()
+            .await?
+            .call_raw(
+                method::ARTIFACT_READ,
+                Some(json!({
+                    "artifactId": artifact_id,
+                    "offset": offset,
+                    "maxBytes": chunk_size,
+                })),
+            )
+            .await
+            .map_err(stringify)?;
+
+        let bytes = extract_artifact_bytes(&chunk)?;
+        let written = bytes.len();
+        if written == 0 {
+            break;
+        }
+        total_written += written;
+        if total_written > max_bytes {
+            return Err(on_overflow(max_bytes));
+        }
+        std::io::Write::write_all(file, &bytes)
+            .map_err(|e| format!("Failed to write file: {e}"))?;
+
+        let truncated = chunk
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !truncated {
+            break;
+        }
+        match chunk.get("nextOffset").and_then(Value::as_u64) {
+            Some(next) if next > offset => offset = next,
+            _ => break,
+        }
+    }
+    Ok(total_written)
+}
+
 /// E1: Download an artifact to the system temp directory. Uses the
 /// Server API `artifact_read` to fetch bytes, then writes them to
 /// `std::env::temp_dir()/loom-downloads/<suggestedName>`. Returns the
@@ -1242,53 +1319,21 @@ pub async fn download_to_temp(
     // Stream artifact_read in chunks until complete or limit exceeded.
     let mut file = std::fs::File::create(&dest_path)
         .map_err(|e| format!("Failed to create temp file: {e}"))?;
-    let mut offset = 0u64;
-    let mut total_written = 0usize;
-    let chunk_size = 65_536u64;
-    loop {
-        let chunk = state
-            .client()
-            .await?
-            .call_raw(
-                method::ARTIFACT_READ,
-                Some(json!({
-                    "artifactId": args.artifact_id,
-                    "offset": offset,
-                    "maxBytes": chunk_size,
-                })),
-            )
-            .await
-            .map_err(stringify)?;
 
-        let bytes = extract_artifact_bytes(&chunk)?;
-        let written = bytes.len();
-        if written == 0 {
-            break;
-        }
-        total_written += written;
-        if total_written > DOWNLOAD_TO_TEMP_MAX_BYTES {
+    let dest_path_for_overflow = dest_path.clone();
+    stream_artifact_to_file(
+        &state,
+        &args.artifact_id,
+        &mut file,
+        DOWNLOAD_TO_TEMP_MAX_BYTES,
+        TEMP_CHUNK_SIZE,
+        move |limit| {
             // Clean up partial file before returning error.
-            let _ = std::fs::remove_file(&dest_path);
-            return Err(format!(
-                "file exceeds {} byte download limit",
-                DOWNLOAD_TO_TEMP_MAX_BYTES
-            ));
-        }
-        std::io::Write::write_all(&mut file, &bytes)
-            .map_err(|e| format!("Failed to write temp file: {e}"))?;
-
-        let truncated = chunk
-            .get("truncated")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if !truncated {
-            break;
-        }
-        match chunk.get("nextOffset").and_then(Value::as_u64) {
-            Some(next) if next > offset => offset = next,
-            _ => break,
-        }
-    }
+            let _ = std::fs::remove_file(&dest_path_for_overflow);
+            format!("file exceeds {} byte download limit", limit)
+        },
+    )
+    .await?;
 
     Ok(dest_path.display().to_string())
 }
@@ -1452,7 +1497,7 @@ fn attachment_cache_root() -> Option<PathBuf> {
 /// `<artifactId>/.meta.json`. Stores the original artifact name, media
 /// type, total byte size, and the ISO-8601 timestamp of the download.
 /// This lets the UI render size/type without re-fetching from the server
-/// and lets `get_attachment_cache_size` avoid re-statting every file.
+/// and lets the category breakdown avoid re-statting every file.
 #[derive(Serialize, Deserialize)]
 struct CachedArtifactMeta {
     artifact_id: String,
@@ -1545,61 +1590,50 @@ pub async fn download_to_cache(
         return Ok(dest_path.display().to_string());
     }
 
-    // Stream artifact_read in chunks until complete or limit exceeded.
-    let mut file = std::fs::File::create(&dest_path)
-        .map_err(|e| format!("Failed to create cache file: {e}"))?;
-    let mut offset = 0u64;
-    let mut total_written = 0u64;
-    loop {
-        let chunk = state
-            .client()
-            .await?
-            .call_raw(
-                method::ARTIFACT_READ,
-                Some(json!({
-                    "artifactId": args.artifact_id,
-                    "offset": offset,
-                    "maxBytes": CACHE_CHUNK_SIZE,
-                })),
-            )
-            .await
-            .map_err(stringify)?;
+    // Atomic write (BLK-3): stream to a `.tmp` sidecar, fsync, then rename
+    // to the final path. This prevents a partial/corrupt file from ever
+    // appearing at `dest_path` if the download is interrupted mid-stream.
+    // Only `download_to_cache` needs this — `download_to_temp` has the 24h
+    // cleanup as a fallback for stale partials.
+    let tmp_path = artifact_dir.join(format!("{safe_name}.tmp"));
+    let mut file = std::fs::File::create(&tmp_path)
+        .map_err(|e| format!("Failed to create cache temp file: {e}"))?;
 
-        let bytes = extract_artifact_bytes(&chunk)?;
-        let written = bytes.len();
-        if written == 0 {
-            break;
-        }
-        total_written += written as u64;
-        if total_written > DOWNLOAD_TO_CACHE_MAX_BYTES as u64 {
-            let _ = std::fs::remove_file(&dest_path);
-            return Err(format!(
-                "file exceeds {} byte cache download limit",
-                DOWNLOAD_TO_CACHE_MAX_BYTES
-            ));
-        }
-        std::io::Write::write_all(&mut file, &bytes)
-            .map_err(|e| format!("Failed to write cache file: {e}"))?;
+    let tmp_path_for_overflow = tmp_path.clone();
+    let total_written = stream_artifact_to_file(
+        &state,
+        &args.artifact_id,
+        &mut file,
+        DOWNLOAD_TO_CACHE_MAX_BYTES,
+        CACHE_CHUNK_SIZE,
+        move |limit| {
+            // Clean up partial temp file before returning error.
+            let _ = std::fs::remove_file(&tmp_path_for_overflow);
+            format!("file exceeds {} byte cache download limit", limit)
+        },
+    )
+    .await?;
 
-        let truncated = chunk
-            .get("truncated")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if !truncated {
-            break;
-        }
-        match chunk.get("nextOffset").and_then(Value::as_u64) {
-            Some(next) if next > offset => offset = next,
-            _ => break,
-        }
-    }
+    // Flush to disk before the atomic rename so the renamed file is
+    // guaranteed to contain all buffered data.
+    file.sync_all()
+        .map_err(|e| format!("Failed to sync cache file: {e}"))?;
+    drop(file);
+
+    // Atomic rename: on all three platforms, rename within the same
+    // filesystem is atomic — either the old or new name exists at every
+    // point in time, never a partial file.
+    std::fs::rename(&tmp_path, &dest_path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        format!("Failed to finalize cache file: {e}")
+    })?;
 
     // Write metadata sidecar (best-effort — failure does not invalidate bytes).
     let cache_meta = CachedArtifactMeta {
         artifact_id: args.artifact_id.clone(),
         name: artifact_name,
         media_type,
-        size: total_written,
+        size: total_written as u64,
         downloaded_at: chrono::Utc::now().to_rfc3339(),
     };
     let _ = write_cache_meta(&artifact_dir, &cache_meta);
@@ -1608,7 +1642,8 @@ pub async fn download_to_cache(
 }
 
 /// Recursively compute the total size in bytes of a directory tree.
-/// Used by `get_attachment_cache_size`. Symlinks are not followed.
+/// Used by `clear_attachment_cache` and the category breakdown helpers.
+/// Symlinks are not followed.
 fn dir_size_bytes(dir: &Path) -> u64 {
     let mut total = 0u64;
     let entries = match std::fs::read_dir(dir) {
@@ -1648,20 +1683,6 @@ pub fn clear_attachment_cache() -> Result<u64, String> {
     std::fs::remove_dir_all(&cache_root)
         .map_err(|e| format!("Failed to clear attachment cache: {e}"))?;
     Ok(size)
-}
-
-/// E3-cache: Get the total size of the attachment cache directory in
-/// bytes (ARCH D3-r1, AC-P0-10). Used by the settings UI to display
-/// the cache size before the user confirms clearing. Returns 0 if the
-/// cache directory does not exist yet.
-#[tauri::command]
-pub fn get_attachment_cache_size() -> Result<u64, String> {
-    let cache_root = attachment_cache_root()
-        .ok_or_else(|| "Cannot determine persistent data directory for cache".to_string())?;
-    if !cache_root.exists() {
-        return Ok(0);
-    }
-    Ok(dir_size_bytes(&cache_root))
 }
 
 /// E4-cache: Read bytes from a local cached file (ARCH D3-r1). This is
@@ -1798,6 +1819,17 @@ struct CacheCategoryStats {
     count: u64,
 }
 
+/// Typed return shape for `get_attachment_cache_breakdown` (SF-3).
+/// Replaces the previous bare `json!()` construction so the field
+/// names and types are checked at compile time.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CacheBreakdownResult {
+    images: CacheCategoryStats,
+    other: CacheCategoryStats,
+    total: CacheCategoryStats,
+}
+
 /// Core breakdown logic parameterized by cache root, so it can be unit
 /// tested with an isolated temp dir instead of the global cache root.
 fn cache_breakdown_at_root(cache_root: &Path) -> (CacheCategoryStats, CacheCategoryStats) {
@@ -1849,11 +1881,8 @@ pub fn get_attachment_cache_breakdown() -> Result<Value, String> {
         size: images.size + other.size,
         count: images.count + other.count,
     };
-    Ok(json!({
-        "images": images,
-        "other": other,
-        "total": total,
-    }))
+    let result = CacheBreakdownResult { images, other, total };
+    serde_json::to_value(result).map_err(|e| format!("Failed to serialize breakdown: {e}"))
 }
 
 /// E6-cache: Clear a single category of the attachment cache.

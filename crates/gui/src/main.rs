@@ -127,7 +127,6 @@ fn main() {
             ipc::download_to_temp,
             ipc::download_to_cache,
             ipc::clear_attachment_cache,
-            ipc::get_attachment_cache_size,
             ipc::read_local_file_bytes,
             ipc::get_attachment_cache_breakdown,
             ipc::clear_attachment_cache_by_type,

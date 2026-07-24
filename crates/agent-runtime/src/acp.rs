@@ -15,7 +15,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::ErrorKind;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, ExitStatus, Output, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, ExitStatus, Stdio};
+#[cfg(unix)]
+use std::process::Output;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1141,6 +1143,7 @@ fn capture_login_shell_env(
     Err("login shell env capture is only implemented on Unix".into())
 }
 
+#[cfg(unix)]
 fn wait_with_timeout(child: Child, timeout: Duration) -> Result<Output, String> {
     let pid = child.id();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -1197,6 +1200,7 @@ fn kill_process(pid: u32) {
     let _ = loom_platform::signal::force_kill_pid(pid);
 }
 
+#[allow(dead_code)]  // Unix-only caller; retained for cross-platform unit tests
 fn parse_env_output(
     stdout: &[u8],
     start: &str,
@@ -1240,6 +1244,7 @@ fn parse_env_output(
     Ok(env)
 }
 
+#[allow(dead_code)]  // Unix-only caller; retained for cross-platform unit tests
 fn trim_ascii_newlines(bytes: &[u8]) -> &[u8] {
     let mut start = 0;
     let mut end = bytes.len();
@@ -1252,6 +1257,7 @@ fn trim_ascii_newlines(bytes: &[u8]) -> &[u8] {
     &bytes[start..end]
 }
 
+#[allow(dead_code)]  // Unix-only caller; retained for cross-platform unit tests
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() {
         return Some(0);

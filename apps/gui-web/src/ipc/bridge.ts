@@ -718,6 +718,82 @@ export async function downloadToTemp(args: {
   });
 }
 
+/**
+ * Download an artifact to the persistent cache directory
+ * (data_dir/loom/cache/attachments/<artifactId>/).
+ *
+ * ARCH D3-r1: replaces downloadToTemp for image auto-download.
+ * Returns the local file path. Persists across restarts.
+ */
+export async function downloadToCache(args: {
+  artifactId: string;
+  suggestedName?: string;
+}): Promise<string> {
+  return invoke<string>("download_to_cache", {
+    args: {
+      artifactId: args.artifactId,
+      ...(args.suggestedName ? { suggestedName: args.suggestedName } : {}),
+    },
+  });
+}
+
+/**
+ * Clear the entire attachment cache directory (disk files).
+ * ARCH D3-r1: used by CacheManagementSection in settings.
+ */
+export async function clearAttachmentCache(): Promise<void> {
+  await invoke("clear_attachment_cache", { args: {} });
+}
+
+/**
+ * Get cache breakdown by media type category.
+ * ARCH D3 design: returns { images: {size,count}, other: {size,count}, total }.
+ */
+export async function getAttachmentCacheBreakdown(): Promise<{
+  images: { size: number; count: number };
+  other: { size: number; count: number };
+  total: { size: number; count: number };
+}> {
+  return invoke("get_attachment_cache_breakdown", { args: {} });
+}
+
+/**
+ * Clear attachment cache by category ("images" or "other").
+ * ARCH D3 design: returns { freedBytes, clearedIds }.
+ */
+export async function clearAttachmentCacheByType(category: "images" | "other"): Promise<{
+  freedBytes: number;
+  clearedIds: string[];
+}> {
+  return invoke("clear_attachment_cache_by_type", { args: { category } });
+}
+
+/**
+ * Open the attachment cache root directory in the system file manager.
+ * ARCH design: opens data_dir/loom/cache/attachments/ (Win/Mac/Linux compatible).
+ */
+export async function openAttachmentCacheDirectory(): Promise<void> {
+  await invoke("open_attachment_cache_directory", { args: {} });
+}
+
+/**
+ * Read bytes from a local cached file (cache-hit path).
+ * ARCH D3-r1: skips network download when file is already cached.
+ */
+export async function readLocalFileBytes(args: {
+  path: string;
+  offset?: number;
+  maxBytes?: number;
+}): Promise<{ bytes: number[]; truncated: boolean; nextOffset?: number }> {
+  return invoke("read_local_file_bytes", {
+    args: {
+      path: args.path,
+      ...(args.offset !== undefined ? { offset: args.offset } : {}),
+      ...(args.maxBytes !== undefined ? { maxBytes: args.maxBytes } : {}),
+    },
+  });
+}
+
 export function onStream(cb: (u: StreamUpdate) => void): Promise<UnlistenFn> {
   return listen<StreamUpdate>("loom://stream", (e) => cb(e.payload));
 }

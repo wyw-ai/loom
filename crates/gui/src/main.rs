@@ -125,6 +125,12 @@ fn main() {
             ipc::path_exists,
             ipc::artifact_exists,
             ipc::download_to_temp,
+            ipc::download_to_cache,
+            ipc::clear_attachment_cache,
+            ipc::read_local_file_bytes,
+            ipc::get_attachment_cache_breakdown,
+            ipc::clear_attachment_cache_by_type,
+            ipc::open_attachment_cache_directory,
             ipc::machine_create,
             ipc::machine_start,
             ipc::machine_remove,
@@ -146,6 +152,8 @@ fn main() {
         .setup(|app| {
             // Best-effort cleanup of stale temp downloads (>24h old).
             ipc::cleanup_downloads();
+            // SF-1B: best-effort cache consistency self-check at startup.
+            ipc::cache_self_check();
             if let Some(win) = app.get_webview_window("main") {
                 let _ = win.show();
                 let _ = win.set_focus();

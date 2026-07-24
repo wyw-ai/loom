@@ -3,11 +3,16 @@ import { createPortal } from "react-dom";
 import { CheckCircle, Copy, Download, ExternalLink, Eye, FileText, FolderOpen, Loader2, Save, X } from "lucide-react";
 
 import * as ipc from "@/ipc/bridge";
-import type { Artifact, ArtifactReadResult } from "@/ipc/types";
+import type { Artifact } from "@/ipc/types";
 import { errorText, formatBytes, formatFileTimestamp } from "@/lib/format-utils";
 import { attachmentKind, attachmentTitle, metadataString } from "@/lib/message-utils";
 import { copyAttachmentToClipboard } from "@/lib/attachment-utils";
+import { readArtifactBlob } from "@/lib/artifact-blob";
 import { useDownloadedArtifacts } from "@/hooks/useDownloadedArtifacts";
+import { InlineImage } from "@/components/chat/InlineImage";
+
+// Re-export for backward compatibility (RemoteFilePanel imports from here)
+export { readArtifactBlob };
 
 export type ArtifactPreviewState =
   | {
@@ -22,7 +27,6 @@ export type ArtifactPreviewState =
       objectUrl: string;
     };
 
-const artifactReadChunkBytes = 1024 * 1024;
 export const artifactPreviewTextBytes = 256 * 1024;
 export const artifactPreviewBinaryBytes = 25 * 1024 * 1024;
 
@@ -212,99 +216,103 @@ function AttachmentCard({ attachment }: { attachment: string }) {
 
   return (
     <>
-      <div className={`attachment-card ${error ? "border-red-200 bg-red-50" : ""}`}>
-        <div className="attachment-icon">
-          {busy || loading ? <Loader2 className="animate-spin" size={18} /> : <FileText size={18} />}
-        </div>
-        <div className="min-w-0 flex-1">
-          <div className="truncate text-sm font-bold text-[#303849]" title={`${title}${artifact ? ` (${artifact.id.slice(-6)})` : ""}`}>
-            {title}
-            {artifact && localTempPath && (
-              <CheckCircle size={13} className="ml-1 inline-block shrink-0 text-emerald-500" aria-label="Downloaded to local temp" />
-            )}
+      {artifact && isImageArtifact(artifact) ? (
+        <InlineImage artifact={artifact} />
+      ) : (
+        <div className={`attachment-card ${error ? "border-red-200 bg-red-50" : ""}`}>
+          <div className="attachment-icon">
+            {busy || loading ? <Loader2 className="animate-spin" size={18} /> : <FileText size={18} />}
           </div>
-          <div className={`mt-0.5 truncate text-xs font-medium ${error ? "text-red-700" : "text-[#667085]"}`}>
-            {detail}
+          <div className="min-w-0 flex-1">
+            <div className="truncate text-sm font-bold text-[#303849]" title={`${title}${artifact ? ` (${artifact.id.slice(-6)})` : ""}`}>
+              {title}
+              {artifact && localTempPath && (
+                <CheckCircle size={13} className="ml-1 inline-block shrink-0 text-emerald-500" aria-label="Downloaded to local temp" />
+              )}
+            </div>
+            <div className={`mt-0.5 truncate text-xs font-medium ${error ? "text-red-700" : "text-[#667085]"}`}>
+              {detail}
+            </div>
           </div>
-        </div>
-        <div className="attachment-file-badge" aria-hidden="true">
-          {attachmentBadge(title, artifact)}
-        </div>
-        {artifact && (
-          <div className="attachment-actions">
-            {previewMode && localTempPath && (
-              <button
-                type="button"
-                className="attachment-action"
-                title="Preview artifact"
-                aria-label={`Preview ${title}`}
-                disabled={Boolean(busy)}
-                onClick={previewArtifact}
-              >
-                {busy === "preview" ? <Loader2 className="animate-spin" size={14} /> : <Eye size={14} />}
-              </button>
-            )}
-            {!localTempPath && (
-              <button
-                type="button"
-                className="attachment-action"
-                title="Download to local temp"
-                aria-label={`Download ${title}`}
-                disabled={Boolean(busy)}
-                onClick={downloadArtifact}
-              >
-                {busy === "download" ? <Loader2 className="animate-spin" size={14} /> : <Download size={14} />}
-              </button>
-            )}
-            <button
-              type="button"
-              className="attachment-action"
-              title="Copy to clipboard"
-              aria-label={`Copy ${title} to clipboard`}
-              disabled={Boolean(busy)}
-              onClick={copyArtifact}
-            >
-              {busy === "copy" ? <Loader2 className="animate-spin" size={14} /> : <Copy size={14} />}
-            </button>
-            {localTempPath && (
-              <button
-                type="button"
-                className="attachment-action"
-                title="Open with default app"
-                aria-label={`Open ${title}`}
-                disabled={Boolean(busy)}
-                onClick={openFile}
-              >
-                {busy === "open" ? <Loader2 className="animate-spin" size={14} /> : <ExternalLink size={14} />}
-              </button>
-            )}
-            {localTempPath && (
-              <button
-                type="button"
-                className="attachment-action"
-                title="Reveal in folder"
-                aria-label={`Reveal ${title} in folder`}
-                disabled={Boolean(busy)}
-                onClick={revealFile}
-              >
-                {busy === "reveal" ? <Loader2 className="animate-spin" size={14} /> : <FolderOpen size={14} />}
-              </button>
-            )}
-            {localTempPath && (
-              <button
-                type="button"
-                className="attachment-action"
-                title="Save as..."
-                aria-label={`Save ${title} as`}
-                disabled={Boolean(busy)}
-                onClick={saveAsFile}
-              >
-                {busy === "save" ? <Loader2 className="animate-spin" size={14} /> : <Save size={14} />}
-              </button>
-            )}
+          <div className="attachment-file-badge" aria-hidden="true">
+            {attachmentBadge(title, artifact)}
           </div>
-        )}
-      </div>
+          {artifact && (
+            <div className="attachment-actions">
+              {previewMode && localTempPath && (
+                <button
+                  type="button"
+                  className="attachment-action"
+                  title="Preview artifact"
+                  aria-label={`Preview ${title}`}
+                  disabled={Boolean(busy)}
+                  onClick={previewArtifact}
+                >
+                  {busy === "preview" ? <Loader2 className="animate-spin" size={14} /> : <Eye size={14} />}
+                </button>
+              )}
+              {!localTempPath && (
+                <button
+                  type="button"
+                  className="attachment-action"
+                  title="Download to local temp"
+                  aria-label={`Download ${title}`}
+                  disabled={Boolean(busy)}
+                  onClick={downloadArtifact}
+                >
+                  {busy === "download" ? <Loader2 className="animate-spin" size={14} /> : <Download size={14} />}
+                </button>
+              )}
+              <button
+                type="button"
+                className="attachment-action"
+                title="Copy to clipboard"
+                aria-label={`Copy ${title} to clipboard`}
+                disabled={Boolean(busy)}
+                onClick={copyArtifact}
+              >
+                {busy === "copy" ? <Loader2 className="animate-spin" size={14} /> : <Copy size={14} />}
+              </button>
+              {localTempPath && (
+                <button
+                  type="button"
+                  className="attachment-action"
+                  title="Open with default app"
+                  aria-label={`Open ${title}`}
+                  disabled={Boolean(busy)}
+                  onClick={openFile}
+                >
+                  {busy === "open" ? <Loader2 className="animate-spin" size={14} /> : <ExternalLink size={14} />}
+                </button>
+              )}
+              {localTempPath && (
+                <button
+                  type="button"
+                  className="attachment-action"
+                  title="Reveal in folder"
+                  aria-label={`Reveal ${title} in folder`}
+                  disabled={Boolean(busy)}
+                  onClick={revealFile}
+                >
+                  {busy === "reveal" ? <Loader2 className="animate-spin" size={14} /> : <FolderOpen size={14} />}
+                </button>
+              )}
+              {localTempPath && (
+                <button
+                  type="button"
+                  className="attachment-action"
+                  title="Save as..."
+                  aria-label={`Save ${title} as`}
+                  disabled={Boolean(busy)}
+                  onClick={saveAsFile}
+                >
+                  {busy === "save" ? <Loader2 className="animate-spin" size={14} /> : <Save size={14} />}
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+      )}
       {preview && (
         <AttachmentPreviewModal
           preview={preview}
@@ -324,6 +332,13 @@ export function AttachmentStack({ attachments }: { attachments: string[] }) {
       ))}
     </div>
   );
+}
+
+/**
+ * Determine whether an artifact is an image type.
+ */
+export function isImageArtifact(artifact: Artifact): boolean {
+  return (artifact.mediaType ?? "").toLowerCase().startsWith("image/");
 }
 
 export function AttachmentPreviewModal({
@@ -482,40 +497,4 @@ function titleCaseWords(value: string) {
     .filter(Boolean)
     .map((word) => word.slice(0, 1).toUpperCase() + word.slice(1))
     .join(" ");
-}
-
-function artifactReadBytes(read: ArtifactReadResult) {
-  if (read.bytes && read.bytes.length > 0) return Uint8Array.from(read.bytes);
-  if (read.content) return new TextEncoder().encode(read.content);
-  return new Uint8Array();
-}
-
-export async function readArtifactBlob(artifact: Artifact) {
-  const chunks: Uint8Array[] = [];
-  let offset = 0;
-  let mediaType = artifact.mediaType;
-  for (let chunkIndex = 0; chunkIndex < 512; chunkIndex += 1) {
-    const read = await ipc.artifactRead({
-      artifactId: artifact.id,
-      offset,
-      maxBytes: artifactReadChunkBytes,
-    });
-    mediaType = read.mediaType || mediaType;
-    const bytes = artifactReadBytes(read);
-    chunks.push(bytes);
-    if (!read.truncated) {
-      const parts = chunks.map((chunk) => {
-        const copy = new Uint8Array(chunk.byteLength);
-        copy.set(chunk);
-        return copy.buffer;
-      });
-      return new Blob(parts, { type: mediaType || "application/octet-stream" });
-    }
-    const nextOffset = read.nextOffset ?? offset + bytes.byteLength;
-    if (nextOffset <= offset) {
-      throw new Error("Artifact read did not advance.");
-    }
-    offset = nextOffset;
-  }
-  throw new Error("Artifact is too large to download in one operation.");
 }

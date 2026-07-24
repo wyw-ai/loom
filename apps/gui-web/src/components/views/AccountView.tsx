@@ -1,6 +1,7 @@
 import { Avatar } from "@/components/layout/Avatar";
 import { PageHeader } from "@/components/shared/PageComponents";
 import { SettingsSection } from "@/components/settings/SettingsSection";
+import { CacheManagementSection } from "@/components/settings/CacheManagementSection";
 import { Button } from "@/components/ui/button";
 import { avatarLibraryUrls } from "@/lib/constants";
 import { accountName, capitalize } from "@/lib/format-utils";
@@ -132,6 +133,9 @@ export function AccountView({
               </div>
             )}
           </SettingsSection>
+          <div className="mt-5">
+            <CacheManagementSection />
+          </div>
         </div>
       </div>
     </section>

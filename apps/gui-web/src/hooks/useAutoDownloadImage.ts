@@ -56,7 +56,7 @@ function releaseObjectUrl(artifactId: string): void {
 
 /**
  * Clear all ObjectURLs from the memory cache.
- * ARCH D3-r1: called by ClearCacheSection after clearing disk cache,
+ * ARCH D3-r1: called by CacheManagementSection after clearing disk cache,
  * so components re-render and re-download visible images.
  */
 export function clearAllObjectUrls(): void {

@@ -1,0 +1,235 @@
+import { useCallback, useEffect, useState } from "react";
+import { HardDrive, ImageIcon, FileIcon, Loader2, Trash2 } from "lucide-react";
+
+import * as ipc from "@/ipc/bridge";
+import { errorText, formatBytes } from "@/lib/format-utils";
+import { useDownloadedArtifacts } from "@/hooks/useDownloadedArtifacts";
+import { clearAllObjectUrls } from "@/hooks/useAutoDownloadImage";
+import { SettingsSection } from "@/components/settings/SettingsSection";
+
+interface CacheBreakdown {
+  images: { size: number; count: number };
+  other: { size: number; count: number };
+  total: { size: number; count: number };
+}
+
+type ClearTarget = "images" | "other" | "all";
+
+/**
+ * Cache management section with per-category breakdown and clearing.
+ *
+ * ARCH D3 design:
+ * - Displays cache size broken down by Images / Other Files
+ * - Per-category clear buttons + full clear
+ * - On clear: deletes disk files + syncs localStorage (clearedIds) + clears ObjectURLs
+ */
+export function CacheManagementSection() {
+  const { clearAllDownloaded, clearDownloadedByIds } = useDownloadedArtifacts();
+  const [breakdown, setBreakdown] = useState<CacheBreakdown | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [clearing, setClearing] = useState<ClearTarget | null>(null);
+  const [confirming, setConfirming] = useState<ClearTarget | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const bd = await ipc.getAttachmentCacheBreakdown();
+      setBreakdown(bd);
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  async function handleClear(target: ClearTarget) {
+    setClearing(target);
+    setError(null);
+    try {
+      if (target === "all") {
+        await ipc.clearAttachmentCache();
+        clearAllDownloaded();
+        clearAllObjectUrls();
+      } else {
+        const result = await ipc.clearAttachmentCacheByType(target);
+        clearDownloadedByIds(result.clearedIds);
+        clearAllObjectUrls();
+      }
+      setConfirming(null);
+      await refresh();
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setClearing(null);
+    }
+  }
+
+  const totalSize = breakdown?.total.size ?? null;
+  const hasCache = totalSize !== null && totalSize > 0;
+
+  return (
+    <SettingsSection
+      title="Cache Management"
+      detail="Downloaded attachments cached on disk for fast display."
+      action={
+        <button
+          type="button"
+          className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-[#dfe3ec] bg-white px-2.5 text-xs font-bold text-[#596174] hover:bg-[#f7f7fb]"
+          title="Refresh cache info"
+          onClick={() => void refresh()}
+          disabled={loading}
+        >
+          {loading ? <Loader2 className="animate-spin" size={13} /> : <HardDrive size={13} />}
+          {loading ? "Checking…" : `${totalSize !== null ? formatBytes(totalSize) : "—"}`}
+        </button>
+      }
+    >
+      {error && (
+        <div className="mb-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+          {error}
+        </div>
+      )}
+
+      {/* Category rows */}
+      <div className="space-y-2">
+        <CategoryRow
+          icon={<ImageIcon size={15} />}
+          label="Images"
+          size={breakdown?.images.size ?? null}
+          count={breakdown?.images.count ?? null}
+          confirming={confirming === "images"}
+          clearing={clearing === "images"}
+          disabled={!hasCache || (breakdown?.images.size ?? 0) === 0}
+          onClear={() => setConfirming("images")}
+          onConfirm={() => void handleClear("images")}
+          onCancel={() => setConfirming(null)}
+        />
+        <CategoryRow
+          icon={<FileIcon size={15} />}
+          label="Other Files"
+          size={breakdown?.other.size ?? null}
+          count={breakdown?.other.count ?? null}
+          confirming={confirming === "other"}
+          clearing={clearing === "other"}
+          disabled={!hasCache || (breakdown?.other.size ?? 0) === 0}
+          onClear={() => setConfirming("other")}
+          onConfirm={() => void handleClear("other")}
+          onCancel={() => setConfirming(null)}
+        />
+      </div>
+
+      {/* Full clear */}
+      <div className="mt-4 border-t border-[#eef0f5] pt-3">
+        {confirming === "all" ? (
+          <div className="flex items-center gap-3">
+            <span className="text-sm text-[#667085]">
+              Clear all cached files? They will be re-downloaded when viewed again.
+            </span>
+            <button
+              type="button"
+              className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-red-500 px-3 text-xs font-bold text-white hover:bg-red-600 disabled:opacity-50"
+              onClick={() => void handleClear("all")}
+              disabled={clearing !== null}
+            >
+              {clearing === "all" ? <Loader2 className="animate-spin" size={13} /> : <Trash2 size={13} />}
+              {clearing === "all" ? "Clearing…" : "Confirm Clear All"}
+            </button>
+            <button
+              type="button"
+              className="inline-flex h-8 items-center rounded-lg border border-[#dfe3ec] bg-white px-3 text-xs font-bold text-[#596174] hover:bg-[#f7f7fb]"
+              onClick={() => setConfirming(null)}
+              disabled={clearing !== null}
+            >
+              Cancel
+            </button>
+          </div>
+        ) : (
+          <button
+            type="button"
+            className="inline-flex h-9 items-center gap-2 rounded-lg border border-red-200 bg-red-50 px-4 text-sm font-bold text-red-600 hover:bg-red-100 disabled:opacity-50"
+            onClick={() => setConfirming("all")}
+            disabled={!hasCache || clearing !== null}
+          >
+            <Trash2 size={15} />
+            Clear All Cache
+          </button>
+        )}
+      </div>
+    </SettingsSection>
+  );
+}
+
+function CategoryRow({
+  icon,
+  label,
+  size,
+  count,
+  confirming,
+  clearing,
+  disabled,
+  onClear,
+  onConfirm,
+  onCancel,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  size: number | null;
+  count: number | null;
+  confirming: boolean;
+  clearing: boolean;
+  disabled: boolean;
+  onClear: () => void;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div className="flex items-center gap-3 rounded-lg border border-[#edf0f5] bg-[#fbfbfd] px-3 py-2.5">
+      <span className="text-[#667085]">{icon}</span>
+      <div className="min-w-0 flex-1">
+        <div className="text-sm font-semibold text-[#303849]">{label}</div>
+        <div className="text-xs text-[#667085]">
+          {size !== null ? formatBytes(size) : "—"}
+          {count !== null && count > 0 ? ` · ${count} file${count !== 1 ? "s" : ""}` : ""}
+        </div>
+      </div>
+      {confirming ? (
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            className="inline-flex h-7 items-center gap-1 rounded-md bg-red-500 px-2.5 text-xs font-bold text-white hover:bg-red-600 disabled:opacity-50"
+            onClick={onConfirm}
+            disabled={clearing}
+          >
+            {clearing ? <Loader2 className="animate-spin" size={12} /> : <Trash2 size={12} />}
+            {clearing ? "…" : "Clear"}
+          </button>
+          <button
+            type="button"
+            className="inline-flex h-7 items-center rounded-md border border-[#dfe3ec] bg-white px-2.5 text-xs font-bold text-[#596174] hover:bg-[#f7f7fb]"
+            onClick={onCancel}
+            disabled={clearing}
+          >
+            Cancel
+          </button>
+        </div>
+      ) : (
+        <button
+          type="button"
+          className="inline-flex h-7 items-center gap-1 rounded-md border border-[#dfe3ec] bg-white px-2.5 text-xs font-bold text-[#596174] hover:bg-[#f7f7fb] disabled:opacity-40"
+          onClick={onClear}
+          disabled={disabled}
+          title={`Clear ${label.toLowerCase()}`}
+        >
+          <Trash2 size={12} />
+          Clear
+        </button>
+      )}
+    </div>
+  );
+}

@@ -1406,6 +1406,72 @@ fn cleanup_dir_older_than(
     }
     Ok(())
 }
+
+/// SF-1B: Lightweight cache consistency self-check at startup.
+///
+/// Walks the persistent attachment cache directory and removes entries
+/// that are in an inconsistent state:
+/// - **Orphan**: data file(s) exist but `.meta.json` is missing — the
+///   cache-hit fast path can't determine the filename without meta, so
+///   the entry is unusable.
+/// - **Residual**: `.meta.json` exists but no data file is present —
+///   the artifact was partially deleted or never fully written.
+///
+/// This is best-effort self-healing: errors are logged to stderr but
+/// never propagated, so a corrupted cache never blocks app startup.
+/// Call this once during GUI app setup (`main.rs` `.setup()` hook),
+/// alongside `cleanup_downloads()`.
+///
+/// Reuses the same directory-walk pattern as `cache_breakdown_at_root`.
+pub fn cache_self_check() {
+    let cache_root = match attachment_cache_root() {
+        Some(r) => r,
+        None => return, // no data dir — nothing to check
+    };
+    cache_self_check_at_root(&cache_root);
+}
+
+/// Testable core of [`cache_self_check`], parameterized by the cache root.
+fn cache_self_check_at_root(cache_root: &Path) {
+    let entries = match std::fs::read_dir(cache_root) {
+        Ok(e) => e,
+        Err(_) => return, // cache doesn't exist yet — nothing to check
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let meta_exists = path.join(".meta.json").exists();
+        // A valid artifact cache dir has at least one data file besides
+        // the `.meta.json` sidecar (and the `.tmp` transient).
+        let has_data_file = std::fs::read_dir(&path)
+            .map(|mut rd| {
+                rd.any(|e| {
+                    if let Ok(e) = e {
+                        let name = e.file_name();
+                        let name = name.to_string_lossy();
+                        name != ".meta.json" && !name.ends_with(".tmp")
+                    } else {
+                        false
+                    }
+                })
+            })
+            .unwrap_or(false);
+
+        if !meta_exists || !has_data_file {
+            // Orphan (no meta) or residual (no data) — remove the dir.
+            if let Err(e) = std::fs::remove_dir_all(&path) {
+                eprintln!(
+                    "cache_self_check: failed to remove inconsistent cache dir {}: {e}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
 /// populates both `bytes` (as a JSON number array) and `content` (as a
 /// lossy UTF-8 string). We prefer `bytes` for binary correctness; fall
 /// back to `content`'s raw bytes only if `bytes` is absent.
@@ -1498,9 +1564,13 @@ fn attachment_cache_root() -> Option<PathBuf> {
 /// type, total byte size, and the ISO-8601 timestamp of the download.
 /// This lets the UI render size/type without re-fetching from the server
 /// and lets the category breakdown avoid re-statting every file.
+///
+/// SF-1C: The `artifactId` is intentionally NOT stored here — the
+/// directory name already carries it, so the field was redundant.
+/// Old `.meta.json` files that still contain an `artifactId` key are
+/// read without error (serde silently ignores unknown fields by default).
 #[derive(Serialize, Deserialize)]
 struct CachedArtifactMeta {
-    artifact_id: String,
     name: String,
     media_type: String,
     size: u64,
@@ -1640,7 +1710,6 @@ pub async fn download_to_cache(
 
     // Write metadata sidecar (best-effort — failure does not invalidate bytes).
     let cache_meta = CachedArtifactMeta {
-        artifact_id: args.artifact_id.clone(),
         name: artifact_name,
         media_type,
         size: total_written as u64,
@@ -5407,7 +5476,6 @@ mod tests {
             .join(uuid::Uuid::new_v4().to_string());
         std::fs::create_dir_all(&dir).expect("create dir");
         let meta = CachedArtifactMeta {
-            artifact_id: "art_123".to_string(),
             name: "photo.png".to_string(),
             media_type: "image/png".to_string(),
             size: 4096,
@@ -5418,10 +5486,29 @@ mod tests {
         let loaded: CachedArtifactMeta =
             serde_json::from_str(&std::fs::read_to_string(dir.join(".meta.json")).expect("read meta"))
                 .expect("parse meta");
-        assert_eq!(loaded.artifact_id, "art_123");
+        assert_eq!(loaded.name, "photo.png");
         assert_eq!(loaded.media_type, "image/png");
         assert_eq!(loaded.size, 4096);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_read_meta_ignores_legacy_artifact_id_field() {
+        // SF-1C backward compat: old .meta.json files that still contain
+        // an "artifactId" key must parse without error (serde ignores
+        // unknown fields by default).
+        let legacy_json = r#"{
+            "artifactId": "art_legacy",
+            "name": "old-photo.png",
+            "media_type": "image/png",
+            "size": 2048,
+            "downloaded_at": "2026-07-20T00:00:00+00:00"
+        }"#;
+        let loaded: CachedArtifactMeta =
+            serde_json::from_str(legacy_json).expect("legacy meta should parse");
+        assert_eq!(loaded.name, "old-photo.png");
+        assert_eq!(loaded.media_type, "image/png");
+        assert_eq!(loaded.size, 2048);
     }
 
     // ---------- Cache: read_local_file_bytes traversal guard ----------
@@ -5467,7 +5554,6 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create artifact dir");
         std::fs::write(dir.join("blob.bin"), bytes).expect("write blob");
         let meta = CachedArtifactMeta {
-            artifact_id: artifact_id.to_string(),
             name: format!("{artifact_id}.bin"),
             media_type: media_type.to_string(),
             size: bytes.len() as u64,
@@ -5582,5 +5668,79 @@ mod tests {
         assert!(!orphan.exists(), "orphan removed");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---------- Cache: SF-1B self-check ----------
+
+    #[test]
+    fn cache_self_check_removes_orphan_and_residual() {
+        let root = std::env::temp_dir()
+            .join("loom-cache-selfcheck-test")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&root).expect("create test root");
+
+        // 1. Healthy entry — should survive.
+        cache_make_artifact_dir(&root, "healthy", "image/png", &[0u8; 100]);
+
+        // 2. Orphan: data file but no .meta.json.
+        let orphan = root.join("orphan");
+        std::fs::create_dir_all(&orphan).expect("create orphan");
+        std::fs::write(orphan.join("blob.bin"), &[0u8; 50]).expect("write blob");
+
+        // 3. Residual: .meta.json but no data file.
+        let residual = root.join("residual");
+        std::fs::create_dir_all(&residual).expect("create residual");
+        let meta = CachedArtifactMeta {
+            name: "ghost.bin".to_string(),
+            media_type: "application/octet-stream".to_string(),
+            size: 0,
+            downloaded_at: "2026-07-24T00:00:00+00:00".to_string(),
+        };
+        write_cache_meta(&residual, &meta).expect("write meta");
+
+        cache_self_check_at_root(&root);
+
+        assert!(root.join("healthy").exists(), "healthy entry preserved");
+        assert!(!orphan.exists(), "orphan (no meta) removed");
+        assert!(!residual.exists(), "residual (no data) removed");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cache_self_check_ignores_tmp_files() {
+        // A .tmp file (from an interrupted atomic write) should not count
+        // as a data file; the entry is still considered residual.
+        let root = std::env::temp_dir()
+            .join("loom-cache-selfcheck-tmp-test")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&root).expect("create test root");
+
+        let entry = root.join("partial");
+        std::fs::create_dir_all(&entry).expect("create entry");
+        // Only a .tmp file + .meta.json — no real data file.
+        std::fs::write(entry.join("blob.bin.tmp"), &[0u8; 30]).expect("write tmp");
+        let meta = CachedArtifactMeta {
+            name: "blob.bin".to_string(),
+            media_type: "image/png".to_string(),
+            size: 30,
+            downloaded_at: "2026-07-24T00:00:00+00:00".to_string(),
+        };
+        write_cache_meta(&entry, &meta).expect("write meta");
+
+        cache_self_check_at_root(&root);
+        assert!(!entry.exists(), "entry with only .tmp should be removed");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cache_self_check_handles_missing_root() {
+        // Non-existent cache root should be a no-op, not an error.
+        let root = std::env::temp_dir()
+            .join("loom-cache-selfcheck-missing")
+            .join(uuid::Uuid::new_v4().to_string());
+        // Note: root is NOT created.
+        cache_self_check_at_root(&root); // should not panic
     }
 }

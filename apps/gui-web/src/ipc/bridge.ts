@@ -746,14 +746,6 @@ export async function clearAttachmentCache(): Promise<void> {
 }
 
 /**
- * Get the total size of the attachment cache directory in bytes.
- * ARCH D3-r1: used by CacheManagementSection to display size before clearing.
- */
-export async function getAttachmentCacheSize(): Promise<number> {
-  return invoke<number>("get_attachment_cache_size", { args: {} });
-}
-
-/**
  * Get cache breakdown by media type category.
  * ARCH D3 design: returns { images: {size,count}, other: {size,count}, total }.
  */

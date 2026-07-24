@@ -338,7 +338,7 @@ export function AttachmentStack({ attachments }: { attachments: string[] }) {
  * Determine whether an artifact is an image type.
  */
 function isImageArtifact(artifact: Artifact): boolean {
-  return artifact.mediaType.toLowerCase().startsWith("image/");
+  return (artifact.mediaType ?? "").toLowerCase().startsWith("image/");
 }
 
 export function AttachmentPreviewModal({

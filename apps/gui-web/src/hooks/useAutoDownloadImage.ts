@@ -245,8 +245,11 @@ async function readLocalFileAsBlob(path: string, mediaType: string): Promise<Blo
       });
       return new Blob(parts, { type: mediaType || "application/octet-stream" });
     }
-    offset = result.nextOffset ?? offset + bytes.byteLength;
-    if (offset <= (result.nextOffset ?? 0) - bytes.byteLength) break;
+    const nextOffset = result.nextOffset ?? offset + bytes.byteLength;
+    if (nextOffset <= offset) {
+      throw new Error("Local file read did not advance.");
+    }
+    offset = nextOffset;
   }
   throw new Error("Local file is too large to read in one operation.");
 }

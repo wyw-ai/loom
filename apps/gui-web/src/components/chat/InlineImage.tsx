@@ -23,22 +23,18 @@ import { ImageContextMenu } from "@/components/chat/ImageContextMenu";
 export function InlineImage({ artifact }: { artifact: Artifact }) {
   const { objectUrl, loading, error, localPath } = useAutoDownloadImage(artifact);
   const [showLightbox, setShowLightbox] = useState(false);
-  const [currentLocalPath, setCurrentLocalPath] = useState(localPath);
-
-  // Sync localPath from hook
-  if (localPath !== currentLocalPath && localPath !== null) {
-    setCurrentLocalPath(localPath);
-  }
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   const title = artifact.name || artifact.id;
 
   async function handleSaveAs() {
+    setSaveError(null);
     try {
       const blob = await readArtifactBlob(artifact);
       const bytes = new Uint8Array(await blob.arrayBuffer());
       await ipc.saveFileDialog(artifact.name || `${artifact.id}.bin`, bytes);
     } catch (err) {
-      void errorText(err);
+      setSaveError(errorText(err));
     }
   }
 
@@ -71,10 +67,14 @@ export function InlineImage({ artifact }: { artifact: Artifact }) {
           />
           <ImageContextMenu
             artifact={artifact}
-            localPath={currentLocalPath}
-            onPathReady={(path) => setCurrentLocalPath(path)}
+            localPath={localPath}
+            onPathReady={() => {}}
           />
         </div>
+      )}
+
+      {saveError && (
+        <div className="inline-image-save-error">{saveError}</div>
       )}
 
       {showLightbox && objectUrl && (

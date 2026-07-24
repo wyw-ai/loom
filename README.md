@@ -14,36 +14,59 @@
 
 </div>
 
-Loom is an open-source communication runtime for mixed human, agent, and program
-workflows. It gives every participant an identity and a durable inbox, then
-connects messages, tasks, threads, artifacts, approvals, and run records in one
-communication graph.
+> **[ MEDIA PLACEHOLDER — hero demo ]** A short demo video or GIF (≤30s,
+> ~1600px wide) of the full loop: a human @mentions an agent in a thread →
+> the agent runs on a registered machine → output streams back as messages →
+> produced files land as artifacts. Suggested path: `docs/images/readme/hero.gif`;
+> when the file exists, replace this block with `![Loom demo](docs/images/readme/hero.gif)`.
+
+Loom is an open-source communication runtime for mixed human, agent, and
+program workflows. It gives every participant an identity and a durable inbox,
+then connects messages, tasks, threads, artifacts, approvals, and run records
+in one communication graph.
 
 It is not trying to be another chat app. Loom is the message graph and runtime
-bridge underneath one: the part that keeps a request, the actor that handled it,
-the machine it ran on, and the resulting files or logs attached to the same
-conversation.
+bridge underneath one: the part that keeps a request, the actor that handled
+it, the machine it ran on, and the resulting files or logs attached to the
+same conversation.
 
-## What Loom Is For
+## Why Loom
 
-- Talk to humans, AI agents, scripts, and services in shared channels, threads,
-  direct messages, and mentions.
-- Give every actor a durable inbox, so work can be routed to a person, an
-  agent, a service, or a group.
-- Turn messages into tasks with owners, assignments, and status that stay tied
-  to the original thread.
-- Run local agent CLIs through provider manifests, with built-in templates for
-  Claude, Codex, Copilot, Kimi, OpenCode, Qoder, and ZCode.
-- Let scripts and long-running services publish messages, receive work, and
-  attach output back to the communication context that produced it.
-- Keep artifacts, run traces, approvals, memory, and workspace files connected
-  to the people and actors that created them.
+- **Chat tools give agents a voice, but no runtime.** A bot in Slack or Discord
+  can reply, but nothing records which machine ran the work, which files it
+  produced, or which conversation triggered it.
+- **Agent CLIs run work, but lose the conversation.** Kicking off Claude Code
+  or Codex in a terminal gets a result — and then the result floats free of
+  who asked, what was approved, and which run produced which file.
+- **Loom keeps one graph.** The request, the actor that handled it, the machine
+  it ran on, the run trace, and the output artifacts all stay attached to the
+  same thread. Tasks, approvals, reminders, actor memory, and MCP servers are
+  first-class citizens of that graph.
+
+## How It Works
+
+1. A human — from the desktop app, the terminal TUI, or the CLI — posts a
+   message or @mentions an agent in a thread.
+2. `loom-daemon` on a registered machine picks up the work and launches the
+   configured agent CLI. Claude, Codex, Copilot, Kimi, OpenCode, Qoder, and
+   ZCode work out of the box; any other CLI can join through a provider
+   manifest.
+3. The agent's output streams back into the same thread, and every run is
+   recorded against the conversation that started it.
+4. Files the agent produces become artifacts attached to the thread; approvals
+   and follow-ups happen inline, where the discussion already is.
+
+> **[ MEDIA PLACEHOLDER — terminal recording ]** An asciinema/GIF of this flow
+> in the terminal: `loom chat` on one side, the agent run on the other.
+> Suggested path: `docs/images/readme/terminal-flow.gif`.
 
 ## Quick Start
 
 The current supported path is building from source. You need a stable Rust
 toolchain (see `rust-toolchain.toml`); building the desktop app additionally
-requires Node.js and pnpm.
+requires Node.js and pnpm. Prebuilt packages will be published on the
+[Releases](https://github.com/wyw-ai/loom/releases) page starting with the
+first tagged release.
 
 ```bash
 make build
@@ -53,24 +76,25 @@ export PATH="$PWD/target/debug:$PATH"
 > On Windows, build with `cargo` directly — see
 > [docs/windows-build-guide.md](docs/windows-build-guide.md).
 
-Start the local Loom server:
+**1. Start the local server.** It serves JSON-RPC over WebSocket and keeps a
+local SQLite journal; no external services are needed.
 
 ```bash
 loom-server --bind 127.0.0.1:7878
 ```
 
-In another terminal, create your local actor and open a channel:
+**2. Say hello.** In another terminal, create your local actor (first run
+writes `~/.loom/cli.toml`) and open a channel:
 
 ```bash
-loom who
+loom who                            # your local actor + server info
 loom channel create --title general
-loom channel list
-loom chat
+loom chat                           # terminal chat UI
 ```
 
-The CLI defaults to `ws://127.0.0.1:7878/rpc` and stores your local identity in
-`~/.loom/cli.toml`. If you do not want to modify `PATH`, replace commands such
-as `loom-server` with `./target/debug/loom-server`.
+> **[ SCREENSHOT PLACEHOLDER — chat TUI ]** `loom chat` in a channel with a
+> few messages and a thread open. Suggested path:
+> `docs/images/readme/chat-tui.png`.
 
 The `loom` CLI covers the whole surface: `channel`, `thread`, `message`,
 `task`, `run`, `inbox`, `artifact`, `memory`, `reminder`, `agent`, `provider`,
@@ -108,14 +132,25 @@ See [`examples/providers`](examples/providers/README.md) and
 
 ## Run Loom Desktop
 
-With `loom-server` and at least one `loom-daemon` running, Loom Desktop can read
-server state, inspect registered-host inventory, and create or edit providers
-and agents on a selected host.
+With `loom-server` and at least one `loom-daemon` running, Loom Desktop can
+read server state, inspect registered-host inventory, and create or edit
+providers and agents on a selected host.
 
 ```bash
 make gui-deps
 make gui-dev
 ```
+
+> **[ SCREENSHOT PLACEHOLDER — desktop app ]** Loom Desktop main window:
+> channel list, message feed, and thread panel. Suggested path:
+> `docs/images/readme/desktop-main.png`.
+
+## Project Status
+
+Loom is pre-1.0 and under active development. The JSON-RPC protocol and the
+on-disk formats are still drafts and may change between releases — if you
+build on top of them, pin to a tag. Bug reports and design feedback are
+welcome via [Issues](https://github.com/wyw-ai/loom/issues).
 
 ## Core Concepts
 

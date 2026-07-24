@@ -48,6 +48,47 @@ Loom 是一个开源通信运行时,面向人、agent 和程序共同参与的�
 > **[ 待补:终端录屏 ]** 用 asciinema/GIF 展示上面这条链路:一侧 `loom chat`,
 > 一侧 agent 运行。建议存放路径 `docs/images/readme/terminal-flow.gif`。
 
+## 架构
+
+```mermaid
+flowchart LR
+  subgraph clients["客户端"]
+    cli["loom CLI<br/>chat TUI · 脚本 · 自动化"]
+    gui["Loom Desktop"]
+    svc["service<br/>loom service serve"]
+  end
+
+  subgraph srv["loom-server"]
+    rpc["JSON-RPC over WebSocket<br/>ws://127.0.0.1:7878/rpc"]
+    db[("SQLite journal<br/>actors · channels · messages<br/>tasks · runs · artifacts")]
+    rpc --> db
+  end
+
+  subgraph host["runtime host(每台机器一个)"]
+    daemon["loom-daemon<br/>providers · agents · 本机执行"]
+    claude["Claude Code"]
+    codex["Codex"]
+    kimi["Kimi"]
+    zcode["ZCode"]
+    more["Copilot · OpenCode · Qoder ·<br/>任意 CLI(provider manifest 接入)"]
+    daemon --> claude
+    daemon --> codex
+    daemon --> kimi
+    daemon --> zcode
+    daemon --> more
+  end
+
+  cli --> rpc
+  gui --> rpc
+  svc --> rpc
+  daemon --> rpc
+```
+
+所有组件都通过 JSON-RPC 连到 `loom-server`,所有事实都落进 SQLite journal。
+agent CLI 只由各 runtime host 上的 `loom-daemon` 拉起,server 绝不启动 agent。
+service 运行在独立的 service host 里(通常由 daemon 启动),同样在 `loom-server`
+之外。
+
 ## 快速开始
 
 当前支持的安装路径是从源码构建。需要 stable Rust toolchain(见 `rust-toolchain.toml`);
@@ -155,25 +196,6 @@ Loom 处于 pre-1.0 阶段,开发活跃。JSON-RPC 协议和磁盘数据格式�
 - `loom` 是 CLI 和终端 chat UI,人、agent、脚本和自动化都可以使用。
 - Loom Desktop 是 GUI client,用来浏览同一份 server 状态,并通过 registered host 管理
   本机 runtime 配置。
-
-## 架构
-
-```mermaid
-flowchart LR
-  cli["loom CLI / chat TUI"] --> server["loom-server"]
-  gui["Loom Desktop"] --> server
-  daemon["loom-daemon"] --> server
-  service["loom service serve"] --> server
-  daemon --> runtime["agent-runtime"]
-  runtime --> providers["local provider CLIs"]
-  daemon --> hostdata["host config / AgentSpecs / profiles / scope workspaces"]
-  service --> svcstate["ServiceSpecs / cursors / dedupe / logs"]
-  server --> store["SQLite journal"]
-  server --> files["server artifacts / scope projections"]
-```
-
-server 有意不负责启动 agent。agent 执行发生在 `loom-daemon` 下;service 执行发生在
-service host 中,通常可以由 daemon 启动。两者都在 `loom-server` 外部运行。
 
 ## 生态
 

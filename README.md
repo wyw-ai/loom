@@ -60,6 +60,47 @@ same conversation.
 > in the terminal: `loom chat` on one side, the agent run on the other.
 > Suggested path: `docs/images/readme/terminal-flow.gif`.
 
+## Architecture
+
+```mermaid
+flowchart LR
+  subgraph clients["clients"]
+    cli["loom CLI<br/>chat TUI · scripts · automation"]
+    gui["Loom Desktop"]
+    svc["services<br/>loom service serve"]
+  end
+
+  subgraph srv["loom-server"]
+    rpc["JSON-RPC over WebSocket<br/>ws://127.0.0.1:7878/rpc"]
+    db[("SQLite journal<br/>actors · channels · messages<br/>tasks · runs · artifacts")]
+    rpc --> db
+  end
+
+  subgraph host["runtime host (one per machine)"]
+    daemon["loom-daemon<br/>providers · agents · local execution"]
+    claude["Claude Code"]
+    codex["Codex"]
+    kimi["Kimi"]
+    zcode["ZCode"]
+    more["Copilot · OpenCode · Qoder ·<br/>any CLI via provider manifest"]
+    daemon --> claude
+    daemon --> codex
+    daemon --> kimi
+    daemon --> zcode
+    daemon --> more
+  end
+
+  cli --> rpc
+  gui --> rpc
+  svc --> rpc
+  daemon --> rpc
+```
+
+Everything talks to `loom-server` over JSON-RPC, and every fact lands in the
+SQLite journal. Agent CLIs are launched only by `loom-daemon` on each runtime
+host — never by the server. Services run in a service host, often started by
+the daemon, and also live outside `loom-server`.
+
 ## Quick Start
 
 The current supported path is building from source. You need a stable Rust
@@ -176,26 +217,6 @@ The important boundary is simple:
   automation.
 - Loom Desktop is the GUI client for browsing the same server state and managing
   local runtime configuration through registered hosts.
-
-## Architecture
-
-```mermaid
-flowchart LR
-  cli["loom CLI / chat TUI"] --> server["loom-server"]
-  gui["Loom Desktop"] --> server
-  daemon["loom-daemon"] --> server
-  service["loom service serve"] --> server
-  daemon --> runtime["agent-runtime"]
-  runtime --> providers["local provider CLIs"]
-  daemon --> hostdata["host config / AgentSpecs / profiles / scope workspaces"]
-  service --> svcstate["ServiceSpecs / cursors / dedupe / logs"]
-  server --> store["SQLite journal"]
-  server --> files["server artifacts / scope projections"]
-```
-
-The server deliberately does not launch agents. Agent execution happens under
-`loom-daemon`; service execution happens in a service host, often started by the
-daemon. Both run outside `loom-server`.
 
 ## Ecosystem
 

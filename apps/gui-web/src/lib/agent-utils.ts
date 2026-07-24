@@ -494,6 +494,7 @@ export function getChannelAgentActivity(
 export function channelPanelTitle(tab: ChannelPanelTab) {
   if (tab === "threads") return "Threads";
   if (tab === "members") return "Members";
+  if (tab === "configure") return "Configure";
   return "Tasks";
 }
 
@@ -505,6 +506,7 @@ export function channelPanelDetail(
 ) {
   if (tab === "threads") return `${threadCount} active threads`;
   if (tab === "members") return `${memberCount} members`;
+  if (tab === "configure") return "Instructions & Skills";
   return `${taskCount} tasks`;
 }
 

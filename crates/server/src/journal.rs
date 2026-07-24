@@ -67,12 +67,29 @@ pub enum Mutation {
     TraceAppend(proto::types::trace::TraceFrame),
     ChannelUpdate {
         channel_id: String,
-        title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         topic: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        visibility: Option<ChannelVisibility>,
     },
     ChannelDelete {
         channel_id: String,
+    },
+    /// Set or replace the channel-level `instructions`. Idempotent on replay.
+    ChannelInstructionSet {
+        channel_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instructions: Option<String>,
+        /// Actor id of the member who performed the edit. Forward-compat
+        /// default `None` so legacy journals replay cleanly.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        modified_by: Option<String>,
+        /// Server-side UTC timestamp of the edit. Forward-compat default
+        /// `None` for legacy journals.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        modified_at: Option<Timestamp>,
     },
     ThreadUpdate {
         thread_id: String,
@@ -84,6 +101,16 @@ pub enum Mutation {
     },
     ThreadDelete {
         thread_id: String,
+    },
+    /// Set or replace the thread-level `instructions`. Idempotent on replay.
+    ThreadInstructionSet {
+        thread_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instructions: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        modified_by: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        modified_at: Option<Timestamp>,
     },
     /// Add `actor_id` to `channel_id`'s member set. Idempotent on replay.
     ChannelGrant {
@@ -210,24 +237,36 @@ impl Journal {
         }
     }
 
-    pub fn replay(&self) -> std::io::Result<Vec<Mutation>> {
+    /// Replay persisted mutations in order without retaining the full journal
+    /// in memory. The visitor receives one owned mutation at a time.
+    ///
+    /// For SQLite storage the visitor runs while the journal connection is
+    /// locked, so it must not call back into this journal.
+    pub fn replay<F>(&self, mut apply: F) -> std::io::Result<usize>
+    where
+        F: FnMut(Mutation),
+    {
+        let started = std::time::Instant::now();
+        let mut count = 0usize;
         match &self.storage {
             JournalStorage::Jsonl { .. } => {
                 let file = OpenOptions::new().read(true).open(&self.path)?;
-                let mut out = Vec::new();
                 for (idx, line) in BufReader::new(file).lines().enumerate() {
                     let line = line?;
                     if line.trim().is_empty() {
                         continue;
                     }
                     match serde_json::from_str::<Mutation>(&line) {
-                        Ok(m) => out.push(m),
+                        Ok(m) => {
+                            apply(m);
+                            count += 1;
+                            log_replay_progress(count, started);
+                        }
                         Err(err) => {
                             tracing::warn!(line = idx + 1, %err, "skipping unreadable journal line");
                         }
                     }
                 }
-                Ok(out)
             }
             JournalStorage::Sqlite { conn } => {
                 let conn = conn.lock();
@@ -239,19 +278,37 @@ impl Journal {
                         Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
                     })
                     .map_err(sqlite_io)?;
-                let mut out = Vec::new();
                 for row in rows {
                     let (id, line) = row.map_err(sqlite_io)?;
                     match serde_json::from_str::<Mutation>(&line) {
-                        Ok(m) => out.push(m),
+                        Ok(m) => {
+                            apply(m);
+                            count += 1;
+                            log_replay_progress(count, started);
+                        }
                         Err(err) => {
                             tracing::warn!(rowid = id, %err, "skipping unreadable sqlite journal record");
                         }
                     }
                 }
-                Ok(out)
             }
         }
+        tracing::info!(
+            records = count,
+            elapsed_ms = started.elapsed().as_millis(),
+            "journal replay complete"
+        );
+        Ok(count)
+    }
+}
+
+fn log_replay_progress(count: usize, started: std::time::Instant) {
+    if count % 10_000 == 0 {
+        tracing::info!(
+            records = count,
+            elapsed_ms = started.elapsed().as_millis(),
+            "journal replay progress"
+        );
     }
 }
 
@@ -527,7 +584,11 @@ mod tests {
             })
             .expect("append");
 
-        let replayed = journal.replay().expect("replay");
+        let mut replayed = Vec::new();
+        let count = journal
+            .replay(|mutation| replayed.push(mutation))
+            .expect("replay");
+        assert_eq!(count, replayed.len());
         assert!(matches!(
             replayed.as_slice(),
             [Mutation::ActorDelete { actor_id }] if actor_id == "actor_old"

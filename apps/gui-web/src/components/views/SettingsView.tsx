@@ -10,6 +10,7 @@ import { HostListItem, RegisteredHostsEmpty, HostRegisterDialog, MachineCard } f
 import { MemberListItem, AgentRosterOverview, AgentCreateDialog, AgentMemberDetail } from "@/components/settings/AgentComponents";
 import { ServiceListItem, ServiceMemberDetail, ServiceRosterOverview } from "@/components/settings/ServiceComponents";
 import { HumanListItem, HumanRosterOverview } from "@/components/settings/HumanComponents";
+
 import { Button } from "@/components/ui/button";
 import { agentMemberEntries, serviceMemberEntries } from "@/lib/agent-utils";
 import { agentFormForMachine, displayName, findAgentMemberEntry, machineCanCreateAgent } from "@/lib/format-utils";

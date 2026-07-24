@@ -119,13 +119,41 @@ fn main() {
             ipc::machine_list,
             ipc::machine_check,
             ipc::open_local_path,
+            ipc::save_file_dialog,
+            ipc::open_file_default,
+            ipc::reveal_in_folder,
+            ipc::path_exists,
+            ipc::artifact_exists,
+            ipc::download_to_temp,
+            ipc::download_to_cache,
+            ipc::clear_attachment_cache,
+            ipc::read_local_file_bytes,
+            ipc::get_attachment_cache_breakdown,
+            ipc::clear_attachment_cache_by_type,
+            ipc::open_attachment_cache_directory,
             ipc::machine_create,
             ipc::machine_start,
             ipc::machine_remove,
             ipc::machine_agent_create,
             ipc::machine_agent_remove,
+            ipc::channel_set_instruction,
+            ipc::channel_get_instruction,
+            ipc::channel_clear_instruction,
+            ipc::thread_set_instruction,
+            ipc::thread_get_instruction,
+            ipc::thread_clear_instruction,
+            ipc::channel_skill_list,
+            ipc::channel_skill_add,
+            ipc::channel_skill_remove,
+            ipc::thread_skill_list,
+            ipc::thread_skill_add,
+            ipc::thread_skill_remove,
         ])
         .setup(|app| {
+            // Best-effort cleanup of stale temp downloads (>24h old).
+            ipc::cleanup_downloads();
+            // SF-1B: best-effort cache consistency self-check at startup.
+            ipc::cache_self_check();
             if let Some(win) = app.get_webview_window("main") {
                 let _ = win.show();
                 let _ = win.set_focus();

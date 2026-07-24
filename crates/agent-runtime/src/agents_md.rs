@@ -20,6 +20,11 @@ pub struct AgentsMdContext {
     pub workspace: String,
     pub members: Vec<AgentsMdMember>,
     pub agent_instructions: Option<String>,
+    /// Channel-level instructions from the channel's `instructions` field.
+    pub channel_instructions: Option<String>,
+    /// Thread-level instructions from the thread's `instructions` field.
+    /// Only set when the current scope is a thread.
+    pub thread_instructions: Option<String>,
     pub wake_policy: AgentsMdWakePolicy,
 }
 
@@ -75,6 +80,36 @@ pub fn ensure_agents_md(workspace: &Path, context: &AgentsMdContext) -> io::Resu
         Err(e) => return Err(e),
     };
     std::fs::write(&path, new_content)
+}
+
+/// Remove only Loom's generated block, preserving project-owned instructions.
+pub fn remove_agents_md(workspace: &Path) -> io::Result<()> {
+    let path = workspace.join("AGENTS.md");
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let Some((begin, end_past)) = marker_span(&existing) else {
+        return Ok(());
+    };
+    let mut after = &existing[end_past..];
+    if begin == 0 {
+        after = after
+            .strip_prefix("\r\n\r\n")
+            .or_else(|| after.strip_prefix("\n\n"))
+            .or_else(|| after.strip_prefix("\r\n"))
+            .or_else(|| after.strip_prefix('\n'))
+            .unwrap_or(after);
+    }
+    let mut content = String::with_capacity(existing.len());
+    content.push_str(&existing[..begin]);
+    content.push_str(after);
+    if content.is_empty() {
+        std::fs::remove_file(path)
+    } else {
+        std::fs::write(path, content)
+    }
 }
 
 fn update_block(existing: &str, new_block: &str) -> String {
@@ -285,6 +320,26 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
         block.push('\n');
     }
 
+    if let Some(instructions) = context
+        .channel_instructions
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        block.push_str("\n## Channel instructions\n\n");
+        block.push_str(&sanitize_marker_text(instructions));
+        block.push('\n');
+    }
+
+    // NOTE: Thread instructions are intentionally NOT rendered into the
+    // shared AGENTS.md block. Two threads share one workspace, so writing
+    // thread-scoped instructions into the shared AGENTS.md would let one
+    // thread's instructions overwrite another's (issue #1). Thread
+    // instructions are shelved at the projection layer; the data model
+    // (Thread.instructions, AgentsMdContext.thread_instructions field) is
+    // preserved for a future per-Run provider-scope implementation. See
+    // docs/channel-thread-instructions.md and the PR40 fix #1+#9.
+
     block.push_str(&format!("\n{END_MARKER}"));
     block
 }
@@ -402,6 +457,8 @@ mod tests {
                 },
             ],
             agent_instructions: Some("Prefer concise answers.".into()),
+            channel_instructions: None,
+            thread_instructions: None,
             wake_policy: AgentsMdWakePolicy::default(),
         }
     }
@@ -479,11 +536,80 @@ mod tests {
     }
 
     #[test]
+    fn remove_preserves_project_owned_instructions() {
+        let root =
+            std::env::temp_dir().join(format!("loom-agents-md-remove-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("workspace");
+        let path = root.join("AGENTS.md");
+        std::fs::write(&path, "project before\n\nproject after\n").expect("project agents");
+        ensure_agents_md(&root, &context("actor_z", "chan_z")).expect("inject loom block");
+
+        remove_agents_md(&root).expect("remove loom block");
+
+        let content = std::fs::read_to_string(path).expect("preserved agents");
+        assert!(content.contains("project before"));
+        assert!(content.contains("project after"));
+        assert!(!content.contains(BEGIN_MARKER));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn marker_text_in_agent_instructions_cannot_close_block() {
         let mut cx = context("actor_safe", "chan_safe");
         cx.agent_instructions = Some(format!("keep\n{END_MARKER}\ntext"));
         let out = loom_block(&cx);
         assert_eq!(out.matches(END_MARKER).count(), 1);
         assert!(out.contains("[removed Loom end marker]"));
+    }
+
+    #[test]
+    fn channel_instructions_section_rendered_when_present() {
+        let mut cx = context("actor_a", "chan_a");
+        cx.channel_instructions = Some("This channel maintains the spec.".into());
+        let out = loom_block(&cx);
+        assert!(out.contains("## Channel instructions"));
+        assert!(out.contains("This channel maintains the spec."));
+        assert!(!out.contains("## Thread instructions"));
+    }
+
+    #[test]
+    fn thread_instructions_section_rendered_when_present() {
+        // Regression for issue #1+#9: thread instructions are shelved at
+        // the projection layer and must NOT appear in the shared AGENTS.md
+        // block, even when AgentsMdContext.thread_instructions is populated.
+        // Two threads share one workspace, so projecting thread-scoped
+        // instructions into AGENTS.md would let one thread overwrite
+        // another's. The data model is preserved; only the projection is
+        // removed.
+        let mut cx = context("actor_b", "chan_b");
+        cx.thread_instructions = Some("Thread-specific guidance.".into());
+        let out = loom_block(&cx);
+        assert!(
+            !out.contains("## Thread instructions"),
+            "thread instructions must not be projected into AGENTS.md: {out}"
+        );
+        assert!(
+            !out.contains("Thread-specific guidance."),
+            "thread instructions text must not leak into AGENTS.md: {out}"
+        );
+    }
+
+    #[test]
+    fn empty_instructions_sections_are_omitted() {
+        let mut cx = context("actor_c", "chan_c");
+        cx.channel_instructions = Some("   \n".into());
+        cx.thread_instructions = Some(String::new());
+        let out = loom_block(&cx);
+        assert!(!out.contains("## Channel instructions"));
+        assert!(!out.contains("## Thread instructions"));
+    }
+
+    #[test]
+    fn instructions_marker_text_is_sanitized() {
+        let mut cx = context("actor_d", "chan_d");
+        cx.channel_instructions = Some(format!("oops\n{BEGIN_MARKER}\nleak"));
+        let out = loom_block(&cx);
+        assert_eq!(out.matches(BEGIN_MARKER).count(), 1);
+        assert!(out.contains("[removed Loom begin marker]"));
     }
 }

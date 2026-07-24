@@ -40,7 +40,7 @@ pub struct WsRef {
 
 impl WsRef {
     pub fn resolve(&self) -> Result<PathBuf> {
-        let base = data_root();
+        let base = super::paths::agent_data_root();
         let channel_root = base.join("channels").join(&self.channel_id);
         let path = match self.kind {
             WsKind::Actor => {
@@ -61,17 +61,6 @@ impl WsRef {
         };
         Ok(path)
     }
-}
-
-fn data_root() -> PathBuf {
-    if let Some(v) = std::env::var_os("LOOM_AGENT_DATA_ROOT") {
-        if !v.is_empty() {
-            return PathBuf::from(v);
-        }
-    }
-    dirs::data_dir()
-        .map(|d| d.join("loom").join("agents"))
-        .unwrap_or_else(|| PathBuf::from(".loom").join("agents-data"))
 }
 
 fn sanitize_relative(rel: &str) -> Result<PathBuf> {

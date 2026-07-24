@@ -7,13 +7,18 @@ use serde_json::json;
 use crate::client::Client;
 use crate::render;
 
-pub async fn create(client: Arc<Client>, actor_id: String, title: String) -> Result<()> {
-    let res: ChannelCreateResult = client
-        .call(
-            method::CHANNEL_CREATE,
-            json!({ "title": title, "actorId": actor_id }),
-        )
-        .await?;
+pub async fn create(
+    client: Arc<Client>,
+    actor_id: String,
+    title: String,
+    public: bool,
+) -> Result<()> {
+    let params = if public {
+        json!({ "title": title, "public": true })
+    } else {
+        json!({ "title": title, "actorId": actor_id })
+    };
+    let res: ChannelCreateResult = client.call(method::CHANNEL_CREATE, params).await?;
     if render::is_json() {
         render::print_json(&res);
     } else {
@@ -33,6 +38,28 @@ pub async fn list(client: Arc<Client>) -> Result<()> {
     }
     for c in res.channels {
         println!("{}\t{}", c.id, c.title);
+    }
+    Ok(())
+}
+
+pub async fn update(
+    client: Arc<Client>,
+    channel_id: String,
+    title: Option<String>,
+    public: bool,
+) -> Result<()> {
+    let mut params = json!({ "channelId": channel_id });
+    if let Some(title) = title {
+        params["title"] = json!(title);
+    }
+    if public {
+        params["visibility"] = json!("public");
+    }
+    let res: ChannelUpdateResult = client.call(method::CHANNEL_UPDATE, params).await?;
+    if render::is_json() {
+        render::print_json(&res);
+    } else {
+        println!("channel {}\t{}", res.channel.id, res.channel.title);
     }
     Ok(())
 }
@@ -214,6 +241,120 @@ pub async fn member_config_clear(
         println!("workspace override cleared");
     } else {
         println!("workspace override was already default");
+    }
+    Ok(())
+}
+
+pub async fn set_instruction(
+    client: Arc<Client>,
+    channel_id: String,
+    instructions: String,
+) -> Result<()> {
+    let res: ChannelSetInstructionResult = client
+        .call(
+            method::CHANNEL_SET_INSTRUCTION,
+            json!({ "channelId": channel_id, "instructions": instructions }),
+        )
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+    } else {
+        println!("instructions set for channel {}", res.channel.id);
+    }
+    Ok(())
+}
+
+pub async fn get_instruction(client: Arc<Client>, channel_id: String) -> Result<()> {
+    let res: ChannelGetInstructionResult = client
+        .call(
+            method::CHANNEL_GET_INSTRUCTION,
+            json!({ "channelId": channel_id }),
+        )
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+        return Ok(());
+    }
+    match res.instructions {
+        Some(instructions) => println!("{}", instructions),
+        None => println!("(none)"),
+    }
+    Ok(())
+}
+
+pub async fn clear_instruction(client: Arc<Client>, channel_id: String) -> Result<()> {
+    let res: ChannelClearInstructionResult = client
+        .call(
+            method::CHANNEL_CLEAR_INSTRUCTION,
+            json!({ "channelId": channel_id }),
+        )
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+    } else if res.cleared {
+        println!("channel instructions cleared");
+    } else {
+        println!("channel instructions were already empty");
+    }
+    Ok(())
+}
+
+// -----------------------------------------------------------------
+// Channel skill management (file-based registry, agent data root)
+// -----------------------------------------------------------------
+
+pub async fn skill_add(channel_id: String, source: String, skill_id: Option<String>) -> Result<()> {
+    let data_root = crate::cmd::agent_serve::default_data_root_pub();
+    let id = skill_id.unwrap_or_else(|| {
+        // Derive skill id from the source path's file name.
+        std::path::Path::new(&source)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("skill")
+            .to_string()
+    });
+    let registry = super::skill_registry::add_channel_skill(
+        &data_root,
+        &channel_id,
+        id.clone(),
+        source.clone(),
+    )
+    .map_err(|err| anyhow::anyhow!("write channel skill registry: {err}"))?;
+    if render::is_json() {
+        render::print_json(&registry);
+    } else {
+        println!("skill '{id}' added to channel {channel_id}");
+    }
+    Ok(())
+}
+
+pub async fn skill_remove(channel_id: String, skill_id: String) -> Result<()> {
+    let data_root = crate::cmd::agent_serve::default_data_root_pub();
+    let (registry, removed) =
+        super::skill_registry::remove_channel_skill(&data_root, &channel_id, &skill_id)
+            .map_err(|err| anyhow::anyhow!("read/remove channel skill registry: {err}"))?;
+    if render::is_json() {
+        render::print_json(&registry);
+    } else if removed {
+        println!("skill '{skill_id}' removed from channel {channel_id}");
+    } else {
+        println!("skill '{skill_id}' was not registered in channel {channel_id}");
+    }
+    Ok(())
+}
+
+pub async fn skill_list(channel_id: String) -> Result<()> {
+    let data_root = crate::cmd::agent_serve::default_data_root_pub();
+    let registry = super::skill_registry::read_channel_skills(&data_root, &channel_id)
+        .map_err(|err| anyhow::anyhow!("read channel skill registry: {err}"))?;
+    if render::is_json() {
+        render::print_json(&registry);
+    } else if registry.skills.is_empty() {
+        println!("(no skills registered for channel {channel_id})");
+    } else {
+        for entry in &registry.skills {
+            println!("{:<20} {}", entry.id, entry.source);
+        }
     }
     Ok(())
 }

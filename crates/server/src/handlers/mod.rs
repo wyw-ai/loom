@@ -85,6 +85,11 @@ pub async fn dispatch(
         method::CHANNEL_MEMBER_CONFIG_CLEAR => {
             channel_member_config_clear(state, connection_id, params)
         }
+        method::CHANNEL_SET_INSTRUCTION => channel_set_instruction(state, connection_id, params),
+        method::CHANNEL_GET_INSTRUCTION => channel_get_instruction(state, connection_id, params),
+        method::CHANNEL_CLEAR_INSTRUCTION => {
+            channel_clear_instruction(state, connection_id, params)
+        }
         method::THREAD_CREATE => thread_create(state, connection_id, params),
         method::THREAD_LIST => thread_list(state, connection_id, params),
         method::THREAD_UPDATE => thread_update(state, connection_id, params),
@@ -92,6 +97,9 @@ pub async fn dispatch(
         method::THREAD_DELETE => thread_delete(state, connection_id, params),
         method::THREAD_FOLLOW => thread_follow(state, connection_id, params),
         method::THREAD_UNFOLLOW => thread_unfollow(state, connection_id, params),
+        method::THREAD_SET_INSTRUCTION => thread_set_instruction(state, connection_id, params),
+        method::THREAD_GET_INSTRUCTION => thread_get_instruction(state, connection_id, params),
+        method::THREAD_CLEAR_INSTRUCTION => thread_clear_instruction(state, connection_id, params),
         method::TASK_CREATE => task_create(state, connection_id, params),
         method::TASK_GET => task_get(state, connection_id, params),
         method::TASK_LIST => task_list(state, connection_id, params),
@@ -219,9 +227,34 @@ fn connection_open(state: &AppState, connection_id: &str, params: Option<Value>)
             state.store.upsert_actor(new_actor).map_err(map_store_err)?
         }
     };
-    state
-        .subscriptions
-        .bind_actor(connection_id, actor_id.clone(), claim_kind, p.claim_inbox);
+    // A short-lived CLI or GUI may reuse LOOM_ACTOR from an agent/service
+    // environment while opening as the default Human kind. It may share the
+    // identity for RPC authorization, but it must not become the runtime inbox
+    // owner. Otherwise a persisted machine actor can look online after its
+    // daemon has stopped, and machine commands are delivered to a client that
+    // cannot execute them. Long-lived agent/service connections must still be
+    // able to recover an actor that was previously auto-created as Human.
+    let human_observer = claim_kind == ActorKind::Human
+        && matches!(actor.kind, ActorKind::Agent | ActorKind::Service);
+    let claim_inbox = p.claim_inbox && !human_observer;
+    if p.claim_inbox && human_observer {
+        tracing::debug!(
+            actor = %actor_id,
+            requested_kind = ?claim_kind,
+            stored_kind = ?actor.kind,
+            "actor-kind mismatch bound as observer",
+        );
+    }
+    state.subscriptions.bind_actor(
+        connection_id,
+        actor_id.clone(),
+        if human_observer {
+            actor.kind
+        } else {
+            claim_kind
+        },
+        claim_inbox,
+    );
     let endpoint_id = format!(
         "ep_{}",
         p.endpoint
@@ -343,9 +376,13 @@ fn channel_create(state: &AppState, connection_id: &str, params: Option<Value>) 
     // a private channel on behalf of the operator); fall back to the
     // connection's bound actor. Only when both are absent (legacy v0
     // callers) do we fall through to a Public channel.
-    let creator = match p.actor_id {
-        Some(id) => Some(id),
-        None => state.subscriptions.actor_for_connection(connection_id),
+    let creator = if p.public {
+        None
+    } else {
+        match p.actor_id {
+            Some(id) => Some(id),
+            None => state.subscriptions.actor_for_connection(connection_id),
+        }
     };
     let channel = if p.topic.trim().is_empty() {
         state.store.create_channel(p.title, creator)
@@ -585,9 +622,85 @@ fn channel_update(state: &AppState, params: Option<Value>) -> HandlerResult {
     let p: ChannelUpdateParams = parse_params(params)?;
     let channel = state
         .store
-        .update_channel(&p.channel_id, p.title, p.topic)
+        .update_channel(&p.channel_id, p.title, p.topic, p.visibility)
         .map_err(map_store_err)?;
     ok(ChannelUpdateResult { channel })
+}
+
+fn channel_set_instruction(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: ChannelSetInstructionParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    if !state.store.is_channel_member(&p.channel_id, &caller) {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!(
+                "actor {caller} cannot set instructions for channel {}",
+                p.channel_id
+            ),
+        ));
+    }
+    let channel = state
+        .store
+        .set_channel_instructions(&p.channel_id, Some(p.instructions), &caller)
+        .map_err(map_store_err)?;
+    ok(ChannelSetInstructionResult { channel })
+}
+
+fn channel_get_instruction(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: ChannelGetInstructionParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    if !state.store.is_channel_member(&p.channel_id, &caller) {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!(
+                "actor {caller} cannot read instructions for channel {}",
+                p.channel_id
+            ),
+        ));
+    }
+    let instructions = state
+        .store
+        .get_channel(&p.channel_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "channel"))?
+        .instructions;
+    ok(ChannelGetInstructionResult { instructions })
+}
+
+fn channel_clear_instruction(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: ChannelClearInstructionParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    if !state.store.is_channel_member(&p.channel_id, &caller) {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!(
+                "actor {caller} cannot clear instructions for channel {}",
+                p.channel_id
+            ),
+        ));
+    }
+    let existing = state
+        .store
+        .get_channel(&p.channel_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "channel"))?
+        .instructions
+        .is_some();
+    let _ = state
+        .store
+        .set_channel_instructions(&p.channel_id, None, &caller)
+        .map_err(map_store_err)?;
+    ok(ChannelClearInstructionResult { cleared: existing })
 }
 
 fn channel_delete(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
@@ -713,6 +826,102 @@ fn thread_update(state: &AppState, connection_id: &str, params: Option<Value>) -
         .pop()
         .expect("one thread");
     ok(ThreadUpdateResult { thread })
+}
+
+fn thread_set_instruction(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: ThreadSetInstructionParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let channel_id = state
+        .store
+        .get_thread(&p.thread_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "thread"))?
+        .channel_id;
+    if !state.store.is_channel_member(&channel_id, &caller) {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!(
+                "actor {caller} cannot set instructions for thread {} in channel {channel_id}",
+                p.thread_id
+            ),
+        ));
+    }
+    let thread = state
+        .store
+        .set_thread_instructions(&p.thread_id, Some(p.instructions), &caller)
+        .map_err(map_store_err)?;
+    let thread = state
+        .store
+        .attach_thread_activity_meta(vec![thread])
+        .pop()
+        .expect("one thread");
+    ok(ThreadSetInstructionResult { thread })
+}
+
+fn thread_get_instruction(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: ThreadGetInstructionParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let channel_id = state
+        .store
+        .get_thread(&p.thread_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "thread"))?
+        .channel_id;
+    if !state.store.is_channel_member(&channel_id, &caller) {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!(
+                "actor {caller} cannot read instructions for thread {} in channel {channel_id}",
+                p.thread_id
+            ),
+        ));
+    }
+    let instructions = state
+        .store
+        .get_thread(&p.thread_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "thread"))?
+        .instructions;
+    ok(ThreadGetInstructionResult { instructions })
+}
+
+fn thread_clear_instruction(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: ThreadClearInstructionParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let channel_id = state
+        .store
+        .get_thread(&p.thread_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "thread"))?
+        .channel_id;
+    if !state.store.is_channel_member(&channel_id, &caller) {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!(
+                "actor {caller} cannot clear instructions for thread {} in channel {channel_id}",
+                p.thread_id
+            ),
+        ));
+    }
+    let existing = state
+        .store
+        .get_thread(&p.thread_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "thread"))?
+        .instructions
+        .is_some();
+    let _ = state
+        .store
+        .set_thread_instructions(&p.thread_id, None, &caller)
+        .map_err(map_store_err)?;
+    ok(ThreadClearInstructionResult { cleared: existing })
 }
 
 fn thread_archive(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
@@ -5954,6 +6163,118 @@ mod tests {
                 .output
                 .and_then(|value| value.get("done").and_then(Value::as_bool).map(bool::from)),
             Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn human_connection_reusing_machine_actor_id_is_observer_only() {
+        let state = fresh_state("machine-human-observer");
+        open_conn(&state, "conn_owner", "actor_human").await;
+        dispatch(
+            &state,
+            "conn_owner",
+            method::ACTOR_UPSERT,
+            Some(json!({
+                "actor": {
+                    "id": "actor_service_machine_remote",
+                    "kind": "service",
+                    "displayName": "Remote Machine",
+                    "_meta": {
+                        "role": "machine",
+                        "source": "daemon",
+                        "inventoryVersion": 2,
+                        "machineId": "machine_remote",
+                        "ownerActorId": "actor_human",
+                        "capabilities": ["inventory.read", "machine.command"],
+                        "revision": 11
+                    }
+                }
+            })),
+        )
+        .await
+        .expect("actor/upsert machine");
+
+        let (observer_tx, _observer_rx) = mpsc::unbounded_channel();
+        state.subscriptions.add_connection(Connection {
+            id: "conn_observer".into(),
+            actor_id: None,
+            tx: observer_tx,
+        });
+        dispatch(
+            &state,
+            "conn_observer",
+            method::CONNECTION_OPEN,
+            Some(json!({ "actorId": "actor_service_machine_remote" })),
+        )
+        .await
+        .expect("human observer connection/open");
+
+        let value = dispatch(
+            &state,
+            "conn_owner",
+            method::CONNECTION_LIST,
+            Some(json!({ "actorIds": ["actor_service_machine_remote"] })),
+        )
+        .await
+        .expect("connection/list without daemon");
+        let connections: ConnectionListResult =
+            serde_json::from_value(value).expect("decode connection/list");
+        assert!(connections.actor_ids.is_empty());
+
+        let err = dispatch(
+            &state,
+            "conn_owner",
+            method::MACHINE_COMMAND,
+            Some(json!({
+                "machineId": "machine_remote",
+                "machineActorId": "actor_service_machine_remote",
+                "ifInventoryRevision": 11,
+                "command": { "op": "agent.create", "actorId": "actor_agent" },
+                "timeoutMs": 1_000
+            })),
+        )
+        .await
+        .expect_err("observer must not receive machine commands");
+        assert_eq!(err.code, ErrorCode::APP_INVALID_STATE);
+        assert!(err.message.contains("daemon is not connected"));
+
+        let _service_rx =
+            open_service_conn(&state, "conn_machine", "actor_service_machine_remote").await;
+        let value = dispatch(
+            &state,
+            "conn_owner",
+            method::CONNECTION_LIST,
+            Some(json!({ "actorIds": ["actor_service_machine_remote"] })),
+        )
+        .await
+        .expect("connection/list with daemon");
+        let connections: ConnectionListResult =
+            serde_json::from_value(value).expect("decode connection/list");
+        assert_eq!(
+            connections.actor_ids,
+            vec!["actor_service_machine_remote".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn service_connection_recovers_actor_previously_created_as_human() {
+        let state = fresh_state("service-recovers-human-actor");
+        open_conn(&state, "conn_bootstrap", "actor_service_runtime").await;
+
+        let _service_rx = open_service_conn(&state, "conn_service", "actor_service_runtime").await;
+        let value = dispatch(
+            &state,
+            "conn_service",
+            method::CONNECTION_LIST,
+            Some(json!({ "actorIds": ["actor_service_runtime"] })),
+        )
+        .await
+        .expect("connection/list after service recovery");
+        let connections: ConnectionListResult =
+            serde_json::from_value(value).expect("decode connection/list");
+        assert_eq!(
+            connections.actor_ids,
+            vec!["actor_service_runtime".to_string()]
         );
     }
 

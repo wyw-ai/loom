@@ -2596,6 +2596,7 @@ fn scope_label(scope: &ScopeRef) -> String {
     format!("{kind}:{}", scope.id)
 }
 
+#[cfg(unix)]
 fn session_lock_path(cfg: &CommandConfig, scope: &ScopeRef) -> Option<PathBuf> {
     let path = session_path(cfg, scope)?;
     let file_name = path

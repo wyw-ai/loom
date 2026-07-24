@@ -1,6 +1,18 @@
-import { describe, expect, it } from "vitest";
+// @vitest-environment jsdom
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createRoot } from "react-dom/client";
+import React from "react";
 
-import { calcPercent } from "@/components/settings/CacheManagementSection";
+// Enable React's act() environment so warnings about the testing
+// environment are silenced and act() behaves correctly.
+(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
+import * as ipc from "@/ipc/bridge";
+import { calcPercent, CacheManagementSection } from "@/components/settings/CacheManagementSection";
+
+vi.mock("@/ipc/bridge");
+
+const STORAGE_KEY = "loom:downloaded-artifacts";
 
 describe("calcPercent", () => {
   it("returns 100 when size equals total", () => {
@@ -56,3 +68,56 @@ describe("calcPercent", () => {
     expect(calcPercent(600, 500)).toBe(120);
   });
 });
+
+/**
+ * ARCH TODO#2 Tier 2: CacheManagementSection.refresh() must call
+ * reconcileDownloaded with the cachedIds returned by the breakdown, so
+ * orphan localStorage entries (file externally deleted) are removed.
+ */
+describe("CacheManagementSection.refresh reconcileDownloaded (ARCH TODO#2 Tier 2)", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    localStorage.clear();
+    vi.restoreAllMocks();
+  });
+
+  it("calls reconcileDownloaded with cachedIds from breakdown", async () => {
+    // Seed localStorage with an orphan entry that disk does not have.
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ orphan: "/cache/orphan/blob", ondisk: "/cache/ondisk/blob" }),
+    );
+
+    const breakdown = {
+      images: { size: 100, count: 1 },
+      other: { size: 0, count: 0 },
+      total: { size: 100, count: 1 },
+      cachedIds: ["ondisk"], // disk only has "ondisk"; "orphan" is stale
+    };
+    vi.mocked(ipc.getAttachmentCacheBreakdown).mockResolvedValue(breakdown);
+
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    await React.act(async () => {
+      root.render(React.createElement(CacheManagementSection));
+    });
+    // Allow the initial refresh effect to complete.
+    await React.act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    // After refresh, reconcileDownloaded must have removed the orphan.
+    const raw = localStorage.getItem(STORAGE_KEY);
+    const map = raw ? (JSON.parse(raw) as Record<string, string>) : {};
+    expect(map).toEqual({ ondisk: "/cache/ondisk/blob" });
+
+    React.act(() => {
+      root.unmount();
+    });
+  });
+});
+

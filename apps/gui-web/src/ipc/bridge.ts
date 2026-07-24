@@ -777,6 +777,14 @@ export async function clearAttachmentCacheByType(category: "images" | "other"): 
 }
 
 /**
+ * Open the attachment cache root directory in the system file manager.
+ * ARCH design: opens data_dir/loom/cache/attachments/ (Win/Mac/Linux compatible).
+ */
+export async function openAttachmentCacheDirectory(): Promise<void> {
+  await invoke("open_attachment_cache_directory", { args: {} });
+}
+
+/**
  * Read bytes from a local cached file (cache-hit path).
  * ARCH D3-r1: skips network download when file is already cached.
  */

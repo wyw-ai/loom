@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { HardDrive, ImageIcon, FileIcon, Loader2, Trash2 } from "lucide-react";
+import { HardDrive, ImageIcon, FileIcon, FolderOpen, Loader2, Trash2 } from "lucide-react";
 
 import * as ipc from "@/ipc/bridge";
 import { errorText, formatBytes } from "@/lib/format-utils";
@@ -29,6 +29,7 @@ export function CacheManagementSection() {
   const [loading, setLoading] = useState(false);
   const [clearing, setClearing] = useState<ClearTarget | null>(null);
   const [confirming, setConfirming] = useState<ClearTarget | null>(null);
+  const [opening, setOpening] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
@@ -70,6 +71,18 @@ export function CacheManagementSection() {
     }
   }
 
+  async function handleOpenFolder() {
+    setOpening(true);
+    setError(null);
+    try {
+      await ipc.openAttachmentCacheDirectory();
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setOpening(false);
+    }
+  }
+
   const totalSize = breakdown?.total.size ?? null;
   const hasCache = totalSize !== null && totalSize > 0;
 
@@ -78,16 +91,28 @@ export function CacheManagementSection() {
       title="Cache Management"
       detail="Downloaded attachments cached on disk for fast display."
       action={
-        <button
-          type="button"
-          className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-[#dfe3ec] bg-white px-2.5 text-xs font-bold text-[#596174] hover:bg-[#f7f7fb]"
-          title="Refresh cache info"
-          onClick={() => void refresh()}
-          disabled={loading}
-        >
-          {loading ? <Loader2 className="animate-spin" size={13} /> : <HardDrive size={13} />}
-          {loading ? "Checking…" : `${totalSize !== null ? formatBytes(totalSize) : "—"}`}
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-[#dfe3ec] bg-white px-2.5 text-xs font-bold text-[#596174] hover:bg-[#f7f7fb]"
+            title="Open cache folder in file manager"
+            onClick={() => void handleOpenFolder()}
+            disabled={opening}
+          >
+            {opening ? <Loader2 className="animate-spin" size={13} /> : <FolderOpen size={13} />}
+            {opening ? "Opening…" : "Open Folder"}
+          </button>
+          <button
+            type="button"
+            className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-[#dfe3ec] bg-white px-2.5 text-xs font-bold text-[#596174] hover:bg-[#f7f7fb]"
+            title="Refresh cache info"
+            onClick={() => void refresh()}
+            disabled={loading}
+          >
+            {loading ? <Loader2 className="animate-spin" size={13} /> : <HardDrive size={13} />}
+            {loading ? "Checking…" : `${totalSize !== null ? formatBytes(totalSize) : "—"}`}
+          </button>
+        </div>
       }
     >
       {error && (

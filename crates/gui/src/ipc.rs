@@ -1464,9 +1464,10 @@ fn cache_self_check_at_root(cache_root: &Path) {
         if !meta_exists || !has_data_file {
             // Orphan (no meta) or residual (no data) — remove the dir.
             if let Err(e) = std::fs::remove_dir_all(&path) {
-                eprintln!(
-                    "cache_self_check: failed to remove inconsistent cache dir {}: {e}",
-                    path.display()
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "cache_self_check: failed to remove inconsistent cache dir"
                 );
             }
         }
@@ -2036,7 +2037,11 @@ fn clear_cache_by_type_at_root(
                 Err(e) => {
                     // Best-effort: log and continue rather than failing the
                     // whole operation when one dir cannot be removed.
-                    eprintln!("Failed to remove cache dir {}: {e}", path.display());
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "failed to remove cache dir during clear-by-type"
+                    );
                 }
             }
         }

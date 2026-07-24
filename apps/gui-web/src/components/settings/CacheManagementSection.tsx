@@ -11,6 +11,7 @@ interface CacheBreakdown {
   images: { size: number; count: number };
   other: { size: number; count: number };
   total: { size: number; count: number };
+  cachedIds: string[];
 }
 
 type ClearTarget = "images" | "other" | "all";
@@ -24,7 +25,7 @@ type ClearTarget = "images" | "other" | "all";
  * - On clear: deletes disk files + syncs localStorage (clearedIds) + clears ObjectURLs
  */
 export function CacheManagementSection() {
-  const { clearDownloadedByIds } = useDownloadedArtifacts();
+  const { clearDownloadedByIds, reconcileDownloaded } = useDownloadedArtifacts();
   const [breakdown, setBreakdown] = useState<CacheBreakdown | null>(null);
   const [loading, setLoading] = useState(false);
   const [clearing, setClearing] = useState<ClearTarget | null>(null);
@@ -38,12 +39,16 @@ export function CacheManagementSection() {
     try {
       const bd = await ipc.getAttachmentCacheBreakdown();
       setBreakdown(bd);
+      // ARCH TODO#2 Tier 2: reconcile localStorage mappings against the
+      // on-disk cache. Removes orphan entries whose backing file was
+      // externally deleted (e.g. via file manager or disk cleanup).
+      reconcileDownloaded(bd.cachedIds);
     } catch (err) {
       setError(errorText(err));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [reconcileDownloaded]);
 
   useEffect(() => {
     void refresh();

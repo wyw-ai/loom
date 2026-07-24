@@ -21,11 +21,14 @@ vi.stubGlobal("window", {
   innerHeight: 1080,
 });
 
-// Stub useDownloadedArtifacts to avoid localStorage side effects
+// Stub useDownloadedArtifacts to avoid localStorage side effects.
+// `clearDownloaded` is spied per-test for ARCH TODO#2 Tier 1 assertions.
+const clearDownloadedMock = vi.fn();
 vi.mock("@/hooks/useDownloadedArtifacts", () => ({
   useDownloadedArtifacts: () => ({
     isDownloaded: () => null,
     setDownloaded: () => {},
+    clearDownloaded: clearDownloadedMock,
     clearAllDownloaded: () => {},
     clearDownloadedByIds: () => {},
   }),

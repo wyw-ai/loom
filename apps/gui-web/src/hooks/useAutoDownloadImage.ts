@@ -32,7 +32,7 @@ function ensureBeforeUnloadHook(): void {
   });
 }
 
-function acquireObjectUrl(artifactId: string, blob: Blob): string {
+export function acquireObjectUrl(artifactId: string, blob: Blob): string {
   ensureBeforeUnloadHook();
   const existing = objectUrlCache.get(artifactId);
   if (existing) {
@@ -44,7 +44,7 @@ function acquireObjectUrl(artifactId: string, blob: Blob): string {
   return objectUrl;
 }
 
-function releaseObjectUrl(artifactId: string): void {
+export function releaseObjectUrl(artifactId: string): void {
   const entry = objectUrlCache.get(artifactId);
   if (!entry) return;
   entry.refCount -= 1;
@@ -229,7 +229,7 @@ export function useDownloadToLocal() {
  * Read a local file as a Blob by paginating through readLocalFileBytes.
  * ARCH D3-r1: cache-hit path — reads from disk instead of network.
  */
-async function readLocalFileAsBlob(path: string, mediaType: string): Promise<Blob> {
+export async function readLocalFileAsBlob(path: string, mediaType: string): Promise<Blob> {
   const chunkSize = 1024 * 1024;
   const chunks: Uint8Array[] = [];
   let offset = 0;

@@ -1,11 +1,18 @@
+<div align="center">
+
+<img src="crates/gui/icons/icon.png" alt="Loom" width="96">
+
 # Loom
+
+**A shared protocol for humans, AI agents, scripts, and services to talk.**
+
+[![License](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE)
+[![CI](https://github.com/wyw-ai/loom/actions/workflows/ci.yml/badge.svg)](https://github.com/wyw-ai/loom/actions/workflows/ci.yml)
+![Status](https://img.shields.io/badge/status-pre--1.0-orange)
 
 [简体中文](README.zh-CN.md)
 
-![License](https://img.shields.io/badge/License-Apache--2.0-blue)
-![Status](https://img.shields.io/badge/Status-pre--1.0-orange)
-
-A shared protocol for humans, AI agents, scripts, and services to talk.
+</div>
 
 Loom is an open-source communication runtime for mixed human, agent, and program
 workflows. It gives every participant an identity and a durable inbox, then
@@ -23,23 +30,28 @@ conversation.
   direct messages, and mentions.
 - Give every actor a durable inbox, so work can be routed to a person, an
   agent, a service, or a group.
-- Turn messages into tasks, assign or claim them, and keep progress tied to the
-  original thread.
-- Run local agent CLIs through provider manifests for tools such as Claude,
-  Codex, Copilot, OpenCode, and Qoder.
+- Turn messages into tasks with owners, assignments, and status that stay tied
+  to the original thread.
+- Run local agent CLIs through provider manifests, with built-in templates for
+  Claude, Codex, Copilot, Kimi, OpenCode, Qoder, and ZCode.
 - Let scripts and long-running services publish messages, receive work, and
   attach output back to the communication context that produced it.
-- Keep artifacts, run traces, approvals, and workspace files connected to the
-  people and actors that created them.
+- Keep artifacts, run traces, approvals, memory, and workspace files connected
+  to the people and actors that created them.
 
 ## Quick Start
 
-The current supported path is building from source.
+The current supported path is building from source. You need a stable Rust
+toolchain (see `rust-toolchain.toml`); building the desktop app additionally
+requires Node.js and pnpm.
 
 ```bash
 make build
 export PATH="$PWD/target/debug:$PATH"
 ```
+
+> On Windows, build with `cargo` directly — see
+> [docs/windows-build-guide.md](docs/windows-build-guide.md).
 
 Start the local Loom server:
 
@@ -59,6 +71,11 @@ loom chat
 The CLI defaults to `ws://127.0.0.1:7878/rpc` and stores your local identity in
 `~/.loom/cli.toml`. If you do not want to modify `PATH`, replace commands such
 as `loom-server` with `./target/debug/loom-server`.
+
+The `loom` CLI covers the whole surface: `channel`, `thread`, `message`,
+`task`, `run`, `inbox`, `artifact`, `memory`, `reminder`, `agent`, `provider`,
+`service`, `machine`, `group`, and more. Every command accepts `--json` for
+scripting; run `loom --help` for the full command tree.
 
 ## Connect Local Agents
 
@@ -81,7 +98,7 @@ assembly, profile files, and workspace prompt files.
 
 ```bash
 loom provider example --claude --json
-loom provider example --codex --json
+loom provider example --kimi --json
 loom provider validate examples/providers/claude.json
 loom provider add path/to/my-provider.json
 ```
@@ -145,6 +162,13 @@ The server deliberately does not launch agents. Agent execution happens under
 `loom-daemon`; service execution happens in a service host, often started by the
 daemon. Both run outside `loom-server`.
 
+## Ecosystem
+
+- [loom-guide](https://github.com/wyw-ai/loom-guide) — official operating
+  guidance for agents running inside Loom; consumed through `loom guide`.
+- [loom-skills](https://github.com/wyw-ai/loom-skills) — official skill pack
+  for Loom-managed agents; consumed through `loom skill`.
+
 ## Documentation
 
 - [Documentation index](docs/README.md)
@@ -153,6 +177,7 @@ daemon. Both run outside `loom-server`.
 - [Open multi-actor protocol draft](docs/protocol/open-multi-actor-collaboration-protocol-v0.md)
 - [JSON-RPC schema draft](docs/protocol/open-multi-actor-collaboration-schema-v0.md)
 - [Provider extension design](docs/protocol/provider-extension-design.md)
+- [Windows build guide](docs/windows-build-guide.md)
 - [Agent and provider examples](examples/agents/README.md)
 
 ## Development
@@ -197,16 +222,20 @@ download metadata.
 
 ## Repository Layout
 
-- `crates/proto` - shared protocol types and JSON-RPC method definitions.
-- `crates/server` - `loom-server`, the communication journal and WebSocket hub.
-- `crates/cli` - `loom`, `loom-daemon`, chat TUI, and automation commands.
-- `crates/agent-runtime` - provider discovery, prompt assembly, adapters, and
+- `crates/proto` — shared protocol types and JSON-RPC method definitions.
+- `crates/server` — `loom-server`, the communication journal and WebSocket hub.
+- `crates/cli` — `loom`, `loom-daemon`, chat TUI, and automation commands.
+- `crates/agent-runtime` — provider discovery, prompt assembly, adapters, and
   agent runtime helpers.
-- `crates/gui` - Tauri desktop shell.
-- `apps/gui-web` - React/Vite frontend used by the desktop GUI.
-- `docs` - architecture, protocol, runtime, GUI, and workflow notes.
-- `examples` - sample agent and provider manifests.
-- `scripts/e2e` - local end-to-end smoke scripts.
+- `crates/loom-platform` — platform abstraction for process spawning and OS
+  integration.
+- `crates/loom-shell` — Windows shell app.
+- `crates/gui` — Tauri desktop shell.
+- `apps/gui-web` — React/Vite frontend used by the desktop GUI.
+- `docs` — architecture, protocol, runtime, GUI, and workflow notes.
+- `examples` — sample agent and provider manifests.
+- `pages` — download portal source for the GitHub Pages site.
+- `scripts/e2e` — local end-to-end smoke scripts.
 
 ## License
 

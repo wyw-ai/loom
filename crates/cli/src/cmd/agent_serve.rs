@@ -4421,8 +4421,10 @@ async fn drain_pending_inbox(
                 tracing::warn!(
                     actor = %actor_id,
                     message = %message.id,
-                    "retrying pending message delivery that was seen but is no longer active or queued"
+                    "acknowledging duplicate pending message delivery that was already seen"
                 );
+                record_delivery_seen_by_id(client, actor_id, &source_id).await?;
+                continue;
             }
             let too_old = now.signed_duration_since(message.created_at) > max_age;
             if too_old {
@@ -4472,8 +4474,10 @@ async fn drain_pending_inbox(
                 tracing::warn!(
                     actor = %actor_id,
                     event = %event.id,
-                    "retrying pending event delivery that was seen but is no longer active or queued"
+                    "acknowledging duplicate pending event delivery that was already seen"
                 );
+                record_delivery_seen_by_id(client, actor_id, &source_id).await?;
+                continue;
             }
             let too_old = now.signed_duration_since(event.occurred_at) > max_age;
             if too_old {

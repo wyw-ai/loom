@@ -88,6 +88,22 @@ Loom 打包时内置 `skills/loom` 的一份快照，并在 agent turn 启动前
 目录。这样 agent 不需要依赖 system prompt，也能知道遇到 Loom 路由、任务、私信、
 artifact、reminder 等场景时应该先读哪个 reference 或 guide topic。
 
+### Host-owned hidden awareness
+
+`AgentSpec.runtimeAwareness` 默认为 `native`。宿主应用如果已经提供自己的 agent-facing
+通信协议和工具，可以设置为 `hidden`。该模式下 Loom 仍负责 channel/thread、投递、
+队列、run 和 provider session，但不向 provider 暴露 Loom 操作面：
+
+- 不写入或保留 Loom 生成的 workspace `AGENTS.md` 区块；
+- 不投影默认 `loom` skill；
+- turn prompt 只传递原始触发消息正文，不加入 Loom turn header、reply contract、
+  history inspection 或 CLI command guidance；
+- 不注入 `LOOM_*` / `AGENTX_*` provider 环境变量；仅使用中性的
+  `RUNTIME_TRIGGER_MESSAGE_ID` 让宿主 wrapper 关联当前投递。
+
+`hidden` 表示宿主接管 provider-facing instructions、工具和结果投递，不改变 Loom
+内部的 durable message、inbox acknowledgement、run lifecycle 或 session 管理语义。
+
 `loom-skills` 的内容同样不应复制维护到 Loom 主仓库。Loom 构建和发布时只读取外部
 仓库内容生成编译期快照。构建机可以通过 `LOOM_SKILLS_DIR` 指向该仓库；未设置时，
 默认查找 Loom 仓库平级的 `../loom-skills`；如果本地路径不存在，则从官方 GitHub

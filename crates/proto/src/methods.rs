@@ -23,6 +23,9 @@ pub mod method {
     pub const CHANNEL_MEMBER_CONFIG_LIST: &str = "channel/member_config.list";
     pub const CHANNEL_MEMBER_CONFIG_SET: &str = "channel/member_config.set";
     pub const CHANNEL_MEMBER_CONFIG_CLEAR: &str = "channel/member_config.clear";
+    pub const CHANNEL_SET_INSTRUCTION: &str = "channel/set_instruction";
+    pub const CHANNEL_GET_INSTRUCTION: &str = "channel/get_instruction";
+    pub const CHANNEL_CLEAR_INSTRUCTION: &str = "channel/clear_instruction";
     pub const THREAD_CREATE: &str = "thread/create";
     pub const THREAD_LIST: &str = "thread/list";
     pub const THREAD_UPDATE: &str = "thread/update";
@@ -30,6 +33,9 @@ pub mod method {
     pub const THREAD_DELETE: &str = "thread/delete";
     pub const THREAD_FOLLOW: &str = "thread.follow";
     pub const THREAD_UNFOLLOW: &str = "thread.unfollow";
+    pub const THREAD_SET_INSTRUCTION: &str = "thread/set_instruction";
+    pub const THREAD_GET_INSTRUCTION: &str = "thread/get_instruction";
+    pub const THREAD_CLEAR_INSTRUCTION: &str = "thread/clear_instruction";
     pub const TASK_CREATE: &str = "task.create";
     pub const TASK_GET: &str = "task.get";
     pub const TASK_LIST: &str = "task.list";
@@ -239,6 +245,11 @@ pub struct ChannelCreateParams {
     pub title: String,
     #[serde(default)]
     pub topic: String,
+    /// Force a public channel even when the connection is bound to an actor.
+    /// This is useful for product-level shared spaces where membership is
+    /// tracked for discovery but should not gate visibility.
+    #[serde(default)]
+    pub public: bool,
     /// When provided, the new channel is created `Private` and the creator
     /// is its sole initial member. When omitted, the channel is created
     /// `Public`.
@@ -352,9 +363,12 @@ pub struct ChannelMemberConfigClearResult {
 #[serde(rename_all = "camelCase")]
 pub struct ChannelUpdateParams {
     pub channel_id: String,
-    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<ChannelVisibility>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -381,6 +395,43 @@ pub struct ChannelDeleteResult {
     /// non-cascade path (the empty-channel happy case) and on no-op deletes.
     #[serde(default)]
     pub deleted_threads: u32,
+}
+
+// ---- channel/set_instruction / get_instruction / clear_instruction ----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelSetInstructionParams {
+    pub channel_id: String,
+    pub instructions: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelSetInstructionResult {
+    pub channel: Channel,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelGetInstructionParams {
+    pub channel_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelGetInstructionResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelClearInstructionParams {
+    pub channel_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelClearInstructionResult {
+    pub cleared: bool,
 }
 
 // ---- thread/create / list ----
@@ -452,6 +503,43 @@ pub struct ThreadDeleteParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadDeleteResult {
     pub deleted: bool,
+}
+
+// ---- thread/set_instruction / get_instruction / clear_instruction ----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadSetInstructionParams {
+    pub thread_id: String,
+    pub instructions: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadSetInstructionResult {
+    pub thread: Thread,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadGetInstructionParams {
+    pub thread_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadGetInstructionResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadClearInstructionParams {
+    pub thread_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadClearInstructionResult {
+    pub cleared: bool,
 }
 
 // ---- thread.follow / thread.unfollow ----
@@ -2738,11 +2826,28 @@ pub enum PromptVia {
     Env,
 }
 
+/// Controls whether Loom teaches its native runtime protocol to the provider.
+/// Hidden mode is intended for host applications that expose their own agent-facing tools.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeAwareness {
+    #[default]
+    Native,
+    Hidden,
+}
+
+impl RuntimeAwareness {
+    pub fn is_native(value: &Self) -> bool {
+        matches!(value, Self::Native)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSpec {
     pub actor: Actor,
-    /// Static instructions for this agent actor. Loom projects these into the
-    /// workspace AGENTS.md Loom block with other stable actor/channel context.
+    /// Static instructions for this agent actor. Native awareness projects
+    /// these into the workspace AGENTS.md block; hidden awareness delegates
+    /// instruction delivery to the host application's provider integration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
     /// Provider-catalog based runtime selection. The host resolves this into a
@@ -2751,6 +2856,14 @@ pub struct AgentSpec {
     pub provider_ref: AgentProviderRef,
     #[serde(default)]
     pub autostart: bool,
+    /// Whether Loom projects its AGENTS.md rules, default skill, turn contract,
+    /// and runtime environment into the provider. Defaults to native behavior.
+    #[serde(
+        default,
+        rename = "runtimeAwareness",
+        skip_serializing_if = "RuntimeAwareness::is_native"
+    )]
+    pub runtime_awareness: RuntimeAwareness,
     /// Optional model menu for this actor. Loom treats these as runtime-level
     /// model ids: `loom-daemon` can surface them through `/models` and
     /// pass the selected id to transports that support model selection.

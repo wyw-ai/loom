@@ -18,7 +18,7 @@ use agent_runtime::provider::{
 use anyhow::{anyhow, Context, Result};
 use proto::methods::{
     AgentBundleSkillSpec, AgentBundleSpec, AgentModelSpec, AgentPromptAssemblySpec,
-    AgentProviderRef, AgentSpec, ProviderManifest, ServiceSpec, WakeSpec,
+    AgentProviderRef, AgentSpec, ProviderManifest, RuntimeAwareness, ServiceSpec, WakeSpec,
 };
 use proto::types::{Actor, ActorKind};
 use serde::{Deserialize, Serialize};
@@ -76,6 +76,12 @@ pub async fn run(
     // Windows. `data_root` is absolute (abs_path), so UNC prefixing is safe.
     loom_platform::path::create_dir_all(&data_root)
         .with_context(|| format!("create data root {}", data_root.display()))?;
+    // BRIDGE CONTRACT: This set_var is the implicit B→A bridge that makes
+    // the daemon's machine_data_root (Class B, default ~/.agentx) visible
+    // to all Class-A callers (agent_serve, spec, workspace, thread, GUI).
+    // Without it, independent CLI invocations would resolve a different
+    // data root (dirs::data_dir()/loom/agents) and fail to see daemon data.
+    // See ARCH design review art_90293d88ca12 for full analysis.
     std::env::set_var("LOOM_AGENT_DATA_ROOT", &data_root);
 
     let mut initial_specs = load_config_agent_specs()?;
@@ -604,6 +610,15 @@ fn agent_spec_from_command(
         .filter(|value| !value.is_null())
         .map(|value| serde_json::from_value::<WakeSpec>(value.clone()).context("parse wake"))
         .transpose()?;
+    let runtime_awareness = command
+        .get("runtimeAwareness")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            serde_json::from_value::<RuntimeAwareness>(value.clone())
+                .context("parse runtimeAwareness")
+        })
+        .transpose()?
+        .unwrap_or_default();
 
     let env: BTreeMap<String, String> = command
         .get("env")
@@ -653,6 +668,7 @@ fn agent_spec_from_command(
             .get("autostart")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        runtime_awareness,
         models: Some(AgentModelSpec {
             default: model.or_else(|| provider.default_model.clone()),
             choices: provider.model_choices.clone(),
@@ -780,6 +796,10 @@ fn update_agent_spec_from_command(
         } else {
             Some(serde_json::from_value::<WakeSpec>(value.clone()).context("parse wake")?)
         };
+    }
+    if let Some(value) = command.get("runtimeAwareness") {
+        spec.runtime_awareness = serde_json::from_value::<RuntimeAwareness>(value.clone())
+            .context("parse runtimeAwareness")?;
     }
     if let Some(env_value) = command.get("env") {
         if env_value.is_null() {
@@ -1967,6 +1987,13 @@ fn list_machine_directory(command: &Value, machine: &MachineConfig) -> Result<Va
         return Err(anyhow!("{} is not a directory", path.display()));
     }
 
+    // E2: When includeFiles is true, file entries are included alongside
+    // directories. Defaults to false for backward compatibility.
+    let include_files = command
+        .get("includeFiles")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(&path).with_context(|| format!("read {}", path.display()))? {
         let entry = match entry {
@@ -1983,15 +2010,26 @@ fn list_machine_directory(command: &Value, machine: &MachineConfig) -> Result<Va
             Err(_) => continue,
         };
         let file_type = metadata.file_type();
-        if file_type.is_symlink() || !metadata.is_dir() {
+        if file_type.is_symlink() {
             continue;
         }
-        entries.push(json!({
-            "name": name,
-            "path": entry_path.display().to_string(),
-            "kind": "directory",
-            "modified": metadata.modified().ok().and_then(system_time_rfc3339),
-        }));
+        if metadata.is_dir() {
+            entries.push(json!({
+                "name": name,
+                "path": entry_path.display().to_string(),
+                "kind": "directory",
+                "modified": metadata.modified().ok().and_then(system_time_rfc3339),
+            }));
+        } else if include_files {
+            // E2: Include file entries with size and modification time.
+            entries.push(json!({
+                "name": name,
+                "path": entry_path.display().to_string(),
+                "kind": "file",
+                "size": metadata.len(),
+                "modified": metadata.modified().ok().and_then(system_time_rfc3339),
+            }));
+        }
     }
     entries.sort_by(|a, b| {
         let left = a
@@ -2693,6 +2731,10 @@ fn fill_missing_machine_context(machine: &mut MachineConfig, fallback: &MachineC
     changed
 }
 
+// TODO(legacy): ~/.agentx is a legacy default from the old "agentx" name.
+// Migrating to dirs::data_dir()/loom/agents (consistent with Class-A callers)
+// requires a data migration script and is a breaking change — deferred to a
+// separate task (P2 in ARCH design review art_90293d88ca12).
 fn machine_data_root(machine: &MachineConfig) -> PathBuf {
     let raw = if machine.data_root.trim().is_empty() {
         expand_home(&default_agent_data_root_expr())
@@ -2718,6 +2760,8 @@ fn machine_connection_actor_id(machine: &MachineConfig) -> String {
     format!("actor_service_{}", machine.id)
 }
 
+// TODO(legacy): "~/.agentx" is the old product name's data root. Should be
+// migrated to dirs::data_dir()/loom/agents in a future breaking-change task.
 fn default_agent_data_root_expr() -> String {
     "~/.agentx".into()
 }
@@ -2876,6 +2920,7 @@ mod tests {
                 ..Default::default()
             },
             autostart: false,
+            runtime_awareness: RuntimeAwareness::Native,
             models: Some(AgentModelSpec {
                 default: Some("gpt-5.5".into()),
                 choices: Vec::new(),
@@ -2921,6 +2966,7 @@ mod tests {
                 "instructions": "Writes concise updates",
                 "model": "opus",
                 "reasoningEffort": "high",
+                "runtimeAwareness": "hidden",
                 "autostart": true
             }),
             "machine_test",
@@ -2931,6 +2977,7 @@ mod tests {
         assert_eq!(spec.provider_ref.id.as_str(), "claude");
         assert_eq!(spec.provider_ref.model.as_deref(), Some("opus"));
         assert_eq!(spec.instructions.as_deref(), Some("Writes concise updates"));
+        assert_eq!(spec.runtime_awareness, RuntimeAwareness::Hidden);
         let value = serde_json::to_value(&spec).expect("json");
         assert!(value.get("providerRef").is_some());
         assert!(value.get("transport").is_none());
@@ -2960,6 +3007,7 @@ mod tests {
                 ..Default::default()
             },
             autostart: false,
+            runtime_awareness: RuntimeAwareness::Native,
             models: None,
             bundle: None,
             memory: None,
@@ -3188,6 +3236,7 @@ mod tests {
                 ..Default::default()
             },
             autostart: true,
+            runtime_awareness: RuntimeAwareness::Native,
             models: None,
             bundle: None,
             memory: None,

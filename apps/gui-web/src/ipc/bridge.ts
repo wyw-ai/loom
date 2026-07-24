@@ -27,6 +27,7 @@ import type {
   MessageIntent,
   Run,
   ScopeRef,
+  SkillEntry,
   StreamUpdate,
   Task,
   TaskAssignmentType,
@@ -281,6 +282,7 @@ export async function messageSend(params: {
   intent?: MessageIntent;
   deliveryPolicy?: DeliveryPolicy;
   metadata?: Record<string, unknown>;
+  attachments?: string[];
 }): Promise<{ message: Message }> {
   return invoke("message_send", {
     params: {
@@ -299,6 +301,7 @@ export async function messageSend(params: {
       intent: params.intent ?? "chat",
       deliveryPolicy: params.deliveryPolicy ?? "notify_only",
       metadata: params.metadata ?? {},
+      attachments: params.attachments ?? [],
     },
   });
 }
@@ -346,6 +349,99 @@ export async function artifactGet(params: {
   return invoke("artifact_get", { params });
 }
 
+export interface ScopeAttachment {
+  artifact: Artifact;
+  messageId: string;
+}
+
+/**
+ * Run async tasks in bounded batches to limit concurrency.
+ *
+ * Preserves input order in the output array. Items that reject produce
+ * `undefined` entries (callers decide how to handle). This keeps memory
+ * and simultaneous IPC pressure bounded when resolving many artifacts.
+ *
+ * @param items Source items.
+ * @param batchSize Max number of in-flight tasks per batch.
+ * @param task Async function applied to each item.
+ */
+export async function mapBatched<T, R>(
+  items: readonly T[],
+  batchSize: number,
+  task: (item: T, index: number) => Promise<R>,
+): Promise<(R | undefined)[]> {
+  const results: (R | undefined)[] = new Array(items.length).fill(undefined);
+  for (let start = 0; start < items.length; start += batchSize) {
+    const end = Math.min(start + batchSize, items.length);
+    const batch = await Promise.all(
+      items.slice(start, end).map((item, i) =>
+        task(item, start + i).catch(() => undefined),
+      ),
+    );
+    for (let i = 0; i < batch.length; i++) {
+      results[start + i] = batch[i];
+    }
+  }
+  return results;
+}
+
+/**
+ * List all attachments in a channel or thread scope by:
+ * 1. Fetching messages via messageList
+ * 2. Extracting attachment URIs from each message
+ * 3. Resolving artifact metadata via artifactGet
+ * Returns a flat list of artifacts (deduplicated by artifact id).
+ *
+ * Artifact metadata resolution runs in bounded batches (default 8) to
+ * cap concurrent IPC pressure. Functionally equivalent to unbounded
+ * Promise.all: all attachments are still fetched, only concurrency is
+ * limited.
+ */
+export async function listScopeAttachments(params: {
+  target: string;
+  limit?: number;
+  /** Max concurrent artifactGet calls per batch. Defaults to 8. */
+  resolveBatchSize?: number;
+}): Promise<ScopeAttachment[]> {
+  const { messages } = await messageList({
+    target: params.target,
+    limit: params.limit ?? 500,
+  });
+
+  // Collect unique attachment URIs with their source message
+  const seen = new Map<string, string>(); // artifactUri -> messageId
+  for (const msg of messages) {
+    if (!msg.attachments || msg.attachments.length === 0) continue;
+    for (const att of msg.attachments) {
+      const clean = att.trim();
+      if (!clean) continue;
+      // Skip non-artifact attachments (e.g. .skill files, URLs)
+      if (!clean.startsWith("artifact://") && !/^art_[A-Za-z0-9_-]+$/.test(clean)) continue;
+      if (!seen.has(clean)) {
+        seen.set(clean, msg.id);
+      }
+    }
+  }
+
+  // Resolve artifact metadata in bounded batches to limit concurrency.
+  const entries = Array.from(seen.entries());
+  const resolved = await mapBatched(entries, params.resolveBatchSize ?? 8, async ([uri, messageId]) => {
+    const lookupParams = uri.startsWith("artifact://")
+      ? { artifactUri: uri }
+      : { artifactId: uri };
+    const { artifact } = await artifactGet(lookupParams);
+    return { artifact, messageId };
+  });
+
+  // Filter out failed resolutions (undefined entries from mapBatched).
+  const results: ScopeAttachment[] = [];
+  for (const item of resolved) {
+    if (item) results.push(item);
+  }
+
+  return results;
+}
+
 export async function artifactRead(params: {
   artifactId: string;
   offset?: number;
@@ -356,6 +452,33 @@ export async function artifactRead(params: {
       artifactId: params.artifactId,
       offset: params.offset ?? 0,
       maxBytes: params.maxBytes ?? 65536,
+    },
+  });
+}
+
+export async function artifactPublish(params: {
+  ingress:
+    | { kind: "inlineText"; name: string; mediaType?: string; text: string }
+    | { kind: "fileBytes"; name: string; mediaType?: string; bytes: number[] };
+  createdBy: string;
+  scope?: ScopeRef;
+}): Promise<{ artifact: Artifact }> {
+  const kind = params.ingress.kind === "inlineText" ? "inline_text" : "file_bytes";
+  const payload: Record<string, unknown> = {
+    kind,
+    name: params.ingress.name,
+    mediaType: params.ingress.mediaType ?? (params.ingress.kind === "inlineText" ? "text/markdown" : "application/octet-stream"),
+  };
+  if (params.ingress.kind === "inlineText") {
+    payload.text = params.ingress.text;
+  } else {
+    payload.bytes = params.ingress.bytes;
+  }
+  return invoke("artifact_publish", {
+    params: {
+      ingress: payload,
+      createdBy: params.createdBy,
+      ...(params.scope ? { scope: params.scope } : {}),
     },
   });
 }
@@ -410,8 +533,15 @@ export async function machineCheck(): Promise<MachineListResult> {
 export async function machineDirList(args: {
   machineId: string;
   path?: string;
+  includeFiles?: boolean;
 }): Promise<MachineDirListResult> {
-  return invoke("machine_dir_list", { args });
+  return invoke("machine_dir_list", {
+    args: {
+      machineId: args.machineId,
+      ...(args.path ? { path: args.path } : {}),
+      ...(args.includeFiles ? { includeFiles: true } : {}),
+    },
+  });
 }
 
 export async function localProviderCheck(): Promise<{
@@ -554,6 +684,116 @@ export async function openLocalPath(path: string): Promise<void> {
   await invoke("open_local_path", { args: { path } });
 }
 
+export async function saveFileDialog(fileName: string, bytes: Uint8Array): Promise<string | null> {
+  return invoke<string | null>("save_file_dialog", {
+    args: { fileName, bytes: Array.from(bytes) },
+  });
+}
+
+export async function openFileDefault(path: string): Promise<void> {
+  await invoke("open_file_default", { args: { path } });
+}
+
+export async function revealInFolder(path: string): Promise<void> {
+  await invoke("reveal_in_folder", { args: { path } });
+}
+
+export async function pathExists(path: string): Promise<boolean> {
+  return invoke<boolean>("path_exists", { args: { path } });
+}
+
+export async function artifactExists(args: { artifactId: string }): Promise<boolean> {
+  return invoke<boolean>("artifact_exists", { args: { artifactId: args.artifactId } });
+}
+
+export async function downloadToTemp(args: {
+  artifactId: string;
+  suggestedName?: string;
+}): Promise<string> {
+  return invoke<string>("download_to_temp", {
+    args: {
+      artifactId: args.artifactId,
+      ...(args.suggestedName ? { suggestedName: args.suggestedName } : {}),
+    },
+  });
+}
+
+/**
+ * Download an artifact to the persistent cache directory
+ * (data_dir/loom/cache/attachments/<artifactId>/).
+ *
+ * ARCH D3-r1: replaces downloadToTemp for image auto-download.
+ * Returns the local file path. Persists across restarts.
+ */
+export async function downloadToCache(args: {
+  artifactId: string;
+  suggestedName?: string;
+}): Promise<string> {
+  return invoke<string>("download_to_cache", {
+    args: {
+      artifactId: args.artifactId,
+      ...(args.suggestedName ? { suggestedName: args.suggestedName } : {}),
+    },
+  });
+}
+
+/**
+ * Clear the entire attachment cache directory (disk files).
+ * ARCH D3-r1: used by CacheManagementSection in settings.
+ */
+export async function clearAttachmentCache(): Promise<void> {
+  await invoke("clear_attachment_cache", { args: {} });
+}
+
+/**
+ * Get cache breakdown by media type category.
+ * ARCH D3 design: returns { images: {size,count}, other: {size,count}, total }.
+ */
+export async function getAttachmentCacheBreakdown(): Promise<{
+  images: { size: number; count: number };
+  other: { size: number; count: number };
+  total: { size: number; count: number };
+}> {
+  return invoke("get_attachment_cache_breakdown", { args: {} });
+}
+
+/**
+ * Clear attachment cache by category ("images" or "other").
+ * ARCH D3 design: returns { freedBytes, clearedIds }.
+ */
+export async function clearAttachmentCacheByType(category: "images" | "other"): Promise<{
+  freedBytes: number;
+  clearedIds: string[];
+}> {
+  return invoke("clear_attachment_cache_by_type", { args: { category } });
+}
+
+/**
+ * Open the attachment cache root directory in the system file manager.
+ * ARCH design: opens data_dir/loom/cache/attachments/ (Win/Mac/Linux compatible).
+ */
+export async function openAttachmentCacheDirectory(): Promise<void> {
+  await invoke("open_attachment_cache_directory", { args: {} });
+}
+
+/**
+ * Read bytes from a local cached file (cache-hit path).
+ * ARCH D3-r1: skips network download when file is already cached.
+ */
+export async function readLocalFileBytes(args: {
+  path: string;
+  offset?: number;
+  maxBytes?: number;
+}): Promise<{ bytes: number[]; truncated: boolean; nextOffset?: number }> {
+  return invoke("read_local_file_bytes", {
+    args: {
+      path: args.path,
+      ...(args.offset !== undefined ? { offset: args.offset } : {}),
+      ...(args.maxBytes !== undefined ? { maxBytes: args.maxBytes } : {}),
+    },
+  });
+}
+
 export function onStream(cb: (u: StreamUpdate) => void): Promise<UnlistenFn> {
   return listen<StreamUpdate>("loom://stream", (e) => cb(e.payload));
 }
@@ -565,4 +805,120 @@ export function onConnection(
     "loom://connection",
     (e) => cb(e.payload),
   );
+}
+
+// ---- channel/thread instructions ----
+
+export async function channelGetInstruction(
+  channelId: string,
+): Promise<{ instructions: string | null }> {
+  return invoke("channel_get_instruction", {
+    params: { channelId },
+  });
+}
+
+export async function channelSetInstruction(params: {
+  channelId: string;
+  instructions: string;
+}): Promise<{ channel: Channel }> {
+  return invoke("channel_set_instruction", { params });
+}
+
+export async function channelClearInstruction(
+  channelId: string,
+): Promise<{ cleared: boolean }> {
+  return invoke("channel_clear_instruction", {
+    params: { channelId },
+  });
+}
+
+export async function threadGetInstruction(
+  threadId: string,
+): Promise<{ instructions: string | null }> {
+  return invoke("thread_get_instruction", {
+    params: { threadId },
+  });
+}
+
+export async function threadSetInstruction(params: {
+  threadId: string;
+  instructions: string;
+}): Promise<{ thread: Thread }> {
+  return invoke("thread_set_instruction", { params });
+}
+
+export async function threadClearInstruction(
+  threadId: string,
+): Promise<{ cleared: boolean }> {
+  return invoke("thread_clear_instruction", {
+    params: { threadId },
+  });
+}
+
+// ---- channel/thread skills (local file I/O) ----
+
+export async function channelSkillList(
+  channelId: string,
+): Promise<{ skills: SkillEntry[] }> {
+  return invoke("channel_skill_list", { args: { channelId } });
+}
+
+export async function channelSkillAdd(params: {
+  channelId: string;
+  source: string;
+  skillId?: string;
+}): Promise<{ skills: SkillEntry[] }> {
+  return invoke("channel_skill_add", {
+    args: {
+      channelId: params.channelId,
+      source: params.source,
+      ...(params.skillId ? { skillId: params.skillId } : {}),
+    },
+  });
+}
+
+export async function channelSkillRemove(params: {
+  channelId: string;
+  skillId: string;
+}): Promise<{ skills: SkillEntry[] }> {
+  return invoke("channel_skill_remove", {
+    args: { channelId: params.channelId, skillId: params.skillId },
+  });
+}
+
+export async function threadSkillList(params: {
+  channelId: string;
+  threadId: string;
+}): Promise<{ skills: SkillEntry[] }> {
+  return invoke("thread_skill_list", { args: params });
+}
+
+export async function threadSkillAdd(params: {
+  channelId: string;
+  threadId: string;
+  source: string;
+  skillId?: string;
+}): Promise<{ skills: SkillEntry[] }> {
+  return invoke("thread_skill_add", {
+    args: {
+      channelId: params.channelId,
+      threadId: params.threadId,
+      source: params.source,
+      ...(params.skillId ? { skillId: params.skillId } : {}),
+    },
+  });
+}
+
+export async function threadSkillRemove(params: {
+  channelId: string;
+  threadId: string;
+  skillId: string;
+}): Promise<{ skills: SkillEntry[] }> {
+  return invoke("thread_skill_remove", {
+    args: {
+      channelId: params.channelId,
+      threadId: params.threadId,
+      skillId: params.skillId,
+    },
+  });
 }

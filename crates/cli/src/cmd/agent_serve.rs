@@ -30,7 +30,7 @@ use proto::methods::{
     BundleInstallMode, ChannelListResult, ChannelMemberConfigGetResult, ChannelMembersResult,
     InboxListResult, MessageListResult, MessageSendResult, OnHumanMessageWhileBusy,
     PromptTemplateSpec, ReplyReminderMode, RunAppendResult, RunCloseResult, RunOpenResult,
-    TaskAssignmentContextResult, TaskAssignmentUpdateResult, ThreadListResult,
+    RuntimeAwareness, TaskAssignmentContextResult, TaskAssignmentUpdateResult, ThreadListResult,
     TriggerPrefixApplyOn,
 };
 use proto::types::trace::TraceKind;
@@ -238,18 +238,11 @@ fn reconnect_delay(attempt: u32) -> Duration {
 }
 
 pub(crate) fn default_data_root_pub() -> PathBuf {
-    default_data_root()
+    super::paths::agent_data_root()
 }
 
 fn default_data_root() -> PathBuf {
-    if let Ok(s) = std::env::var("LOOM_AGENT_DATA_ROOT") {
-        if !s.is_empty() {
-            return PathBuf::from(s);
-        }
-    }
-    dirs::data_dir()
-        .map(|d| d.join("loom").join("agents"))
-        .unwrap_or_else(|| PathBuf::from(".loom").join("agents-data"))
+    super::paths::agent_data_root()
 }
 
 fn default_specs_dir() -> PathBuf {
@@ -1010,6 +1003,7 @@ impl AgentPaths {
         scope_ref: &ScopeRef,
         workspace_override: Option<&Path>,
         agents_md_context: &agent_runtime::AgentsMdContext,
+        runtime_awareness: RuntimeAwareness,
     ) -> std::io::Result<ScopePaths> {
         let scope =
             self.scope_with_workspace_override(actor_id, channel_id, scope_ref, workspace_override);
@@ -1060,17 +1054,34 @@ impl AgentPaths {
             );
             e
         })?;
-        let mut agents_md_context = agents_md_context.clone();
-        agents_md_context.workspace = scope.workspace.display().to_string();
-        agent_runtime::ensure_agents_md(&scope.workspace, &agents_md_context).map_err(|e| {
-            tracing::error!(
-                actor = %actor_id,
-                workspace = %scope.workspace.display(),
-                %e,
-                "ensure_scope: ensure_agents_md failed"
-            );
-            e
-        })?;
+        match runtime_awareness {
+            RuntimeAwareness::Native => {
+                let mut agents_md_context = agents_md_context.clone();
+                agents_md_context.workspace = scope.workspace.display().to_string();
+                agent_runtime::ensure_agents_md(&scope.workspace, &agents_md_context).map_err(
+                    |e| {
+                        tracing::error!(
+                            actor = %actor_id,
+                            workspace = %scope.workspace.display(),
+                            %e,
+                            "ensure_scope: ensure_agents_md failed"
+                        );
+                        e
+                    },
+                )?;
+            }
+            RuntimeAwareness::Hidden => {
+                agent_runtime::remove_agents_md(&scope.workspace).map_err(|e| {
+                    tracing::error!(
+                        actor = %actor_id,
+                        workspace = %scope.workspace.display(),
+                        %e,
+                        "ensure_scope: remove_agents_md failed"
+                    );
+                    e
+                })?;
+            }
+        }
         ensure_opencode_skill_workspace_config(
             &scope.workspace,
             &scope.workspace.join("AGENTS.md"),
@@ -1848,6 +1859,13 @@ fn reconcile_skill_mount_dir(
         .keys()
         .map(String::as_str)
         .collect::<HashSet<_>>();
+    // Defense-in-depth (issue #2): canonicalize the skills directory and
+    // reject any entry whose canonical path escapes it. validate_path_component
+    // already blocks path-traversal in skill ids/sources at the registry layer,
+    // but a pre-existing symlink inside skills_dir could point outside. We
+    // refuse to remove such escaped entries (they are not ours to manage) and
+    // log a warning instead.
+    let skills_dir_canon = skills_dir.canonicalize().ok();
     if let Ok(entries) = std::fs::read_dir(skills_dir) {
         for entry in entries {
             let entry = entry?;
@@ -1863,6 +1881,25 @@ fn reconcile_skill_mount_dir(
                 Err(err) => return Err(err),
             };
             if meta.file_type().is_symlink() {
+                // Containment check: only remove symlinks whose resolved
+                // target stays within skills_dir. A symlink escaping
+                // skills_dir is suspicious (not created by our mount logic)
+                // and is left untouched with a warning.
+                if let Some(ref dir_canon) = skills_dir_canon {
+                    let entry_canon = entry.path().canonicalize();
+                    let contained = match entry_canon {
+                        Ok(ref p) => p.starts_with(dir_canon),
+                        Err(_) => false, // broken symlink: safe to remove
+                    };
+                    if !contained {
+                        tracing::warn!(
+                            entry = %entry.path().display(),
+                            skills_dir = %dir_canon.display(),
+                            "reconcile_skill_mount_dir: skipping symlink that escapes skills_dir (issue #2 defense-in-depth)"
+                        );
+                        continue;
+                    }
+                }
                 remove_path_if_exists(&entry.path())?;
             }
         }
@@ -3347,9 +3384,16 @@ fn model_choice_label(choice: &AgentModelChoice) -> &str {
     }
 }
 
-async fn run_agent_worker(spec: AgentSpec, server_url: String, data_root: PathBuf) -> Result<()> {
+async fn run_agent_worker(
+    mut spec: AgentSpec,
+    server_url: String,
+    data_root: PathBuf,
+) -> Result<()> {
     let transport = resolve_transport_for_spec(&spec)
         .with_context(|| format!("resolve transport for agent {}", spec.actor.id))?;
+    if requires_hidden_host_runtime(&spec, &transport) {
+        spec.runtime_awareness = RuntimeAwareness::Hidden;
+    }
     let actor_id = spec.actor.id.clone();
     let display_name = if spec.actor.display_name.is_empty() {
         actor_id.clone()
@@ -3438,6 +3482,14 @@ fn resolve_transport_for_spec(spec: &AgentSpec) -> Result<AgentTransport> {
     agent_runtime::provider::default_registry()
         .and_then(|registry| registry.resolve_transport(&spec.provider_ref))
         .map_err(|e| anyhow!(e))
+}
+
+fn requires_hidden_host_runtime(spec: &AgentSpec, transport: &AgentTransport) -> bool {
+    spec.actor.id.starts_with("am.")
+        || spec.provider_ref.id.starts_with("am-")
+        || transport
+            .env
+            .contains_key("AM_BOT_PROVIDER_LAUNCHER_VERSION")
 }
 
 async fn publish_runtime_agent_config(
@@ -4369,8 +4421,10 @@ async fn drain_pending_inbox(
                 tracing::warn!(
                     actor = %actor_id,
                     message = %message.id,
-                    "retrying pending message delivery that was seen but is no longer active or queued"
+                    "acknowledging duplicate pending message delivery that was already seen"
                 );
+                record_delivery_seen_by_id(client, actor_id, &source_id).await?;
+                continue;
             }
             let too_old = now.signed_duration_since(message.created_at) > max_age;
             if too_old {
@@ -4420,8 +4474,10 @@ async fn drain_pending_inbox(
                 tracing::warn!(
                     actor = %actor_id,
                     event = %event.id,
-                    "retrying pending event delivery that was seen but is no longer active or queued"
+                    "acknowledging duplicate pending event delivery that was already seen"
                 );
+                record_delivery_seen_by_id(client, actor_id, &source_id).await?;
+                continue;
             }
             let too_old = now.signed_duration_since(event.occurred_at) > max_age;
             if too_old {
@@ -5155,15 +5211,21 @@ async fn build_adapter_prompt(
         .ok_or_else(|| anyhow!("cannot resolve channel for scope {}", scope.id))?;
     let workspace_override =
         channel_member_workspace_override(client, state, &channel_id, scope).await?;
-    let agents_md_context = agents_md_context_for_scope(client, state, &channel_id).await;
+    let thread_id = match scope.kind {
+        ScopeKind::Thread => Some(scope.id.as_str()),
+        ScopeKind::Channel => None,
+    };
+    let agents_md_context =
+        agents_md_context_for_scope(client, state, &channel_id, thread_id).await;
     let scope_paths = state.paths.ensure_scope(
         &state.actor_id,
         &channel_id,
         scope,
         workspace_override.as_deref(),
         &agents_md_context,
+        state.spec.runtime_awareness,
     )?;
-    let skill_targets = current_scope_skill_targets(client, state, &channel_id).await;
+    let skill_targets = current_scope_skill_targets(client, state, &channel_id, thread_id).await;
     ensure_scope_skill_targets(&scope_paths.skills, &skill_targets)
         .with_context(|| format!("ensure scope skill targets for scope {}", scope.id))?;
     let mut workspace_skill_targets = scope_skill_targets_from_dir(&scope_paths.skills)
@@ -5175,9 +5237,11 @@ async fn build_adapter_prompt(
             .actor_bundle_skill_targets(&state.spec, &bundle_paths)
             .with_context(|| format!("resolve actor bundle skills for {}", state.actor_id))?,
     );
-    let loom_skill = ensure_default_loom_skill(&state.paths.data_root)
-        .context("ensure default Loom skill snapshot")?;
-    workspace_skill_targets.insert(DEFAULT_LOOM_SKILL_ID.into(), loom_skill);
+    if state.spec.runtime_awareness == RuntimeAwareness::Native {
+        let loom_skill = ensure_default_loom_skill(&state.paths.data_root)
+            .context("ensure default Loom skill snapshot")?;
+        workspace_skill_targets.insert(DEFAULT_LOOM_SKILL_ID.into(), loom_skill);
+    }
     ensure_workspace_skill_targets(&scope_paths.workspace, &workspace_skill_targets)
         .with_context(|| format!("project workspace skills for scope {}", scope.id))?;
     let mut template_vars =
@@ -5220,6 +5284,17 @@ async fn build_adapter_prompt(
     )?);
     let outputs =
         render_agent_prompt_outputs(state.spec.prompt_assembly.as_ref(), &parts, &prompt.content)?;
+    let mut env = state.paths.scope_env_for_scope(
+        &state.actor_id,
+        &channel_id,
+        scope,
+        &state.agent_server_url,
+        active,
+        &scope_paths,
+    );
+    if state.spec.runtime_awareness == RuntimeAwareness::Hidden {
+        hide_runtime_environment(&mut env);
+    }
     Ok(AdapterPrompt {
         scope: scope.clone(),
         content: prompt.content.clone(),
@@ -5227,16 +5302,17 @@ async fn build_adapter_prompt(
         outputs,
         model: state.current_model(),
         cwd: scope_paths.workspace.clone(),
-        env: state.paths.scope_env_for_scope(
-            &state.actor_id,
-            &channel_id,
-            scope,
-            &state.agent_server_url,
-            active,
-            &scope_paths,
-        ),
+        env,
         template_vars,
     })
+}
+
+fn hide_runtime_environment(env: &mut BTreeMap<String, String>) {
+    let trigger_message_id = env.get("LOOM_TRIGGER_MESSAGE_ID").cloned();
+    env.retain(|key, _| !key.starts_with("LOOM_") && !key.starts_with("AGENTX_"));
+    if let Some(trigger_message_id) = trigger_message_id {
+        env.insert("RUNTIME_TRIGGER_MESSAGE_ID".into(), trigger_message_id);
+    }
 }
 
 const AGENT_PROMPT_FILE_MAX_BYTES: u64 = 128 * 1024;
@@ -5771,6 +5847,28 @@ async fn render_trigger_prompt(
     let Some(primary) = batch.last() else {
         return TriggerPromptText::default();
     };
+    if state.spec.runtime_awareness == RuntimeAwareness::Hidden {
+        let actor_names = actor_display_map_for_prompt(client, state, primary.scope()).await;
+        let delivery_context = hidden_delivery_context(client, state, primary, batch, &actor_names)
+            .await
+            .unwrap_or_else(|err| {
+                tracing::debug!(
+                    actor = %state.actor_id,
+                    trigger = %primary.id(),
+                    %err,
+                    "hidden delivery context unavailable"
+                );
+                String::new()
+            });
+        let latest_message = render_hidden_turn_input(batch);
+        let turn_input = join_prompt_sections([delivery_context.clone(), latest_message.clone()]);
+        return TriggerPromptText {
+            latest_message: latest_message.clone(),
+            delivery_context,
+            turn_input,
+            ..Default::default()
+        };
+    }
     let actor_names = actor_display_map_for_prompt(client, state, primary.scope()).await;
     let reminder = reminder_render_for_turn(&state.spec, first_turn);
     let delivery_context = delivery_cursor_context(client, state, batch, first_turn, &actor_names)
@@ -5813,6 +5911,48 @@ async fn render_trigger_prompt(
         turn_input,
         ack_source_ids: delivery_context.ack_source_ids,
     }
+}
+
+fn render_hidden_turn_input(batch: &[AgentTrigger]) -> String {
+    batch
+        .iter()
+        .map(render_prompt)
+        .filter(|message| !message.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+async fn hidden_delivery_context(
+    client: &Arc<Client>,
+    state: &Arc<WorkerState>,
+    primary: &AgentTrigger,
+    batch: &[AgentTrigger],
+    actor_names: &HashMap<String, String>,
+) -> Result<String> {
+    let Some(message) = trigger_message(primary) else {
+        return Ok(String::new());
+    };
+    let target = reply_target_for_message(message);
+    let result: MessageListResult = client
+        .call(
+            method::MESSAGE_LIST,
+            json!({
+                "target": target,
+                "limit": 30,
+            }),
+        )
+        .await
+        .with_context(|| format!("message.list target={target} for hidden context"))?;
+    let exclude_ids: HashSet<&str> = batch.iter().map(|trigger| trigger.id()).collect();
+    let budget = wake_context_token_budget(&state.spec);
+    Ok(format_hidden_visible_history(
+        &result.messages,
+        &exclude_ids,
+        &state.actor_id,
+        actor_names,
+        budget,
+        result.page_info.has_more,
+    ))
 }
 
 async fn delivery_cursor_context(
@@ -6044,6 +6184,7 @@ async fn agents_md_context_for_scope(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
     channel_id: &str,
+    _thread_id: Option<&str>,
 ) -> agent_runtime::AgentsMdContext {
     let channel = match client
         .call::<_, ChannelListResult>(method::CHANNEL_LIST, json!({}))
@@ -6063,6 +6204,7 @@ async fn agents_md_context_for_scope(
             None
         }
     };
+    let thread_instructions = None;
     let members = match client
         .call::<_, ChannelMembersResult>(
             method::CHANNEL_MEMBERS,
@@ -6100,10 +6242,15 @@ async fn agents_md_context_for_scope(
             .as_ref()
             .map(|ch| ch.title.clone())
             .unwrap_or_default(),
-        channel_topic: channel.map(|ch| ch.topic).unwrap_or_default(),
+        channel_topic: channel
+            .as_ref()
+            .map(|ch| ch.topic.clone())
+            .unwrap_or_default(),
         workspace: String::new(),
         members,
         agent_instructions: agent_instructions_text(&state.spec),
+        channel_instructions: channel.and_then(|ch| ch.instructions),
+        thread_instructions,
         wake_policy: agents_md_wake_policy(&state.spec),
     }
 }
@@ -6155,6 +6302,7 @@ async fn current_scope_skill_targets(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
     channel_id: &str,
+    thread_id: Option<&str>,
 ) -> BTreeMap<String, PathBuf> {
     let result: Result<ChannelMembersResult> = client
         .call(
@@ -6195,7 +6343,82 @@ async fn current_scope_skill_targets(
             }
         }
     }
+
+    // 2. Channel skills (from file-based registry).
+    //    Channel skills override actor bundle skills for the same id,
+    //    EXCEPT for reserved skill ids (e.g. "loom") which are always
+    //    backed by the embedded builtin skill and must not be overridden
+    //    by user-supplied registries.
+    match crate::cmd::skill_registry::read_channel_skills(&state.paths.data_root, channel_id) {
+        Ok(registry) => {
+            for entry in &registry.skills {
+                if is_reserved_skill_id(&entry.id) {
+                    tracing::warn!(
+                        actor = %state.actor_id,
+                        channel = %channel_id,
+                        skill = %entry.id,
+                        "ignoring channel skill with reserved id; reserved ids are backed by builtins"
+                    );
+                    continue;
+                }
+                targets.insert(entry.id.clone(), PathBuf::from(&entry.source));
+            }
+        }
+        Err(err) => {
+            tracing::debug!(
+                actor = %state.actor_id,
+                channel = %channel_id,
+                %err,
+                "channel skill registry unavailable"
+            );
+        }
+    }
+
+    // 3. Thread skills (only in thread scope).
+    //    Thread skills override channel skills for the same id, EXCEPT
+    //    for reserved ids (same rule as channel skills).
+    if let Some(tid) = thread_id {
+        match crate::cmd::skill_registry::read_thread_skills(
+            &state.paths.data_root,
+            channel_id,
+            tid,
+        ) {
+            Ok(registry) => {
+                for entry in &registry.skills {
+                    if is_reserved_skill_id(&entry.id) {
+                        tracing::warn!(
+                            actor = %state.actor_id,
+                            thread = %tid,
+                            skill = %entry.id,
+                            "ignoring thread skill with reserved id; reserved ids are backed by builtins"
+                        );
+                        continue;
+                    }
+                    targets.insert(entry.id.clone(), PathBuf::from(&entry.source));
+                }
+            }
+            Err(err) => {
+                tracing::debug!(
+                    actor = %state.actor_id,
+                    thread = %tid,
+                    %err,
+                    "thread skill registry unavailable"
+                );
+            }
+        }
+    }
+
     targets
+}
+
+/// Returns true if `skill_id` is a reserved skill id backed by a builtin
+/// skill snapshot and therefore must not be overridden by channel/thread
+/// skill registries. The reserved set is intentionally small and
+/// load-bearing: overriding "loom" would let a user-supplied registry
+/// shadow the official Loom skill that agents rely on for the Loom
+/// operating protocol.
+fn is_reserved_skill_id(skill_id: &str) -> bool {
+    skill_id == DEFAULT_LOOM_SKILL_ID
 }
 
 fn actor_bundle_source(agents_root: &Path, actor_id: &str) -> std::io::Result<Option<PathBuf>> {
@@ -6265,6 +6488,79 @@ fn format_recent_conversation_context(
     )
 }
 
+fn format_hidden_visible_history(
+    messages: &[Message],
+    exclude_ids: &HashSet<&str>,
+    local_actor_id: &str,
+    actor_names: &HashMap<String, String>,
+    budget: u64,
+    has_more: bool,
+) -> String {
+    let mut out = String::from(
+        "=== Visible collaboration history ===\n\
+         Prior visible messages in this bot conversation. Use them as shared context; they are history, not new work.",
+    );
+    let header = out.clone();
+    let mut rendered = Vec::new();
+    for message in messages
+        .iter()
+        .filter(|message| !exclude_ids.contains(message.id.as_str()))
+        .filter(|message| message.created_at <= Utc::now())
+        .filter(|message| {
+            message.metadata.get("kind").and_then(Value::as_str) != Some("run.started_ack")
+        })
+        .filter(|message| message_visible_to_actor_for_prompt(message, local_actor_id))
+    {
+        let body = compact_message_body(&message_body_for_prompt(message));
+        if body.is_empty() {
+            continue;
+        }
+        let visibility = message_visibility_label(message, actor_names)
+            .map(|label| format!(" [{label}]"))
+            .unwrap_or_default();
+        rendered.push(format!(
+            "- {}{}: {}",
+            actor_label(&message.author_actor_id, actor_names),
+            visibility,
+            body
+        ));
+    }
+
+    let mut selected_newest_first: Vec<String> = Vec::new();
+    let mut omitted = 0usize;
+    for line in rendered.iter().rev() {
+        let mut candidate_lines = selected_newest_first.clone();
+        candidate_lines.push(line.clone());
+        let candidate = render_hidden_history_lines(&header, &candidate_lines);
+        if usage::estimate_tokens(&candidate) > budget {
+            omitted += 1;
+            continue;
+        }
+        selected_newest_first = candidate_lines;
+    }
+
+    if selected_newest_first.is_empty() {
+        return String::new();
+    }
+    out = render_hidden_history_lines(&header, &selected_newest_first);
+    if omitted > 0 || has_more {
+        out.push_str(&format!(
+            "\nHistory gap: {} earlier messages omitted by context budget.",
+            omitted + usize::from(has_more)
+        ));
+    }
+    out
+}
+
+fn render_hidden_history_lines(header: &str, newest_first: &[String]) -> String {
+    let mut out = header.to_string();
+    for line in newest_first.iter().rev() {
+        out.push('\n');
+        out.push_str(line);
+    }
+    out
+}
+
 fn compact_message_body(body: &str) -> String {
     let compact = body.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.chars().count() <= 800 {
@@ -6277,7 +6573,8 @@ fn compact_message_body(body: &str) -> String {
 fn join_prompt_sections(sections: impl IntoIterator<Item = String>) -> String {
     sections
         .into_iter()
-        .filter(|section| !section.trim().is_empty())
+        .map(|section| section.trim().to_string())
+        .filter(|section| !section.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n")
 }
@@ -8055,7 +8352,7 @@ async fn translate_one(
             let mut effective_success = success;
             let mut effective_summary = summary;
             if effective_success
-                && turn_requires_visible_outcome(&active)
+                && runtime_requires_visible_outcome(state.spec.runtime_awareness, &active)
                 && !active.cancel_requested
                 && !turn_no_reply_requested(&active)
             {
@@ -8569,6 +8866,13 @@ fn turn_requires_visible_outcome(active: &ActiveTurn) -> bool {
         .trigger_batch
         .iter()
         .any(trigger_requires_visible_outcome)
+}
+
+fn runtime_requires_visible_outcome(
+    runtime_awareness: RuntimeAwareness,
+    active: &ActiveTurn,
+) -> bool {
+    runtime_awareness == RuntimeAwareness::Native && turn_requires_visible_outcome(active)
 }
 
 fn trigger_requires_visible_outcome(trigger: &AgentTrigger) -> bool {
@@ -9103,6 +9407,7 @@ mod tests {
                 ..Default::default()
             },
             autostart: false,
+            runtime_awareness: RuntimeAwareness::Native,
             models: None,
             bundle,
             memory: None,
@@ -9426,10 +9731,19 @@ mod tests {
             workspace: String::new(),
             members: Vec::new(),
             agent_instructions: None,
+            channel_instructions: None,
+            thread_instructions: None,
             wake_policy: agent_runtime::AgentsMdWakePolicy::default(),
         };
         let scope_paths = paths
-            .ensure_scope("actor_demo", "chan_demo", &scope, None, &agents_md_context)
+            .ensure_scope(
+                "actor_demo",
+                "chan_demo",
+                &scope,
+                None,
+                &agents_md_context,
+                RuntimeAwareness::Native,
+            )
             .expect("ensure scope");
 
         assert!(scope_paths.workspace.join("skills").is_dir());
@@ -9441,6 +9755,115 @@ mod tests {
         assert!(scope_paths.skills.exists());
 
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn hidden_runtime_awareness_removes_loom_agents_block() {
+        let root = temp_path("hidden-runtime-awareness");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        let scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: "thread_demo".into(),
+        };
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::write(workspace.join("AGENTS.md"), "# Project rules\n").expect("project rules");
+        let context = agent_runtime::AgentsMdContext {
+            actor_id: "actor_demo".into(),
+            actor_display_name: "Demo".into(),
+            channel_id: "chan_demo".into(),
+            ..Default::default()
+        };
+        paths
+            .ensure_scope(
+                "actor_demo",
+                "chan_demo",
+                &scope,
+                Some(&workspace),
+                &context,
+                RuntimeAwareness::Native,
+            )
+            .expect("native scope");
+        assert!(std::fs::read_to_string(workspace.join("AGENTS.md"))
+            .expect("native agents")
+            .contains("# Loom runtime bootstrap"));
+
+        paths
+            .ensure_scope(
+                "actor_demo",
+                "chan_demo",
+                &scope,
+                Some(&workspace),
+                &context,
+                RuntimeAwareness::Hidden,
+            )
+            .expect("hidden scope");
+
+        let agents = std::fs::read_to_string(workspace.join("AGENTS.md")).expect("project agents");
+        assert_eq!(agents, "# Project rules\n");
+        assert!(!agents.contains("Loom"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn native_runtime_awareness_is_not_serialized_by_default() {
+        let mut spec = sample_spec(None);
+        spec.runtime_awareness = RuntimeAwareness::Native;
+        let value = serde_json::to_value(&spec).expect("native spec json");
+        assert!(value.get("runtimeAwareness").is_none());
+
+        spec.runtime_awareness = RuntimeAwareness::Hidden;
+        let value = serde_json::to_value(&spec).expect("hidden spec json");
+        assert_eq!(
+            value.get("runtimeAwareness").and_then(Value::as_str),
+            Some("hidden")
+        );
+    }
+
+    #[test]
+    fn am_provider_runtime_is_hidden_without_serialized_agent_spec_field() {
+        let mut spec = sample_spec(None);
+        spec.actor.id = "am.dingbot".into();
+        spec.provider_ref.id = "am-qoder-dingbot".into();
+        spec.runtime_awareness = RuntimeAwareness::Native;
+        let value = serde_json::to_value(&spec).expect("am spec json");
+        assert!(value.get("runtimeAwareness").is_none());
+
+        let transport = test_command_transport();
+        assert!(requires_hidden_host_runtime(&spec, &transport));
+    }
+
+    #[test]
+    fn hidden_runtime_input_and_environment_do_not_expose_loom_protocol() {
+        let message = sample_message(
+            "msg-hidden",
+            ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_hidden".into(),
+            },
+            "#chan:root",
+            None,
+            Some("root"),
+        );
+        let prompt = render_hidden_turn_input(&[AgentTrigger::Message(message)]);
+        assert!(!prompt.contains("Loom turn input"));
+        assert!(!prompt.contains("loom --json"));
+
+        let mut env = BTreeMap::from([
+            ("LOOM_TRIGGER_MESSAGE_ID".into(), "msg-hidden".into()),
+            ("LOOM_REPLY_TARGET".into(), "#chan:root".into()),
+            ("AGENTX_CHANNEL_ID".into(), "chan".into()),
+            ("PATH".into(), "/safe/bin".into()),
+        ]);
+        hide_runtime_environment(&mut env);
+        assert_eq!(
+            env.get("RUNTIME_TRIGGER_MESSAGE_ID").map(String::as_str),
+            Some("msg-hidden")
+        );
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/safe/bin"));
+        assert!(!env
+            .keys()
+            .any(|key| key.starts_with("LOOM_") || key.starts_with("AGENTX_")));
     }
 
     #[cfg(unix)]
@@ -9713,6 +10136,8 @@ mod tests {
             workspace: String::new(),
             members: Vec::new(),
             agent_instructions: None,
+            channel_instructions: None,
+            thread_instructions: None,
             wake_policy: agent_runtime::AgentsMdWakePolicy::default(),
         };
 
@@ -9723,6 +10148,7 @@ mod tests {
                 &scope,
                 Some(&custom_workspace),
                 &agents_md_context,
+                RuntimeAwareness::Native,
             )
             .expect("ensure scope");
 
@@ -10776,6 +11202,14 @@ mod tests {
         let mut active = sample_active_turn("actor_agent_requester");
         active.trigger_batch = vec![AgentTrigger::Message(ask)];
         assert!(turn_requires_visible_outcome(&active));
+        assert!(runtime_requires_visible_outcome(
+            RuntimeAwareness::Native,
+            &active
+        ));
+        assert!(!runtime_requires_visible_outcome(
+            RuntimeAwareness::Hidden,
+            &active
+        ));
 
         active.trigger_batch = vec![AgentTrigger::Message(notify)];
         assert!(!turn_requires_visible_outcome(&active));
@@ -10924,6 +11358,81 @@ mod tests {
         assert!(context.contains(
             "Coordinator (@actor_agent_coordinator) [private to Recipient (@actor_agent_recipient)]: 私密说明：审批码 alpha"
         ));
+    }
+
+    #[test]
+    fn hidden_visible_history_includes_public_and_recipient_private_messages() {
+        let scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: "thread_demo".into(),
+        };
+        let mut public = sample_message(
+            "msg_public",
+            scope.clone(),
+            "#chan_demo:msg_root",
+            None,
+            None,
+        );
+        public.author_actor_id = "actor_agent_a".into();
+        public.body = "public result".into();
+        let mut private = sample_message("msg_private", scope, "#chan_demo:msg_root", None, None);
+        private.author_actor_id = "actor_agent_b".into();
+        private.body = "private result".into();
+        private
+            .metadata
+            .insert("privateTo".into(), json!(["actor_agent_c"]));
+        let mut names = HashMap::new();
+        names.insert("actor_agent_a".into(), "A".into());
+        names.insert("actor_agent_b".into(), "B".into());
+        names.insert("actor_agent_c".into(), "C".into());
+        let excludes = HashSet::from(["msg_current"]);
+
+        let context = format_hidden_visible_history(
+            &[public, private],
+            &excludes,
+            "actor_agent_c",
+            &names,
+            10_000,
+            false,
+        );
+
+        assert!(context.contains("Visible collaboration history"));
+        assert!(context.contains("A (@actor_agent_a): public result"));
+        assert!(
+            context.contains("B (@actor_agent_b) [private to C (@actor_agent_c)]: private result")
+        );
+        assert!(!context.contains("loom-message"));
+        assert!(!context.contains("message read"));
+    }
+
+    #[test]
+    fn hidden_visible_history_budget_keeps_recent_messages() {
+        let scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: "thread_demo".into(),
+        };
+        let mut old = sample_message("msg_old", scope.clone(), "#chan_demo:msg_root", None, None);
+        old.author_actor_id = "actor_agent_a".into();
+        old.body = "old context ".repeat(300);
+        let mut latest = sample_message("msg_latest", scope, "#chan_demo:msg_root", None, None);
+        latest.author_actor_id = "actor_agent_b".into();
+        latest.body = "latest handoff result".into();
+        let mut names = HashMap::new();
+        names.insert("actor_agent_a".into(), "A".into());
+        names.insert("actor_agent_b".into(), "B".into());
+
+        let context = format_hidden_visible_history(
+            &[old, latest],
+            &HashSet::new(),
+            "actor_agent_b",
+            &names,
+            120,
+            false,
+        );
+
+        assert!(context.contains("latest handoff result"));
+        assert!(!context.contains("old context"));
+        assert!(context.contains("History gap"));
     }
 
     #[test]
@@ -13459,5 +13968,79 @@ mod tests {
             "actor_engineering",
             &TaskAssignmentStatus::Running,
         ));
+    }
+
+    /// Regression for issue #4: `loom` is a reserved skill id and must
+    /// never be treated as overridable. This unit test pins the
+    /// `is_reserved_skill_id` predicate so that any future change to the
+    /// reserved set is a deliberate edit here.
+    #[test]
+    fn loom_is_reserved_skill_id_and_cannot_be_overridden() {
+        assert!(is_reserved_skill_id(DEFAULT_LOOM_SKILL_ID));
+        assert_eq!(DEFAULT_LOOM_SKILL_ID, "loom");
+        // Non-reserved ids are not flagged.
+        assert!(!is_reserved_skill_id("obsidian"));
+        assert!(!is_reserved_skill_id("pdf"));
+        assert!(!is_reserved_skill_id("my-skill"));
+        // Empty / lookalikes are not reserved (they are just invalid elsewhere).
+        assert!(!is_reserved_skill_id(""));
+        assert!(!is_reserved_skill_id("Loom"));
+        assert!(!is_reserved_skill_id("loom-v2"));
+    }
+
+    /// Regression for issue #2 (defense-in-depth): reconcile_skill_mount_dir
+    /// must NOT remove a symlink whose canonical path escapes the skills
+    /// directory. validate_path_component already blocks path traversal in
+    /// skill ids at the registry layer; this containment check guards
+    /// against a pre-existing or maliciously-placed symlink inside
+    /// skills_dir that points outside.
+    #[test]
+    fn reconcile_skill_mount_dir_skips_symlink_escaping_skills_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skills_dir = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills_dir).expect("create skills_dir");
+
+        // An outside target directory that the escaping symlink will point to.
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("create outside");
+
+        // A symlink inside skills_dir that points outside (escape).
+        let escaping_link = skills_dir.join("escape-link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &escaping_link).expect("symlink");
+        #[cfg(windows)]
+        {
+            // On Windows, creating a symlink may require elevated privileges.
+            // If it fails, skip this test rather than failing.
+            if std::os::windows::fs::symlink_dir(&outside, &escaping_link).is_err() {
+                eprintln!("skipping reconcile containment test: cannot create symlink on Windows");
+                return;
+            }
+        }
+
+        // A legitimate symlink inside skills_dir pointing to a subdir within.
+        let inner_target = skills_dir.join("legit-target");
+        std::fs::create_dir_all(&inner_target).expect("create inner target");
+        let legit_link = skills_dir.join("legit");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&inner_target, &legit_link).expect("symlink legit");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&inner_target, &legit_link)
+            .expect("symlink legit");
+
+        // reconcile with an empty desired set (no skills wanted).
+        let targets: BTreeMap<String, PathBuf> = BTreeMap::new();
+        reconcile_skill_mount_dir(&skills_dir, &targets).expect("reconcile");
+
+        // The escaping symlink must still exist (was skipped).
+        assert!(
+            escaping_link.exists(),
+            "escaping symlink should NOT have been removed"
+        );
+        // The legitimate symlink within skills_dir was removed (it is not desired).
+        assert!(
+            !legit_link.exists(),
+            "legit symlink should have been removed (not in desired set)"
+        );
     }
 }

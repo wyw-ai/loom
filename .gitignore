@@ -28,6 +28,7 @@ __pycache__/
 !/docs/windows-build-guide.md
 !/docs/ci/
 !/docs/ci/local-matrix.md
+!/docs/channel-thread-instructions.md
 data
 # Desktop GUI (apps/gui-web + Tauri build artifacts)
 /apps/gui-web/node_modules/
@@ -44,3 +45,10 @@ data
 # In-repo checkouts of official runtime content (CI checks these out here)
 /loom-guide/
 /loom-skills/
+
+# Loom runtime artifacts (not source)
+/.loom-art.txt
+/.loom-thread.txt
+
+# Understand-Anything knowledge graph output
+/.understand-anything/

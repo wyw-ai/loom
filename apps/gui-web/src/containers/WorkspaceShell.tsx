@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type {
   Channel,
   ChannelMemberConfig,
@@ -29,6 +30,7 @@ import { Sidebar } from "@/components/layout/Sidebar";
 import { ThreadPanel } from "@/components/chat/ThreadPanel";
 import { ChannelPanel } from "@/components/panels/ChannelPanels";
 import { MainContent } from "@/containers/MainContent";
+import { RemoteFilePanel } from "@/components/chat/RemoteFilePanel";
 
 export interface WorkspaceShellProps {
   // Shell state
@@ -109,8 +111,8 @@ export interface WorkspaceShellProps {
   setReplyTo: (replyTo: Message | null) => void;
   setWorkspaceForm: (form: WorkspaceFormState) => void;
   setAgentForm: (updater: AgentFormState | ((current: AgentFormState) => AgentFormState)) => void;
-  sendMessage: () => Promise<void>;
-  sendThreadMessage: () => Promise<void>;
+  sendMessage: (attachments?: import("@/lib/attachment-utils").PendingAttachment[]) => Promise<void>;
+  sendThreadMessage: (attachments?: import("@/lib/attachment-utils").PendingAttachment[]) => Promise<void>;
   sendDirectMessage: () => Promise<void>;
   startThread: (message: Message) => Promise<void>;
   toggleMessageReaction: (message: Message, emoji: string) => Promise<void>;
@@ -130,6 +132,7 @@ export interface WorkspaceShellProps {
   addAgentSkill: (machineId: string, actorId: string, source: string) => Promise<boolean>;
   removeAgent: (machineId: string, actorId: string) => Promise<void>;
   openLocalPath: (path: string) => Promise<void>;
+  setError: (error: string | null) => void;
   // Detail panel
   activeChannel: Channel | null;
   memberCandidates: Actor[];
@@ -143,6 +146,7 @@ export interface WorkspaceShellProps {
 
 export function WorkspaceShell(props: WorkspaceShellProps) {
   const p = props;
+  const [threadFilePanel, setThreadFilePanel] = useState(false);
 
   return (
     <div
@@ -301,6 +305,7 @@ export function WorkspaceShell(props: WorkspaceShellProps) {
           addAgentSkill={p.addAgentSkill}
           removeAgent={p.removeAgent}
           openLocalPath={p.openLocalPath}
+          setError={p.setError}
         />
       </main>
       {p.showChatDetail && (
@@ -329,11 +334,12 @@ export function WorkspaceShell(props: WorkspaceShellProps) {
             task={p.activeThreadTask}
             thread={p.activeThread}
             busy={p.busy}
-            className="hidden min-h-0 min-w-0 flex-col bg-white xl:flex"
+            className="flex min-h-0 min-w-0 flex-col bg-white"
             onClose={() => p.setActiveThreadId(null)}
             onSend={p.sendThreadMessage}
             onToggleReaction={p.toggleMessageReaction}
             onOpenAgentSettings={p.openAgentSettings}
+            onOpenFolder={() => setThreadFilePanel(true)}
             scopeId={p.activeThreadScope?.id}
           />
         ) : p.channelPanelTab && p.activeChannel ? (
@@ -368,6 +374,13 @@ export function WorkspaceShell(props: WorkspaceShellProps) {
         <div className="fixed bottom-4 left-1/2 z-50 -translate-x-1/2 rounded-md border border-border bg-popover px-4 py-2 text-sm shadow-soft">
           {p.notice}
         </div>
+      )}
+      {threadFilePanel && p.activeChannel && p.threadMessageTarget && (
+        <RemoteFilePanel
+          channelId={p.activeChannel.id}
+          target={p.threadMessageTarget}
+          onClose={() => setThreadFilePanel(false)}
+        />
       )}
     </div>
   );

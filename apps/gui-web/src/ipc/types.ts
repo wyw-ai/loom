@@ -257,6 +257,12 @@ export interface AgentBundleSkillSpec {
   source: string;
 }
 
+export interface SkillEntry {
+  id: string;
+  source: string;
+  addedAt: string;
+}
+
 export interface AgentBundleSpec {
   source?: string;
   version?: string;
@@ -408,7 +414,8 @@ export interface MachineDirRoot {
 export interface MachineDirEntry {
   name: string;
   path: string;
-  kind: "directory";
+  kind: "directory" | "file";
+  size?: number | null;
   modified?: string | null;
 }
 

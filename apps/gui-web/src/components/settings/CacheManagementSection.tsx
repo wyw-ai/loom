@@ -103,6 +103,7 @@ export function CacheManagementSection() {
           label="Images"
           size={breakdown?.images.size ?? null}
           count={breakdown?.images.count ?? null}
+          percent={calcPercent(breakdown?.images.size ?? null, totalSize)}
           confirming={confirming === "images"}
           clearing={clearing === "images"}
           disabled={!hasCache || (breakdown?.images.size ?? 0) === 0}
@@ -115,6 +116,7 @@ export function CacheManagementSection() {
           label="Other Files"
           size={breakdown?.other.size ?? null}
           count={breakdown?.other.count ?? null}
+          percent={calcPercent(breakdown?.other.size ?? null, totalSize)}
           confirming={confirming === "other"}
           clearing={clearing === "other"}
           disabled={!hasCache || (breakdown?.other.size ?? 0) === 0}
@@ -170,6 +172,7 @@ function CategoryRow({
   label,
   size,
   count,
+  percent,
   confirming,
   clearing,
   disabled,
@@ -181,6 +184,7 @@ function CategoryRow({
   label: string;
   size: number | null;
   count: number | null;
+  percent: number | null;
   confirming: boolean;
   clearing: boolean;
   disabled: boolean;
@@ -195,6 +199,7 @@ function CategoryRow({
         <div className="text-sm font-semibold text-[#303849]">{label}</div>
         <div className="text-xs text-[#667085]">
           {size !== null ? formatBytes(size) : "—"}
+          {percent !== null ? ` · ${percent}%` : ""}
           {count !== null && count > 0 ? ` · ${count} file${count !== 1 ? "s" : ""}` : ""}
         </div>
       </div>
@@ -232,4 +237,10 @@ function CategoryRow({
       )}
     </div>
   );
+}
+
+/** Calculate integer percentage of category size relative to total. */
+function calcPercent(size: number | null, total: number | null): number | null {
+  if (size === null || total === null || total <= 0) return null;
+  return Math.round((size / total) * 100);
 }

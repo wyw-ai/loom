@@ -131,6 +131,7 @@ fn main() {
             ipc::read_local_file_bytes,
             ipc::get_attachment_cache_breakdown,
             ipc::clear_attachment_cache_by_type,
+            ipc::open_attachment_cache_directory,
             ipc::machine_create,
             ipc::machine_start,
             ipc::machine_remove,

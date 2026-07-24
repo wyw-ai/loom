@@ -633,6 +633,12 @@
     border-color: #fecaca;
   }
 
+  .inline-image-save-error {
+    margin-top: 4px;
+    font-size: 11px;
+    color: #ef4444;
+  }
+
   .inline-image-container {
     position: relative;
     display: inline-block;

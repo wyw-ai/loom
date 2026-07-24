@@ -71,13 +71,28 @@ export function useDownloadedArtifacts() {
   }, []);
 
   /**
+   * Clear specific downloaded artifact mappings by artifact ID (localStorage).
+   * ARCH D3 design: used by CacheManagementSection after per-category cache clear.
+   */
+  const clearDownloadedByIds = useCallback((artifactIds: string[]) => {
+    if (artifactIds.length === 0) return;
+    const current = loadMap();
+    const next = { ...current };
+    for (const id of artifactIds) {
+      delete next[id];
+    }
+    saveMap(next);
+    notifyAll();
+  }, []);
+
+  /**
    * Clear all downloaded artifact mappings (localStorage).
-   * ARCH D3-r1: used by ClearCacheSection after clearing disk cache.
+   * ARCH D3-r1: used by CacheManagementSection after clearing disk cache.
    */
   const clearAllDownloaded = useCallback(() => {
     saveMap({});
     notifyAll();
   }, []);
 
-  return { isDownloaded, setDownloaded, clearDownloaded, clearAllDownloaded };
+  return { isDownloaded, setDownloaded, clearDownloaded, clearAllDownloaded, clearDownloadedByIds };
 }

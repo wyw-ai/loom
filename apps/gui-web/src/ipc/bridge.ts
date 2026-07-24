@@ -739,7 +739,7 @@ export async function downloadToCache(args: {
 
 /**
  * Clear the entire attachment cache directory (disk files).
- * ARCH D3-r1: used by ClearCacheSection in settings.
+ * ARCH D3-r1: used by CacheManagementSection in settings.
  */
 export async function clearAttachmentCache(): Promise<void> {
   await invoke("clear_attachment_cache", { args: {} });
@@ -747,10 +747,33 @@ export async function clearAttachmentCache(): Promise<void> {
 
 /**
  * Get the total size of the attachment cache directory in bytes.
- * ARCH D3-r1: used by ClearCacheSection to display size before clearing.
+ * ARCH D3-r1: used by CacheManagementSection to display size before clearing.
  */
 export async function getAttachmentCacheSize(): Promise<number> {
   return invoke<number>("get_attachment_cache_size", { args: {} });
+}
+
+/**
+ * Get cache breakdown by media type category.
+ * ARCH D3 design: returns { images: {size,count}, other: {size,count}, total }.
+ */
+export async function getAttachmentCacheBreakdown(): Promise<{
+  images: { size: number; count: number };
+  other: { size: number; count: number };
+  total: { size: number; count: number };
+}> {
+  return invoke("get_attachment_cache_breakdown", { args: {} });
+}
+
+/**
+ * Clear attachment cache by category ("images" or "other").
+ * ARCH D3 design: returns { freedBytes, clearedIds }.
+ */
+export async function clearAttachmentCacheByType(category: "images" | "other"): Promise<{
+  freedBytes: number;
+  clearedIds: string[];
+}> {
+  return invoke("clear_attachment_cache_by_type", { args: { category } });
 }
 
 /**

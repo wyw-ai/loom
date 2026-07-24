@@ -10,7 +10,6 @@ import React from "react";
 import * as ipc from "@/ipc/bridge";
 import { useAutoDownloadImage } from "@/hooks/useAutoDownloadImage";
 import type { Artifact } from "@/ipc/types";
-import { useDownloadedArtifacts } from "@/hooks/useDownloadedArtifacts";
 
 /**
  * ARCH TODO#2 Tier 1 integration tests: useAutoDownloadImage must clear
@@ -18,23 +17,32 @@ import { useDownloadedArtifacts } from "@/hooks/useDownloadedArtifacts";
  * externally deleted), but must NOT clear it when pathExists throws
  * (transient FS error - conservative).
  *
- * Uses jsdom so React effects run. The real useDownloadedArtifacts hook
- * is used (with localStorage seeded) so clearDownloaded is exercised
- * end-to-end.
+ * Issue 1 fix (PR#53 review): the previous version of this test asserted
+ * on the resulting localStorage map state, which was tautological -
+ * `setDownloaded` from the re-download reset the same id regardless of
+ * whether `clearDownloaded` ran. The fix is to mock `useDownloadedArtifacts`
+ * with a spy on `clearDownloaded` and assert the spy was called (or not)
+ * directly. This makes the test fail if the Tier 1 cleanup is removed.
+ *
+ * Uses jsdom so React effects run.
  */
 
 vi.mock("@/ipc/bridge");
 
-const STORAGE_KEY = "loom:downloaded-artifacts";
-
-function setMap(map: Record<string, string>): void {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(map));
-}
-
-function readMap(): Record<string, string> {
-  const raw = localStorage.getItem(STORAGE_KEY);
-  return raw ? (JSON.parse(raw) as Record<string, string>) : {};
-}
+// Mock useDownloadedArtifacts so clearDownloaded is a spy we can assert on.
+// `isDownloaded` returns a cached path so the cache-hit branch is taken.
+// `setDownloaded` is a no-op (we don't need localStorage writes here).
+const clearDownloadedMock = vi.fn();
+const setDownloadedMock = vi.fn();
+vi.mock("@/hooks/useDownloadedArtifacts", () => ({
+  useDownloadedArtifacts: () => ({
+    isDownloaded: () => "/cache/art-orphan/blob.png",
+    setDownloaded: setDownloadedMock,
+    clearDownloaded: clearDownloadedMock,
+    clearDownloadedByIds: () => {},
+    reconcileDownloaded: () => {},
+  }),
+}));
 
 function makeArtifact(id: string): Artifact {
   return {
@@ -51,13 +59,11 @@ function makeArtifact(id: string): Artifact {
 }
 
 /**
- * Render useAutoDownloadImage and flush effects. Returns the last state
- * plus a cleanup function.
+ * Render useAutoDownloadImage and flush effects. Returns a cleanup function.
  */
 function renderHook(artifact: Artifact | null) {
-  let state: ReturnType<typeof useAutoDownloadImage> | null = null;
   function Probe() {
-    state = useAutoDownloadImage(artifact);
+    useAutoDownloadImage(artifact);
     return null;
   }
   const container = document.createElement("div");
@@ -66,9 +72,6 @@ function renderHook(artifact: Artifact | null) {
     root.render(React.createElement(Probe));
   });
   return {
-    get state() {
-      return state!;
-    },
     unmount() {
       React.act(() => {
         root.unmount();
@@ -79,21 +82,16 @@ function renderHook(artifact: Artifact | null) {
 
 describe("useAutoDownloadImage Tier 1 orphan cleanup (ARCH TODO#2)", () => {
   beforeEach(() => {
-    localStorage.clear();
     vi.clearAllMocks();
   });
 
   afterEach(() => {
-    localStorage.clear();
     vi.restoreAllMocks();
   });
 
-  it("clears orphan localStorage mapping when pathExists returns false", async () => {
-    // Seed an orphan mapping: localStorage says the file is cached, but
-    // pathExists will report it as gone (externally deleted).
-    setMap({ "art-orphan": "/cache/art-orphan/blob.png" });
-
-    // pathExists -> false (file deleted externally)
+  it("calls clearDownloaded when pathExists returns false (orphan cleanup)", async () => {
+    // pathExists -> false (file deleted externally). This is the definitive
+    // "file missing" signal that must trigger Tier 1 cleanup.
     vi.mocked(ipc.pathExists).mockResolvedValue(false);
     // After clearing the orphan, the hook falls through to a network
     // download. Mock downloadToCache + readLocalFileBytes so the effect
@@ -111,24 +109,21 @@ describe("useAutoDownloadImage Tier 1 orphan cleanup (ARCH TODO#2)", () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
     });
 
-    // Tier 1: the orphan mapping must have been cleared and replaced
-    // with the freshly downloaded path.
-    const map = readMap();
-    expect(map["art-orphan"]).toBeDefined();
+    // Tier 1 assertion: clearDownloaded MUST have been called with the
+    // orphan artifactId. This is the direct spy assertion that fails if
+    // the Tier 1 cleanup is removed from useAutoDownloadImage.
+    expect(clearDownloadedMock).toHaveBeenCalledWith("art-orphan");
     // pathExists was called to verify the cached path.
     expect(ipc.pathExists).toHaveBeenCalledWith("/cache/art-orphan/blob.png");
-    // clearDownloaded was called (Tier 1) then setDownloaded after download.
-    // The mapping now points to the re-downloaded cache path.
-    expect(map["art-orphan"]).toBe("/cache/art-orphan/blob.png");
+    // Re-download happened (setDownloaded called after fall-through).
+    expect(setDownloadedMock).toHaveBeenCalledWith("art-orphan", "/cache/art-orphan/blob.png");
 
     result.unmount();
   });
 
-  it("does NOT clear mapping when pathExists throws (transient FS error)", async () => {
-    setMap({ "art-transient": "/cache/art-transient/blob.png" });
-
+  it("does NOT call clearDownloaded when pathExists throws (transient FS error)", async () => {
     // pathExists throws a transient FS error (permission/lock), NOT a
-    // definitive "file missing" signal.
+    // definitive "file missing" signal. Conservative: do not clear.
     vi.mocked(ipc.pathExists).mockRejectedValue(new Error("EACCES"));
     // Fall-through download still succeeds.
     vi.mocked(ipc.downloadToCache).mockResolvedValue("/cache/art-transient/blob.png");
@@ -143,59 +138,35 @@ describe("useAutoDownloadImage Tier 1 orphan cleanup (ARCH TODO#2)", () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
     });
 
-    // Conservative: the mapping must still be present (not cleared) because
-    // pathExists threw rather than returning false. The fall-through
-    // download re-set it, but the key point is clearDownloaded was NOT
-    // invoked due to the throw. We verify the mapping survived by checking
-    // it still exists (setDownloaded from the re-download would set it
-    // regardless, so we verify pathExists was called and threw).
+    // Conservative assertion: clearDownloaded MUST NOT have been called
+    // because pathExists threw (transient error), not returned false.
+    expect(clearDownloadedMock).not.toHaveBeenCalled();
+    // pathExists was called (and threw), then fall-through download ran.
     expect(ipc.pathExists).toHaveBeenCalled();
-    const map = readMap();
-    expect(map["art-transient"]).toBeDefined();
+    expect(setDownloadedMock).toHaveBeenCalledWith("art-transient", "/cache/art-transient/blob.png");
 
     result.unmount();
   });
-});
 
-/**
- * Isolate the useDownloadedArtifacts clearDownloaded call assertion.
- * This sub-describe verifies that when pathExists returns false, the
- * orphan entry is removed from localStorage before the re-download
- * sets a new path - proving Tier 1 clearDownloaded ran.
- */
-describe("useDownloadedArtifacts clearDownloaded integration", () => {
-  beforeEach(() => {
-    localStorage.clear();
-    vi.clearAllMocks();
-  });
-
-  afterEach(() => {
-    localStorage.clear();
-    vi.restoreAllMocks();
-  });
-
-  it("clearDownloaded removes a single orphan entry from localStorage", () => {
-    setMap({ a: "/cache/a", b: "/cache/b" });
-
-    let hook: ReturnType<typeof useDownloadedArtifacts> | null = null;
-    function Probe() {
-      hook = useDownloadedArtifacts();
-      return null;
-    }
-    const container = document.createElement("div");
-    const root = createRoot(container);
-    React.act(() => {
-      root.render(React.createElement(Probe));
+  it("does NOT call clearDownloaded when pathExists returns true (file exists)", async () => {
+    // pathExists -> true (file is on disk). No orphan, no cleanup needed.
+    // Clear the module-level ObjectURL cache so this test is isolated.
+    vi.mocked(ipc.pathExists).mockResolvedValue(true);
+    vi.mocked(ipc.readLocalFileBytes).mockResolvedValue({
+      bytes: [1, 2, 3],
+      truncated: false,
     });
 
-    React.act(() => {
-      hook!.clearDownloaded("a");
+    const result = renderHook(makeArtifact("art-present"));
+
+    await React.act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
     });
 
-    expect(readMap()).toEqual({ b: "/cache/b" });
+    // File exists -> no orphan cleanup needed.
+    expect(clearDownloadedMock).not.toHaveBeenCalled();
+    expect(ipc.pathExists).toHaveBeenCalledWith("/cache/art-orphan/blob.png");
 
-    React.act(() => {
-      root.unmount();
-    });
+    result.unmount();
   });
 });

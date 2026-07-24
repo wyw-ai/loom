@@ -29,7 +29,6 @@ vi.mock("@/hooks/useDownloadedArtifacts", () => ({
     isDownloaded: () => null,
     setDownloaded: () => {},
     clearDownloaded: clearDownloadedMock,
-    clearAllDownloaded: () => {},
     clearDownloadedByIds: () => {},
   }),
 }));

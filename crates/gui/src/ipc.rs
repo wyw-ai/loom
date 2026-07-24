@@ -1753,6 +1753,191 @@ pub fn read_local_file_bytes(args: ReadLocalFileBytesArgs) -> Result<Value, Stri
     serde_json::to_value(result).map_err(|e| format!("Failed to serialize result: {e}"))
 }
 
+// =========================================================================
+// Category-based cache management (ARCH D3 v2)
+//
+// Extends the flat clear/size IPC with per-mediaType breakdown so the
+// UI can show "Images: X MB (N files)" / "Other: Y MB (M files)" and
+// let the user clear just one category.
+// =========================================================================
+
+/// Classify a media type into a cache category. Only `image/*` is
+/// "images"; everything else (including a missing `.meta.json`) falls
+/// back to "other". This keeps the categorization stable and simple —
+/// new media types (video/audio) can be promoted to their own bucket
+/// later without breaking the existing two-category contract.
+fn cache_category_for_media_type(media_type: &str) -> &'static str {
+    if media_type.starts_with("image/") {
+        "images"
+    } else {
+        "other"
+    }
+}
+
+/// Read the `.meta.json` sidecar for a single artifact cache dir.
+/// Returns `None` if the file is missing or unparseable — callers
+/// treat that as the "other" category with on-disk size fallback.
+fn read_cache_meta(artifact_dir: &Path) -> Option<CachedArtifactMeta> {
+    let meta_path = artifact_dir.join(".meta.json");
+    let content = std::fs::read_to_string(&meta_path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+/// Size of a single artifact cache dir on disk (the artifact file +
+/// `.meta.json`). Walks the dir rather than trusting `meta.size` so the
+/// number reflects actual disk usage even if the meta is stale/missing.
+fn artifact_dir_size(artifact_dir: &Path) -> u64 {
+    dir_size_bytes(artifact_dir)
+}
+
+/// Per-category aggregate used by `get_attachment_cache_breakdown`.
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct CacheCategoryStats {
+    size: u64,
+    count: u64,
+}
+
+/// Core breakdown logic parameterized by cache root, so it can be unit
+/// tested with an isolated temp dir instead of the global cache root.
+fn cache_breakdown_at_root(cache_root: &Path) -> (CacheCategoryStats, CacheCategoryStats) {
+    let mut images = CacheCategoryStats::default();
+    let mut other = CacheCategoryStats::default();
+
+    if let Ok(entries) = std::fs::read_dir(cache_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let size = artifact_dir_size(&path);
+            let category = read_cache_meta(&path)
+                .map(|m| cache_category_for_media_type(&m.media_type))
+                .unwrap_or("other");
+            match category {
+                "images" => {
+                    images.size += size;
+                    images.count += 1;
+                }
+                _ => {
+                    other.size += size;
+                    other.count += 1;
+                }
+            }
+        }
+    }
+    (images, other)
+}
+
+/// E5-cache: Get a per-category breakdown of the attachment cache.
+/// Walks `<cache_root>/<artifactId>/` dirs, reads each `.meta.json` to
+/// classify by mediaType (image/* → "images", else → "other"), and
+/// sums on-disk sizes. Returns:
+/// `{ images: {size, count}, other: {size, count}, total: <bytes> }`.
+///
+/// Missing/unparseable `.meta.json` falls back to "other" (ARCH spec).
+#[tauri::command]
+pub fn get_attachment_cache_breakdown() -> Result<Value, String> {
+    let cache_root = attachment_cache_root()
+        .ok_or_else(|| "Cannot determine persistent data directory for cache".to_string())?;
+
+    let (images, other) = cache_breakdown_at_root(&cache_root);
+    let total = images.size + other.size;
+    Ok(json!({
+        "images": images,
+        "other": other,
+        "total": total,
+    }))
+}
+
+/// E6-cache: Clear a single category of the attachment cache.
+/// `category` is "images" or "other". Walks the cache dirs, classifies
+/// each by `.meta.json` mediaType, and removes only the dirs matching
+/// the requested category. Returns `{ freedBytes, clearedIds }` so the
+/// FE can batch-clear the corresponding localStorage entries.
+///
+/// Missing `.meta.json` dirs are treated as "other" (ARCH spec), so
+/// clearing "other" also reclaims orphaned/untracked cache dirs.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClearAttachmentCacheByTypeArgs {
+    pub category: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClearAttachmentCacheByTypeResult {
+    freed_bytes: u64,
+    cleared_ids: Vec<String>,
+}
+
+/// Core clear-by-type logic parameterized by cache root, so it can be
+/// unit tested with an isolated temp dir.
+fn clear_cache_by_type_at_root(
+    cache_root: &Path,
+    category: &str,
+) -> (u64, Vec<String>) {
+    let mut freed_bytes = 0u64;
+    let mut cleared_ids = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(cache_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let dir_category = read_cache_meta(&path)
+                .map(|m| cache_category_for_media_type(&m.media_type))
+                .unwrap_or("other");
+            if dir_category != category {
+                continue;
+            }
+
+            let size = artifact_dir_size(&path);
+            let artifact_id = entry.file_name().to_string_lossy().to_string();
+
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => {
+                    freed_bytes += size;
+                    cleared_ids.push(artifact_id);
+                }
+                Err(e) => {
+                    // Best-effort: log and continue rather than failing the
+                    // whole operation when one dir cannot be removed.
+                    eprintln!("Failed to remove cache dir {}: {e}", path.display());
+                }
+            }
+        }
+    }
+
+    (freed_bytes, cleared_ids)
+}
+
+#[tauri::command]
+pub fn clear_attachment_cache_by_type(
+    args: ClearAttachmentCacheByTypeArgs,
+) -> Result<Value, String> {
+    let category = match args.category.as_str() {
+        "images" | "other" => args.category.as_str(),
+        _ => {
+            return Err(format!(
+                "Invalid category '{}': expected 'images' or 'other'",
+                args.category
+            ))
+        }
+    };
+
+    let cache_root = attachment_cache_root()
+        .ok_or_else(|| "Cannot determine persistent data directory for cache".to_string())?;
+
+    let (freed_bytes, cleared_ids) = clear_cache_by_type_at_root(&cache_root, category);
+    let result = ClearAttachmentCacheByTypeResult {
+        freed_bytes,
+        cleared_ids,
+    };
+    serde_json::to_value(result).map_err(|e| format!("Failed to serialize result: {e}"))
+}
+
 #[tauri::command]
 pub async fn run_cancel(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
     state
@@ -5188,5 +5373,109 @@ mod tests {
             "expected traversal rejection, got: {err}"
         );
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    // ---------- Cache: category classification & breakdown ----------
+
+    #[test]
+    fn cache_category_classifies_image_media_types() {
+        assert_eq!(cache_category_for_media_type("image/png"), "images");
+        assert_eq!(cache_category_for_media_type("image/jpeg"), "images");
+        assert_eq!(cache_category_for_media_type("image/gif"), "images");
+        assert_eq!(cache_category_for_media_type("application/pdf"), "other");
+        assert_eq!(cache_category_for_media_type("video/mp4"), "other");
+        assert_eq!(cache_category_for_media_type(""), "other");
+    }
+
+    /// Helper: create a fake artifact cache dir with a .meta.json.
+    fn cache_make_artifact_dir(root: &Path, artifact_id: &str, media_type: &str, bytes: &[u8]) {
+        let dir = root.join(artifact_id);
+        std::fs::create_dir_all(&dir).expect("create artifact dir");
+        std::fs::write(dir.join("blob.bin"), bytes).expect("write blob");
+        let meta = CachedArtifactMeta {
+            artifact_id: artifact_id.to_string(),
+            name: format!("{artifact_id}.bin"),
+            media_type: media_type.to_string(),
+            size: bytes.len() as u64,
+            downloaded_at: "2026-07-24T00:00:00+00:00".to_string(),
+        };
+        write_cache_meta(&dir, &meta).expect("write meta");
+    }
+
+    #[test]
+    fn cache_breakdown_splits_images_and_other() {
+        // Use an isolated temp dir so the test doesn't depend on the
+        // global cache root's contents.
+        let root = std::env::temp_dir()
+            .join("loom-cache-breakdown-test")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&root).expect("create test root");
+
+        cache_make_artifact_dir(&root, "img1", "image/png", &[0u8; 100]);
+        cache_make_artifact_dir(&root, "img2", "image/jpeg", &[0u8; 50]);
+        cache_make_artifact_dir(&root, "doc1", "application/pdf", &[0u8; 200]);
+
+        let (images, other) = cache_breakdown_at_root(&root);
+        assert_eq!(images.count, 2, "two image artifacts");
+        assert_eq!(other.count, 1, "one other artifact");
+        assert!(images.size >= 150, "images size >= blob bytes");
+        assert!(other.size >= 200, "other size >= blob bytes");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cache_clear_by_type_removes_only_matching_category() {
+        let root = std::env::temp_dir()
+            .join("loom-cache-clearbytype-test")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&root).expect("create test root");
+
+        cache_make_artifact_dir(&root, "clr-img1", "image/png", &[0u8; 100]);
+        cache_make_artifact_dir(&root, "clr-img2", "image/gif", &[0u8; 80]);
+        cache_make_artifact_dir(&root, "clr-doc1", "text/plain", &[0u8; 300]);
+
+        let (freed, cleared) = clear_cache_by_type_at_root(&root, "images");
+        assert_eq!(cleared.len(), 2, "cleared 2 images");
+        assert!(freed > 0, "freed bytes > 0");
+
+        // Images removed, other preserved.
+        assert!(!root.join("clr-img1").exists(), "clr-img1 removed");
+        assert!(!root.join("clr-img2").exists(), "clr-img2 removed");
+        assert!(root.join("clr-doc1").exists(), "clr-doc1 preserved");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cache_clear_by_type_rejects_invalid_category() {
+        let args = ClearAttachmentCacheByTypeArgs {
+            category: "videos".to_string(),
+        };
+        let err = clear_attachment_cache_by_type(args).unwrap_err();
+        assert!(err.contains("Invalid category"), "expected invalid category error, got: {err}");
+    }
+
+    #[test]
+    fn cache_clear_by_type_missing_meta_falls_back_to_other() {
+        let root = std::env::temp_dir()
+            .join("loom-cache-orphan-test")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&root).expect("create test root");
+
+        // An artifact dir with no .meta.json should classify as "other".
+        let orphan = root.join("clr-orphan");
+        std::fs::create_dir_all(&orphan).expect("create orphan");
+        std::fs::write(orphan.join("blob.bin"), &[0u8; 64]).expect("write blob");
+
+        let (freed, cleared) = clear_cache_by_type_at_root(&root, "other");
+        assert!(
+            cleared.iter().any(|id| id == "clr-orphan"),
+            "orphan (no meta) should be cleared as 'other'"
+        );
+        assert!(freed > 0, "freed bytes > 0");
+        assert!(!orphan.exists(), "orphan removed");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

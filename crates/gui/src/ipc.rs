@@ -1944,6 +1944,23 @@ pub fn clear_attachment_cache_by_type(
     serde_json::to_value(result).map_err(|e| format!("Failed to serialize result: {e}"))
 }
 
+/// E7-cache: Open the attachment cache root directory in the platform
+/// file manager (Explorer/Finder/xdg-open). Creates the directory first
+/// if it doesn't exist so the user always sees a valid (possibly empty)
+/// folder rather than an error. Reuses `open_path_with_system` for
+/// three-platform compatibility (ARCH D3 v2, Founder request).
+#[tauri::command]
+pub fn open_attachment_cache_directory() -> Result<(), String> {
+    let cache_root = attachment_cache_root()
+        .ok_or_else(|| "Cannot determine persistent data directory for cache".to_string())?;
+
+    // Ensure the dir exists so the file manager opens a valid folder.
+    std::fs::create_dir_all(&cache_root)
+        .map_err(|e| format!("Failed to create cache directory: {e}"))?;
+
+    open_path_with_system(&cache_root).map_err(stringify)
+}
+
 #[tauri::command]
 pub async fn run_cancel(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
     state

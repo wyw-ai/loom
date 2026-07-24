@@ -10,7 +10,7 @@ default-members = ["crates/proto", "crates/agent-runtime", "crates/server", "cra
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-authors = ["bojun.cbj"]
+authors = ["The Loom Authors"]
 
 [workspace.dependencies]
 proto = { path = "crates/proto" }

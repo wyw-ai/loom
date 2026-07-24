@@ -13,7 +13,7 @@ agent runtime。
 
 ## 1. 当前定位
 
-`loom-apps` 是一个本地多 actor 协作工作台：
+Loom 是一个本地多 actor 协作工作台：
 
 - `Channel` 是长期协作空间。
 - `Thread` 是 channel 公共区某条 root message 下的任务分支，不支持嵌套。
@@ -82,12 +82,15 @@ GUI 和 chat CLI 是人类交互层。它们负责：
 | 数据 | 默认位置 |
 | --- | --- |
 | server journal / SQLite / artifacts | server `--data-dir` |
-| CLI config | `~/.loom-apps/cli.toml` |
+| CLI config | `~/.loom/cli.toml` |
 | machine / agent config | `~/.loom-apps/desktop.toml` |
-| actor-private runtime 状态 | `~/.agentx/agents/<actor_id>` |
-| channel-scoped workspace | `~/.agentx/channels/<channel_id>/agents/<actor_id>/workspace` |
-| channel-scoped runtime logs | `~/.agentx/channels/<channel_id>/agents/<actor_id>/logs` |
-| shared channel artifacts | `~/.agentx/channels/<channel_id>/shared/artifacts` |
+| actor-private runtime 状态 | `<agent 数据根>/agents/<actor_id>` |
+| channel-scoped workspace | `<agent 数据根>/channels/<channel_id>/agents/<actor_id>/workspace` |
+| channel-scoped runtime logs | `<agent 数据根>/channels/<channel_id>/agents/<actor_id>/logs` |
+| shared channel artifacts | `<agent 数据根>/channels/<channel_id>/shared/artifacts` |
+
+agent 数据根默认为平台数据目录下的 `loom/agents`（Linux 为
+`~/.local/share/loom/agents`），可用 `LOOM_AGENT_DATA_ROOT` 覆盖。
 
 workspace 已经按 channel 细分。ACP `session/new.cwd` 和 command subprocess cwd 都来自
 同一套 `AdapterPrompt.cwd`。

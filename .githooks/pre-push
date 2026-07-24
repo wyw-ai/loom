@@ -15,10 +15,8 @@
 #   0       matrix green, allow push
 #   non-0   block push
 #
-# Founder policy reminder: this iteration's organizational rule is "local
-# commits only, do NOT push to origin." This hook is a belt-and-braces
-# guard. It runs the local matrix on push attempts; the primary discipline
-# is still the human commitment not to push.
+# This hook is a quality gate: it runs the local CI matrix before any push
+# so broken code never leaves your machine.
 
 set -u
 
@@ -75,9 +73,8 @@ if [ $rc -ne 0 ]; then
 
 [pre-push] local matrix FAILED (exit $rc). Push blocked.
 
-Reminder: this iteration's policy is "local commits only" — pushes should be
-deliberate. To bypass once (emergency only):  LOOM_SKIP_PREPUSH=1 git push ...
-For faster iteration on subsequent attempts:  LOOM_PREPUSH_QUICK=1 git push ...
+Fix the failures first; to bypass once (emergency only):  LOOM_SKIP_PREPUSH=1 git push ...
+For faster iteration on subsequent attempts:        LOOM_PREPUSH_QUICK=1 git push ...
 
 EOF
     exit $rc

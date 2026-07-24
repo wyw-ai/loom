@@ -23,7 +23,7 @@ pub fn ensure_profile_scaffold(params: &ProfileScaffold<'_>) -> io::Result<()> {
     create_dir_all_unc(&memory_root)?;
 
     // Drop a memory/meta.json marker next to records/ so the dir layout is
-    // self-describing. Same convention as AgentX.
+    // self-describing, following the runtime's directory conventions.
     let memory_meta = memory_root
         .parent()
         .unwrap_or(&memory_root)

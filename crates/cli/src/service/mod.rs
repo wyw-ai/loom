@@ -15,13 +15,12 @@
 //!   runtime owns the connection; the plugin only gets a handle and a
 //!   shutdown signal via [`plugin::ServiceContext`].
 //! * [`host::ServiceHost`] supervises a fleet of plugin instances loaded
-//!   from `ServiceSpec` files. S1 ships with no built-in plugins — the
-//!   first one (`am`) lands in S2.
+//!   from `ServiceSpec` files; the bundled scheduler plugin is the
+//!   reference implementation.
 //!
 //! `state` is the file-ops layer for per-service private storage
 //! (`~/.local/share/loom/service-host/services/<sid>/`). Pure I/O, no WS.
 
-pub mod am;
 pub mod host;
 pub mod instance;
 pub mod plugin;

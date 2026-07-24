@@ -1799,20 +1799,26 @@ pub fn read_local_file_bytes(args: ReadLocalFileBytesArgs) -> Result<Value, Stri
     // prevents the FE from arbitrary file reads via this command.
     let cache_root = attachment_cache_root()
         .ok_or_else(|| "Cannot determine persistent data directory for cache".to_string())?;
-    // canonicalize the cache root, creating it if missing so the prefix
-    // check works even on a fresh install where no artifact has been
-    // cached yet. (A read of a non-existent file under a non-existent
-    // cache root still fails at the open() step below.)
-    let canonical_root = match std::fs::canonicalize(&cache_root) {
-        Ok(c) => c,
-        Err(_) => match std::fs::create_dir_all(&cache_root)
-            .and_then(|_| std::fs::canonicalize(&cache_root))
-        {
-            Ok(c) => c,
-            Err(e) => return Err(format!("Failed to resolve cache root: {e}")),
-        },
-    };
-    let canonical_target = std::fs::canonicalize(&path)
+    read_local_file_bytes_at_root(&cache_root, &path, args.offset, args.max_bytes)
+}
+
+/// Core read logic parameterized by cache root, so it can be unit tested
+/// with an isolated temp dir without depending on the global cache root.
+///
+/// This is a *read* path: it must not create the cache root as a side
+/// effect (AC-A1). If the cache root does not exist there is nothing to
+/// read, and we surface an explicit error instead of mutating the
+/// filesystem. Callers that need the directory created should use the
+/// download/open-cache paths which own that responsibility.
+fn read_local_file_bytes_at_root(
+    cache_root: &Path,
+    path: &Path,
+    offset: Option<u64>,
+    max_bytes: Option<u64>,
+) -> Result<Value, String> {
+    let canonical_root = std::fs::canonicalize(cache_root)
+        .map_err(|e| format!("Cache directory does not exist: {e}"))?;
+    let canonical_target = std::fs::canonicalize(path)
         .map_err(|e| format!("Failed to resolve path: {e}"))?;
     if !canonical_target.starts_with(&canonical_root) {
         return Err("Path is outside the attachment cache directory".to_string());
@@ -1821,8 +1827,8 @@ pub fn read_local_file_bytes(args: ReadLocalFileBytesArgs) -> Result<Value, Stri
     let mut file = std::fs::File::open(&canonical_target)
         .map_err(|e| format!("Failed to open cached file: {e}"))?;
 
-    let offset = args.offset.unwrap_or(0);
-    let max_bytes = args.max_bytes.unwrap_or(CACHE_CHUNK_SIZE);
+    let offset = offset.unwrap_or(0);
+    let max_bytes = max_bytes.unwrap_or(CACHE_CHUNK_SIZE);
 
     use std::io::{Read, Seek, SeekFrom};
     if offset > 0 {
@@ -5534,6 +5540,28 @@ mod tests {
             "expected traversal rejection, got: {err}"
         );
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn cache_read_local_file_bytes_errors_when_root_missing_no_mkdir() {
+        // AC-A1: the read path must NOT create the cache root as a side
+        // effect. Using the parameterized helper against an isolated temp
+        // dir that does not exist, the read must error and the dir must
+        // remain absent.
+        let root = std::env::temp_dir()
+            .join("loom-cache-read-noroot-test")
+            .join(uuid::Uuid::new_v4().to_string());
+        // root is intentionally NOT created.
+        let target = root.join("any.bin");
+        let err = read_local_file_bytes_at_root(&root, &target, None, None).unwrap_err();
+        assert!(
+            err.contains("Cache directory does not exist"),
+            "expected missing-cache-root error, got: {err}"
+        );
+        assert!(
+            !root.exists(),
+            "read_local_file_bytes must not create the cache root"
+        );
     }
 
     // ---------- Cache: category classification & breakdown ----------

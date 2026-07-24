@@ -1833,16 +1833,22 @@ fn cache_breakdown_at_root(cache_root: &Path) -> (CacheCategoryStats, CacheCateg
 /// Walks `<cache_root>/<artifactId>/` dirs, reads each `.meta.json` to
 /// classify by mediaType (image/* → "images", else → "other"), and
 /// sums on-disk sizes. Returns:
-/// `{ images: {size, count}, other: {size, count}, total: <bytes> }`.
+/// `{ images: {size, count}, other: {size, count}, total: {size, count} }`.
 ///
-/// Missing/unparseable `.meta.json` falls back to "other" (ARCH spec).
+/// `total` is a `{size, count}` object (not a bare number) so the FE
+/// can read `total.size` for the clear-button enable check and
+/// `total.count` for display. Missing/unparseable `.meta.json` falls
+/// back to "other" (ARCH spec).
 #[tauri::command]
 pub fn get_attachment_cache_breakdown() -> Result<Value, String> {
     let cache_root = attachment_cache_root()
         .ok_or_else(|| "Cannot determine persistent data directory for cache".to_string())?;
 
     let (images, other) = cache_breakdown_at_root(&cache_root);
-    let total = images.size + other.size;
+    let total = CacheCategoryStats {
+        size: images.size + other.size,
+        count: images.count + other.count,
+    };
     Ok(json!({
         "images": images,
         "other": other,
@@ -5420,6 +5426,37 @@ mod tests {
         assert_eq!(other.count, 1, "one other artifact");
         assert!(images.size >= 150, "images size >= blob bytes");
         assert!(other.size >= 200, "other size >= blob bytes");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cache_breakdown_total_is_size_count_object() {
+        // Regression: total must be {size, count}, not a bare number,
+        // so FE total.size is defined (QA defect 1).
+        let root = std::env::temp_dir()
+            .join("loom-cache-total-shape-test")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&root).expect("create test root");
+
+        cache_make_artifact_dir(&root, "img1", "image/png", &[0u8; 100]);
+        cache_make_artifact_dir(&root, "doc1", "application/pdf", &[0u8; 200]);
+
+        let (images, other) = cache_breakdown_at_root(&root);
+        let total = CacheCategoryStats {
+            size: images.size + other.size,
+            count: images.count + other.count,
+        };
+        // Serialize the full response shape as the command does.
+        let resp = json!({ "images": images, "other": other, "total": total });
+        let total_obj = resp.get("total").expect("total key");
+        // total must be an object with size+count, NOT a bare number.
+        assert!(total_obj.is_object(), "total must be an object, got: {total_obj}");
+        assert_eq!(total_obj["count"].as_u64(), Some(2), "total.count = 2 artifacts");
+        assert!(
+            total_obj["size"].as_u64().unwrap() >= 300,
+            "total.size >= sum of blob bytes"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

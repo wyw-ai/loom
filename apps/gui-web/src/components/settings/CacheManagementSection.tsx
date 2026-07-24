@@ -24,7 +24,7 @@ type ClearTarget = "images" | "other" | "all";
  * - On clear: deletes disk files + syncs localStorage (clearedIds) + clears ObjectURLs
  */
 export function CacheManagementSection() {
-  const { clearAllDownloaded, clearDownloadedByIds } = useDownloadedArtifacts();
+  const { clearDownloadedByIds } = useDownloadedArtifacts();
   const [breakdown, setBreakdown] = useState<CacheBreakdown | null>(null);
   const [loading, setLoading] = useState(false);
   const [clearing, setClearing] = useState<ClearTarget | null>(null);
@@ -54,8 +54,11 @@ export function CacheManagementSection() {
     setError(null);
     try {
       if (target === "all") {
-        await ipc.clearAttachmentCache();
-        clearAllDownloaded();
+        // AC-A6: clearAttachmentCache now returns { freedBytes, clearedIds };
+        // consume clearedIds to remove only the actually-cleared localStorage
+        // entries, matching the by-type path (symmetric contract).
+        const result = await ipc.clearAttachmentCache();
+        clearDownloadedByIds(result.clearedIds);
         clearAllObjectUrls();
       } else {
         const result = await ipc.clearAttachmentCacheByType(target);

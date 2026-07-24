@@ -740,9 +740,15 @@ export async function downloadToCache(args: {
 /**
  * Clear the entire attachment cache directory (disk files).
  * ARCH D3-r1: used by CacheManagementSection in settings.
+ * Returns `{ freedBytes, clearedIds }` (AC-A6: symmetric with
+ * clearAttachmentCacheByType) so the FE can batch-clear the
+ * corresponding localStorage entries by artifact id.
  */
-export async function clearAttachmentCache(): Promise<void> {
-  await invoke("clear_attachment_cache", { args: {} });
+export async function clearAttachmentCache(): Promise<{
+  freedBytes: number;
+  clearedIds: string[];
+}> {
+  return invoke("clear_attachment_cache", { args: {} });
 }
 
 /**

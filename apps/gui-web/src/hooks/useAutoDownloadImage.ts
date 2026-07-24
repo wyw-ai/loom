@@ -96,7 +96,7 @@ export interface AutoDownloadImageState {
  * ARCH D3-r1: uses downloadToCache (not downloadToTemp) for persistence.
  */
 export function useAutoDownloadImage(artifact: Artifact | null): AutoDownloadImageState {
-  const { isDownloaded, setDownloaded } = useDownloadedArtifacts();
+  const { isDownloaded, setDownloaded, clearDownloaded } = useDownloadedArtifacts();
   const [objectUrl, setObjectUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -152,8 +152,16 @@ export function useAutoDownloadImage(artifact: Artifact | null): AutoDownloadIma
                   const url = acquireObjectUrl(artifactId, blob);
                   return { blob, objectUrl: url };
                 }
+                // ARCH TODO#2 Tier 1: file was externally deleted (e.g. user
+                // cleared it via file manager) -> remove the orphan localStorage
+                // mapping so it stops shadowing future lookups, then fall
+                // through to a fresh network download.
+                clearDownloaded(artifactId);
               } catch {
-                // Local file read failed — fall through to network download
+                // pathExists threw (transient FS error: permission, lock, etc.)
+                // -> do NOT clear the mapping (conservative; ARCH TODO#2). The
+                // batch Tier 2 reconciliation on panel refresh will catch it
+                // if the deletion persists. Fall through to network download.
               }
             }
 

@@ -1964,19 +1964,30 @@ struct CacheCategoryStats {
 /// Typed return shape for `get_attachment_cache_breakdown` (SF-3).
 /// Replaces the previous bare `json!()` construction so the field
 /// names and types are checked at compile time.
+///
+/// `cached_ids` (ARCH TODO#2 Tier 2): the list of artifactIds that
+/// actually exist on disk (= cache dir subdirectory names). The FE
+/// reconciles its localStorage mappings against this set to remove
+/// orphan entries whose backing file was externally deleted.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CacheBreakdownResult {
     images: CacheCategoryStats,
     other: CacheCategoryStats,
     total: CacheCategoryStats,
+    cached_ids: Vec<String>,
 }
 
 /// Core breakdown logic parameterized by cache root, so it can be unit
 /// tested with an isolated temp dir instead of the global cache root.
-fn cache_breakdown_at_root(cache_root: &Path) -> (CacheCategoryStats, CacheCategoryStats) {
+///
+/// Returns `(images, other, cached_ids)` where `cached_ids` is the list
+/// of artifactIds (= subdirectory names) present on disk. ARCH TODO#2:
+/// the FE uses this set to reconcile localStorage orphan mappings.
+fn cache_breakdown_at_root(cache_root: &Path) -> (CacheCategoryStats, CacheCategoryStats, Vec<String>) {
     let mut images = CacheCategoryStats::default();
     let mut other = CacheCategoryStats::default();
+    let mut cached_ids = Vec::new();
 
     if let Ok(entries) = std::fs::read_dir(cache_root) {
         for entry in entries.flatten() {
@@ -1984,6 +1995,10 @@ fn cache_breakdown_at_root(cache_root: &Path) -> (CacheCategoryStats, CacheCateg
             if !path.is_dir() {
                 continue;
             }
+            // ARCH TODO#2: collect the artifactId (directory name) so the
+            // FE can reconcile localStorage against the on-disk cache.
+            let artifact_id = entry.file_name().to_string_lossy().to_string();
+            cached_ids.push(artifact_id);
             let size = artifact_dir_size(&path);
             let category = read_cache_meta(&path)
                 .map(|m| cache_category_for_media_type(&m.media_type))
@@ -2000,7 +2015,7 @@ fn cache_breakdown_at_root(cache_root: &Path) -> (CacheCategoryStats, CacheCateg
             }
         }
     }
-    (images, other)
+    (images, other, cached_ids)
 }
 
 /// E5-cache: Get a per-category breakdown of the attachment cache.
@@ -2018,12 +2033,12 @@ pub fn get_attachment_cache_breakdown() -> Result<Value, String> {
     let cache_root = attachment_cache_root()
         .ok_or_else(|| "Cannot determine persistent data directory for cache".to_string())?;
 
-    let (images, other) = cache_breakdown_at_root(&cache_root);
+    let (images, other, cached_ids) = cache_breakdown_at_root(&cache_root);
     let total = CacheCategoryStats {
         size: images.size + other.size,
         count: images.count + other.count,
     };
-    let result = CacheBreakdownResult { images, other, total };
+    let result = CacheBreakdownResult { images, other, total, cached_ids };
     serde_json::to_value(result).map_err(|e| format!("Failed to serialize breakdown: {e}"))
 }
 
@@ -5652,7 +5667,7 @@ mod tests {
         cache_make_artifact_dir(&root, "img2", "image/jpeg", &[0u8; 50]);
         cache_make_artifact_dir(&root, "doc1", "application/pdf", &[0u8; 200]);
 
-        let (images, other) = cache_breakdown_at_root(&root);
+        let (images, other, _cached_ids) = cache_breakdown_at_root(&root);
         assert_eq!(images.count, 2, "two image artifacts");
         assert_eq!(other.count, 1, "one other artifact");
         assert!(images.size >= 150, "images size >= blob bytes");
@@ -5673,7 +5688,7 @@ mod tests {
         cache_make_artifact_dir(&root, "img1", "image/png", &[0u8; 100]);
         cache_make_artifact_dir(&root, "doc1", "application/pdf", &[0u8; 200]);
 
-        let (images, other) = cache_breakdown_at_root(&root);
+        let (images, other, _cached_ids) = cache_breakdown_at_root(&root);
         let total = CacheCategoryStats {
             size: images.size + other.size,
             count: images.count + other.count,
@@ -5688,6 +5703,48 @@ mod tests {
             total_obj["size"].as_u64().unwrap() >= 300,
             "total.size >= sum of blob bytes"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ARCH TODO#2 Tier 2: `cache_breakdown_at_root` must return the list
+    /// of artifactIds present on disk so the FE can reconcile localStorage
+    /// orphan mappings. Verifies AC-B2.3 (localStorage only retains entries
+    /// that actually exist on disk).
+    #[test]
+    fn cache_breakdown_returns_cached_ids() {
+        let root = std::env::temp_dir()
+            .join("loom-cache-cached-ids-test")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&root).expect("create test root");
+
+        cache_make_artifact_dir(&root, "art-a", "image/png", &[0u8; 100]);
+        cache_make_artifact_dir(&root, "art-b", "image/jpeg", &[0u8; 50]);
+        cache_make_artifact_dir(&root, "art-c", "application/pdf", &[0u8; 200]);
+
+        let (_images, _other, cached_ids) = cache_breakdown_at_root(&root);
+
+        // All three artifactIds (= directory names) must be collected.
+        assert_eq!(cached_ids.len(), 3, "cached_ids must contain all 3 artifact dirs");
+        assert!(cached_ids.contains(&"art-a".to_string()), "cached_ids contains art-a");
+        assert!(cached_ids.contains(&"art-b".to_string()), "cached_ids contains art-b");
+        assert!(cached_ids.contains(&"art-c".to_string()), "cached_ids contains art-c");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ARCH TODO#2 Tier 2: an empty cache root must yield an empty
+    /// `cached_ids` vector (no spurious entries).
+    #[test]
+    fn cache_breakdown_returns_empty_cached_ids_for_empty_dir() {
+        let root = std::env::temp_dir()
+            .join("loom-cache-empty-cached-ids-test")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&root).expect("create test root");
+
+        let (_images, _other, cached_ids) = cache_breakdown_at_root(&root);
+
+        assert!(cached_ids.is_empty(), "empty cache root -> empty cached_ids");
 
         let _ = std::fs::remove_dir_all(&root);
     }

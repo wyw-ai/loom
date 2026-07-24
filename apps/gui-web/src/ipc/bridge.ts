@@ -754,11 +754,14 @@ export async function clearAttachmentCache(): Promise<{
 /**
  * Get cache breakdown by media type category.
  * ARCH D3 design: returns { images: {size,count}, other: {size,count}, total }.
+ * ARCH TODO#2 Tier 2: also returns `cachedIds` - the list of artifactIds
+ * present on disk, used to reconcile localStorage orphan mappings.
  */
 export async function getAttachmentCacheBreakdown(): Promise<{
   images: { size: number; count: number };
   other: { size: number; count: number };
   total: { size: number; count: number };
+  cachedIds: string[];
 }> {
   return invoke("get_attachment_cache_breakdown", { args: {} });
 }

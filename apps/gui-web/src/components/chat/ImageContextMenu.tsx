@@ -29,7 +29,7 @@ export function ImageContextMenu({
   artifact: Artifact;
   localPath: string | null;
   /** Called when a download-to-local completes, so parent can update state. */
-  onPathReady: (path: string) => void;
+  onPathReady?: (path: string) => void;
 }) {
   const [menuPos, setMenuPos] = useState<MenuPosition | null>(null);
   const [busy, setBusy] = useState<"open" | "save" | "reveal" | null>(null);
@@ -87,7 +87,7 @@ export function ImageContextMenu({
     }
     // Download to temp
     const path = await downloadToLocal(artifact);
-    onPathReady(path);
+    onPathReady?.(path);
     return path;
   }
 

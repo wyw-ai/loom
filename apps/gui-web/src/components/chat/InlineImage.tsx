@@ -68,7 +68,6 @@ export function InlineImage({ artifact }: { artifact: Artifact }) {
           <ImageContextMenu
             artifact={artifact}
             localPath={localPath}
-            onPathReady={() => {}}
           />
         </div>
       )}

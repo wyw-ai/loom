@@ -41,7 +41,6 @@ export function ImageLightbox({
   const [transform, setTransform] = useState<Transform>(INITIAL_TRANSFORM);
   const [dragging, setDragging] = useState(false);
   const dragStartRef = useRef<{ x: number; y: number; tx: number; ty: number } | null>(null);
-  const containerRef = useRef<HTMLDivElement | null>(null);
 
   const title = artifact.name || artifact.id;
 
@@ -125,7 +124,6 @@ export function ImageLightbox({
 
   return createPortal(
     <div
-      ref={containerRef}
       className="image-lightbox-backdrop"
       role="dialog"
       aria-modal="true"

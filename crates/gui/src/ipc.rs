@@ -1547,7 +1547,26 @@ pub async fn download_to_cache(
         .ok_or_else(|| "Cannot determine persistent data directory for cache".to_string())?;
     let artifact_dir = cache_root.join(&args.artifact_id);
 
-    // Fetch artifact metadata to determine media type and validate existence.
+    std::fs::create_dir_all(&artifact_dir)
+        .map_err(|e| format!("Failed to create cache directory: {e}"))?;
+
+    // SF-5: Cache-hit fast path BEFORE the ARTIFACT_GET network request.
+    // If the cached file and .meta.json already exist, we can read the
+    // original filename from the sidecar and return immediately — zero
+    // network round-trips. This avoids a wasteful ARTIFACT_GET call on
+    // every cache-hit (AC-P0-9 persistence + read_local_file_bytes).
+    if let Some(cached_meta) = read_cache_meta(&artifact_dir) {
+        let safe_name = sanitize_filename(&cached_meta.name);
+        let dest_path = artifact_dir.join(&safe_name);
+        if dest_path.exists() {
+            return Ok(dest_path.display().to_string());
+        }
+    }
+
+    // Cache miss — fetch artifact metadata to determine media type and
+    // validate existence. If the artifact does not exist, call_raw
+    // returns an APP_NOT_FOUND error which is propagated via
+    // map_err(stringify)?.
     let meta = state
         .client()
         .await?
@@ -1579,16 +1598,7 @@ pub async fn download_to_cache(
         .unwrap_or_else(|| artifact_name.clone());
     let safe_name = sanitize_filename(&file_name);
 
-    std::fs::create_dir_all(&artifact_dir)
-        .map_err(|e| format!("Failed to create cache directory: {e}"))?;
     let dest_path = artifact_dir.join(&safe_name);
-
-    // Cache-hit fast path: if the file and .meta.json already exist, skip
-    // the network download entirely (AC-P0-9 persistence + read_local_file_bytes).
-    let meta_path = artifact_dir.join(".meta.json");
-    if dest_path.exists() && meta_path.exists() {
-        return Ok(dest_path.display().to_string());
-    }
 
     // Atomic write (BLK-3): stream to a `.tmp` sidecar, fsync, then rename
     // to the final path. This prevents a partial/corrupt file from ever
@@ -1757,7 +1767,19 @@ pub fn read_local_file_bytes(args: ReadLocalFileBytesArgs) -> Result<Value, Stri
         .map_err(|e| format!("Failed to read cached file: {e}"))?;
     buf.truncate(read);
 
-    let truncated = read as u64 == max_bytes;
+    // SF-4: Determine truncation from actual file size rather than the
+    // `read == max_bytes` heuristic. The old heuristic caused one extra
+    // IPC round-trip when the file size was an exact multiple of
+    // `max_bytes` (the final chunk fills the buffer completely, so the
+    // FE would request the next chunk only to get 0 bytes). By checking
+    // the real file length we know definitively whether more data
+    // remains beyond the current read window.
+    let file_len = file
+        .metadata()
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let bytes_after = file_len.saturating_sub(offset + read as u64);
+    let truncated = bytes_after > 0;
     let next_offset = if truncated {
         Some(offset + read as u64)
     } else {

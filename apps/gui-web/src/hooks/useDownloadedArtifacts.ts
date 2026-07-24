@@ -86,15 +86,6 @@ export function useDownloadedArtifacts() {
   }, []);
 
   /**
-   * Clear all downloaded artifact mappings (localStorage).
-   * ARCH D3-r1: used by CacheManagementSection after clearing disk cache.
-   */
-  const clearAllDownloaded = useCallback(() => {
-    saveMap({});
-    notifyAll();
-  }, []);
-
-  /**
    * Reconcile localStorage mappings against the on-disk cache.
    * Removes entries whose artifactId is NOT in cachedIds (orphan mappings
    * where localStorage records a path but the disk file was externally
@@ -122,5 +113,5 @@ export function useDownloadedArtifacts() {
     }
   }, []);
 
-  return { isDownloaded, setDownloaded, clearDownloaded, clearAllDownloaded, clearDownloadedByIds, reconcileDownloaded };
+  return { isDownloaded, setDownloaded, clearDownloaded, clearDownloadedByIds, reconcileDownloaded };
 }

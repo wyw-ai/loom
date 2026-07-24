@@ -265,7 +265,7 @@ function CategoryRow({
 }
 
 /** Calculate integer percentage of category size relative to total. */
-function calcPercent(size: number | null, total: number | null): number | null {
+export function calcPercent(size: number | null, total: number | null): number | null {
   if (size === null || total === null || total <= 0) return null;
   return Math.round((size / total) * 100);
 }

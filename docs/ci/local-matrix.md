@@ -160,7 +160,7 @@ re-compiles the workspace from cold. Subsequent runs are incremental.
 To share the host project cache instead (faster but less isolated):
 
 ```powershell
-$env:LOOM_MATRIX_TARGET_DIR = "$env:LOCALAPPDATA\joi-apps-temp\target"
+$env:LOOM_MATRIX_TARGET_DIR = "$env:LOCALAPPDATA\loom-test\target"
 .\scripts\ci\run-matrix.ps1
 ```
 

@@ -22,10 +22,15 @@ The channel directory is a shared namespace, not a single live workspace.
 - `shared`: channel-scoped published files and artifacts
 - `attachments` / `threads/<thread-id>/context`: existing published context managed by Loom
 
+The agent data root defaults to the platform data directory —
+`~/.local/share/loom/agents` on Linux, `~/Library/Application Support/loom/agents`
+on macOS, `%APPDATA%\loom\agents` on Windows — and can be overridden with
+`LOOM_AGENT_DATA_ROOT`.
+
 Directory layout:
 
 ```text
-~/.agentx/channels/<channel-id>/
+<agent data root>/channels/<channel-id>/
   attachments/
   threads/
   shared/
@@ -45,7 +50,7 @@ Directory layout:
 Default agent `cwd` is now:
 
 ```text
-~/.agentx/channels/<channel-id>/agents/<agent-id>/workspace
+<agent data root>/channels/<channel-id>/agents/<agent-id>/workspace
 ```
 
 The cwd is not configurable in `AgentTransport`; Loom computes it from the
@@ -68,12 +73,16 @@ variables. ACP transports receive the channel workspace through
 `session/new.cwd`; the long-lived ACP process itself only gets actor-level
 environment variables.
 
-- `AGENTX_CHANNEL_ROOT`
-- `AGENTX_CHANNEL_SHARED`
-- `AGENTX_CHANNEL_SHARED_ARTIFACTS`
-- `AGENTX_AGENT_ROOT`
-- `AGENTX_AGENT_WORKSPACE`
-- `AGENTX_AGENT_LOGS`
+- `LOOM_CHANNEL_ROOT`
+- `LOOM_CHANNEL_SHARED`
+- `LOOM_CHANNEL_SHARED_ARTIFACTS`
+- `LOOM_AGENT_ROOT`
+- `LOOM_AGENT_WORKSPACE`
+- `LOOM_AGENT_LOGS`
+
+The same values are also injected under legacy `AGENTX_*` aliases
+(`AGENTX_CHANNEL_ROOT`, and so on) for backward compatibility with older
+provider manifests; new integrations should use the `LOOM_*` names.
 
 ## Sharing Model
 

@@ -379,21 +379,6 @@ enum ServiceCmd {
     /// Validate a single ServiceSpec JSON file. Exits 0 on success and
     /// non-zero with the parsing/validation error otherwise.
     Validate { path: PathBuf },
-    /// Per-message AM bridge handler. Spawned by `am listen --script
-    /// "loom service am-handler --service-id <id>"` once per DingTalk
-    /// message. Replaces the removed Python bridge.
-    AmHandler {
-        /// ServiceSpec id under --specs (defaults to ~/.config/loom/services/).
-        #[arg(long = "service-id")]
-        service_id: String,
-        /// Override the specs directory.
-        #[arg(long)]
-        specs: Option<PathBuf>,
-        /// Internal: spawned by ourselves in async_send mode. Carries
-        /// the JSON payload `{sourcePayload, triggerId, scopeKind, scopeId}`.
-        #[arg(long = "async-reply", hide = true)]
-        async_reply: Option<String>,
-    },
     /// Bump the reload-epoch marker for `service_id` so a running
     /// `loom service serve` host re-reads the ServiceSpec and respawns
     /// the supervised plugin instance(s). See design §7.1.
@@ -1900,22 +1885,6 @@ async fn async_main() -> Result<()> {
     } = &args.cmd
     {
         return cmd::service::reload(service_id.clone());
-    }
-
-    // `service am-handler` opens its own connection bound to the AM
-    // service actor; bypass the human-actor `connection/open` below
-    // (would otherwise pollute the actor table and fight the
-    // §9.4 preempt rule).
-    if let Cmd::Service {
-        sub:
-            ServiceCmd::AmHandler {
-                service_id,
-                specs,
-                async_reply,
-            },
-    } = args.cmd
-    {
-        return cmd::service::am_handler(cfg.server_url, service_id, specs, async_reply).await;
     }
 
     // `agent spec` / `agent bundle` / `service spec` are local-only —

@@ -809,7 +809,7 @@ mod tests {
             "actor_human_current".into(),
             "thread_demo".into(),
             proto::types::ScopeKind::Thread,
-            "bojun.cbj".into(),
+            "tester".into(),
         );
         app.display_for
             .insert("actor_agent_opencode".into(), "OpenCode".into());
@@ -818,7 +818,7 @@ mod tests {
         app.agent_ids.insert("actor_agent_opencode".into());
 
         app.display_for
-            .insert("actor_human_old".into(), "bojun.cbj".into());
+            .insert("actor_human_old".into(), "tester".into());
         app.actor_kinds
             .insert("actor_human_old".into(), "human".into());
 
@@ -839,7 +839,7 @@ mod tests {
             "actor_human_current".into(),
             "thread_demo".into(),
             proto::types::ScopeKind::Thread,
-            "bojun.cbj".into(),
+            "tester".into(),
         );
         // Three registered agents:
         //   alpha: member of the current private channel
@@ -915,7 +915,7 @@ mod tests {
             "actor_human_current".into(),
             "thread_demo".into(),
             proto::types::ScopeKind::Thread,
-            "bojun.cbj".into(),
+            "tester".into(),
         );
         app.agent_ids.insert("actor_agent_loner".into());
         app.display_for
@@ -1007,7 +1007,7 @@ mod tests {
             "actor_human_current".into(),
             "thread_demo".into(),
             proto::types::ScopeKind::Thread,
-            "bojun.cbj".into(),
+            "tester".into(),
         );
         app.history.push_system("system");
         app.history.bubbles.push(Bubble {

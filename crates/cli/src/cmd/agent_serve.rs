@@ -747,7 +747,7 @@ async fn upsert_machine_actor(client: &Client, host: &MachineHostSpec) -> Result
     Ok(())
 }
 
-/// Actor-level state plus channel-scoped workspaces under the AgentX root.
+/// Actor-level state plus channel-scoped workspaces under the agent data root.
 #[derive(Clone)]
 struct AgentPaths {
     profile: PathBuf,

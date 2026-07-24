@@ -1,0 +1,19 @@
+name: Feature request
+description: Suggest an idea or improvement for Loom
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the workflow or pain point you are running into.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What should Loom do? Sketches of CLI, UI, or protocol changes are welcome.
+    validations:
+      required: true

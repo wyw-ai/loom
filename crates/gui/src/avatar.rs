@@ -9,7 +9,6 @@ use crate::config::{self, HumanAccount};
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_AVATAR_BYTES: usize = 2 * 1024 * 1024;
-const WORK_AVATAR_HOST: &str = "work.alibaba-inc.com";
 
 pub async fn prefetch_account_avatar(account: &HumanAccount) -> Result<()> {
     cached_avatar_data_url(&account.avatar_url)
@@ -23,7 +22,7 @@ pub async fn cached_avatar_data_url(source: &str) -> Result<String> {
         return Ok(source.to_string());
     }
 
-    let url = normalize_work_avatar_url(source)?;
+    let url = normalize_avatar_url(source)?;
     let path = cache_path_for_url(url.as_str());
     let mime = mime_for_path(url.path());
 
@@ -43,7 +42,7 @@ pub async fn cached_avatar_data_url(source: &str) -> Result<String> {
     Ok(data_url(mime, &bytes))
 }
 
-fn normalize_work_avatar_url(source: &str) -> Result<Url> {
+fn normalize_avatar_url(source: &str) -> Result<Url> {
     let normalized = if source.starts_with("//") {
         format!("https:{source}")
     } else {
@@ -53,12 +52,6 @@ fn normalize_work_avatar_url(source: &str) -> Result<Url> {
     match url.scheme() {
         "http" | "https" => {}
         other => bail!("unsupported avatar URL scheme: {other}"),
-    }
-    if url.host_str() != Some(WORK_AVATAR_HOST) {
-        bail!("unsupported avatar URL host");
-    }
-    if !url.path().starts_with("/photo/") {
-        bail!("unsupported work avatar path");
     }
     Ok(url)
 }
@@ -139,14 +132,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalize_accepts_scheme_relative_work_avatar() {
-        let url = normalize_work_avatar_url("//work.alibaba-inc.com/photo/123.140x140.jpg")
-            .expect("normalize");
+    fn normalize_accepts_scheme_relative_avatar_url() {
+        let url = normalize_avatar_url("//example.com/photo/123.140x140.jpg").expect("normalize");
 
-        assert_eq!(
-            url.as_str(),
-            "https://work.alibaba-inc.com/photo/123.140x140.jpg"
-        );
+        assert_eq!(url.as_str(), "https://example.com/photo/123.140x140.jpg");
     }
 
     #[test]

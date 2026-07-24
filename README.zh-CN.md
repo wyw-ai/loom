@@ -14,11 +14,6 @@
 
 </div>
 
-> **[ 待补:首屏演示动图 ]** 一段 ≤30s、宽约 1600px 的 GIF/MP4,展示完整链路:
-> 人在 thread 里 @ 一个 agent → agent 在已注册的机器上运行 → 输出作为消息回流 →
-> 产出文件挂为 artifact。建议存放路径 `docs/images/readme/hero.gif`,文件就绪后
-> 把本段替换为 `![Loom 演示](docs/images/readme/hero.gif)`。
-
 Loom 是一个开源通信运行时,面向人、agent 和程序共同参与的工作流。它给每个参与者身份
 和可持久化 inbox,并把消息、任务、thread、artifact、审批和运行记录连进同一张通信图。
 
@@ -44,9 +39,6 @@ Loom 是一个开源通信运行时,面向人、agent 和程序共同参与的�
 3. agent 的输出流式回到同一条 thread,每次运行都会记在触发它的对话名下。
 4. agent 产出的文件成为挂在 thread 上的 artifact;审批和后续讨论就地完成,
    不用离开对话上下文。
-
-> **[ 待补:终端录屏 ]** 用 asciinema/GIF 展示上面这条链路:一侧 `loom chat`,
-> 一侧 agent 运行。建议存放路径 `docs/images/readme/terminal-flow.gif`。
 
 ## 架构
 
@@ -119,9 +111,6 @@ loom channel create --title general
 loom chat                           # 终端聊天界面
 ```
 
-> **[ 待补:chat TUI 截图 ]** `loom chat` 在某个频道里,带几条消息和一个打开的
-> thread。建议存放路径 `docs/images/readme/chat-tui.png`。
-
 `loom` CLI 覆盖完整功能面:`channel`、`thread`、`message`、`task`、`run`、`inbox`、
 `artifact`、`memory`、`reminder`、`agent`、`provider`、`service`、`machine`、`group`
 等。所有命令都支持 `--json` 便于脚本化;完整命令树见 `loom --help`。
@@ -163,9 +152,6 @@ Manifest 示例见 [`examples/providers`](examples/providers/README.md) 和
 make gui-deps
 make gui-dev
 ```
-
-> **[ 待补:桌面应用截图 ]** Loom Desktop 主界面:频道列表、消息流和 thread 面板。
-> 建议存放路径 `docs/images/readme/desktop-main.png`。
 
 ## 项目状态
 
@@ -373,4 +359,5 @@ git push origin v0.1.0
 
 ## 许可证
 
-Loom 使用 [Apache License 2.0](LICENSE) 开源协议。
+版权所有 2026 The Loom Authors。Loom 使用 [Apache License 2.0](LICENSE)
+开源协议，归属说明见 [NOTICE](NOTICE)。

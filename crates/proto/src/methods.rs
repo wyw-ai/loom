@@ -3429,9 +3429,9 @@ mod service_spec_tests {
 
     fn service_actor() -> Actor {
         Actor {
-            id: "svc_am_bridge".into(),
+            id: "svc_webhook_bridge".into(),
             kind: ActorKind::Service,
-            display_name: "DingTalk QA Bridge".into(),
+            display_name: "Webhook Bridge".into(),
             capabilities: None,
             _meta: None,
         }
@@ -3439,8 +3439,8 @@ mod service_spec_tests {
 
     fn base_spec() -> ServiceSpec {
         ServiceSpec {
-            id: "am_dingtalk_qa".into(),
-            kind: "am".into(),
+            id: "webhook_bridge".into(),
+            kind: "webhook".into(),
             actor: service_actor(),
             autostart: true,
             channel_id: Some("chan_x".into()),
@@ -3499,37 +3499,35 @@ mod service_spec_tests {
         assert_eq!(
             spec.validate(),
             Err(ServiceSpecError::EmptyKind {
-                spec_id: "am_dingtalk_qa".into()
+                spec_id: "webhook_bridge".into()
             })
         );
     }
 
     #[test]
-    fn round_trips_through_section_6_1_example() {
-        // The doc's §6.1 am example must deserialize cleanly. If this test
-        // breaks the doc and the type are out of sync — fix one or the other,
-        // not the test.
+    fn round_trips_through_full_example() {
+        // A fully-populated ServiceSpec must deserialize cleanly and keep
+        // the opaque plugin config intact.
         let raw = json!({
-            "id": "am_dingtalk_qa",
-            "kind": "am",
+            "id": "webhook_bridge",
+            "kind": "webhook",
             "actor": {
-                "id": "svc_am_bridge",
+                "id": "svc_webhook_bridge",
                 "kind": "service",
-                "displayName": "DingTalk QA Bridge"
+                "displayName": "Webhook Bridge"
             },
             "channelId": "chan_x",
             "targetAgent": "actor_qa",
             "config": {
-                "amBin": "am",
-                "topic": "/v1.0/im/bot/messages/get",
+                "endpoint": "https://example.com/hook",
                 "scope": "auto_thread",
                 "replyMode": "async_send"
             }
         });
         let spec: ServiceSpec = serde_json::from_value(raw.clone()).expect("deserialize");
         spec.validate().expect("valid");
-        assert_eq!(spec.id, "am_dingtalk_qa");
-        assert_eq!(spec.kind, "am");
+        assert_eq!(spec.id, "webhook_bridge");
+        assert_eq!(spec.kind, "webhook");
         assert!(spec.autostart, "autostart defaults to true when absent");
         assert_eq!(spec.config["scope"], "auto_thread");
         assert_eq!(spec.config["replyMode"], "async_send");

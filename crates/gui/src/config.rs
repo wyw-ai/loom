@@ -27,7 +27,7 @@
 //! name = "Local"
 //! server_url = "ws://127.0.0.1:7878/rpc"
 //! actor_id = "actor_human_<staff_id>"
-//! display_name = "bojun"
+//! display_name = "tester"
 //! ```
 //!
 //! We deliberately keep this file separate from the TUI's `cli.toml`. The
@@ -36,7 +36,7 @@
 //! On first launch we migrate the TUI's `cli.toml` into a starter workspace
 //! named "Local" so the operator doesn't face an empty picker.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -110,7 +110,6 @@ fn legacy_cli_config_path() -> PathBuf {
 }
 
 pub fn load_or_init() -> Result<DesktopConfig> {
-    migrate_legacy_configs();
     let path = desktop_config_path();
     if let Ok(text) = std::fs::read_to_string(&path) {
         if let Ok(cfg) = toml::from_str::<DesktopConfig>(&text) {
@@ -138,41 +137,6 @@ pub fn save(cfg: &DesktopConfig) -> Result<()> {
     let text = toml::to_string_pretty(cfg)?;
     std::fs::write(desktop_config_path(), text)?;
     Ok(())
-}
-
-fn migrate_legacy_configs() {
-    let new_root = config_dir();
-    for legacy_root in legacy_config_dirs() {
-        copy_legacy_file(&legacy_root, &new_root, "cli.toml");
-        copy_legacy_file(&legacy_root, &new_root, "desktop.toml");
-    }
-}
-
-fn legacy_config_dirs() -> Vec<PathBuf> {
-    let new_root = config_dir();
-    let mut roots = Vec::new();
-    if let Some(home) = dirs::home_dir() {
-        roots.push(home.join(".joi-apps"));
-    }
-    if let Some(config) = dirs::config_dir() {
-        roots.push(config.join("joi-apps"));
-    }
-    roots.retain(|dir| dir != &new_root);
-    roots.sort();
-    roots.dedup();
-    roots
-}
-
-fn copy_legacy_file(legacy_root: &Path, new_root: &Path, file_name: &str) {
-    let source = legacy_root.join(file_name);
-    let dest = new_root.join(file_name);
-    if dest.exists() || !source.is_file() {
-        return;
-    }
-    if let Some(parent) = dest.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::copy(source, dest);
 }
 
 fn has_legacy_desktop_machine_state(text: &str) -> bool {
@@ -495,8 +459,8 @@ mod tests {
     fn normalize_local_human_account_preserves_custom_actor_id() {
         let account = normalize_human_account(HumanAccount {
             provider: "local".into(),
-            staff_id: "canfeng".into(),
-            nickname: "Canfeng".into(),
+            staff_id: "tester".into(),
+            nickname: "Tester".into(),
             real_name: String::new(),
             email: String::new(),
             actor_id: "actor_human_custom:01".into(),
@@ -675,7 +639,7 @@ display_name = "Local"
 id = "machine_legacy"
 name = "Legacy"
 kind = "local"
-data_root = "~/.agentx"
+data_root = "~/.loom"
 "#;
         let cfg: DesktopConfig = toml::from_str(text).expect("parse legacy desktop config");
 

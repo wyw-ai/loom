@@ -6,8 +6,8 @@
 //! [`ServiceContext`] — the handle the host passes to `run`.
 //!
 //! Designed thin on purpose. Plugins own their own loops (cron tick for
-//! scheduler, `am listen` subprocess for am, etc.); the runtime exists
-//! to give them protocol primitives. Anything plugin-specific (DingTalk
+//! scheduler, webhook listener subprocesses, etc.); the runtime exists
+//! to give them protocol primitives. Anything plugin-specific (message
 //! send-back, cron parsing, HTTP fetching) stays inside the plugin —
 //! see §8.7's API-surface validation conclusion.
 

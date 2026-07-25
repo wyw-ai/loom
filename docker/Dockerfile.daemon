@@ -1,0 +1,56 @@
+# loom-daemon image: runtime host that discovers and runs agent CLIs.
+#
+# Loom binaries come from the release installer (same as Dockerfile.server);
+# agent CLIs are installed via the contract scripts in docker/agents/.
+#
+# Build args:
+#   LOOM_VERSION   release tag to install (default: latest)
+#   LOOM_REPO      GitHub repo to download from (default: wyw-ai/loom)
+#   LOOM_TARGET    runtime package target triple (default: auto-detected musl)
+#   AGENTS         agents to bake into the image (default: all npm/script
+#                  installable built-ins). The runtime AGENTS env var then
+#                  decides which of them the entrypoint enables/validates.
+FROM node:22-alpine
+
+ARG LOOM_VERSION=latest
+ARG LOOM_REPO=wyw-ai/loom
+ARG LOOM_TARGET=""
+ARG AGENTS="claude codex copilot opencode kimi qoder"
+
+RUN apk add --no-cache bash curl ca-certificates
+
+# Install loom + loom-daemon from the release installer.
+RUN target="$LOOM_TARGET"; \
+    if [ -z "$target" ]; then \
+      case "$(uname -m)" in \
+        x86_64)  target="x86_64-unknown-linux-musl" ;; \
+        aarch64) target="aarch64-unknown-linux-musl" ;; \
+        *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;; \
+      esac; \
+    fi; \
+    if [ "$LOOM_VERSION" = "latest" ]; then \
+      url="https://github.com/${LOOM_REPO}/releases/latest/download/install.sh"; \
+    else \
+      url="https://github.com/${LOOM_REPO}/releases/download/${LOOM_VERSION}/install.sh"; \
+    fi; \
+    echo "installing loom + loom-daemon ($target) from $url"; \
+    curl -fsSL "$url" | sh -s -- \
+      --target "$target" \
+      --module loom \
+      --module loom-daemon \
+      --bin-dir /usr/local/bin
+
+COPY docker/agents /opt/loom/agents
+COPY docker/install-agents.sh /usr/local/bin/loom-install-agents
+COPY docker/entrypoint-daemon.sh /usr/local/bin/loom-daemon-entrypoint
+RUN chmod 0755 /usr/local/bin/loom-install-agents /usr/local/bin/loom-daemon-entrypoint
+
+# Bake the requested agents (versions pinnable via e.g. CLAUDE_CODE_VERSION).
+RUN set -- $(printf '%s' "$AGENTS" | tr ',' ' ') && loom-install-agents "$@"
+
+ENV LOOM_SERVER="ws://server:7878/rpc" \
+    LOOM_MACHINE_NAME="docker" \
+    LOOM_DATA_ROOT="/data"
+VOLUME ["/data"]
+
+ENTRYPOINT ["loom-daemon-entrypoint"]

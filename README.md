@@ -93,19 +93,35 @@ the daemon, and also live outside `loom-server`.
 
 ## Quick Start
 
-The current supported path is building from source. You need a stable Rust
-toolchain (see `rust-toolchain.toml`); building the desktop app additionally
-requires Node.js and pnpm. Prebuilt packages will be published on the
-[Releases](https://github.com/wyw-ai/loom/releases) page starting with the
-first tagged release.
+**Install the Loom runtime** — you get `loom` (CLI + chat TUI), `loom-server`,
+and `loom-daemon`:
+
+macOS / Linux:
 
 ```bash
-make build
-export PATH="$PWD/target/debug:$PATH"
+curl -fsSL https://github.com/wyw-ai/loom/releases/latest/download/install.sh | sh
 ```
 
-> On Windows, build with `cargo` directly — see
-> [docs/windows-build-guide.md](docs/windows-build-guide.md).
+Windows (PowerShell):
+
+```powershell
+iwr -useb https://raw.githubusercontent.com/wyw-ai/loom/main/scripts/install.ps1 | iex
+```
+
+Both installers fetch the latest release, verify the SHA-256 checksum, and
+install into `~/.local/bin` (macOS/Linux) or `%LOCALAPPDATA%\Programs\Loom\bin`
+(Windows). To pick a specific platform or the desktop app, download directly
+from [Releases](https://github.com/wyw-ai/loom/releases):
+
+| Platform | Package |
+| --- | --- |
+| macOS (universal) | `loom-runtime-*-universal-apple-darwin.tar.gz` |
+| Linux x86_64 | `loom-runtime-*-x86_64-unknown-linux-gnu.tar.gz` (`-musl` for static) |
+| Linux arm64 | `loom-runtime-*-aarch64-unknown-linux-musl.tar.gz` |
+| Windows x86_64 | `loom-runtime-*-x86_64-pc-windows-msvc.zip` |
+| Loom Desktop, macOS (Apple Silicon) | `loom-gui-*-aarch64-apple-darwin.dmg` |
+
+Building from source instead? See [Development](#development).
 
 **1. Start the local server.** It serves JSON-RPC over WebSocket and keeps a
 local SQLite journal; no external services are needed.
@@ -219,6 +235,17 @@ The important boundary is simple:
 - [Agent and provider examples](examples/agents/README.md)
 
 ## Development
+
+Build from source (stable Rust toolchain, see `rust-toolchain.toml`; the
+desktop app additionally requires Node.js and pnpm):
+
+```bash
+make build
+export PATH="$PWD/target/debug:$PATH"
+```
+
+> On Windows, build with `cargo` directly — see
+> [docs/windows-build-guide.md](docs/windows-build-guide.md).
 
 Common checks:
 

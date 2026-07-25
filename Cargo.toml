@@ -32,7 +32,7 @@ clap = { version = "4", features = ["derive", "env"] }
 chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
 hex = "0.4"
-axum = { version = "0.7", features = ["ws"] }
+axum = { version = "0.8", features = ["ws"] }
 tower = "0.4"
 futures-util = "0.3"
 tokio-tungstenite = { version = "0.21", features = ["connect", "rustls-tls-native-roots"] }

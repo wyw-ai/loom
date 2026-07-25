@@ -1358,8 +1358,52 @@ pub async fn agent_update(
         command["bundleSkills"] = bundle_skills;
     }
     let output = run_remote_machine_command(&state, &cfg, &target_machine_id, command).await?;
-    agent_info_from_machine_command_output(output)
-        .ok_or_else(|| format!("updated agent not returned by daemon: {}", args.actor_id))
+    let info = agent_info_from_machine_command_output(output)
+        .ok_or_else(|| format!("updated agent not returned by daemon: {}", args.actor_id))?;
+    if let Some(client) = state.try_client().await {
+        sync_agent_actor_on_server(&client, &info.spec.actor).await;
+    }
+    Ok(info)
+}
+
+/// The daemon only rewrites the on-disk spec; the agent worker re-upserts the
+/// actor row (with `_meta.avatarUrl` etc.) only on restart, and `_meta`-only
+/// changes never trigger a restart. Push the updated actor to the server here
+/// so avatar changes show up without waiting for a worker restart.
+async fn sync_agent_actor_on_server(client: &Arc<Client>, updated: &proto::types::Actor) {
+    let mut actor = updated.clone();
+    if let Ok(value) = client.call_raw(method::ACTOR_LIST, None).await {
+        let existing_meta = value
+            .get("actors")
+            .and_then(Value::as_array)
+            .and_then(|rows| {
+                rows.iter().find(|row| {
+                    row.get("id").and_then(Value::as_str) == Some(actor.id.as_str())
+                })
+            })
+            .and_then(|row| row.get("_meta"))
+            .and_then(Value::as_object)
+            .cloned();
+        if let Some(existing_meta) = existing_meta {
+            let meta = actor._meta.get_or_insert_with(Default::default);
+            for key in ["machineId", "workspaceId", "ownerActorId"] {
+                if !meta.contains_key(key) {
+                    if let Some(value) = existing_meta.get(key) {
+                        meta.insert(key.to_string(), value.clone());
+                    }
+                }
+            }
+        }
+    }
+    if let Err(err) = client
+        .call_raw(method::ACTOR_UPSERT, Some(json!({ "actor": actor })))
+        .await
+    {
+        eprintln!(
+            "loom-gui: failed to sync actor {} after agent update: {err:#}",
+            actor.id
+        );
+    }
 }
 
 #[derive(Deserialize)]

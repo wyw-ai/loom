@@ -510,12 +510,19 @@ fn write_config_agent_spec(spec: &AgentSpec) -> Result<PathBuf> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create agent spec dir {}", parent.display()))?;
     }
-    // Strip _meta before writing to disk — _meta is runtime-injected daemon
-    // metadata (machineId, workspaceId, etc.) and should not be persisted to
-    // spec.json. Otherwise fingerprint mismatches on reload trigger an infinite
-    // restart loop.
+    // Strip only the runtime-injected daemon metadata (machineId, workspaceId,
+    // ownerActorId) before writing to disk — those are re-injected by
+    // annotate_machine_agent_specs() on every load and would cause fingerprint
+    // drift. User-configured _meta (avatarUrl, description, ...) must persist.
     let mut clean_spec = spec.clone();
-    clean_spec.actor._meta = None;
+    if let Some(meta) = clean_spec.actor._meta.as_mut() {
+        for key in ["machineId", "workspaceId", "ownerActorId"] {
+            meta.remove(key);
+        }
+        if meta.is_empty() {
+            clean_spec.actor._meta = None;
+        }
+    }
     let text = serde_json::to_string_pretty(&clean_spec)?;
     atomic_write(&path, &text).with_context(|| format!("write {}", path.display()))?;
     Ok(path)

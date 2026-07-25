@@ -395,9 +395,8 @@ impl ServiceRuntime {
 
     /// Create a fresh thread under `channel_id`, rooted at a channel message.
     /// Returns the new thread row. The "or-get" half of §6.3's
-    /// `create_or_get_thread` lives in plugin-specific thread-map state
-    /// (e.g., `service::am::scope`) — the runtime exposes only the
-    /// stateless server-side primitive.
+    /// `create_or_get_thread` lives in plugin-specific thread-map state —
+    /// the runtime exposes only the stateless server-side primitive.
     pub async fn create_thread(
         &self,
         channel_id: &str,

@@ -1,0 +1,27 @@
+name: Bug report
+description: Report a reproducible problem with Loom
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect to happen, and what actually happened?
+      placeholder: Steps to reproduce, expected behavior, actual behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Loom version or commit, how you installed/built it, and any agent CLIs involved.
+      placeholder: e.g. Windows 11, loom built from source at v0.1.0, Claude Code
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or output
+      description: Terminal output or log excerpts. Please redact private information.
+      render: text

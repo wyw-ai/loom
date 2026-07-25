@@ -605,13 +605,13 @@ mod tests {
 
     #[test]
     fn parse_mounts_from_clone_manifest() {
-        let body = r#"{"repos":[{"repo_id":"aone/loom-apps"},{"repo_id":"aone/other","to":"repos/custom","readonly":true}]}"#;
+        let body = r#"{"repos":[{"repo_id":"example/loom-apps"},{"repo_id":"example/other","to":"repos/custom","readonly":true}]}"#;
         let mounts = parse_bootstrap_mounts(body).expect("parse");
         assert_eq!(mounts.len(), 2);
-        assert_eq!(mounts[0]["name"], "target-repo:aone/loom-apps");
+        assert_eq!(mounts[0]["name"], "target-repo:example/loom-apps");
         assert_eq!(
             mounts[0]["from"],
-            "service://repo-cache/cache/aone%2Floom-apps"
+            "service://repo-cache/cache/example%2Floom-apps"
         );
         assert_eq!(mounts[0]["to"], "repos/loom-apps");
         assert_eq!(mounts[0]["readonly"], false);

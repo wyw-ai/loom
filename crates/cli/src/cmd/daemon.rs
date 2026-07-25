@@ -2763,7 +2763,7 @@ fn machine_connection_actor_id(machine: &MachineConfig) -> String {
 // TODO(legacy): "~/.agentx" is the old product name's data root. Should be
 // migrated to dirs::data_dir()/loom/agents in a future breaking-change task.
 fn default_agent_data_root_expr() -> String {
-    "~/.agentx".into()
+    "~/.loom/agents".into()
 }
 
 fn expand_home(value: &str) -> PathBuf {
@@ -2837,18 +2837,18 @@ mod tests {
             server_url: "ws://127.0.0.1:7878/rpc".into(),
             machine: Some(MachineConfig {
                 workspace_id: Some("ws_main".into()),
-                owner_actor_id: Some("actor_human_88084".into()),
+                owner_actor_id: Some("actor_human_test".into()),
                 id: "machine_2eabfd47".into(),
-                name: "CanfengMac".into(),
+                name: "TesterMac".into(),
                 kind: default_machine_kind(),
-                data_root: "~/.agentx/machines/ws_main/actor_human_88084/canfengmac".into(),
+                data_root: "~/.loom/machines/ws_main/actor_human_test/testermac".into(),
             }),
         };
 
         let text = toml::to_string_pretty(&cfg).expect("serialize daemon config");
         assert!(text.contains("serverUrl = \"ws://127.0.0.1:7878/rpc\""));
         assert!(text.contains("[machine]"));
-        assert!(text.contains("name = \"CanfengMac\""));
+        assert!(text.contains("name = \"TesterMac\""));
         assert!(!text.contains("[[workspaces]]"));
         assert!(!text.contains("[account]"));
 
@@ -2877,21 +2877,21 @@ mod tests {
     #[test]
     fn select_machine_for_daemon_initializes_daemon_config_from_args() {
         let mut cfg = DaemonConfig::default();
-        let data_root = PathBuf::from("/tmp/.agentx/machines/ws_main/actor_human_88084/canfengmac");
+        let data_root = PathBuf::from("/tmp/.loom/machines/ws_main/actor_human_test/testermac");
 
         let (machine, changed) = select_machine_for_daemon(
             &mut cfg,
             Some("machine_2eabfd47"),
-            Some("CanfengMac"),
+            Some("TesterMac"),
             Some(&data_root),
         )
         .expect("select daemon machine");
 
         assert!(changed);
         assert_eq!(machine.id, "machine_2eabfd47");
-        assert_eq!(machine.name, "CanfengMac");
+        assert_eq!(machine.name, "TesterMac");
         assert_eq!(machine.workspace_id.as_deref(), Some("ws_main"));
-        assert_eq!(machine.owner_actor_id.as_deref(), Some("actor_human_88084"));
+        assert_eq!(machine.owner_actor_id.as_deref(), Some("actor_human_test"));
         assert_eq!(
             cfg.machine.as_ref().map(|machine| machine.id.as_str()),
             Some("machine_2eabfd47")
@@ -2933,14 +2933,14 @@ mod tests {
             prompt_assembly: None,
             prompt_template: None,
         }];
-        let machine = machine("machine_2eabfd47", Some("actor_human_88084"));
+        let machine = machine("machine_2eabfd47", Some("actor_human_test"));
 
         annotate_machine_agent_specs(&mut specs, &machine);
 
         let meta = specs[0].actor._meta.as_ref().expect("agent meta");
         assert_eq!(meta["machineId"], json!("machine_2eabfd47"));
         assert_eq!(meta["workspaceId"], json!("ws_main"));
-        assert_eq!(meta["ownerActorId"], json!("actor_human_88084"));
+        assert_eq!(meta["ownerActorId"], json!("actor_human_test"));
         assert_eq!(meta["providerId"], json!("codex"));
     }
 
@@ -3218,7 +3218,7 @@ mod tests {
 
     #[test]
     fn machine_inventory_meta_publishes_agent_specs_not_legacy_agents() {
-        let machine = machine("machine_2eabfd47", Some("actor_human_88084"));
+        let machine = machine("machine_2eabfd47", Some("actor_human_test"));
         let mut spec = AgentSpec {
             actor: Actor {
                 id: "actor_agent_legacy".into(),

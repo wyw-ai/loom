@@ -430,7 +430,7 @@ spec 增加 `onHumanMessageWhileBusy: queue | cancel_and_requeue | inject`：
 
 分支 `optimize-agent-runtime-awareness`，改动文件：
 `crates/proto/src/methods.rs`、`crates/cli/src/cmd/agent_serve.rs`、
-`crates/cli/src/cmd/daemon.rs`、`docs/ISSUES.md`（#7）。
+`crates/cli/src/cmd/daemon.rs`。
 测试：loom-cli 391/391、loom-server 123/123、proto 19/19 通过；
 agent-runtime 有 4 个预先存在的 Windows 环境失败（测试依赖 `/bin/sh`，与本次改动无关）。
 
@@ -558,5 +558,4 @@ delivery；`run.open` metadata 带 `coalescedSourceIds`。批量渲染
   契约（6.2 合并与 6.5 intent 显式化可显著降低其对模型自觉性的依赖）。
 - `docs/protocol/open-multi-actor-collaboration-protocol-v0.md` — Delivery /
   Receipt / Turn 模型（6.3 的事实基础）。
-- `docs/ISSUES.md` #5 — instructions 注入膨胀的历史修复（本文 5.2 是其
-  turn 级别的延续问题）。
+- 历史问题：instructions 注入膨胀的修复（本文 5.2 是其 turn 级别的延续问题）。

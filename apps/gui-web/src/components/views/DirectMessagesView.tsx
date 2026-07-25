@@ -22,6 +22,7 @@ export function DirectMessagesView({
   machines,
   runs,
   messages,
+  anchorMessageId,
   selectedAgent,
   setDraft,
   onOpenLinkedChannel,
@@ -41,6 +42,7 @@ export function DirectMessagesView({
   machines: MachineInfo[];
   runs: Record<string, Run>;
   messages: Message[];
+  anchorMessageId?: string | null;
   selectedAgent: Actor | null;
   setDraft: (value: string) => void;
   onOpenLinkedChannel: (channelId: string) => void;
@@ -157,6 +159,7 @@ export function DirectMessagesView({
               onOpenAgentSettings={onOpenAgentSettings}
               currentActorId={currentActorId}
               busy={busy}
+              anchorMessageId={anchorMessageId}
             />
             <Composer
               draft={draft}

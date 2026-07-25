@@ -768,6 +768,26 @@ pub async fn message_list(state: State<'_, AppState>, params: Value) -> Result<V
 }
 
 #[tauri::command]
+pub async fn message_search(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::MESSAGE_SEARCH, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn message_context(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::MESSAGE_CONTEXT, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
 pub async fn message_send(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
     let cfg = config::load_or_init().map_err(stringify)?;
     let client = state.client().await?;
@@ -2157,6 +2177,26 @@ pub async fn run_cancel(state: State<'_, AppState>, params: Value) -> Result<Val
         .client()
         .await?
         .call_raw(method::RUN_CANCEL, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn run_list(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::RUN_LIST, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn run_get(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::RUN_GET, Some(params))
         .await
         .map_err(stringify)
 }

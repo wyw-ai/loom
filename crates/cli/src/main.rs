@@ -1286,6 +1286,31 @@ enum RunCmd {
         #[arg(long, default_value = "completed")]
         status: String,
     },
+    /// List runs visible to the current actor.
+    List {
+        /// Filter by canonical run status; repeatable.
+        #[arg(long)]
+        status: Vec<String>,
+        /// Filter by the run's actor id.
+        #[arg(long = "actor")]
+        filter_actor: Option<String>,
+        /// Filter by message-style target scope (#channel or #channel:rootMessageId).
+        #[arg(long)]
+        target: Option<String>,
+    },
+    /// Show a single run.
+    Get { run_id: String },
+    /// Watch a run: print the current state, then every run.updated until terminal.
+    Watch { run_id: String },
+    /// Stop a run via run.cancel.
+    Cancel {
+        run_id: String,
+        #[arg(long)]
+        reason: Option<String>,
+        /// Skip the interactive confirmation (required for non-interactive use).
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -2153,11 +2178,14 @@ async fn async_main() -> Result<()> {
         return cmd::mcp_announcement::run(actor_id.clone(), server.clone()).await;
     }
 
-    let client = connect_client(&cfg.server_url, explicit_server_arg_present()).await?;
-    client.initialize().await?;
-    let _ = client
-        .open_connection(&cfg.actor_id, Some(&cfg.display_name))
-        .await?;
+    let explicit_server_arg = explicit_server_arg_present();
+    let client = connect_bound_client(
+        &cfg.server_url,
+        explicit_server_arg,
+        &cfg.actor_id,
+        &cfg.display_name,
+    )
+    .await?;
 
     match args.cmd {
         Cmd::Who => unreachable!(),
@@ -2747,6 +2775,37 @@ async fn async_main() -> Result<()> {
             } => cmd::run::append(client, run_id, status, frame_kind, payload_json).await?,
             RunCmd::Ignore { run_id, reason } => cmd::run::ignore(client, run_id, reason).await?,
             RunCmd::Close { run_id, status } => cmd::run::close(client, run_id, status).await?,
+            RunCmd::List {
+                status,
+                filter_actor,
+                target,
+            } => cmd::run::list(client, status, filter_actor, target).await?,
+            RunCmd::Get { run_id } => cmd::run::get(client, run_id).await?,
+            RunCmd::Watch { run_id } => {
+                let server_url = cfg.server_url.clone();
+                let actor_id = cfg.actor_id.clone();
+                let display_name = cfg.display_name.clone();
+                cmd::run::watch(client, run_id, move || {
+                    let server_url = server_url.clone();
+                    let actor_id = actor_id.clone();
+                    let display_name = display_name.clone();
+                    async move {
+                        connect_bound_client(
+                            &server_url,
+                            explicit_server_arg,
+                            &actor_id,
+                            &display_name,
+                        )
+                        .await
+                    }
+                })
+                .await?
+            }
+            RunCmd::Cancel {
+                run_id,
+                reason,
+                yes,
+            } => cmd::run::cancel(client, run_id, reason, yes).await?,
         },
         Cmd::Coordination { sub } => match sub {
             CoordinationCmd::Propose {
@@ -3141,6 +3200,18 @@ async fn connect_client(
     }
 
     Client::connect(server_url).await
+}
+
+async fn connect_bound_client(
+    server_url: &str,
+    explicit_server_arg: bool,
+    actor_id: &str,
+    display_name: &str,
+) -> Result<std::sync::Arc<Client>> {
+    let client = connect_client(server_url, explicit_server_arg).await?;
+    client.initialize().await?;
+    let _ = client.open_connection(actor_id, Some(display_name)).await?;
+    Ok(client)
 }
 
 fn explicit_server_arg_present() -> bool {
@@ -3576,6 +3647,58 @@ mod tests {
             } => {
                 assert_eq!(run_id.as_deref(), Some("run_123"));
                 assert_eq!(reason.as_deref(), Some("not directed at me"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_cancel_accepts_explicit_yes_for_non_interactive_use() {
+        let args = Args::try_parse_from([
+            "loom",
+            "run",
+            "cancel",
+            "run_123",
+            "--reason",
+            "operator requested stop",
+            "--yes",
+        ])
+        .expect("parse run cancel --yes");
+
+        match args.cmd {
+            Cmd::Run {
+                sub:
+                    RunCmd::Cancel {
+                        run_id,
+                        reason,
+                        yes,
+                    },
+            } => {
+                assert_eq!(run_id, "run_123");
+                assert_eq!(reason.as_deref(), Some("operator requested stop"));
+                assert!(yes);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_cancel_legacy_arguments_still_parse_for_interactive_confirmation() {
+        let args = Args::try_parse_from(["loom", "run", "cancel", "run_123"])
+            .expect("parse interactive run cancel");
+
+        match args.cmd {
+            Cmd::Run {
+                sub:
+                    RunCmd::Cancel {
+                        run_id,
+                        reason,
+                        yes,
+                    },
+            } => {
+                assert_eq!(run_id, "run_123");
+                assert!(reason.is_none());
+                assert!(!yes);
             }
             other => panic!("unexpected command: {other:?}"),
         }

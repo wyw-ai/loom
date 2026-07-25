@@ -1,0 +1,41 @@
+# loom-server image: the communication journal + WebSocket hub.
+#
+# The Loom binaries are fetched through the project's own release installer
+# (install.sh), so image builds dogfood the same path users install with.
+#
+# Build args:
+#   LOOM_VERSION   release tag to install (default: latest)
+#   LOOM_REPO      GitHub repo to download from (default: wyw-ai/loom)
+#   LOOM_TARGET    runtime package target triple (default: auto-detected musl)
+FROM alpine:3
+
+ARG LOOM_VERSION=latest
+ARG LOOM_REPO=wyw-ai/loom
+ARG LOOM_TARGET=""
+
+RUN apk add --no-cache curl ca-certificates && \
+    target="$LOOM_TARGET"; \
+    if [ -z "$target" ]; then \
+      case "$(uname -m)" in \
+        x86_64)  target="x86_64-unknown-linux-musl" ;; \
+        aarch64) target="aarch64-unknown-linux-musl" ;; \
+        *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;; \
+      esac; \
+    fi; \
+    if [ "$LOOM_VERSION" = "latest" ]; then \
+      url="https://github.com/${LOOM_REPO}/releases/latest/download/install.sh"; \
+    else \
+      url="https://github.com/${LOOM_REPO}/releases/download/${LOOM_VERSION}/install.sh"; \
+    fi; \
+    echo "installing loom-server ($target) from $url"; \
+    curl -fsSL "$url" | sh -s -- \
+      --target "$target" \
+      --module loom-server \
+      --bin-dir /usr/local/bin
+
+ENV LOOM_DATA_DIR=/data
+VOLUME ["/data"]
+EXPOSE 7878
+
+ENTRYPOINT ["loom-server"]
+CMD ["--bind", "0.0.0.0:7878"]

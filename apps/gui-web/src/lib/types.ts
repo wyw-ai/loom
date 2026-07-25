@@ -1,7 +1,7 @@
 import type { Actor, AgentBundleSkillSpec, Channel, MachineAgentProviderInfo, MachineInfo, Thread, WakeSpec } from "@/ipc/types";
 
 export type ConnectionState = "idle" | "connecting" | "open" | "closed" | "error";
-export type View = "chat" | "threads" | "channels" | "direct" | "inbox" | "tasks" | "spaces" | "account" | "settings";
+export type View = "chat" | "threads" | "channels" | "direct" | "inbox" | "tasks" | "runs" | "spaces" | "account" | "settings";
 export type ChannelPanelTab = "threads" | "members" | "tasks" | "configure";
 export type ChannelGroup = {
   id: string;

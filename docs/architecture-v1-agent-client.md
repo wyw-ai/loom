@@ -183,9 +183,12 @@ id 与 `actor.kind = "agent"`）。这样 server 端 `subscribe::bind_actor` 的
 | --- | --- | --- |
 | Agent spec（`*.json`） | `<server-data>/agents/` 由 server 扫描 | `~/.config/loom/agents/` 由 agent client 扫描；`--specs <dir>` 可覆盖 |
 | Marketplace catalog | 无 server 归属 | 由 CLI 读取内置 catalog；`loom agent install` 直接写本地 spec |
-| Actor 持久状态 | `<server-data>/agents/<id>/{profile,bundles,logs}` | `~/.agentx/agents/<id>/{profile,bundles}` |
-| Agent workspace（`{agent.workspace}` 等模板变量） | `<server-data>/channels/<channel-id>/agents/<id>/{workspace,logs}` | `~/.agentx/channels/<channel-id>/agents/<id>/{workspace,logs}` |
-| Command session 簿记 | （v0 没有 command transport） | `~/.agentx/sessions/<actor_id>/<scope_id>.json` |
+| Actor 持久状态 | `<server-data>/agents/<id>/{profile,bundles,logs}` | `<agent 数据根>/agents/<id>/{profile,bundles}` |
+| Agent workspace（`{agent.workspace}` 等模板变量） | `<server-data>/channels/<channel-id>/agents/<id>/{workspace,logs}` | `<agent 数据根>/channels/<channel-id>/agents/<id>/{workspace,logs}` |
+| Command session 簿记 | （v0 没有 command transport） | `<agent 数据根>/sessions/<actor_id>/<scope_id>.json` |
+
+> agent 数据根默认为平台数据目录下的 `loom/agents`（Linux 为
+> `~/.local/share/loom/agents`），可用 `LOOM_AGENT_DATA_ROOT` 覆盖。
 
 > **迁移工具**：尚未提供专门的 `migrate-from-server` 命令；当前用法是手工
 > `cp <server-data>/agents/*.json ~/.config/loom/agents/`，因为 spec 文件结构本身没变。
@@ -362,7 +365,7 @@ flowchart TD
 `loom agent serve` 进程之外，仍然要让用户能 `loom agent install foo` /
 `loom agent stop bar`。两条选择：
 
-- **a)** agent client 在 `~/.agentx/loom-agent.sock` 起 unix socket，
+- **a)** agent client 在 `<agent 数据根>/loom-agent.sock` 起 unix socket，
   `loom agent <op>` 命令通过它管理本地 registry。
 - **b)** 不起 socket，`loom agent install` 直接写 `~/.config/loom/agents/foo.json`，
   agent client 监听文件目录变更（notify crate）做 hot reload。

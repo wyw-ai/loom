@@ -2590,7 +2590,7 @@ mod tests {
             "actor_human_current".into(),
             "thread_demo".into(),
             proto::types::ScopeKind::Thread,
-            "bojun.cbj".into(),
+            "tester".into(),
         );
         app.input = "/reply ".into();
 
@@ -2609,7 +2609,7 @@ mod tests {
             "actor_human_current".into(),
             "thread_demo".into(),
             proto::types::ScopeKind::Thread,
-            "bojun.cbj".into(),
+            "tester".into(),
         );
         app.actor_kinds
             .insert("actor_agent_opencode".into(), "agent".into());
@@ -2640,7 +2640,7 @@ mod tests {
             "actor_human_current".into(),
             "thread_demo".into(),
             proto::types::ScopeKind::Thread,
-            "bojun.cbj".into(),
+            "tester".into(),
         );
         app.history.bubbles.push(Bubble {
             actor_id: "actor_human_current".into(),
@@ -2667,7 +2667,7 @@ mod tests {
             "actor_human_current".into(),
             "thread_demo".into(),
             proto::types::ScopeKind::Thread,
-            "bojun.cbj".into(),
+            "tester".into(),
         );
         app.history.bubbles.push(Bubble {
             actor_id: "actor_agent_opencode".into(),
@@ -2697,7 +2697,7 @@ mod tests {
             "actor_human_current".into(),
             "thread_demo".into(),
             proto::types::ScopeKind::Thread,
-            "bojun.cbj".into(),
+            "tester".into(),
         );
 
         reply_selected_history(&mut app);
@@ -2718,7 +2718,7 @@ mod tests {
             "actor_human_current".into(),
             "thread_demo".into(),
             proto::types::ScopeKind::Thread,
-            "bojun.cbj".into(),
+            "tester".into(),
         );
         let scope = test_scope();
         for (a, t) in actors_and_turns {
@@ -2801,7 +2801,7 @@ mod tests {
             "actor_human_current".into(),
             "thread_demo".into(),
             proto::types::ScopeKind::Thread,
-            "bojun.cbj".into(),
+            "tester".into(),
         );
         app.open_turns.insert(
             "turn_silent".into(),
@@ -2825,7 +2825,7 @@ mod tests {
             "actor_human_current".into(),
             "thread_demo".into(),
             proto::types::ScopeKind::Thread,
-            "bojun.cbj".into(),
+            "tester".into(),
         );
         let other = proto::types::ScopeRef {
             kind: proto::types::ScopeKind::Thread,
@@ -2850,7 +2850,7 @@ mod tests {
             "actor_human_current".into(),
             "thread_demo".into(),
             proto::types::ScopeKind::Thread,
-            "bojun.cbj".into(),
+            "tester".into(),
         );
         app.prompt = Some(PromptModal::text(
             PromptKind::CreateChannel,
@@ -2872,7 +2872,7 @@ mod tests {
             "actor_human_current".into(),
             "thread_demo".into(),
             proto::types::ScopeKind::Thread,
-            "bojun.cbj".into(),
+            "tester".into(),
         );
         app.mode = Mode::Picker(PickerKind::Action);
         app.picker = Some(Picker::new("Pick actor", vec![]));
@@ -2891,7 +2891,7 @@ mod tests {
             "actor_human_current".into(),
             "thread_demo".into(),
             proto::types::ScopeKind::Thread,
-            "bojun.cbj".into(),
+            "tester".into(),
         );
         app.toggle_sidebar();
 

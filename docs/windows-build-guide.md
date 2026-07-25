@@ -93,15 +93,14 @@ winget install Microsoft.EdgeWebView2Runtime
 ## 2. 项目克隆与结构
 
 ```powershell
-git clone https://github.com/plumeink/joi-apps-temp.git
-cd joi-apps-temp
-git checkout dev
+git clone https://github.com/wyw-ai/loom.git
+cd loom
 ```
 
 ### Crate 结构概览
 
 ```
-joi-apps-temp/
+loom/
 ├── Cargo.toml                 # 工作区根配置
 ├── crates/
 │   ├── agent-runtime/         # Agent 运行时核心 (库)
@@ -375,5 +374,5 @@ winget install NSIS.NSIS
 1. **GitHub Actions CI 不适用**：当前 GitHub Actions 构建配额不足，本文档面向本地 Windows 构建。CI 配置（`.github/workflows/gui-build.yml`）已包含 NSIS 打包和 artifact 上传逻辑，配额恢复后可复用。
 2. **Tauri NSIS 安装包仅 Windows 产出**：macOS/Linux 需要各自平台构建（`--bundles dmg` / `--bundles deb`）。
 3. **GUI 构建时间较长**：首次构建需下载所有 Rust 依赖 + 前端 npm 包 + Tauri CLI，预计 15-30 分钟（取决于网络和机器性能）。
-4. **Windows 构建路径建议短路径**：尽管项目已做 UNC 前缀修复，仍建议将项目克隆到短路径（如 `C:\src\joi-apps`）以避免超出系统级路径限制。
+4. **Windows 构建路径建议短路径**：尽管项目已做 UNC 前缀修复，仍建议将项目克隆到短路径（如 `C:\src\loom`）以避免超出系统级路径限制。
 5. **loom-shell 与 GUI 的关系**：`loom-shell.exe` 是独立进程，不嵌入 Tauri GUI。GUI 通过进程间通信调用 shell。如果只构建 GUI 安装包，shell 不会自动包含 — 需单独分发或集成到安装脚本。

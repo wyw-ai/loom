@@ -4536,7 +4536,7 @@ mod tests {
     fn test_account() -> HumanAccount {
         config::normalize_human_account(HumanAccount {
             provider: "github".into(),
-            staff_id: "88084".into(),
+            staff_id: "test".into(),
             nickname: "octocat".into(),
             real_name: "Octo Cat".into(),
             email: String::new(),
@@ -4591,7 +4591,7 @@ mod tests {
     fn local_account_defaults_are_generic_and_actor_id_safe() {
         assert_eq!(local_user_id_from_display_name("Jane Doe"), "jane_doe");
         assert_eq!(local_user_id_from_display_name("!!!"), "local_user");
-        assert_eq!(local_user_id_from_display_name("残风 MacBook"), "macbook");
+        assert_eq!(local_user_id_from_display_name("测试 MacBook"), "macbook");
 
         let long_user_id = local_user_id_from_display_name(&"A".repeat(80));
         let actor_id = default_actor_id_for_local_user(&long_user_id);
@@ -4619,11 +4619,11 @@ mod tests {
             Some(Path::new("/tmp/loom config")),
             custom_url,
             "machine_test",
-            "CanfengMac",
+            "TesterMac",
         );
 
         assert!(serve_command.contains(&format!(
-            "--server {custom_url} --machine-id machine_test --machine-name CanfengMac"
+            "--server {custom_url} --machine-id machine_test --machine-name TesterMac"
         )));
         assert!(serve_command.starts_with("LOOM_CONFIG_DIR="));
         assert!(serve_command.contains("LOOM_AGENT_DATA_ROOT="));
@@ -4631,7 +4631,7 @@ mod tests {
         assert!(setup_script.contains("export LOOM_CONFIG_DIR="));
         assert!(setup_script.contains("LOOM_DAEMON_BIN"));
         assert!(setup_script.contains(&format!(
-            "exec \"$LOOM_DAEMON_BIN\" --server {custom_url} --machine-id machine_test --machine-name CanfengMac"
+            "exec \"$LOOM_DAEMON_BIN\" --server {custom_url} --machine-id machine_test --machine-name TesterMac"
         )));
         assert!(!setup_script.contains(" daemon --machine-id "));
     }
@@ -4810,8 +4810,8 @@ mod tests {
                 id: "default".into(),
                 name: "Local".into(),
                 server_url: "ws://127.0.0.1:7878/rpc".into(),
-                actor_id: "actor_human_88084".into(),
-                display_name: "actor_human_88084".into(),
+                actor_id: "actor_human_test".into(),
+                display_name: "actor_human_test".into(),
             }],
         };
         let value = json!({
@@ -4828,11 +4828,11 @@ mod tests {
                         "revision": 7,
                         "observedAt": "2026-05-13T10:50:00Z",
                         "workspaceId": "server_workspace",
-                        "ownerActorId": "actor_human_88084",
+                        "ownerActorId": "actor_human_test",
                         "name": "Remote Box",
                         "kind": "remote",
-                        "dataRoot": "/home/canfeng/.agentx/machine_remote",
-                        "configDir": "/home/canfeng/.loom-apps",
+                        "dataRoot": "/home/tester/.loom/machine_remote",
+                        "configDir": "/home/tester/.loom-apps",
                         "capabilities": ["inventory.read", "connection.status", "machine.command"],
                         "providers": [{
                             "id": "codex",
@@ -4904,8 +4904,8 @@ mod tests {
                 "ownerActorId": account.actor_id,
                 "name": "Remote Box",
                 "kind": "remote",
-                "dataRoot": "/home/canfeng/.agentx/machine_remote",
-                "configDir": "/home/canfeng/.loom-apps",
+                "dataRoot": "/home/tester/.loom/machine_remote",
+                "configDir": "/home/tester/.loom-apps",
                 "capabilities": ["inventory.read", "connection.status", "machine.command"],
                 "providers": [{
                     "id": "claude",
@@ -4959,7 +4959,7 @@ mod tests {
         assert_eq!(
             machine.agents[0].profile_path,
             format!(
-                "/home/canfeng/.agentx/machine_remote{}agents{}actor_remote_agent{}profile",
+                "/home/tester/.loom/machine_remote{}agents{}actor_remote_agent{}profile",
                 std::path::MAIN_SEPARATOR,
                 std::path::MAIN_SEPARATOR,
                 std::path::MAIN_SEPARATOR
@@ -4996,8 +4996,8 @@ mod tests {
                 "ownerActorId": account.actor_id,
                 "name": "Remote Box",
                 "kind": "remote",
-                "dataRoot": "/home/canfeng/.agentx/machine_remote",
-                "configDir": "/home/canfeng/.loom-apps",
+                "dataRoot": "/home/tester/.loom/machine_remote",
+                "configDir": "/home/tester/.loom-apps",
                 "capabilities": ["inventory.read", "connection.status", "machine.command"],
                 "providers": [],
                 "agentSpecs": []
@@ -5041,7 +5041,7 @@ mod tests {
                 "ownerActorId": "actor_human_other",
                 "name": "Other Box",
                 "kind": "remote",
-                "dataRoot": "/home/other/.agentx/machine_other",
+                "dataRoot": "/home/other/.loom/machine_other",
                 "configDir": "/home/other/.loom-apps",
                 "capabilities": ["inventory.read", "connection.status", "machine.command"],
                 "providers": [],
@@ -5086,8 +5086,8 @@ mod tests {
                 "ownerActorId": account.actor_id,
                 "name": "Remote Box",
                 "kind": "remote",
-                "dataRoot": "/home/canfeng/.agentx/machine_remote",
-                "configDir": "/home/canfeng/.loom-apps",
+                "dataRoot": "/home/tester/.loom/machine_remote",
+                "configDir": "/home/tester/.loom-apps",
                 "capabilities": ["inventory.read", "connection.status", "machine.command"],
                 "providers": [{
                     "id": "claude",
@@ -5203,8 +5203,8 @@ mod tests {
                 "ownerActorId": account.actor_id,
                 "name": "Old Local Machine",
                 "kind": "local",
-                "dataRoot": "/Users/boyd/.agentx/machines/ws_abbb0e0b/actor_human_local_ws_abbb0e0b/local",
-                "configDir": "/Users/boyd/.loom-apps",
+                "dataRoot": "/Users/alice/.loom/machines/ws_abbb0e0b/actor_human_local_ws_abbb0e0b/local",
+                "configDir": "/Users/alice/.loom-apps",
                 "capabilities": ["inventory.read", "connection.status", "machine.command", "agent.create"],
                 "providers": [],
                 "agents": []

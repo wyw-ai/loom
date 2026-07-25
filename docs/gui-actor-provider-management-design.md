@@ -559,7 +559,7 @@ AgentSpec 通过 `providerRef.id` 引用 provider。一个 provider 可以被多
     "kind": "local",
     "workspaceId": "ws_123",
     "ownerActorId": "actor_human_123",
-    "dataRoot": "/Users/me/.agentx",
+    "dataRoot": "/Users/me/.local/share/loom/agents",
     "configDir": "/Users/me/.loom"
   },
   "capabilities": [

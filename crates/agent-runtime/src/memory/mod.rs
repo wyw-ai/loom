@@ -14,7 +14,7 @@
 //! threaded all the way down to the selector; it prevents records sourced
 //! from channel A from being recalled when the agent is operating in
 //! channel B. This is the multi-actor safety net that the upstream
-//! single-user design of AgentX did not need.
+//! legacy single-user design did not need.
 
 pub mod jsonl_store;
 pub mod record;

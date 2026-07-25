@@ -333,10 +333,10 @@ session_key =
 
 ### 5.2 持久化记录
 
-建议沿用当前 agent data root 下的 session 目录，扩展记录结构：
+建议沿用 agent 数据根下的 session 目录，扩展记录结构：
 
 ```text
-~/.agentx/sessions/<actor_id>/<scope_kind>-<scope_id>.json
+<agent 数据根>/sessions/<actor_id>/<scope_kind>-<scope_id>.json
 ```
 
 示例：

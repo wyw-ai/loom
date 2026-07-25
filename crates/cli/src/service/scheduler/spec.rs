@@ -1,8 +1,7 @@
 //! Plugin-specific deserialization of `ServiceSpec.config` for
-//! `kind = "scheduler"`. Mirrors `crate::service::am::AmConfig` in role:
-//! the host treats the JSON as opaque and hands it to the plugin, which
-//! then projects it into typed structs that drive the cron loop and
-//! per-job execution.
+//! `kind = "scheduler"`. The host treats the JSON as opaque and hands it
+//! to the plugin, which then projects it into typed structs that drive
+//! the cron loop and per-job execution.
 //!
 //! Schema follows `docs/service-plugin-system-design.md` §6.1 (scheduler
 //! example) and §8.3 (job field table). Fields not in the doc table are

@@ -14,12 +14,6 @@
 
 </div>
 
-> **[ MEDIA PLACEHOLDER — hero demo ]** A short demo video or GIF (≤30s,
-> ~1600px wide) of the full loop: a human @mentions an agent in a thread →
-> the agent runs on a registered machine → output streams back as messages →
-> produced files land as artifacts. Suggested path: `docs/images/readme/hero.gif`;
-> when the file exists, replace this block with `![Loom demo](docs/images/readme/hero.gif)`.
-
 Loom is an open-source communication runtime for mixed human, agent, and
 program workflows. It gives every participant an identity and a durable inbox,
 then connects messages, tasks, threads, artifacts, approvals, and run records
@@ -55,10 +49,6 @@ same conversation.
    recorded against the conversation that started it.
 4. Files the agent produces become artifacts attached to the thread; approvals
    and follow-ups happen inline, where the discussion already is.
-
-> **[ MEDIA PLACEHOLDER — terminal recording ]** An asciinema/GIF of this flow
-> in the terminal: `loom chat` on one side, the agent run on the other.
-> Suggested path: `docs/images/readme/terminal-flow.gif`.
 
 ## Architecture
 
@@ -133,10 +123,6 @@ loom channel create --title general
 loom chat                           # terminal chat UI
 ```
 
-> **[ SCREENSHOT PLACEHOLDER — chat TUI ]** `loom chat` in a channel with a
-> few messages and a thread open. Suggested path:
-> `docs/images/readme/chat-tui.png`.
-
 The `loom` CLI covers the whole surface: `channel`, `thread`, `message`,
 `task`, `run`, `inbox`, `artifact`, `memory`, `reminder`, `agent`, `provider`,
 `service`, `machine`, `group`, and more. Every command accepts `--json` for
@@ -181,10 +167,6 @@ providers and agents on a selected host.
 make gui-deps
 make gui-dev
 ```
-
-> **[ SCREENSHOT PLACEHOLDER — desktop app ]** Loom Desktop main window:
-> channel list, message feed, and thread panel. Suggested path:
-> `docs/images/readme/desktop-main.png`.
 
 ## Project Status
 
@@ -398,4 +380,5 @@ Thanks to everyone who has been building Loom:
 
 ## License
 
-Loom is licensed under the [Apache License 2.0](LICENSE).
+Copyright 2026 The Loom Authors. Loom is licensed under the
+[Apache License 2.0](LICENSE); see [NOTICE](NOTICE) for attribution.

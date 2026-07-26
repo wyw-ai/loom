@@ -1,0 +1,6 @@
+# Shell scripts and container build files must keep LF even on Windows
+# checkouts — CRLF breaks /bin/sh, entrypoints, and heredocs in images.
+*.sh text eol=lf
+docker/** text eol=lf
+docker-compose.yml text eol=lf
+.env.example text eol=lf

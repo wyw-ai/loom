@@ -83,17 +83,34 @@ service 运行在独立的 service host 里(通常由 daemon 启动),同样在 `
 
 ## 快速开始
 
-当前支持的安装路径是从源码构建。需要 stable Rust toolchain(见 `rust-toolchain.toml`);
-构建桌面应用还需要 Node.js 和 pnpm。预编译包会从第一个版本 tag 起发布到
-[Releases](https://github.com/wyw-ai/loom/releases) 页面。
+**安装 Loom runtime** —— 包含 `loom`(CLI + chat TUI)、`loom-server` 和
+`loom-daemon`:
+
+macOS / Linux:
 
 ```bash
-make build
-export PATH="$PWD/target/debug:$PATH"
+curl -fsSL https://github.com/wyw-ai/loom/releases/latest/download/install.sh | sh
 ```
 
-> 在 Windows 上请直接用 `cargo` 构建,详见
-> [docs/windows-build-guide.md](docs/windows-build-guide.md)。
+Windows(PowerShell):
+
+```powershell
+iwr -useb https://raw.githubusercontent.com/wyw-ai/loom/main/scripts/install.ps1 | iex
+```
+
+两个安装器都会拉取最新 release、校验 SHA-256,并安装到 `~/.local/bin`
+(macOS/Linux)或 `%LOCALAPPDATA%\Programs\Loom\bin`(Windows)。想自选平台
+或下载桌面应用,可以直接去 [Releases](https://github.com/wyw-ai/loom/releases):
+
+| 平台 | 包 |
+| --- | --- |
+| macOS(通用) | `loom-runtime-*-universal-apple-darwin.tar.gz` |
+| Linux x86_64 | `loom-runtime-*-x86_64-unknown-linux-gnu.tar.gz`(静态版选 `-musl`) |
+| Linux arm64 | `loom-runtime-*-aarch64-unknown-linux-musl.tar.gz` |
+| Windows x86_64 | `loom-runtime-*-x86_64-pc-windows-msvc.zip` |
+| Loom Desktop,macOS(Apple Silicon) | `loom-gui-*-aarch64-apple-darwin.dmg` |
+
+想从源码构建?见[开发](#开发)。
 
 **1. 启动本地 server。** 它通过 WebSocket 提供 JSON-RPC,用本地 SQLite 做 journal,
 不依赖任何外部服务。
@@ -202,6 +219,17 @@ Loom 处于 pre-1.0 阶段,开发活跃。JSON-RPC 协议和磁盘数据格式�
 - [Agent 和 provider 示例](examples/agents/README.md)
 
 ## 开发
+
+从源码构建(需要 stable Rust toolchain,见 `rust-toolchain.toml`;桌面应用
+还需要 Node.js 和 pnpm):
+
+```bash
+make build
+export PATH="$PWD/target/debug:$PATH"
+```
+
+> 在 Windows 上请直接用 `cargo` 构建,详见
+> [docs/windows-build-guide.md](docs/windows-build-guide.md)。
 
 常用检查:
 

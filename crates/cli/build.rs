@@ -208,47 +208,117 @@ fn generate_guide_snapshot(guide_source: &ContentSource, out_dir: &Path) {
 }
 
 fn generate_skill_snapshot(skills_source: &ContentSource, out_dir: &Path) {
-    let skill_dir = skills_source.path.join("skills").join("loom");
-    let skill_md = skill_dir.join("SKILL.md");
+    // Snapshot every skill under `skills/` (a directory with a SKILL.md).
+    // `skills/loom/SKILL.md` is the required file of resolve_content_source,
+    // so the default loom skill is always part of the snapshot.
+    let skills_root = skills_source.path.join("skills");
     if !skills_source.cloned {
-        println!("cargo:rerun-if-changed={}", skill_md.display());
-    }
-    if !skill_md.is_file() {
-        panic!("default Loom skill missing {}", skill_md.display());
+        println!("cargo:rerun-if-changed={}", skills_root.display());
     }
 
-    let mut files = collect_files(&skill_dir, !skills_source.cloned);
-    files.sort();
-    if files.is_empty() {
+    let mut skill_dirs = fs::read_dir(&skills_root)
+        .unwrap_or_else(|err| panic!("read {} failed: {err}", skills_root.display()))
+        .map(|entry| entry.expect("read skill entry").path())
+        .filter(|path| path.is_dir())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| !name.starts_with('.'))
+        })
+        .filter(|path| path.join("SKILL.md").is_file())
+        .collect::<Vec<_>>();
+    skill_dirs.sort();
+    if skill_dirs.is_empty() {
         panic!(
-            "no default Loom skill files found under {}",
-            skill_dir.display()
+            "no skills with SKILL.md found under {}",
+            skills_root.display()
         );
     }
 
+    let mut skills = Vec::new();
+    for skill_dir in skill_dirs {
+        let id = skill_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_else(|| panic!("invalid skill directory name: {}", skill_dir.display()))
+            .to_owned();
+        let mut files = collect_files(&skill_dir, !skills_source.cloned);
+        files.sort();
+        skills.push((id, skill_dir, files));
+    }
+
     let mut generated = String::new();
-    generated.push_str("const EMBEDDED_LOOM_SKILL_FILES: &[EmbeddedSkillFile] = &[\n");
-    for path in files {
-        if !skills_source.cloned {
-            println!("cargo:rerun-if-changed={}", path.display());
+    generated.push_str("const EMBEDDED_BUILTIN_SKILL_IDS: &[&str] = &[\n");
+    for (id, _, _) in &skills {
+        writeln!(generated, "    {id:?},").expect("write generated skill snapshot");
+    }
+    generated.push_str("];\n\n");
+
+    let mut static_names = Vec::new();
+    for (id, skill_dir, files) in &skills {
+        let static_name = embedded_skill_files_static_name(id);
+        if static_names.contains(&static_name) {
+            panic!("skill id `{id}` collides with another skill in generated snapshot");
         }
-        let rel = path
-            .strip_prefix(&skill_dir)
-            .unwrap_or_else(|err| panic!("strip skill prefix {} failed: {err}", path.display()))
-            .to_string_lossy()
-            .replace('\\', "/");
-        let content = fs::read_to_string(&path)
-            .unwrap_or_else(|err| panic!("read {} failed: {err}", path.display()));
+        static_names.push(static_name.clone());
+        writeln!(generated, "static {static_name}: &[EmbeddedSkillFile] = &[")
+            .expect("write generated skill snapshot");
+        for path in files {
+            if !skills_source.cloned {
+                println!("cargo:rerun-if-changed={}", path.display());
+            }
+            let rel = path
+                .strip_prefix(skill_dir)
+                .unwrap_or_else(|err| panic!("strip skill prefix {} failed: {err}", path.display()))
+                .to_string_lossy()
+                .replace('\\', "/");
+            let content = fs::read_to_string(path)
+                .unwrap_or_else(|err| panic!("read {} failed: {err}", path.display()));
+            writeln!(
+                generated,
+                "    EmbeddedSkillFile {{ path: {rel:?}, content: {content:?} }},"
+            )
+            .expect("write generated skill snapshot");
+        }
+        generated.push_str("];\n\n");
+    }
+
+    generated.push_str("static EMBEDDED_BUILTIN_SKILLS: &[EmbeddedBuiltinSkill] = &[\n");
+    for (id, _, _) in &skills {
+        let static_name = embedded_skill_files_static_name(id);
         writeln!(
             generated,
-            "    EmbeddedSkillFile {{ path: {rel:?}, content: {content:?} }},"
+            "    EmbeddedBuiltinSkill {{ id: {id:?}, files: {static_name} }},"
         )
         .expect("write generated skill snapshot");
     }
-    generated.push_str("];\n");
+    generated.push_str("];\n\n");
+
+    let loom_static = skills
+        .iter()
+        .find(|(id, _, _)| id == "loom")
+        .map(|(id, _, _)| embedded_skill_files_static_name(id))
+        .unwrap_or_else(|| panic!("default Loom skill missing under {}", skills_root.display()));
+    writeln!(
+        generated,
+        "const EMBEDDED_LOOM_SKILL_FILES: &[EmbeddedSkillFile] = {loom_static};"
+    )
+    .expect("write generated skill snapshot");
 
     fs::write(out_dir.join("loom_skill_embedded.rs"), generated)
         .expect("write generated skill snapshot");
+}
+
+fn embedded_skill_files_static_name(skill_id: &str) -> String {
+    let mut name = String::from("EMBEDDED_SKILL_FILES_");
+    for ch in skill_id.chars() {
+        if ch.is_ascii_alphanumeric() {
+            name.push(ch.to_ascii_uppercase());
+        } else {
+            name.push('_');
+        }
+    }
+    name
 }
 
 fn collect_files(dir: &Path, emit_rerun: bool) -> Vec<PathBuf> {

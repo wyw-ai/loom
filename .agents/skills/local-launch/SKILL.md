@@ -22,7 +22,7 @@ description: 在本地启动一套可用的 Loom 环境(server + daemon + agent)
    - `AGENTS`(逗号分隔,如 `claude,codex`)— 填什么,daemon 里就有什么命令
    - 对应的 API key(如 `ANTHROPIC_API_KEY`);用挂载配置的(claude settings.json 之类)可以不填 key,见"配置挂载"一节
 3. 构建并拉起:`docker compose up -d --build`
-4. 镜像下载 release 的 URL 由 build args 控制:`LOOM_REPO`(默认 `wyw-ai/loom`)、`LOOM_VERSION`(默认 `latest`)。**如果目标仓库是私有的,匿名下载会 404** — 这时需要先用有权限的方式下载 release 资产(install.sh + 对应平台的 tar.gz + SHA256SUMS),改用从本地目录安装的变体(参考本次测试用的 `Dockerfile.*.test` 思路:`--package-dir` 指向资产目录)。
+4. 镜像下载 release 的 URL 由 build args 控制:`LOOM_REPO`(默认 `wyw-ai/loom`)、`LOOM_VERSION`(默认 `latest`)。**如果目标仓库是私有的,匿名下载会 404** — 这时先用有权限的方式(如 `gh release download`)把 install.sh、对应平台的 tar.gz 和 SHA256SUMS 取回,放进构建上下文,然后把 Dockerfile 里的下载步骤临时换成 `COPY` + `install.sh --package-dir <资产目录>`;校验逻辑不变,资产真实性仍由 SHA-256 保证。
 
 ## 路径 B:源码构建启动
 

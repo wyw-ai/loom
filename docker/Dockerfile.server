@@ -34,6 +34,11 @@ RUN apk add --no-cache curl ca-certificates && \
       --bin-dir /usr/local/bin
 
 ENV LOOM_DATA_DIR=/data
+
+# Run as an unprivileged user; loom-server needs no capabilities.
+RUN addgroup -g 1000 loom && adduser -D -u 1000 -G loom loom && \
+    mkdir -p /data && chown loom:loom /data
+USER loom
 VOLUME ["/data"]
 EXPOSE 7878
 

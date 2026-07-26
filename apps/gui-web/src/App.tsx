@@ -1,6 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Loader2 } from "lucide-react";
-import { type ChannelMemberConfig, type ScopeRef, type Workspace } from "@/ipc/types";
+import {
+  type ChannelMemberConfig,
+  type MessageContextResult,
+  type ScopeRef,
+  type Workspace,
+} from "@/ipc/types";
 import { detailPanelBreakpoint, machineStatusPollIntervalMs } from "@/lib/constants";
 import type { AgentFormState } from "@/lib/types";
 import { defaultWakeSpec } from "@/lib/wake-utils";
@@ -15,6 +20,7 @@ import { useChannelGroups } from "@/hooks/useChannelGroups";
 import { useConnectionLifecycle } from "@/hooks/useConnectionLifecycle";
 import { useChannelScope } from "@/hooks/useChannelScope";
 import { useActions } from "@/hooks/useActions";
+import { useRunsList } from "@/hooks/useRunsList";
 import { useWorkspaceConnection } from "@/hooks/useWorkspaceConnection";
 import { useAppStores } from "@/hooks/useAppStores";
 import { useAppEffects } from "@/hooks/useAppEffects";
@@ -25,6 +31,7 @@ export function App() {
     config, setConfig, workspace, setWorkspace, connection, setConnection,
     error, setError, notice, setNotice, busy, setBusy, workspaceForm, setWorkspaceForm,
     view, setView, settingsAgentId, setSettingsAgentId, channelPanelTab, setChannelPanelTab,
+    searchPanelOpen, setSearchPanelOpen, selectedRunId, setSelectedRunId,
     panelSizes, setPanelSizes, viewportWidth, setViewportWidth, resizingPanel, setResizingPanel,
     replyTo, setReplyTo,
     channels, setChannels, channelGroups, setChannelGroups, threadsByChannel, setThreadsByChannel,
@@ -55,12 +62,14 @@ export function App() {
   const [channelMemberConfigsByChannel, setChannelMemberConfigsByChannel] = useState<
     Record<string, Record<string, ChannelMemberConfig>>
   >({});
+  const [messageAnchorId, setMessageAnchorId] = useState<string | null>(null);
 
   const activeScopeRef = useRef<ScopeRef | null>(null);
   const activeThreadScopeRef = useRef<ScopeRef | null>(null);
   const activeDirectScopeRef = useRef<ScopeRef | null>(null);
   const activeDirectActorIdRef = useRef<string | null>(null);
   const actorIdRef = useRef<string | null>(null);
+  const pendingMessageContextRef = useRef<MessageContextResult | null>(null);
   const workspaceRef = useRef<Workspace | null>(null);
   const autoReconnectRef = useRef(false);
   const hasOpenedConnectionRef = useRef(false);
@@ -86,7 +95,7 @@ export function App() {
   const actorList = D.deriveActorList(actors);
   const agentActors = D.deriveAgentActors(actorList);
   const agentActorIdsKey = agentActors.map((actor) => actor.id).join("|");
-  const activeDirectActor = D.deriveActiveDirectActor(agentActors, activeDirectActorId, machines);
+  const activeDirectActor = D.deriveActiveDirectActor(actorList, activeDirectActorId, machines);
   const activeDirectTarget = D.deriveActiveDirectTarget(activeDirectActor);
   const activeDirectScope = D.deriveActiveDirectScope(activeDirectActor, workspace, channels, directScopesByActorId);
   const memberCandidates = D.deriveMemberCandidates(actorList);
@@ -212,6 +221,14 @@ export function App() {
     activeDirectActorIdRef.current = activeDirectActor?.id ?? null;
   }, [activeDirectActor?.id]);
 
+  // A new search session should not retain the previous result's highlight or
+  // context seed. This also makes reopening the same hit scroll to it again.
+  useEffect(() => {
+    if (!searchPanelOpen) return;
+    setMessageAnchorId(null);
+    pendingMessageContextRef.current = null;
+  }, [searchPanelOpen]);
+
   useEffect(() => {
     const actorDirectoryVisible =
       view === "settings" ||
@@ -241,6 +258,7 @@ export function App() {
     activeScopeRef,
     activeThreadScopeRef,
     activeDirectScopeRef,
+    pendingMessageContextRef,
     setActors,
     setChannelMemberConfigsByChannel,
     setThreadsByChannel,
@@ -278,6 +296,9 @@ export function App() {
     sendDirectMessage,
     startThread,
     toggleMessageReaction,
+    cancelRun,
+    openScope,
+    openMessageContext,
     answerAction,
     answerDirectAction,
     selectWorkspace,
@@ -311,6 +332,7 @@ export function App() {
     setChannelMemberConfigsByChannel,
     setThreadsByChannel,
     setView,
+    setMessageAnchorId,
     draft,
     threadDraft,
     directDraft,
@@ -320,7 +342,10 @@ export function App() {
     activeDirectTarget,
     activeDirectActor,
     activeChannel,
+    channels,
     channelThreads,
+    threadsByChannel,
+    visibleChannels,
     actors,
     machines,
     workspace,
@@ -335,6 +360,7 @@ export function App() {
     activeThreadScopeRef,
     activeDirectScopeRef,
     actorIdRef,
+    pendingMessageContextRef,
     applyConfig,
     applyMachines,
     loadMachines,
@@ -352,6 +378,26 @@ export function App() {
         : "No channels."
       : "No space connection.";
 
+  // Runs view: initial list comes from run.list (stream only covers subscribed
+  // scopes); sorted openedAt DESC, stable.
+  const {
+    loading: runsLoading,
+    error: runsError,
+    refresh: refreshRuns,
+  } = useRunsList({
+    connection,
+    workspaceId: workspace?.id ?? null,
+    view,
+    setRuns,
+  });
+  const runsList = useMemo(
+    () => Object.values(runs).sort(
+      (a, b) => b.openedAt.localeCompare(a.openedAt) || b.id.localeCompare(a.id),
+    ),
+    [runs],
+  );
+  const selectedRun = selectedRunId ? runs[selectedRunId] ?? null : null;
+
   const showWorkspaceChrome =
     view === "chat" ||
     view === "threads" ||
@@ -359,10 +405,11 @@ export function App() {
     view === "direct" ||
     view === "inbox" ||
     view === "tasks" ||
+    view === "runs" ||
     view === "settings";
   const showChatDetail =
     view === "chat" &&
-    (Boolean(activeThread) || (Boolean(channelPanelTab) && Boolean(activeChannel)));
+    (Boolean(activeThread) || (Boolean(channelPanelTab) && Boolean(activeChannel)) || searchPanelOpen);
   const detailVisibleInGrid =
     showChatDetail && viewportWidth >= detailPanelBreakpoint;
 
@@ -436,7 +483,10 @@ export function App() {
     shellStyle, showWorkspaceChrome, showChatDetail, resizingPanel, notice,
     account, busy, connection, workspace, workspaces, selectWorkspace, setView,
     view, visibleChannels, channelGroups, activeChannelId, activeDirectActorId,
-    activeThreadId, agentActors, runs, machines, threadsByChannel,
+    activeThreadId, agentActors, runs, runsList, selectedRun, setSelectedRunId,
+    cancelRun, openScope, openMessageContext, messageAnchorId,
+    searchPanelOpen, setSearchPanelOpen, machines, threadsByChannel,
+    runsLoading, runsError, refreshRuns,
     createChannelWithTitle, addChannelGroup, moveChannelToGroup, deleteChannel,
     renameChannel, removeChannelGroup, renameChannelGroup, toggleChannelGroup,
     setActiveChannelId, setActiveThreadId, setActiveDirectActorId, setChannelPanelTab,

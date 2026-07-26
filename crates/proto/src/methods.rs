@@ -69,6 +69,8 @@ pub mod method {
     pub const RUN_APPEND: &str = "run.append";
     pub const RUN_CLOSE: &str = "run.close";
     pub const RUN_CANCEL: &str = "run.cancel";
+    pub const RUN_LIST: &str = "run.list";
+    pub const RUN_GET: &str = "run.get";
     pub const COORDINATION_PROPOSE: &str = "coordination.propose";
     pub const COORDINATION_COMMIT: &str = "coordination.commit";
     pub const COORDINATION_RESPOND: &str = "coordination.respond";
@@ -82,6 +84,7 @@ pub mod method {
     pub const MESSAGE_READ: &str = "message.read";
     pub const MESSAGE_REACTION_TOGGLE: &str = "message.reaction.toggle";
     pub const MESSAGE_SEARCH: &str = "message.search";
+    pub const MESSAGE_CONTEXT: &str = "message.context";
     pub const ARTIFACT_PUBLISH: &str = "artifact/publish";
     pub const ARTIFACT_GET: &str = "artifact/get";
     pub const ARTIFACT_READ: &str = "artifact/read";
@@ -1209,6 +1212,23 @@ mod tests {
         assert_eq!(serialized["timeoutMs"], -1);
         assert_eq!(serialized["idleTimeoutMs"], -1);
     }
+
+    #[test]
+    fn run_list_params_rust_and_wire_defaults_match() {
+        let rust_default = RunListParams::default();
+        let wire_default: RunListParams =
+            serde_json::from_value(serde_json::json!({})).expect("deserialize empty params");
+
+        for params in [&rust_default, &wire_default] {
+            assert!(params.statuses.is_none());
+            assert!(params.actor_id.is_none());
+            assert!(params.target.is_none());
+            assert_eq!(params.limit, 50);
+        }
+
+        let serialized = serde_json::to_value(rust_default).expect("serialize default params");
+        assert_eq!(serialized, serde_json::json!({ "limit": 50 }));
+    }
 }
 
 // ---- run.* ----
@@ -1284,6 +1304,46 @@ pub struct RunCancelResult {
     pub run: Run,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancel_message: Option<Message>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunListParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statuses: Option<Vec<RunStatus>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(default = "default_limit")]
+    pub limit: u32,
+}
+
+impl Default for RunListParams {
+    fn default() -> Self {
+        Self {
+            statuses: None,
+            actor_id: None,
+            target: None,
+            limit: default_limit(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunListResult {
+    pub runs: Vec<Run>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunGetParams {
+    pub run_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunGetResult {
+    pub run: Run,
 }
 
 // ---- coordination.* ----
@@ -1535,6 +1595,12 @@ pub struct MessageSearchParams {
     pub query: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    /// Inclusive lower bound on `createdAt` (absolute timestamp, compared in UTC).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_after: Option<Timestamp>,
+    /// Exclusive upper bound on `createdAt` (absolute timestamp, compared in UTC).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_before: Option<Timestamp>,
     #[serde(default = "default_search_limit")]
     pub limit: u32,
 }
@@ -1546,6 +1612,30 @@ fn default_search_limit() -> u32 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageSearchResult {
     pub messages: Vec<Message>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageContextParams {
+    pub message_id: String,
+    #[serde(default = "default_message_context_window")]
+    pub before: u32,
+    #[serde(default = "default_message_context_window")]
+    pub after: u32,
+}
+
+fn default_message_context_window() -> u32 {
+    20
+}
+
+/// Server-side hard cap for each `message.context` window side.
+pub const MESSAGE_CONTEXT_MAX_WINDOW: u32 = 50;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageContextResult {
+    pub before: Vec<Message>,
+    pub anchor: Message,
+    pub after: Vec<Message>,
 }
 
 // ---- artifact/publish / get / read ----

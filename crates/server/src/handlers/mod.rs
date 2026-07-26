@@ -141,6 +141,8 @@ pub async fn dispatch(
         method::RUN_APPEND => run_append(state, connection_id, params),
         method::RUN_CLOSE => run_close(state, connection_id, params),
         method::RUN_CANCEL => run_cancel(state, connection_id, params),
+        method::RUN_LIST => run_list(state, connection_id, params),
+        method::RUN_GET => run_get(state, connection_id, params),
         method::COORDINATION_PROPOSE => coordination_propose(state, connection_id, params),
         method::COORDINATION_COMMIT => coordination_commit(state, connection_id, params),
         method::COORDINATION_RESPOND => coordination_respond(state, connection_id, params),
@@ -154,6 +156,7 @@ pub async fn dispatch(
         method::MESSAGE_READ => message_read(state, connection_id, params),
         method::MESSAGE_REACTION_TOGGLE => message_reaction_toggle(state, connection_id, params),
         method::MESSAGE_SEARCH => message_search(state, connection_id, params),
+        method::MESSAGE_CONTEXT => message_context(state, connection_id, params),
         method::ARTIFACT_PUBLISH => artifact_publish(state, params),
         method::ARTIFACT_GET => artifact_get(state, params),
         method::ARTIFACT_READ => artifact_read(state, params),
@@ -2083,13 +2086,13 @@ fn run_cancel(state: &AppState, connection_id: &str, params: Option<Value>) -> H
         .get_run(&p.run_id)
         .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "run"))?;
 
+    // Keep inaccessible and missing runs indistinguishable. In particular, a
+    // private-channel non-member must not be able to use this mutating RPC as
+    // a run/channel existence oracle.
     let channel_id = crate::ws::channel_id_for_scope(state, &run.scope)
-        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "channel for run scope"))?;
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "run"))?;
     if !state.store.is_channel_member(&channel_id, &caller) {
-        return Err(ErrorObject::new(
-            ErrorCode::APP_INVALID_STATE,
-            format!("actor {caller} cannot cancel run in channel {channel_id}"),
-        ));
+        return Err(ErrorObject::new(ErrorCode::APP_NOT_FOUND, "run"));
     }
     if matches!(
         run.status,
@@ -2148,6 +2151,46 @@ fn run_cancel(state: &AppState, connection_id: &str, params: Option<Value>) -> H
         run,
         cancel_message: Some(cancel_message),
     })
+}
+
+/// Server-side hard cap for `run.list` limits (no cursor in v1).
+const RUN_LIST_MAX_LIMIT: u32 = 200;
+
+fn normalize_run_list_limit(limit: u32) -> u32 {
+    limit.clamp(1, RUN_LIST_MAX_LIMIT)
+}
+
+fn run_list(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
+    let p: RunListParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let limit = normalize_run_list_limit(p.limit);
+    let runs = state
+        .store
+        .list_runs(
+            &caller,
+            p.statuses.as_deref(),
+            p.actor_id.as_deref(),
+            p.target.as_deref(),
+            limit,
+        )
+        .map_err(map_store_err)?;
+    ok(RunListResult { runs })
+}
+
+fn run_get(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
+    let p: RunGetParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let run = state
+        .store
+        .get_run(&p.run_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "run"))?;
+    // Invisible and missing runs are indistinguishable: both are not-found.
+    let channel_id = crate::ws::channel_id_for_scope(state, &run.scope)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "run"))?;
+    if !state.store.is_channel_member(&channel_id, &caller) {
+        return Err(ErrorObject::new(ErrorCode::APP_NOT_FOUND, "run"));
+    }
+    ok(RunGetResult { run })
 }
 
 // ---- coordination ----
@@ -2407,11 +2450,42 @@ fn message_search(state: &AppState, connection_id: &str, params: Option<Value>) 
             "query is empty",
         ));
     }
+    if let (Some(after), Some(before)) = (p.created_after, p.created_before) {
+        if after >= before {
+            return Err(ErrorObject::new(
+                ErrorCode::INVALID_PARAMS,
+                "createdAfter must be before createdBefore",
+            ));
+        }
+    }
     ok(MessageSearchResult {
         messages: state
             .store
-            .search_message_records(&actor_id, &p.query, p.target.as_deref(), p.limit)
+            .search_message_records(
+                &actor_id,
+                &p.query,
+                p.target.as_deref(),
+                p.limit,
+                p.created_after,
+                p.created_before,
+            )
             .map_err(map_store_err)?,
+    })
+}
+
+fn message_context(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
+    let p: MessageContextParams = parse_params(params)?;
+    let actor_id = caller_actor(state, connection_id)?;
+    let before = p.before.min(MESSAGE_CONTEXT_MAX_WINDOW);
+    let after = p.after.min(MESSAGE_CONTEXT_MAX_WINDOW);
+    let (before, anchor, after) = state
+        .store
+        .message_context(&actor_id, &p.message_id, before, after)
+        .map_err(map_store_err)?;
+    ok(MessageContextResult {
+        before,
+        anchor,
+        after,
     })
 }
 
@@ -3824,6 +3898,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn message_rpc_search_time_bounds_and_context() {
+        let state = fresh_state("message_rpc_context");
+        open_conn(&state, "conn_alice", "actor_alice").await;
+        let channel_value = dispatch(
+            &state,
+            "conn_alice",
+            method::CHANNEL_CREATE,
+            Some(json!({ "title": "backend" })),
+        )
+        .await
+        .expect("channel/create");
+        let channel: ChannelCreateResult =
+            serde_json::from_value(channel_value).expect("channel result");
+        let target = format!("#{}", channel.channel.id);
+        let mut sent = Vec::new();
+        for body in ["alpha note", "beta needle", "gamma needle"] {
+            let value = dispatch(
+                &state,
+                "conn_alice",
+                method::MESSAGE_SEND,
+                Some(json!({ "target": target, "body": body })),
+            )
+            .await
+            .expect("message.send");
+            let result: MessageSendResult = serde_json::from_value(value).expect("send result");
+            sent.push(result.message);
+            // Keep createdAt distinct even on coarse wall-clock resolutions.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        // createdAfter inclusive / createdBefore exclusive.
+        let search_value = dispatch(
+            &state,
+            "conn_alice",
+            method::MESSAGE_SEARCH,
+            Some(json!({
+                "query": "needle",
+                "target": target,
+                "createdAfter": sent[1].created_at,
+                "createdBefore": sent[2].created_at,
+            })),
+        )
+        .await
+        .expect("message.search bounded");
+        let search: MessageSearchResult =
+            serde_json::from_value(search_value).expect("bounded search result");
+        assert_eq!(
+            search
+                .messages
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![sent[1].id.as_str()]
+        );
+
+        // createdAfter >= createdBefore is invalid-params.
+        let err = dispatch(
+            &state,
+            "conn_alice",
+            method::MESSAGE_SEARCH,
+            Some(json!({
+                "query": "needle",
+                "createdAfter": sent[2].created_at,
+                "createdBefore": sent[1].created_at,
+            })),
+        )
+        .await
+        .expect_err("reversed bounds must fail");
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+
+        // message.context returns ordered neighbors around the anchor.
+        let context_value = dispatch(
+            &state,
+            "conn_alice",
+            method::MESSAGE_CONTEXT,
+            Some(json!({ "messageId": sent[1].id, "before": 5, "after": 5 })),
+        )
+        .await
+        .expect("message.context");
+        let context: MessageContextResult =
+            serde_json::from_value(context_value).expect("context result");
+        assert_eq!(context.anchor.id, sent[1].id);
+        assert_eq!(
+            context
+                .before
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![sent[0].id.as_str()]
+        );
+        assert_eq!(
+            context
+                .after
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![sent[2].id.as_str()]
+        );
+
+        // A missing anchor is a not-found, never an existence leak.
+        let err = dispatch(
+            &state,
+            "conn_alice",
+            method::MESSAGE_CONTEXT,
+            Some(json!({ "messageId": "msg_missing" })),
+        )
+        .await
+        .expect_err("missing anchor must fail");
+        assert_eq!(err.code, ErrorCode::APP_NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn message_rpc_parses_middle_mention_into_delivery() {
         let state = fresh_state("message_rpc_mention");
         open_conn(&state, "conn_alice", "actor_alice").await;
@@ -4154,11 +4340,182 @@ mod tests {
         assert!(closed.run.closed_at.is_some());
     }
 
+    #[test]
+    fn run_list_limit_is_clamped_to_server_bounds() {
+        assert_eq!(normalize_run_list_limit(0), 1);
+        assert_eq!(normalize_run_list_limit(50), 50);
+        assert_eq!(normalize_run_list_limit(RUN_LIST_MAX_LIMIT), 200);
+        assert_eq!(normalize_run_list_limit(RUN_LIST_MAX_LIMIT + 1), 200);
+        assert_eq!(normalize_run_list_limit(u32::MAX), 200);
+    }
+
+    #[tokio::test]
+    async fn run_rpc_list_and_get_respect_scope_acl() {
+        let state = fresh_state("run_rpc_list");
+        open_conn(&state, "conn_agent", "actor_agent_bot").await;
+        open_conn(&state, "conn_alice", "actor_alice").await;
+        let channel_value = dispatch(
+            &state,
+            "conn_agent",
+            method::CHANNEL_CREATE,
+            Some(json!({ "title": "runtime" })),
+        )
+        .await
+        .expect("channel/create");
+        let channel: ChannelCreateResult =
+            serde_json::from_value(channel_value).expect("channel result");
+        let config_value = dispatch(
+            &state,
+            "conn_agent",
+            method::AGENT_CONFIG_PUBLISH,
+            Some(json!({
+                "actorId": "actor_agent_bot",
+                "version": "v1",
+                "model": "test-model",
+            })),
+        )
+        .await
+        .expect("agent_config.publish");
+        let config: AgentConfigPublishResult =
+            serde_json::from_value(config_value).expect("config result");
+        let open_value = dispatch(
+            &state,
+            "conn_agent",
+            method::RUN_OPEN,
+            Some(json!({
+                "actorId": "actor_agent_bot",
+                "scope": { "kind": "channel", "id": channel.channel.id },
+                "startReason": "manual",
+                "agentConfigVersionId": config.version.id,
+            })),
+        )
+        .await
+        .expect("run.open");
+        let opened: RunOpenResult = serde_json::from_value(open_value).expect("run open result");
+
+        // The owner lists and gets the run in its private channel.
+        let list_value = dispatch(&state, "conn_agent", method::RUN_LIST, Some(json!({})))
+            .await
+            .expect("run.list");
+        let list: RunListResult = serde_json::from_value(list_value).expect("run list result");
+        assert_eq!(list.runs.len(), 1);
+        assert_eq!(list.runs[0].id, opened.run.id);
+        let get_value = dispatch(
+            &state,
+            "conn_agent",
+            method::RUN_GET,
+            Some(json!({ "runId": opened.run.id })),
+        )
+        .await
+        .expect("run.get");
+        let got: RunGetResult = serde_json::from_value(get_value).expect("run get result");
+        assert_eq!(got.run.id, opened.run.id);
+        assert_eq!(got.run.status, RunStatus::Queued);
+
+        // Status filter narrows the list.
+        let list_value = dispatch(
+            &state,
+            "conn_agent",
+            method::RUN_LIST,
+            Some(json!({ "statuses": ["failed"] })),
+        )
+        .await
+        .expect("run.list filtered");
+        let list: RunListResult =
+            serde_json::from_value(list_value).expect("filtered run list result");
+        assert!(list.runs.is_empty());
+
+        // Alice is not a channel member: the run is hidden from list and
+        // get does not leak its existence.
+        let list_value = dispatch(&state, "conn_alice", method::RUN_LIST, Some(json!({})))
+            .await
+            .expect("run.list alice");
+        let list: RunListResult =
+            serde_json::from_value(list_value).expect("alice run list result");
+        assert!(list.runs.is_empty());
+        let err = dispatch(
+            &state,
+            "conn_alice",
+            method::RUN_GET,
+            Some(json!({ "runId": opened.run.id })),
+        )
+        .await
+        .expect_err("invisible run must be not-found");
+        assert_eq!(err.code, ErrorCode::APP_NOT_FOUND);
+
+        // After joining the channel, Alice sees the same canonical run.
+        dispatch(
+            &state,
+            "conn_agent",
+            method::CHANNEL_INVITE,
+            Some(json!({
+                "channelId": channel.channel.id,
+                "actorId": "actor_alice",
+            })),
+        )
+        .await
+        .expect("channel/invite");
+        let get_value = dispatch(
+            &state,
+            "conn_alice",
+            method::RUN_GET,
+            Some(json!({ "runId": opened.run.id })),
+        )
+        .await
+        .expect("run.get alice");
+        let got: RunGetResult = serde_json::from_value(get_value).expect("alice run get result");
+        assert_eq!(got.run.id, opened.run.id);
+
+        // Limit is applied after canonical `(openedAt DESC, id DESC)`
+        // sorting, so a one-row page always returns the canonical head.
+        let second_value = dispatch(
+            &state,
+            "conn_agent",
+            method::RUN_OPEN,
+            Some(json!({
+                "actorId": "actor_agent_bot",
+                "scope": { "kind": "channel", "id": channel.channel.id.clone() },
+                "startReason": "second",
+                "agentConfigVersionId": opened.run.agent_config_version_id.clone(),
+            })),
+        )
+        .await
+        .expect("run.open second");
+        let second: RunOpenResult =
+            serde_json::from_value(second_value).expect("second run result");
+        let limited_value = dispatch(
+            &state,
+            "conn_agent",
+            method::RUN_LIST,
+            Some(json!({ "limit": 1 })),
+        )
+        .await
+        .expect("run.list limited");
+        let limited: RunListResult =
+            serde_json::from_value(limited_value).expect("limited run list result");
+        let mut expected = vec![opened.run.clone(), second.run.clone()];
+        expected.sort_by(|a, b| b.opened_at.cmp(&a.opened_at).then_with(|| b.id.cmp(&a.id)));
+        assert_eq!(limited.runs.len(), 1);
+        assert_eq!(limited.runs[0].id, expected[0].id);
+
+        // Unknown run ids are not-found too.
+        let err = dispatch(
+            &state,
+            "conn_agent",
+            method::RUN_GET,
+            Some(json!({ "runId": "run_missing" })),
+        )
+        .await
+        .expect_err("missing run must be not-found");
+        assert_eq!(err.code, ErrorCode::APP_NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn run_cancel_closes_run_and_wakes_agent() {
         let state = fresh_state("run_cancel");
         open_conn(&state, "conn_agent", "actor_agent_bot").await;
         open_conn(&state, "conn_human", "actor_human").await;
+        open_conn(&state, "conn_intruder", "actor_intruder").await;
         let channel_value = dispatch(
             &state,
             "conn_agent",
@@ -4202,6 +4559,59 @@ mod tests {
         .expect("run.open");
         let opened: RunOpenResult = serde_json::from_value(open_value).expect("run open result");
 
+        // Model the concrete stale-id case introduced by exposing run.get:
+        // an actor can legitimately observe the canonical id, then lose
+        // private-channel access before trying the global cancel action.
+        state
+            .store
+            .grant_channel(&channel.channel.id, "actor_intruder")
+            .expect("temporarily grant intruder");
+        let visible_value = dispatch(
+            &state,
+            "conn_intruder",
+            method::RUN_GET,
+            Some(json!({ "runId": opened.run.id })),
+        )
+        .await
+        .expect("run is initially visible");
+        let visible: RunGetResult = serde_json::from_value(visible_value).expect("run get result");
+        assert_eq!(visible.run.id, opened.run.id);
+        state
+            .store
+            .revoke_channel(&channel.channel.id, "actor_intruder")
+            .expect("revoke intruder");
+
+        // After revocation, the real run is indistinguishable from a missing
+        // run and cannot be changed through the stale id.
+        let hidden_err = dispatch(
+            &state,
+            "conn_intruder",
+            method::RUN_CANCEL,
+            Some(json!({ "runId": opened.run.id })),
+        )
+        .await
+        .expect_err("invisible run must be not-found");
+        let missing_err = dispatch(
+            &state,
+            "conn_intruder",
+            method::RUN_CANCEL,
+            Some(json!({ "runId": "run_missing" })),
+        )
+        .await
+        .expect_err("missing run must be not-found");
+        assert_eq!(hidden_err.code, ErrorCode::APP_NOT_FOUND);
+        assert_eq!(hidden_err.code, missing_err.code);
+        assert_eq!(hidden_err.message, missing_err.message);
+        assert_eq!(hidden_err.data, missing_err.data);
+        assert_eq!(
+            state
+                .store
+                .get_run(&opened.run.id)
+                .expect("run remains")
+                .status,
+            RunStatus::Queued
+        );
+
         let cancel_value = dispatch(
             &state,
             "conn_human",
@@ -4242,6 +4652,81 @@ mod tests {
             .deliveries
             .iter()
             .any(|entry| entry.message.as_ref().is_some_and(|m| m.id == message.id)));
+    }
+
+    #[tokio::test]
+    async fn run_cancel_allows_any_actor_in_a_public_channel() {
+        let state = fresh_state("run_cancel_public");
+        open_conn(&state, "conn_agent", "actor_agent_bot").await;
+        open_conn(&state, "conn_human", "actor_human").await;
+        let channel = state
+            .store
+            .create_channel("public runtime".into(), None)
+            .expect("create public channel");
+        state
+            .store
+            .grant_channel(&channel.id, "actor_agent_bot")
+            .expect("make run actor routable");
+        assert!(!state
+            .store
+            .get_channel(&channel.id)
+            .expect("public channel")
+            .members
+            .iter()
+            .any(|actor_id| actor_id == "actor_human"));
+
+        let config_value = dispatch(
+            &state,
+            "conn_agent",
+            method::AGENT_CONFIG_PUBLISH,
+            Some(json!({
+                "actorId": "actor_agent_bot",
+                "version": "v1",
+                "model": "test-model",
+            })),
+        )
+        .await
+        .expect("agent_config.publish");
+        let config: AgentConfigPublishResult =
+            serde_json::from_value(config_value).expect("config result");
+        let open_value = dispatch(
+            &state,
+            "conn_agent",
+            method::RUN_OPEN,
+            Some(json!({
+                "actorId": "actor_agent_bot",
+                "scope": { "kind": "channel", "id": channel.id },
+                "startReason": "manual",
+                "agentConfigVersionId": config.version.id,
+            })),
+        )
+        .await
+        .expect("run.open");
+        let opened: RunOpenResult = serde_json::from_value(open_value).expect("run open result");
+
+        // Public channels deliberately treat every actor as a read/write
+        // member. Preserve that existing ACL instead of inventing a separate
+        // run-cancel role as part of the read-API exposure.
+        let cancel_value = dispatch(
+            &state,
+            "conn_human",
+            method::RUN_CANCEL,
+            Some(json!({ "runId": opened.run.id })),
+        )
+        .await
+        .expect("public-channel run.cancel");
+        let canceled: RunCancelResult =
+            serde_json::from_value(cancel_value).expect("run cancel result");
+        assert_eq!(canceled.run.status, RunStatus::Canceled);
+        assert_eq!(
+            canceled
+                .cancel_message
+                .expect("cancel message")
+                .metadata
+                .get("canceledBy")
+                .and_then(Value::as_str),
+            Some("actor_human")
+        );
     }
 
     #[tokio::test]

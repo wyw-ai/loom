@@ -230,6 +230,7 @@ export const runStatusLabel: Record<string, string> = {
   preparing_context: "Preparing",
   running: "Thinking",
   waiting_tool: "Running tool",
+  completed: "Completed",
   failed: "Failed",
   canceled: "Canceled",
 };
@@ -437,6 +438,8 @@ export interface ChannelAgentActivity {
   primaryAgentName: string;
   /** Status of the highest-priority active agent */
   primaryStatus: RunStatus;
+  /** The highest-priority active run, when any agent is active */
+  primaryRun: Run | null;
   /** Total number of active (non-terminal) agent runs */
   activeCount: number;
   /** Whether any agent has a failed run */
@@ -456,7 +459,7 @@ export function getChannelAgentActivity(
   runs: Record<string, Run>,
   agentActors: Actor[],
 ): ChannelAgentActivity | null {
-  let best: { actorId: string; status: RunStatus; priority: number } | null = null;
+  let best: { actorId: string; status: RunStatus; priority: number; run: Run } | null = null;
   let activeCount = 0;
   let hasFailed = false;
 
@@ -469,7 +472,7 @@ export function getChannelAgentActivity(
     activeCount++;
     const p = ACTIVITY_PRIORITY[ctx.status] ?? 0;
     if (p > (best?.priority ?? 0)) {
-      best = { actorId: actor.id, status: ctx.status, priority: p };
+      best = { actorId: actor.id, status: ctx.status, priority: p, run: ctx.run };
     }
   }
 
@@ -482,6 +485,7 @@ export function getChannelAgentActivity(
   return {
     primaryAgentName,
     primaryStatus: best?.status ?? "failed",
+    primaryRun: best?.run ?? null,
     activeCount,
     hasFailed,
     isIdle: false,

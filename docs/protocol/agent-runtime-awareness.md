@@ -64,12 +64,12 @@ Loom 打包时内置该仓库的一份快照。用户或 agent 可以运行 `loo
 仓库临时 clone 到构建输出目录，生成内置快照后删除临时 clone。需要覆盖远程地址时，
 可以设置 `LOOM_GUIDE_REPO`。
 
-### `loom-skills` 是官方 Skill 集合
+### `skills` 是官方 Skill 集合
 
 Loom 默认给每个 agent 投影一个官方 `loom` skill。该 skill 的源仓库是：
 
 ```text
-https://github.com/wyw-ai/loom-skills.git
+https://github.com/wyw-ai/skills.git
 ```
 
 该仓库可以维护多个 skill。Loom 当前默认内置和投影的是其中的 `skills/loom`
@@ -104,7 +104,7 @@ artifact、reminder 等场景时应该先读哪个 reference 或 guide topic。
 `hidden` 表示宿主接管 provider-facing instructions、工具和结果投递，不改变 Loom
 内部的 durable message、inbox acknowledgement、run lifecycle 或 session 管理语义。
 
-`loom-skills` 的内容同样不应复制维护到 Loom 主仓库。Loom 构建和发布时只读取外部
+`skills` 的内容同样不应复制维护到 Loom 主仓库。Loom 构建和发布时只读取外部
 仓库内容生成编译期快照。构建机可以通过 `LOOM_SKILLS_DIR` 指向该仓库；未设置时，
 默认查找 Loom 仓库平级的 `../loom-skills`；如果本地路径不存在，则从官方 GitHub
 仓库临时 clone 到构建输出目录，生成内置快照后删除临时 clone。需要覆盖远程地址时，
@@ -227,14 +227,14 @@ instruction 管理。是否把它投影进 Loom marker 内部，由 actor/profil
 内容来源是：
 
 ```text
-https://github.com/wyw-ai/loom-skills.git
+https://github.com/wyw-ai/skills.git
 ```
 
 默认 skill id 是 `loom`。每个 agent turn 构造 workspace 前，Loom 应确保该 skill
 存在并投影到当前 workspace；channel/member scope skills 和 actor bundle skills
 可以和它并存，但不应替代默认 `loom` skill。
 
-Loom 只内置并同步 `loom-skills` 仓库中的 `skills/loom` 目录。运行时写入
+Loom 只内置并同步 `skills` 仓库中的 `skills/loom` 目录。运行时写入
 `data_root/builtin/skills/loom` 时，应同步完整目录树，包括 `SKILL.md` 和
 `references` 下的文档；如果内置快照删除了旧文件，运行时也应清理
 `data_root/builtin/skills/loom` 中对应的旧文件，避免 agent 读到过期 reference。
@@ -338,7 +338,7 @@ instruction path 指向同一份 workspace bootstrap 内容。这是 provider ad
 
 1. 将本文作为 agent 感知 Loom 运行规则的协议来源。
 2. 引入外部 `loom-guide` 的打包和更新机制。
-3. 引入外部 `loom-skills` 的 `skills/loom` 打包快照，并默认投影到每个 agent
+3. 引入外部 `skills` 的 `skills/loom` 打包快照，并默认投影到每个 agent
    workspace。
 4. 把生成的 Loom `AGENTS.md` block 缩短为最小启动契约。
 5. 修改 `AGENTS.md` 生成逻辑：已有 marker block 时，只有生成内容不同才替换
@@ -368,6 +368,6 @@ instruction path 指向同一份 workspace bootstrap 内容。这是 provider ad
   本地缓存；运行时可用 `LOOM_GUIDE_REPO` 环境变量覆盖仓库地址（例如私有镜像
   或带凭证的 URL）。
 - 每个 agent workspace 都能发现默认 `loom` skill。
-- 默认 `loom` skill 的内容来自 `https://github.com/wyw-ai/loom-skills.git` 的
+- 默认 `loom` skill 的内容来自 `https://github.com/wyw-ai/skills.git` 的
   `skills/loom` 打包快照。
 - 官方 Loom skill 负责把 agent 指向 guide topic，而不是复制 guide 全文。

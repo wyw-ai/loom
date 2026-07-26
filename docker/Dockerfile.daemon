@@ -48,6 +48,11 @@ RUN chmod 0755 /usr/local/bin/loom-install-agents /usr/local/bin/loom-daemon-ent
 # Bake the requested agents (versions pinnable via e.g. CLAUDE_CODE_VERSION).
 RUN set -- $(printf '%s' "$AGENTS" | tr ',' ' ') && loom-install-agents "$@"
 
+# claude-code refuses --dangerously-skip-permissions as root, and agent CLIs
+# should not run as root anyway: run the daemon as the node user.
+RUN mkdir -p /data && chown node:node /data
+USER node
+
 ENV LOOM_SERVER="ws://server:7878/rpc" \
     LOOM_MACHINE_NAME="docker" \
     LOOM_DATA_ROOT="/data"

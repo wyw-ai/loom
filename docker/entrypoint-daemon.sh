@@ -38,8 +38,13 @@ if [ -n "$AGENTS" ]; then
 
     if ! command -v "$AGENT_BIN" >/dev/null 2>&1; then
       warn "$name: '$AGENT_BIN' not baked into the image; installing at runtime"
-      "$INSTALL_AGENTS" "$name"
+      if ! "$INSTALL_AGENTS" "$name"; then
+        warn "$name: runtime install failed (non-root container?); continuing without it"
+        continue
+      fi
     fi
+
+    agent_configure
 
     for var in $AGENT_REQUIRED_ENV; do
       eval "val=\"\${$var:-}\""

@@ -35,6 +35,11 @@ compose changes needed.
 
 Notes:
 
+- The daemon container runs as the `node` user (not root): claude-code
+  refuses `--dangerously-skip-permissions` as root. Mount config dirs at
+  `/home/node/.claude` (not `/root/.claude`).
+- Runtime installs from the entrypoint are a fallback and need a writable
+  global npm prefix; prefer baking agents at build time (`AGENTS` build arg).
 - `zcode` ships as a desktop app only; see `docker/agents/zcode.sh` for the
   `ZCODE_INSTALL_CMD` escape hatch.
 - OAuth-style CLIs (e.g. Copilot device flow) need a mounted config dir —

@@ -3,10 +3,15 @@
 /data/artifacts/
 /dist/
 /pages/build/
+# Local secrets / Docker stack config (only .env.example is tracked)
+.env
+.env.*
+!.env.example
 .idea
 .DS_Store
 /.claude/
-/.agents/
+/.agents/*
+!/.agents/skills/
 /.am/
 __pycache__/
 /docs/*

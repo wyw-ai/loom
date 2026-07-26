@@ -96,7 +96,7 @@ jobs:
       - name: Checkout official Loom skills content
         uses: actions/checkout@v6.0.3
         with:
-          repository: wyw-ai/loom-skills
+          repository: wyw-ai/skills
           token: ${{ secrets.LOOM_CONTENT_TOKEN || github.token }}
           path: loom-skills
 
@@ -142,7 +142,7 @@ jobs:
       - name: Checkout official Loom skills content
         uses: actions/checkout@v6.0.3
         with:
-          repository: wyw-ai/loom-skills
+          repository: wyw-ai/skills
           token: ${{ secrets.LOOM_CONTENT_TOKEN || github.token }}
           path: loom-skills
 
@@ -185,7 +185,7 @@ jobs:
       - name: Checkout official Loom skills content
         uses: actions/checkout@v6.0.3
         with:
-          repository: wyw-ai/loom-skills
+          repository: wyw-ai/skills
           token: ${{ secrets.LOOM_CONTENT_TOKEN || github.token }}
           path: loom-skills
 

@@ -86,13 +86,32 @@ export function useDownloadedArtifacts() {
   }, []);
 
   /**
-   * Clear all downloaded artifact mappings (localStorage).
-   * ARCH D3-r1: used by CacheManagementSection after clearing disk cache.
+   * Reconcile localStorage mappings against the on-disk cache.
+   * Removes entries whose artifactId is NOT in cachedIds (orphan mappings
+   * where localStorage records a path but the disk file was externally
+   * deleted).
+   *
+   * ARCH TODO#2 Tier 2: called by CacheManagementSection.refresh() after
+   * getting the breakdown (incl. cachedIds) from BE. This is the batch
+   * counterpart to the lazy per-artifact cleanup in useAutoDownloadImage.
    */
-  const clearAllDownloaded = useCallback(() => {
-    saveMap({});
-    notifyAll();
+  const reconcileDownloaded = useCallback((cachedIds: string[]) => {
+    const current = loadMap();
+    const onDiskSet = new Set(cachedIds);
+    let changed = false;
+    const next: DownloadMap = {};
+    for (const [id, path] of Object.entries(current)) {
+      if (onDiskSet.has(id)) {
+        next[id] = path;
+      } else {
+        changed = true; // orphan detected - disk file externally deleted
+      }
+    }
+    if (changed) {
+      saveMap(next);
+      notifyAll();
+    }
   }, []);
 
-  return { isDownloaded, setDownloaded, clearDownloaded, clearAllDownloaded, clearDownloadedByIds };
+  return { isDownloaded, setDownloaded, clearDownloaded, clearDownloadedByIds, reconcileDownloaded };
 }

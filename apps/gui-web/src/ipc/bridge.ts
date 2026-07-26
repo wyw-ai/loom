@@ -24,8 +24,15 @@ import type {
   MachineDirListResult,
   MachineListResult,
   Message,
+  MessageContextParams,
+  MessageContextResult,
   MessageIntent,
+  MessageSearchParams,
+  MessageSearchResult,
   Run,
+  RunGetResult,
+  RunListParams,
+  RunListResult,
   ScopeRef,
   SkillEntry,
   StreamUpdate,
@@ -261,15 +268,21 @@ export async function messageList(params: {
   limit?: number;
   beforeMessageId?: string;
 }): Promise<{ messages: Message[]; pageInfo?: { hasMore?: boolean } }> {
-  return invoke("message_list", {
-    params: {
-      target: params.target,
-      limit: params.limit ?? 100,
-      ...(params.beforeMessageId
-        ? { beforeMessageId: params.beforeMessageId }
-        : {}),
+  // Wire shape is `page_info` (MessageListResult has no camelCase rename);
+  // remap to the frontend's camelCase convention.
+  const res = await invoke<{ messages: Message[]; page_info?: { hasMore?: boolean } }>(
+    "message_list",
+    {
+      params: {
+        target: params.target,
+        limit: params.limit ?? 100,
+        ...(params.beforeMessageId
+          ? { beforeMessageId: params.beforeMessageId }
+          : {}),
+      },
     },
-  });
+  );
+  return { messages: res.messages, pageInfo: res.page_info };
 }
 
 export async function messageSend(params: {
@@ -319,11 +332,31 @@ export async function messageReactionToggle(params: {
   return invoke("message_reaction_toggle", { params });
 }
 
+export async function messageSearch(
+  params: MessageSearchParams,
+): Promise<MessageSearchResult> {
+  return invoke("message_search", { params });
+}
+
+export async function messageContext(
+  params: MessageContextParams,
+): Promise<MessageContextResult> {
+  return invoke("message_context", { params });
+}
+
 export async function runCancel(params: {
   runId: string;
   reason?: string;
-}): Promise<{ run: Run; cancelMessage?: Message | null; scope?: ScopeRef | null }> {
+}): Promise<{ run: Run; cancelMessage?: Message | null }> {
   return invoke("run_cancel", { params });
+}
+
+export async function runList(params: RunListParams): Promise<RunListResult> {
+  return invoke("run_list", { params });
+}
+
+export async function runGet(params: { runId: string }): Promise<RunGetResult> {
+  return invoke("run_get", { params });
 }
 
 export async function inboxList(params: {
@@ -740,19 +773,28 @@ export async function downloadToCache(args: {
 /**
  * Clear the entire attachment cache directory (disk files).
  * ARCH D3-r1: used by CacheManagementSection in settings.
+ * Returns `{ freedBytes, clearedIds }` (AC-A6: symmetric with
+ * clearAttachmentCacheByType) so the FE can batch-clear the
+ * corresponding localStorage entries by artifact id.
  */
-export async function clearAttachmentCache(): Promise<void> {
-  await invoke("clear_attachment_cache", { args: {} });
+export async function clearAttachmentCache(): Promise<{
+  freedBytes: number;
+  clearedIds: string[];
+}> {
+  return invoke("clear_attachment_cache", { args: {} });
 }
 
 /**
  * Get cache breakdown by media type category.
  * ARCH D3 design: returns { images: {size,count}, other: {size,count}, total }.
+ * ARCH TODO#2 Tier 2: also returns `cachedIds` - the list of artifactIds
+ * present on disk, used to reconcile localStorage orphan mappings.
  */
 export async function getAttachmentCacheBreakdown(): Promise<{
   images: { size: number; count: number };
   other: { size: number; count: number };
   total: { size: number; count: number };
+  cachedIds: string[];
 }> {
   return invoke("get_attachment_cache_breakdown", { args: {} });
 }

@@ -5,6 +5,7 @@ import type {
   ChannelMemberConfig,
   MachineInfo,
   Message,
+  MessageContextResult,
   Workspace,
 } from "@/ipc/types";
 import type { AgentFormState, AgentUpdatePatch } from "@/lib/types";
@@ -25,6 +26,7 @@ import {
 } from "@/lib/format-utils";
 import {
   channelMentionActors,
+  directChannelPeerId,
   directMessageTarget,
   directPeerForMessage,
   isChannelMentionActor,
@@ -83,6 +85,7 @@ export interface ActionDeps {
   setChannelMemberConfigsByChannel: React.Dispatch<React.SetStateAction<Record<string, Record<string, ChannelMemberConfig>>>>;
   setThreadsByChannel: (updater: (current: Record<string, import("@/ipc/types").Thread[]>) => Record<string, import("@/ipc/types").Thread[]>) => void;
   setView: (view: import("@/lib/types").View) => void;
+  setMessageAnchorId: (messageId: string | null) => void;
 
   // State values
   draft: string;
@@ -94,7 +97,10 @@ export interface ActionDeps {
   activeDirectTarget: string | null;
   activeDirectActor: { id: string } | null;
   activeChannel: Channel | null;
+  channels: Channel[];
   channelThreads: import("@/ipc/types").Thread[];
+  threadsByChannel: Record<string, import("@/ipc/types").Thread[]>;
+  visibleChannels: import("@/ipc/types").Channel[];
   actors: Record<string, import("@/ipc/types").Actor>;
   machines: MachineInfo[];
   workspace: Workspace | null;
@@ -111,6 +117,7 @@ export interface ActionDeps {
   activeThreadScopeRef: React.MutableRefObject<ScopeRef | null>;
   activeDirectScopeRef: React.MutableRefObject<ScopeRef | null>;
   actorIdRef: React.MutableRefObject<string | null>;
+  pendingMessageContextRef: React.MutableRefObject<MessageContextResult | null>;
 
   // Callbacks
   applyConfig: (config: import("@/ipc/types").DesktopConfig) => void;
@@ -125,6 +132,12 @@ export interface ActionDeps {
   clearReconnectTimer: () => void;
   pushNotice: (msg: string) => void;
   applyChannelDeleted: (channelId: string) => void;
+}
+
+function mergeContextMessages(current: Message[], context: Message[]): Message[] {
+  const byId = new Map(current.map((message) => [message.id, message]));
+  for (const message of context) byId.set(message.id, message);
+  return sortMessages([...byId.values()]);
 }
 
 export function useActions(deps: ActionDeps) {
@@ -1027,6 +1040,148 @@ export function useActions(deps: ActionDeps) {
     }
   }, []);
 
+  const cancelRun = useCallback(async (runId: string) => {
+    const d = depsRef.current;
+    d.setBusy(`run:cancel:${runId}`);
+    d.setError(null);
+    try {
+      const result = await ipc.runCancel({ runId });
+      // Canonical status comes from the response (and subsequent run.updated);
+      // never fake a terminal state client-side.
+      d.setRuns((current) => ({ ...current, [result.run.id]: result.run }));
+    } catch (err) {
+      d.setError(errorText(err));
+    } finally {
+      d.setBusy(null);
+    }
+  }, []);
+
+  const openScope = useCallback(async (scope: ScopeRef) => {
+    const d = depsRef.current;
+    const navigate = (channelId: string, threadId: string | null) => {
+      d.setView("chat");
+      d.setActiveChannelId(channelId);
+      d.setActiveThreadId(threadId);
+      d.setChannelPanelTab(null);
+    };
+    if (scope.kind === "channel") {
+      const channel = d.channels.find((candidate) => candidate.id === scope.id);
+      const directPeerId = directChannelPeerId(
+        channel,
+        d.workspace?.actorId ?? null,
+      );
+      if (directPeerId) {
+        d.setDirectScopesByActorId((current) => ({
+          ...current,
+          [directPeerId]: scope,
+        }));
+        d.activeDirectScopeRef.current = scope;
+        d.setView("direct");
+        d.setActiveDirectActorId(directPeerId);
+        d.setActiveThreadId(null);
+        d.setChannelPanelTab(null);
+        return;
+      }
+      navigate(scope.id, null);
+      return;
+    }
+    // Thread scope: scope.id is the thread id; the thread knows its channel.
+    const findThread = (byChannel: Record<string, import("@/ipc/types").Thread[]>) => {
+      for (const threads of Object.values(byChannel)) {
+        const found = threads.find((thread) => thread.id === scope.id);
+        if (found) return found;
+      }
+      return null;
+    };
+    let thread = findThread(d.threadsByChannel);
+    if (!thread) {
+      // Threads for the scope's channel may not be loaded yet; refetch first.
+      const results = await Promise.allSettled(
+        d.visibleChannels.map((channel) => ipc.threadList(channel.id)),
+      );
+      const merged: Record<string, import("@/ipc/types").Thread[]> = {
+        ...d.threadsByChannel,
+      };
+      results.forEach((result, index) => {
+        if (result.status === "fulfilled") {
+          merged[d.visibleChannels[index].id] = sortThreads(result.value.threads);
+        }
+      });
+      d.setThreadsByChannel(() => merged);
+      thread = findThread(merged);
+    }
+    if (!thread) {
+      d.setError("The source scope is not visible.");
+      return;
+    }
+    navigate(thread.channelId, thread.id);
+  }, []);
+
+  const openMessageContext = useCallback(async (context: MessageContextResult) => {
+    const d = depsRef.current;
+    const normalizedContext: MessageContextResult = {
+      before: context.before.map(normalizeMessage),
+      anchor: normalizeMessage(context.anchor),
+      after: context.after.map(normalizeMessage),
+    };
+    const contextMessages = sortMessages([
+      ...normalizedContext.before,
+      normalizedContext.anchor,
+      ...normalizedContext.after,
+    ]);
+    d.pendingMessageContextRef.current = normalizedContext;
+    d.setMessageAnchorId(normalizedContext.anchor.id);
+
+    const directPeerId = directPeerForMessage(
+      normalizedContext.anchor,
+      d.workspace?.actorId ?? null,
+    );
+    if (directPeerId) {
+      const alreadyActive = Boolean(
+        d.activeDirectScopeRef.current &&
+          sameScope(d.activeDirectScopeRef.current, normalizedContext.anchor.scope),
+      );
+      d.setDirectScopesByActorId((current) => ({
+        ...current,
+        [directPeerId]: normalizedContext.anchor.scope,
+      }));
+      d.activeDirectScopeRef.current = normalizedContext.anchor.scope;
+      d.setDirectMessages(
+        alreadyActive
+          ? (current) => mergeContextMessages(current, contextMessages)
+          : contextMessages,
+      );
+      d.setView("direct");
+      d.setActiveDirectActorId(directPeerId);
+      d.setActiveThreadId(null);
+      d.setChannelPanelTab(null);
+      return;
+    }
+
+    if (normalizedContext.anchor.scope.kind === "thread") {
+      const alreadyActive = Boolean(
+        d.activeThreadScopeRef.current &&
+          sameScope(d.activeThreadScopeRef.current, normalizedContext.anchor.scope),
+      );
+      d.setThreadMessages(
+        alreadyActive
+          ? (current) => mergeContextMessages(current, contextMessages)
+          : contextMessages,
+      );
+    } else {
+      const alreadyActive = Boolean(
+        d.activeScopeRef.current &&
+          sameScope(d.activeScopeRef.current, normalizedContext.anchor.scope),
+      );
+      d.setMessages(
+        alreadyActive
+          ? (current) => mergeContextMessages(current, contextMessages)
+          : contextMessages,
+      );
+    }
+    await openScope(normalizedContext.anchor.scope);
+  }, [openScope]);
+
   const answerAction = useCallback(async (message: Message, optionId: string, accepted: boolean) => {
     const d = depsRef.current;
     const responseTarget = message.target || d.target;
@@ -1149,6 +1304,9 @@ export function useActions(deps: ActionDeps) {
     sendDirectMessage,
     startThread,
     toggleMessageReaction,
+    cancelRun,
+    openScope,
+    openMessageContext,
     answerAction,
     answerDirectAction,
     selectWorkspace,

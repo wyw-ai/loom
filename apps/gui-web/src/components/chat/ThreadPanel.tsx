@@ -38,6 +38,7 @@ export function ThreadPanel({
   onOpenAgentSettings,
   onOpenFolder,
   scopeId,
+  anchorMessageId,
 }: {
   actors: Record<string, Actor>;
   channel: Channel | null;
@@ -60,6 +61,7 @@ export function ThreadPanel({
   onOpenAgentSettings: (actorId: string) => void;
   onOpenFolder?: () => void;
   scopeId?: string | null;
+  anchorMessageId?: string | null;
 }) {
   const rootMessage = thread
     ? channelMessages.find((message) => message.id === thread.rootMessageId) ?? null
@@ -104,21 +106,30 @@ export function ThreadPanel({
           </div>
         );
       }
+      const isAnchor = item.message.id === anchorMessageId;
       return (
-        <ThreadConversationMessage
-          actor={actors[item.message.authorActorId]}
-          actors={actors}
-          busy={busy}
-          currentActorId={currentActorId}
-          machines={machines}
-          runs={runs}
-          message={item.message}
-          onOpenAgentSettings={onOpenAgentSettings}
-          onToggleReaction={onToggleReaction}
-        />
+        <div
+          data-search-anchor={isAnchor ? "true" : undefined}
+          className={cn(
+            isAnchor &&
+              "relative z-[1] rounded-lg bg-amber-50/70 ring-2 ring-inset ring-amber-300",
+          )}
+        >
+          <ThreadConversationMessage
+            actor={actors[item.message.authorActorId]}
+            actors={actors}
+            busy={busy}
+            currentActorId={currentActorId}
+            machines={machines}
+            runs={runs}
+            message={item.message}
+            onOpenAgentSettings={onOpenAgentSettings}
+            onToggleReaction={onToggleReaction}
+          />
+        </div>
       );
     },
-    [replyItems, actors, busy, currentActorId, machines, runs, onOpenAgentSettings, onToggleReaction],
+    [replyItems, actors, busy, currentActorId, machines, runs, onOpenAgentSettings, onToggleReaction, anchorMessageId],
   );
 
   const headerRenderer = useCallback(
@@ -179,7 +190,7 @@ export function ThreadPanel({
             )}
           </div>
           <div className="flex items-center gap-1">
-            {/* L1/L2 thread token summary (AC-T2) - silent-hidden when null */}
+            {/* L1/L2 thread token summary (AC-T2) — silent-hidden when null */}
             <ScopeTokenSummary scopeId={scopeId} actors={actors} />
             {onOpenFolder && thread && (
               <button
@@ -198,7 +209,7 @@ export function ThreadPanel({
         </div>
       </div>
 
-      {/* Body - root message header + virtualized replies via FeedScrollManager */}
+      {/* Body — root message header + virtualized replies via FeedScrollManager */}
       {!thread ? (
         <div className="flex min-h-0 flex-1 items-center justify-center p-4">
           <EmptyState icon={Split} text="Select a thread." />
@@ -213,6 +224,7 @@ export function ThreadPanel({
           feedItems={replyItems}
           renderItem={renderItem}
           headerRenderer={headerRenderer}
+          anchorMessageId={anchorMessageId}
         />
       )}
 

@@ -3,7 +3,7 @@ name = "loom-shell"
 version = "0.1.0"
 edition = "2021"
 description = "Windows 管理 GUI — 通过托盘+标签页管理 loom-server / loom-daemon 服务"
-license = "MIT"
+license = "Apache-2.0"
 
 # Only build on Windows; excluded from default-members so non-Windows
 # `cargo check --workspace` won't try to resolve these deps.

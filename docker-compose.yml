@@ -1,0 +1,49 @@
+name: loom
+
+# One-command Loom stack: loom-server + loom-daemon (with agent CLIs).
+#
+#   cp .env.example .env   # fill in AGENTS + API keys
+#   docker compose up -d --build
+#
+# Then from the host: loom who --server ws://127.0.0.1:7878/rpc
+# (or point Loom Desktop at 127.0.0.1:7878).
+
+services:
+  server:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.server
+      args:
+        LOOM_VERSION: ${LOOM_VERSION:-latest}
+    ports:
+      - "127.0.0.1:7878:7878"
+    volumes:
+      - loom-server-data:/data
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "7878"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  daemon:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.daemon
+      args:
+        LOOM_VERSION: ${LOOM_VERSION:-latest}
+        AGENTS: ${AGENTS:-claude,codex}
+    env_file: .env
+    environment:
+      LOOM_SERVER: ws://server:7878/rpc
+      LOOM_MACHINE_NAME: ${LOOM_MACHINE_NAME:-docker}
+    volumes:
+      - loom-daemon-data:/data
+    depends_on:
+      server:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  loom-server-data:
+  loom-daemon-data:

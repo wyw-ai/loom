@@ -768,6 +768,26 @@ pub async fn message_list(state: State<'_, AppState>, params: Value) -> Result<V
 }
 
 #[tauri::command]
+pub async fn message_search(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::MESSAGE_SEARCH, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn message_context(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::MESSAGE_CONTEXT, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
 pub async fn message_send(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
     let cfg = config::load_or_init().map_err(stringify)?;
     let client = state.client().await?;
@@ -1464,9 +1484,10 @@ fn cache_self_check_at_root(cache_root: &Path) {
         if !meta_exists || !has_data_file {
             // Orphan (no meta) or residual (no data) — remove the dir.
             if let Err(e) = std::fs::remove_dir_all(&path) {
-                eprintln!(
-                    "cache_self_check: failed to remove inconsistent cache dir {}: {e}",
-                    path.display()
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "cache_self_check: failed to remove inconsistent cache dir"
                 );
             }
         }
@@ -1747,21 +1768,65 @@ fn dir_size_bytes(dir: &Path) -> u64 {
 /// E2-cache: Clear the entire attachment cache directory, deleting all
 /// cached artifact files on disk (ARCH D3-r1, AC-P0-10). The FE is
 /// responsible for also clearing the localStorage mapping and in-memory
-/// Object URLs after this returns. Returns the number of bytes freed
-/// so the UI can confirm what was removed.
+/// Object URLs after this returns. Returns `{ freedBytes, clearedIds }`
+/// so the FE can batch-clear the corresponding localStorage entries,
+/// mirroring the `clear_attachment_cache_by_type` contract (AC-A6).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClearAttachmentCacheResult {
+    freed_bytes: u64,
+    cleared_ids: Vec<String>,
+}
+
+/// Core clear-all logic parameterized by cache root, so it can be unit
+/// tested with an isolated temp dir. Walks the cache root, removes each
+/// artifact subdirectory, and accumulates the freed bytes plus the list
+/// of cleared artifact ids (the subdirectory names). Best-effort: a
+/// failure to remove one dir is logged and skipped so a single
+/// unreadable entry does not abort the whole clear.
+fn clear_attachment_cache_at_root(cache_root: &Path) -> (u64, Vec<String>) {
+    let mut freed_bytes = 0u64;
+    let mut cleared_ids = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(cache_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let size = artifact_dir_size(&path);
+            let artifact_id = entry.file_name().to_string_lossy().to_string();
+
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => {
+                    freed_bytes += size;
+                    cleared_ids.push(artifact_id);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "failed to remove cache dir during clear-all"
+                    );
+                }
+            }
+        }
+    }
+
+    (freed_bytes, cleared_ids)
+}
+
 #[tauri::command]
-pub fn clear_attachment_cache() -> Result<u64, String> {
+pub fn clear_attachment_cache() -> Result<Value, String> {
     let cache_root = attachment_cache_root()
         .ok_or_else(|| "Cannot determine persistent data directory for cache".to_string())?;
 
-    if !cache_root.exists() {
-        return Ok(0);
-    }
-
-    let size = dir_size_bytes(&cache_root);
-    std::fs::remove_dir_all(&cache_root)
-        .map_err(|e| format!("Failed to clear attachment cache: {e}"))?;
-    Ok(size)
+    let (freed_bytes, cleared_ids) = clear_attachment_cache_at_root(&cache_root);
+    let result = ClearAttachmentCacheResult {
+        freed_bytes,
+        cleared_ids,
+    };
+    serde_json::to_value(result).map_err(|e| format!("Failed to serialize result: {e}"))
 }
 
 /// E4-cache: Read bytes from a local cached file (ARCH D3-r1). This is
@@ -1799,20 +1864,26 @@ pub fn read_local_file_bytes(args: ReadLocalFileBytesArgs) -> Result<Value, Stri
     // prevents the FE from arbitrary file reads via this command.
     let cache_root = attachment_cache_root()
         .ok_or_else(|| "Cannot determine persistent data directory for cache".to_string())?;
-    // canonicalize the cache root, creating it if missing so the prefix
-    // check works even on a fresh install where no artifact has been
-    // cached yet. (A read of a non-existent file under a non-existent
-    // cache root still fails at the open() step below.)
-    let canonical_root = match std::fs::canonicalize(&cache_root) {
-        Ok(c) => c,
-        Err(_) => match std::fs::create_dir_all(&cache_root)
-            .and_then(|_| std::fs::canonicalize(&cache_root))
-        {
-            Ok(c) => c,
-            Err(e) => return Err(format!("Failed to resolve cache root: {e}")),
-        },
-    };
-    let canonical_target = std::fs::canonicalize(&path)
+    read_local_file_bytes_at_root(&cache_root, &path, args.offset, args.max_bytes)
+}
+
+/// Core read logic parameterized by cache root, so it can be unit tested
+/// with an isolated temp dir without depending on the global cache root.
+///
+/// This is a *read* path: it must not create the cache root as a side
+/// effect (AC-A1). If the cache root does not exist there is nothing to
+/// read, and we surface an explicit error instead of mutating the
+/// filesystem. Callers that need the directory created should use the
+/// download/open-cache paths which own that responsibility.
+fn read_local_file_bytes_at_root(
+    cache_root: &Path,
+    path: &Path,
+    offset: Option<u64>,
+    max_bytes: Option<u64>,
+) -> Result<Value, String> {
+    let canonical_root = std::fs::canonicalize(cache_root)
+        .map_err(|e| format!("Cache directory does not exist: {e}"))?;
+    let canonical_target = std::fs::canonicalize(path)
         .map_err(|e| format!("Failed to resolve path: {e}"))?;
     if !canonical_target.starts_with(&canonical_root) {
         return Err("Path is outside the attachment cache directory".to_string());
@@ -1821,8 +1892,8 @@ pub fn read_local_file_bytes(args: ReadLocalFileBytesArgs) -> Result<Value, Stri
     let mut file = std::fs::File::open(&canonical_target)
         .map_err(|e| format!("Failed to open cached file: {e}"))?;
 
-    let offset = args.offset.unwrap_or(0);
-    let max_bytes = args.max_bytes.unwrap_or(CACHE_CHUNK_SIZE);
+    let offset = offset.unwrap_or(0);
+    let max_bytes = max_bytes.unwrap_or(CACHE_CHUNK_SIZE);
 
     use std::io::{Read, Seek, SeekFrom};
     if offset > 0 {
@@ -1913,19 +1984,30 @@ struct CacheCategoryStats {
 /// Typed return shape for `get_attachment_cache_breakdown` (SF-3).
 /// Replaces the previous bare `json!()` construction so the field
 /// names and types are checked at compile time.
+///
+/// `cached_ids` (ARCH TODO#2 Tier 2): the list of artifactIds that
+/// actually exist on disk (= cache dir subdirectory names). The FE
+/// reconciles its localStorage mappings against this set to remove
+/// orphan entries whose backing file was externally deleted.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CacheBreakdownResult {
     images: CacheCategoryStats,
     other: CacheCategoryStats,
     total: CacheCategoryStats,
+    cached_ids: Vec<String>,
 }
 
 /// Core breakdown logic parameterized by cache root, so it can be unit
 /// tested with an isolated temp dir instead of the global cache root.
-fn cache_breakdown_at_root(cache_root: &Path) -> (CacheCategoryStats, CacheCategoryStats) {
+///
+/// Returns `(images, other, cached_ids)` where `cached_ids` is the list
+/// of artifactIds (= subdirectory names) present on disk. ARCH TODO#2:
+/// the FE uses this set to reconcile localStorage orphan mappings.
+fn cache_breakdown_at_root(cache_root: &Path) -> (CacheCategoryStats, CacheCategoryStats, Vec<String>) {
     let mut images = CacheCategoryStats::default();
     let mut other = CacheCategoryStats::default();
+    let mut cached_ids = Vec::new();
 
     if let Ok(entries) = std::fs::read_dir(cache_root) {
         for entry in entries.flatten() {
@@ -1933,6 +2015,10 @@ fn cache_breakdown_at_root(cache_root: &Path) -> (CacheCategoryStats, CacheCateg
             if !path.is_dir() {
                 continue;
             }
+            // ARCH TODO#2: collect the artifactId (directory name) so the
+            // FE can reconcile localStorage against the on-disk cache.
+            let artifact_id = entry.file_name().to_string_lossy().to_string();
+            cached_ids.push(artifact_id);
             let size = artifact_dir_size(&path);
             let category = read_cache_meta(&path)
                 .map(|m| cache_category_for_media_type(&m.media_type))
@@ -1949,7 +2035,7 @@ fn cache_breakdown_at_root(cache_root: &Path) -> (CacheCategoryStats, CacheCateg
             }
         }
     }
-    (images, other)
+    (images, other, cached_ids)
 }
 
 /// E5-cache: Get a per-category breakdown of the attachment cache.
@@ -1967,12 +2053,12 @@ pub fn get_attachment_cache_breakdown() -> Result<Value, String> {
     let cache_root = attachment_cache_root()
         .ok_or_else(|| "Cannot determine persistent data directory for cache".to_string())?;
 
-    let (images, other) = cache_breakdown_at_root(&cache_root);
+    let (images, other, cached_ids) = cache_breakdown_at_root(&cache_root);
     let total = CacheCategoryStats {
         size: images.size + other.size,
         count: images.count + other.count,
     };
-    let result = CacheBreakdownResult { images, other, total };
+    let result = CacheBreakdownResult { images, other, total, cached_ids };
     serde_json::to_value(result).map_err(|e| format!("Failed to serialize breakdown: {e}"))
 }
 
@@ -2030,7 +2116,11 @@ fn clear_cache_by_type_at_root(
                 Err(e) => {
                     // Best-effort: log and continue rather than failing the
                     // whole operation when one dir cannot be removed.
-                    eprintln!("Failed to remove cache dir {}: {e}", path.display());
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "failed to remove cache dir during clear-by-type"
+                    );
                 }
             }
         }
@@ -2087,6 +2177,26 @@ pub async fn run_cancel(state: State<'_, AppState>, params: Value) -> Result<Val
         .client()
         .await?
         .call_raw(method::RUN_CANCEL, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn run_list(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::RUN_LIST, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn run_get(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::RUN_GET, Some(params))
         .await
         .map_err(stringify)
 }
@@ -2309,8 +2419,52 @@ pub async fn agent_update(
         command["bundleSkills"] = bundle_skills;
     }
     let output = run_remote_machine_command(&state, &cfg, &target_machine_id, command).await?;
-    agent_info_from_machine_command_output(output)
-        .ok_or_else(|| format!("updated agent not returned by daemon: {}", args.actor_id))
+    let info = agent_info_from_machine_command_output(output)
+        .ok_or_else(|| format!("updated agent not returned by daemon: {}", args.actor_id))?;
+    if let Some(client) = state.try_client().await {
+        sync_agent_actor_on_server(&client, &info.spec.actor).await;
+    }
+    Ok(info)
+}
+
+/// The daemon only rewrites the on-disk spec; the agent worker re-upserts the
+/// actor row (with `_meta.avatarUrl` etc.) only on restart, and `_meta`-only
+/// changes never trigger a restart. Push the updated actor to the server here
+/// so avatar changes show up without waiting for a worker restart.
+async fn sync_agent_actor_on_server(client: &Arc<Client>, updated: &proto::types::Actor) {
+    let mut actor = updated.clone();
+    if let Ok(value) = client.call_raw(method::ACTOR_LIST, None).await {
+        let existing_meta = value
+            .get("actors")
+            .and_then(Value::as_array)
+            .and_then(|rows| {
+                rows.iter().find(|row| {
+                    row.get("id").and_then(Value::as_str) == Some(actor.id.as_str())
+                })
+            })
+            .and_then(|row| row.get("_meta"))
+            .and_then(Value::as_object)
+            .cloned();
+        if let Some(existing_meta) = existing_meta {
+            let meta = actor._meta.get_or_insert_with(Default::default);
+            for key in ["machineId", "workspaceId", "ownerActorId"] {
+                if !meta.contains_key(key) {
+                    if let Some(value) = existing_meta.get(key) {
+                        meta.insert(key.to_string(), value.clone());
+                    }
+                }
+            }
+        }
+    }
+    if let Err(err) = client
+        .call_raw(method::ACTOR_UPSERT, Some(json!({ "actor": actor })))
+        .await
+    {
+        eprintln!(
+            "loom-gui: failed to sync actor {} after agent update: {err:#}",
+            actor.id
+        );
+    }
 }
 
 #[derive(Deserialize)]
@@ -5536,6 +5690,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&outside);
     }
 
+    #[test]
+    fn cache_read_local_file_bytes_errors_when_root_missing_no_mkdir() {
+        // AC-A1: the read path must NOT create the cache root as a side
+        // effect. Using the parameterized helper against an isolated temp
+        // dir that does not exist, the read must error and the dir must
+        // remain absent.
+        let root = std::env::temp_dir()
+            .join("loom-cache-read-noroot-test")
+            .join(uuid::Uuid::new_v4().to_string());
+        // root is intentionally NOT created.
+        let target = root.join("any.bin");
+        let err = read_local_file_bytes_at_root(&root, &target, None, None).unwrap_err();
+        assert!(
+            err.contains("Cache directory does not exist"),
+            "expected missing-cache-root error, got: {err}"
+        );
+        assert!(
+            !root.exists(),
+            "read_local_file_bytes must not create the cache root"
+        );
+    }
+
     // ---------- Cache: category classification & breakdown ----------
 
     #[test]
@@ -5575,7 +5751,7 @@ mod tests {
         cache_make_artifact_dir(&root, "img2", "image/jpeg", &[0u8; 50]);
         cache_make_artifact_dir(&root, "doc1", "application/pdf", &[0u8; 200]);
 
-        let (images, other) = cache_breakdown_at_root(&root);
+        let (images, other, _cached_ids) = cache_breakdown_at_root(&root);
         assert_eq!(images.count, 2, "two image artifacts");
         assert_eq!(other.count, 1, "one other artifact");
         assert!(images.size >= 150, "images size >= blob bytes");
@@ -5596,7 +5772,7 @@ mod tests {
         cache_make_artifact_dir(&root, "img1", "image/png", &[0u8; 100]);
         cache_make_artifact_dir(&root, "doc1", "application/pdf", &[0u8; 200]);
 
-        let (images, other) = cache_breakdown_at_root(&root);
+        let (images, other, _cached_ids) = cache_breakdown_at_root(&root);
         let total = CacheCategoryStats {
             size: images.size + other.size,
             count: images.count + other.count,
@@ -5611,6 +5787,48 @@ mod tests {
             total_obj["size"].as_u64().unwrap() >= 300,
             "total.size >= sum of blob bytes"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ARCH TODO#2 Tier 2: `cache_breakdown_at_root` must return the list
+    /// of artifactIds present on disk so the FE can reconcile localStorage
+    /// orphan mappings. Verifies AC-B2.3 (localStorage only retains entries
+    /// that actually exist on disk).
+    #[test]
+    fn cache_breakdown_returns_cached_ids() {
+        let root = std::env::temp_dir()
+            .join("loom-cache-cached-ids-test")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&root).expect("create test root");
+
+        cache_make_artifact_dir(&root, "art-a", "image/png", &[0u8; 100]);
+        cache_make_artifact_dir(&root, "art-b", "image/jpeg", &[0u8; 50]);
+        cache_make_artifact_dir(&root, "art-c", "application/pdf", &[0u8; 200]);
+
+        let (_images, _other, cached_ids) = cache_breakdown_at_root(&root);
+
+        // All three artifactIds (= directory names) must be collected.
+        assert_eq!(cached_ids.len(), 3, "cached_ids must contain all 3 artifact dirs");
+        assert!(cached_ids.contains(&"art-a".to_string()), "cached_ids contains art-a");
+        assert!(cached_ids.contains(&"art-b".to_string()), "cached_ids contains art-b");
+        assert!(cached_ids.contains(&"art-c".to_string()), "cached_ids contains art-c");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ARCH TODO#2 Tier 2: an empty cache root must yield an empty
+    /// `cached_ids` vector (no spurious entries).
+    #[test]
+    fn cache_breakdown_returns_empty_cached_ids_for_empty_dir() {
+        let root = std::env::temp_dir()
+            .join("loom-cache-empty-cached-ids-test")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&root).expect("create test root");
+
+        let (_images, _other, cached_ids) = cache_breakdown_at_root(&root);
+
+        assert!(cached_ids.is_empty(), "empty cache root -> empty cached_ids");
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -5645,6 +5863,65 @@ mod tests {
         };
         let err = clear_attachment_cache_by_type(args).unwrap_err();
         assert!(err.contains("Invalid category"), "expected invalid category error, got: {err}");
+    }
+
+    #[test]
+    fn cache_clear_total_shape_returns_freed_bytes_and_cleared_ids() {
+        // AC-A6: clear_attachment_cache must return { freedBytes, clearedIds },
+        // symmetric with clear_attachment_cache_by_type. clearedIds must list
+        // the artifact ids (subdirectory names) actually removed.
+        let root = std::env::temp_dir()
+            .join("loom-cache-clearall-shape-test")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&root).expect("create test root");
+
+        cache_make_artifact_dir(&root, "art-1", "image/png", &[0u8; 100]);
+        cache_make_artifact_dir(&root, "art-2", "application/pdf", &[0u8; 200]);
+
+        let (freed, cleared) = clear_attachment_cache_at_root(&root);
+        assert!(freed >= 300, "freed bytes should cover both blobs, got {freed}");
+        assert_eq!(cleared.len(), 2, "cleared both artifact ids");
+        assert!(
+            cleared.iter().any(|id| id == "art-1"),
+            "clearedIds should contain art-1, got {cleared:?}"
+        );
+        assert!(
+            cleared.iter().any(|id| id == "art-2"),
+            "clearedIds should contain art-2, got {cleared:?}"
+        );
+        assert!(!root.join("art-1").exists(), "art-1 removed");
+        assert!(!root.join("art-2").exists(), "art-2 removed");
+
+        // Serialize the result shape exactly as the command does.
+        let result = ClearAttachmentCacheResult {
+            freed_bytes: freed,
+            cleared_ids: cleared.clone(),
+        };
+        let value = serde_json::to_value(&result).expect("serialize result");
+        assert!(
+            value.get("freedBytes").is_some(),
+            "result must have freedBytes field, got: {value}"
+        );
+        assert!(
+            value.get("clearedIds").and_then(|v| v.as_array()).is_some(),
+            "result must have clearedIds array, got: {value}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cache_clear_total_shape_missing_root_is_noop_empty_arrays() {
+        // AC-A6: clearing a non-existent cache root is a no-op that
+        // returns { freedBytes: 0, clearedIds: [] } without error.
+        let root = std::env::temp_dir()
+            .join("loom-cache-clearall-missing-test")
+            .join(uuid::Uuid::new_v4().to_string());
+        // root intentionally NOT created.
+        let (freed, cleared) = clear_attachment_cache_at_root(&root);
+        assert_eq!(freed, 0, "no bytes freed for missing root");
+        assert!(cleared.is_empty(), "no ids cleared for missing root");
+        assert!(!root.exists(), "missing root must not be created");
     }
 
     #[test]

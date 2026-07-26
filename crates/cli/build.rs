@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const GUIDE_REPO_URL: &str = "https://github.com/wyw-ai/loom-guide.git";
-const SKILLS_REPO_URL: &str = "https://github.com/wyw-ai/loom-skills.git";
+const SKILLS_REPO_URL: &str = "https://github.com/wyw-ai/skills.git";
 
 fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by cargo"));

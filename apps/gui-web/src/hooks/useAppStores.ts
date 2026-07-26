@@ -29,6 +29,10 @@ export function useAppStores() {
   const setSettingsAgentId = useUIStore((s) => s.setSettingsAgentId);
   const channelPanelTab = useUIStore((s) => s.channelPanelTab);
   const setChannelPanelTab = useUIStore((s) => s.setChannelPanelTab);
+  const searchPanelOpen = useUIStore((s) => s.searchPanelOpen);
+  const setSearchPanelOpen = useUIStore((s) => s.setSearchPanelOpen);
+  const selectedRunId = useUIStore((s) => s.selectedRunId);
+  const setSelectedRunId = useUIStore((s) => s.setSelectedRunId);
   const panelSizes = useUIStore((s) => s.panelSizes);
   const setPanelSizes = useUIStore((s) => s.setPanelSizes);
   const viewportWidth = useUIStore((s) => s.viewportWidth);
@@ -88,6 +92,7 @@ export function useAppStores() {
     config, setConfig, workspace, setWorkspace, connection, setConnection,
     error, setError, notice, setNotice, busy, setBusy, workspaceForm, setWorkspaceForm,
     view, setView, settingsAgentId, setSettingsAgentId, channelPanelTab, setChannelPanelTab,
+    searchPanelOpen, setSearchPanelOpen, selectedRunId, setSelectedRunId,
     panelSizes, setPanelSizes, viewportWidth, setViewportWidth, resizingPanel, setResizingPanel,
     replyTo, setReplyTo,
     channels, setChannels, channelGroups, setChannelGroups, threadsByChannel, setThreadsByChannel,

@@ -100,6 +100,13 @@ jobs:
           token: ${{ secrets.LOOM_CONTENT_TOKEN || github.token }}
           path: loom-skills
 
+      - name: Checkout official actor-circuit skills content
+        uses: actions/checkout@v6.0.3
+        with:
+          repository: wyw-ai/actor-circuit
+          token: ${{ secrets.LOOM_CONTENT_TOKEN || github.token }}
+          path: actor-circuit
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -146,6 +153,13 @@ jobs:
           token: ${{ secrets.LOOM_CONTENT_TOKEN || github.token }}
           path: loom-skills
 
+      - name: Checkout official actor-circuit skills content
+        uses: actions/checkout@v6.0.3
+        with:
+          repository: wyw-ai/actor-circuit
+          token: ${{ secrets.LOOM_CONTENT_TOKEN || github.token }}
+          path: actor-circuit
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -188,6 +202,13 @@ jobs:
           repository: wyw-ai/skills
           token: ${{ secrets.LOOM_CONTENT_TOKEN || github.token }}
           path: loom-skills
+
+      - name: Checkout official actor-circuit skills content
+        uses: actions/checkout@v6.0.3
+        with:
+          repository: wyw-ai/actor-circuit
+          token: ${{ secrets.LOOM_CONTENT_TOKEN || github.token }}
+          path: actor-circuit
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

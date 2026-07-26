@@ -1376,6 +1376,12 @@ struct EmbeddedSkillFile {
     content: &'static str,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct EmbeddedBuiltinSkill {
+    id: &'static str,
+    files: &'static [EmbeddedSkillFile],
+}
+
 include!(concat!(env!("OUT_DIR"), "/loom_skill_embedded.rs"));
 
 const WORKSPACE_PROJECTION_MANIFEST: &str = "workspace.json";
@@ -1450,14 +1456,37 @@ fn skill_targets_from_dir(skills_dir: &Path) -> std::io::Result<BTreeMap<String,
     Ok(targets)
 }
 
+/// Sync every embedded builtin skill snapshot into
+/// `data_root/builtin/skills/<skill_id>` and return the synced targets keyed
+/// by skill id. Each embedded snapshot is authoritative: files that are not
+/// present in the current snapshot are removed from the target directory.
+fn ensure_builtin_skills(data_root: &Path) -> std::io::Result<BTreeMap<String, PathBuf>> {
+    let mut targets = BTreeMap::new();
+    for skill in EMBEDDED_BUILTIN_SKILLS {
+        let skill_dir = data_root.join("builtin").join("skills").join(skill.id);
+        create_dir_all_unc(&skill_dir)?;
+        sync_embedded_skill_dir(&skill_dir, skill.files)?;
+        targets.insert(skill.id.to_string(), skill_dir);
+    }
+    Ok(targets)
+}
+
+#[cfg(test)]
 fn ensure_default_loom_skill(data_root: &Path) -> std::io::Result<PathBuf> {
-    let skill_dir = data_root
-        .join("builtin")
-        .join("skills")
-        .join(DEFAULT_LOOM_SKILL_ID);
-    create_dir_all_unc(&skill_dir)?;
-    sync_embedded_skill_dir(&skill_dir, EMBEDDED_LOOM_SKILL_FILES)?;
-    Ok(skill_dir)
+    ensure_builtin_skills(data_root)?
+        .remove(DEFAULT_LOOM_SKILL_ID)
+        .ok_or_else(|| std::io::Error::other("embedded builtin skills missing default loom skill"))
+}
+
+/// Project every embedded builtin skill into `workspace_skill_targets`.
+/// Builtin targets are inserted last so they override any same-id target
+/// from scope registries or actor bundles.
+fn project_builtin_skill_targets(
+    data_root: &Path,
+    workspace_skill_targets: &mut BTreeMap<String, PathBuf>,
+) -> std::io::Result<()> {
+    workspace_skill_targets.extend(ensure_builtin_skills(data_root)?);
+    Ok(())
 }
 
 /// Write the embedded official Loom skill into an exact, dedicated skill directory.
@@ -5238,9 +5267,8 @@ async fn build_adapter_prompt(
             .with_context(|| format!("resolve actor bundle skills for {}", state.actor_id))?,
     );
     if state.spec.runtime_awareness == RuntimeAwareness::Native {
-        let loom_skill = ensure_default_loom_skill(&state.paths.data_root)
-            .context("ensure default Loom skill snapshot")?;
-        workspace_skill_targets.insert(DEFAULT_LOOM_SKILL_ID.into(), loom_skill);
+        project_builtin_skill_targets(&state.paths.data_root, &mut workspace_skill_targets)
+            .context("project builtin skill snapshots")?;
     }
     ensure_workspace_skill_targets(&scope_paths.workspace, &workspace_skill_targets)
         .with_context(|| format!("project workspace skills for scope {}", scope.id))?;
@@ -6346,9 +6374,9 @@ async fn current_scope_skill_targets(
 
     // 2. Channel skills (from file-based registry).
     //    Channel skills override actor bundle skills for the same id,
-    //    EXCEPT for reserved skill ids (e.g. "loom") which are always
-    //    backed by the embedded builtin skill and must not be overridden
-    //    by user-supplied registries.
+    //    EXCEPT for reserved skill ids (the embedded builtin ids) which are
+    //    always backed by the embedded builtin skills and must not be
+    //    overridden by user-supplied registries.
     match crate::cmd::skill_registry::read_channel_skills(&state.paths.data_root, channel_id) {
         Ok(registry) => {
             for entry in &registry.skills {
@@ -6411,14 +6439,13 @@ async fn current_scope_skill_targets(
     targets
 }
 
-/// Returns true if `skill_id` is a reserved skill id backed by a builtin
-/// skill snapshot and therefore must not be overridden by channel/thread
-/// skill registries. The reserved set is intentionally small and
-/// load-bearing: overriding "loom" would let a user-supplied registry
-/// shadow the official Loom skill that agents rely on for the Loom
-/// operating protocol.
+/// Returns true if `skill_id` is a reserved skill id backed by an embedded
+/// builtin skill snapshot and therefore must not be overridden by
+/// channel/thread skill registries. Every embedded builtin id is reserved:
+/// a user-supplied registry must not shadow the official skills that agents
+/// rely on (e.g. `loom` for the Loom operating protocol).
 fn is_reserved_skill_id(skill_id: &str) -> bool {
-    skill_id == DEFAULT_LOOM_SKILL_ID
+    EMBEDDED_BUILTIN_SKILL_IDS.contains(&skill_id)
 }
 
 fn actor_bundle_source(agents_root: &Path, actor_id: &str) -> std::io::Result<Option<PathBuf>> {
@@ -9933,6 +9960,61 @@ mod tests {
         std::fs::write(&stale, "old").expect("stale reference");
         ensure_default_loom_skill(&root).expect("resync default loom skill");
         assert!(!stale.exists());
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn builtin_skill_snapshots_are_written_under_data_root() {
+        let root = temp_path("builtin-skills");
+
+        let targets = ensure_builtin_skills(&root).expect("builtin skills");
+        assert_eq!(targets.len(), EMBEDDED_BUILTIN_SKILL_IDS.len());
+        for id in EMBEDDED_BUILTIN_SKILL_IDS {
+            let dir = root.join("builtin").join("skills").join(id);
+            assert_eq!(targets.get(*id).map(PathBuf::as_path), Some(dir.as_path()));
+            assert!(dir.join("SKILL.md").is_file());
+
+            let stale = dir.join("stale.md");
+            std::fs::write(&stale, "old").expect("stale file");
+        }
+
+        ensure_builtin_skills(&root).expect("resync builtin skills");
+        for id in EMBEDDED_BUILTIN_SKILL_IDS {
+            assert!(!root
+                .join("builtin")
+                .join("skills")
+                .join(id)
+                .join("stale.md")
+                .exists());
+        }
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn builtin_skill_projection_covers_every_builtin_id_and_overrides_same_id_targets() {
+        let root = temp_path("builtin-skill-projection");
+        let decoy = root.join("decoy");
+        std::fs::create_dir_all(&decoy).expect("decoy dir");
+
+        let mut targets: BTreeMap<String, PathBuf> =
+            BTreeMap::from([("custom".to_string(), decoy.clone())]);
+        for id in EMBEDDED_BUILTIN_SKILL_IDS {
+            targets.insert((*id).to_string(), decoy.clone());
+        }
+
+        project_builtin_skill_targets(&root, &mut targets).expect("project builtin skills");
+
+        assert_eq!(targets.get("custom"), Some(&decoy));
+        for id in EMBEDDED_BUILTIN_SKILL_IDS {
+            let dir = root.join("builtin").join("skills").join(id);
+            assert_eq!(
+                targets.get(*id).map(PathBuf::as_path),
+                Some(dir.as_path()),
+                "builtin skill `{id}` must override any same-id target"
+            );
+        }
 
         std::fs::remove_dir_all(root).ok();
     }
@@ -13970,14 +14052,23 @@ mod tests {
         ));
     }
 
-    /// Regression for issue #4: `loom` is a reserved skill id and must
-    /// never be treated as overridable. This unit test pins the
+    /// Regression for issue #4: every embedded builtin skill id is reserved
+    /// and must never be treated as overridable. This unit test pins the
     /// `is_reserved_skill_id` predicate so that any future change to the
     /// reserved set is a deliberate edit here.
     #[test]
-    fn loom_is_reserved_skill_id_and_cannot_be_overridden() {
+    fn builtin_skill_ids_are_reserved_and_cannot_be_overridden() {
         assert!(is_reserved_skill_id(DEFAULT_LOOM_SKILL_ID));
         assert_eq!(DEFAULT_LOOM_SKILL_ID, "loom");
+        // Every embedded builtin id (loom plus any additional official skill)
+        // is reserved.
+        assert!(EMBEDDED_BUILTIN_SKILL_IDS.contains(&DEFAULT_LOOM_SKILL_ID));
+        for id in EMBEDDED_BUILTIN_SKILL_IDS {
+            assert!(
+                is_reserved_skill_id(id),
+                "builtin skill id `{id}` must be reserved"
+            );
+        }
         // Non-reserved ids are not flagged.
         assert!(!is_reserved_skill_id("obsidian"));
         assert!(!is_reserved_skill_id("pdf"));

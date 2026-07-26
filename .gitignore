@@ -6,7 +6,8 @@
 .idea
 .DS_Store
 /.claude/
-/.agents/
+/.agents/*
+!/.agents/skills/
 /.am/
 __pycache__/
 /docs/*

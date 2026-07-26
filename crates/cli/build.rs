@@ -5,7 +5,37 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const GUIDE_REPO_URL: &str = "https://github.com/wyw-ai/loom-guide.git";
-const SKILLS_REPO_URL: &str = "https://github.com/wyw-ai/skills.git";
+
+/// One official skill content source repository. Adding a new official skill
+/// source is a single new entry in `OFFICIAL_SKILL_SOURCES`.
+struct OfficialSkillSource {
+    /// Env vars pointing at a local checkout of the source repo.
+    dir_env: &'static [&'static str],
+    /// Sibling-directory lookup name and temp clone directory name.
+    repo_dir_name: &'static str,
+    /// File that must exist for the source to be considered valid.
+    required_rel: &'static str,
+    /// Env var overriding the repo URL to clone.
+    repo_env: &'static str,
+    default_repo_url: &'static str,
+}
+
+const OFFICIAL_SKILL_SOURCES: &[OfficialSkillSource] = &[
+    OfficialSkillSource {
+        dir_env: &["LOOM_SKILLS_DIR", "LOOM_SKILL_DIR"],
+        repo_dir_name: "loom-skills",
+        required_rel: "skills/loom/SKILL.md",
+        repo_env: "LOOM_SKILLS_REPO",
+        default_repo_url: "https://github.com/wyw-ai/skills.git",
+    },
+    OfficialSkillSource {
+        dir_env: &["LOOM_ACTOR_CIRCUIT_DIR"],
+        repo_dir_name: "actor-circuit",
+        required_rel: "skills/actor-circuit/SKILL.md",
+        repo_env: "LOOM_ACTOR_CIRCUIT_REPO",
+        default_repo_url: "https://github.com/wyw-ai/actor-circuit.git",
+    },
+];
 
 fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by cargo"));
@@ -19,20 +49,37 @@ fn main() {
         GUIDE_REPO_URL,
         &clone_root,
     );
-    let skills_dir = resolve_content_source(
-        &["LOOM_SKILLS_DIR", "LOOM_SKILL_DIR"],
-        "loom-skills",
-        "skills/loom/SKILL.md",
-        "LOOM_SKILLS_REPO",
-        SKILLS_REPO_URL,
-        &clone_root,
-    );
+    let skill_sources = resolve_skill_sources(&clone_root);
 
     generate_guide_snapshot(&guide_dir, &out_dir);
-    generate_skill_snapshot(&skills_dir, &out_dir);
+    generate_skill_snapshot(&skill_sources, &out_dir);
 
     cleanup_temp_source(&guide_dir, &out_dir);
-    cleanup_temp_source(&skills_dir, &out_dir);
+    for source in &skill_sources {
+        cleanup_temp_source(&source.content, &out_dir);
+    }
+}
+
+struct ResolvedSkillSource {
+    repo_dir_name: &'static str,
+    content: ContentSource,
+}
+
+fn resolve_skill_sources(clone_root: &Path) -> Vec<ResolvedSkillSource> {
+    OFFICIAL_SKILL_SOURCES
+        .iter()
+        .map(|source| ResolvedSkillSource {
+            repo_dir_name: source.repo_dir_name,
+            content: resolve_content_source(
+                source.dir_env,
+                source.repo_dir_name,
+                source.required_rel,
+                source.repo_env,
+                source.default_repo_url,
+                clone_root,
+            ),
+        })
+        .collect()
 }
 
 #[derive(Debug)]
@@ -207,55 +254,72 @@ fn generate_guide_snapshot(guide_source: &ContentSource, out_dir: &Path) {
         .expect("write generated guide snapshot");
 }
 
-fn generate_skill_snapshot(skills_source: &ContentSource, out_dir: &Path) {
-    // Snapshot every skill under `skills/` (a directory with a SKILL.md).
-    // `skills/loom/SKILL.md` is the required file of resolve_content_source,
-    // so the default loom skill is always part of the snapshot.
-    let skills_root = skills_source.path.join("skills");
-    if !skills_source.cloned {
-        println!("cargo:rerun-if-changed={}", skills_root.display());
-    }
+fn generate_skill_snapshot(sources: &[ResolvedSkillSource], out_dir: &Path) {
+    // Snapshot every skill under each source's `skills/` tree (a directory
+    // with a SKILL.md). `skills/loom/SKILL.md` is the required file of the
+    // loom-skills source, so the default loom skill is always part of the
+    // snapshot. A skill id provided by two sources is a release-level error
+    // and fails the build.
+    let mut skills: Vec<(String, &'static str, PathBuf, Vec<PathBuf>)> = Vec::new();
+    for source in sources {
+        let content = &source.content;
+        let skills_root = content.path.join("skills");
+        if !content.cloned {
+            println!("cargo:rerun-if-changed={}", skills_root.display());
+        }
 
-    let mut skill_dirs = fs::read_dir(&skills_root)
-        .unwrap_or_else(|err| panic!("read {} failed: {err}", skills_root.display()))
-        .map(|entry| entry.expect("read skill entry").path())
-        .filter(|path| path.is_dir())
-        .filter(|path| {
-            path.file_name()
+        let mut skill_dirs = fs::read_dir(&skills_root)
+            .unwrap_or_else(|err| panic!("read {} failed: {err}", skills_root.display()))
+            .map(|entry| entry.expect("read skill entry").path())
+            .filter(|path| path.is_dir())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| !name.starts_with('.'))
+            })
+            .filter(|path| path.join("SKILL.md").is_file())
+            .collect::<Vec<_>>();
+        skill_dirs.sort();
+        if skill_dirs.is_empty() {
+            panic!(
+                "no skills with SKILL.md found under {}",
+                skills_root.display()
+            );
+        }
+
+        for skill_dir in skill_dirs {
+            let id = skill_dir
+                .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| !name.starts_with('.'))
-        })
-        .filter(|path| path.join("SKILL.md").is_file())
-        .collect::<Vec<_>>();
-    skill_dirs.sort();
-    if skill_dirs.is_empty() {
-        panic!(
-            "no skills with SKILL.md found under {}",
-            skills_root.display()
-        );
+                .unwrap_or_else(|| panic!("invalid skill directory name: {}", skill_dir.display()))
+                .to_owned();
+            if let Some(existing) = skills.iter().find(|skill| skill.0 == id) {
+                panic!(
+                    "skill id `{id}` provided by both official skill sources `{}` and `{}`",
+                    existing.1, source.repo_dir_name
+                );
+            }
+            let mut files = collect_files(&skill_dir, !content.cloned);
+            files.sort();
+            if !content.cloned {
+                for path in &files {
+                    println!("cargo:rerun-if-changed={}", path.display());
+                }
+            }
+            skills.push((id, source.repo_dir_name, skill_dir, files));
+        }
     }
-
-    let mut skills = Vec::new();
-    for skill_dir in skill_dirs {
-        let id = skill_dir
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_else(|| panic!("invalid skill directory name: {}", skill_dir.display()))
-            .to_owned();
-        let mut files = collect_files(&skill_dir, !skills_source.cloned);
-        files.sort();
-        skills.push((id, skill_dir, files));
-    }
+    skills.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut generated = String::new();
     generated.push_str("const EMBEDDED_BUILTIN_SKILL_IDS: &[&str] = &[\n");
-    for (id, _, _) in &skills {
+    for (id, _, _, _) in &skills {
         writeln!(generated, "    {id:?},").expect("write generated skill snapshot");
     }
     generated.push_str("];\n\n");
 
     let mut static_names = Vec::new();
-    for (id, skill_dir, files) in &skills {
+    for (id, _, skill_dir, files) in &skills {
         let static_name = embedded_skill_files_static_name(id);
         if static_names.contains(&static_name) {
             panic!("skill id `{id}` collides with another skill in generated snapshot");
@@ -264,9 +328,6 @@ fn generate_skill_snapshot(skills_source: &ContentSource, out_dir: &Path) {
         writeln!(generated, "static {static_name}: &[EmbeddedSkillFile] = &[")
             .expect("write generated skill snapshot");
         for path in files {
-            if !skills_source.cloned {
-                println!("cargo:rerun-if-changed={}", path.display());
-            }
             let rel = path
                 .strip_prefix(skill_dir)
                 .unwrap_or_else(|err| panic!("strip skill prefix {} failed: {err}", path.display()))
@@ -284,7 +345,7 @@ fn generate_skill_snapshot(skills_source: &ContentSource, out_dir: &Path) {
     }
 
     generated.push_str("static EMBEDDED_BUILTIN_SKILLS: &[EmbeddedBuiltinSkill] = &[\n");
-    for (id, _, _) in &skills {
+    for (id, _, _, _) in &skills {
         let static_name = embedded_skill_files_static_name(id);
         writeln!(
             generated,
@@ -296,9 +357,9 @@ fn generate_skill_snapshot(skills_source: &ContentSource, out_dir: &Path) {
 
     let loom_static = skills
         .iter()
-        .find(|(id, _, _)| id == "loom")
-        .map(|(id, _, _)| embedded_skill_files_static_name(id))
-        .unwrap_or_else(|| panic!("default Loom skill missing under {}", skills_root.display()));
+        .find(|(id, _, _, _)| id == "loom")
+        .map(|(id, _, _, _)| embedded_skill_files_static_name(id))
+        .unwrap_or_else(|| panic!("default Loom skill missing from official skill sources"));
     writeln!(
         generated,
         "const EMBEDDED_LOOM_SKILL_FILES: &[EmbeddedSkillFile] = {loom_static};"

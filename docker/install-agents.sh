@@ -12,7 +12,16 @@
 #   agent_configure()   optional post-install file generation
 set -eu
 
-AGENTS_DIR="${AGENTS_DIR:-$(CDPATH= cd "$(dirname "$0")/agents" && pwd)}"
+if [ -z "${AGENTS_DIR:-}" ]; then
+  _self_dir="$(CDPATH= cd "$(dirname "$0")" && pwd)"
+  if [ -d "$_self_dir/agents" ]; then
+    # Running from the repo (docker/install-agents.sh next to docker/agents).
+    AGENTS_DIR="$_self_dir/agents"
+  else
+    # Installed into an image (contracts live in /opt/loom/agents).
+    AGENTS_DIR="/opt/loom/agents"
+  fi
+fi
 
 fail() {
   printf 'install-agents: %s\n' "$*" >&2

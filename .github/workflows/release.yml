@@ -41,7 +41,7 @@ jobs:
       download_base_url: ${{ steps.meta.outputs.download_base_url }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v7.0.1
 
       - name: Install Node
         uses: actions/setup-node@v4
@@ -84,24 +84,24 @@ jobs:
     needs: version
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v7.0.1
 
       - name: Checkout official Loom guide content
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v7.0.1
         with:
           repository: wyw-ai/loom-guide
           token: ${{ secrets.LOOM_CONTENT_TOKEN || github.token }}
           path: loom-guide
 
       - name: Checkout official Loom skills content
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v7.0.1
         with:
           repository: wyw-ai/skills
           token: ${{ secrets.LOOM_CONTENT_TOKEN || github.token }}
           path: loom-skills
 
       - name: Checkout official actor-circuit skills content
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v7.0.1
         with:
           repository: wyw-ai/actor-circuit
           token: ${{ secrets.LOOM_CONTENT_TOKEN || github.token }}
@@ -137,24 +137,24 @@ jobs:
     needs: version
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v7.0.1
 
       - name: Checkout official Loom guide content
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v7.0.1
         with:
           repository: wyw-ai/loom-guide
           token: ${{ secrets.LOOM_CONTENT_TOKEN || github.token }}
           path: loom-guide
 
       - name: Checkout official Loom skills content
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v7.0.1
         with:
           repository: wyw-ai/skills
           token: ${{ secrets.LOOM_CONTENT_TOKEN || github.token }}
           path: loom-skills
 
       - name: Checkout official actor-circuit skills content
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v7.0.1
         with:
           repository: wyw-ai/actor-circuit
           token: ${{ secrets.LOOM_CONTENT_TOKEN || github.token }}
@@ -187,24 +187,24 @@ jobs:
     needs: version
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v7.0.1
 
       - name: Checkout official Loom guide content
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v7.0.1
         with:
           repository: wyw-ai/loom-guide
           token: ${{ secrets.LOOM_CONTENT_TOKEN || github.token }}
           path: loom-guide
 
       - name: Checkout official Loom skills content
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v7.0.1
         with:
           repository: wyw-ai/skills
           token: ${{ secrets.LOOM_CONTENT_TOKEN || github.token }}
           path: loom-skills
 
       - name: Checkout official actor-circuit skills content
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v7.0.1
         with:
           repository: wyw-ai/actor-circuit
           token: ${{ secrets.LOOM_CONTENT_TOKEN || github.token }}
@@ -274,7 +274,7 @@ jobs:
       publish: ${{ needs.version.outputs.publish }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v7.0.1
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

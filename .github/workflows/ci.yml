@@ -32,7 +32,7 @@ jobs:
       LOOM_ACTOR_CIRCUIT_DIR: ${{ github.workspace }}/crates/cli/fixtures/ci-runtime-content/actor-circuit
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v7.0.1
 
       - name: Validate CI runtime content fixture
         shell: bash
@@ -71,7 +71,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v7.0.1
 
       - name: Install pnpm
         uses: pnpm/action-setup@v6.0.8
@@ -99,7 +99,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v7.0.1
 
       - name: Install Node
         uses: actions/setup-node@v4

@@ -1,10 +1,28 @@
 import { useEffect } from "react";
 import * as ipc from "@/ipc/bridge";
-import { scopeKey, type Actor, type Channel, type ChannelMemberConfig, type Message, type ScopeRef, type Thread } from "@/ipc/types";
+import { scopeKey, type Actor, type Channel, type ChannelMemberConfig, type Message, type MessageContextResult, type ScopeRef, type Thread } from "@/ipc/types";
 import type { ConnectionState } from "@/lib/types";
 import type { ThreadActivityStats } from "@/lib/types";
 import { errorText, sortThreads } from "@/lib/format-utils";
 import { normalizeMessage, sortMessages, threadStatsFromMessages } from "@/lib/message-utils";
+import { sameScope } from "@/lib/channel-utils";
+
+function contextMessagesForScope(
+  context: MessageContextResult | null,
+  scope: ScopeRef | null,
+): Message[] {
+  if (!context || !scope || !sameScope(context.anchor.scope, scope)) return [];
+  return sortMessages(
+    [...context.before, context.anchor, ...context.after].map(normalizeMessage),
+  );
+}
+
+function mergeMessages(context: Message[], loaded: Message[]): Message[] {
+  const byId = new Map<string, Message>();
+  for (const message of context) byId.set(message.id, message);
+  for (const message of loaded) byId.set(message.id, message);
+  return sortMessages([...byId.values()]);
+}
 
 export interface ChannelScopeDeps {
   connection: ConnectionState;
@@ -21,6 +39,7 @@ export interface ChannelScopeDeps {
   activeScopeRef: React.MutableRefObject<ScopeRef | null>;
   activeThreadScopeRef: React.MutableRefObject<ScopeRef | null>;
   activeDirectScopeRef: React.MutableRefObject<ScopeRef | null>;
+  pendingMessageContextRef: React.MutableRefObject<MessageContextResult | null>;
   setActors: (
     updater: (current: Record<string, Actor>) => Record<string, Actor>,
   ) => void;
@@ -53,6 +72,7 @@ export function useChannelScope(deps: ChannelScopeDeps) {
     activeScopeRef,
     activeThreadScopeRef,
     activeDirectScopeRef,
+    pendingMessageContextRef,
     setActors,
     setChannelMemberConfigsByChannel,
     setThreadsByChannel,
@@ -99,7 +119,9 @@ export function useChannelScope(deps: ChannelScopeDeps) {
           [activeChannel.id]: sortThreads(result.threads),
         }));
       })
-      .catch((err) => setError(errorText(err)));
+      .catch((err) => {
+        if (alive) setError(errorText(err));
+      });
     return () => {
       alive = false;
     };
@@ -142,16 +164,27 @@ export function useChannelScope(deps: ChannelScopeDeps) {
     }
 
     let alive = true;
-    setMessages([]);
+    const contextMessages = contextMessagesForScope(
+      pendingMessageContextRef.current,
+      activeScope,
+    );
+    setMessages(contextMessages);
     void ipc.scopeSubscribe(activeScope).catch(() => {});
     void ipc
       .messageList({ target, limit: 150 })
       .then((result) => {
         if (!alive) return;
         setError(null);
-        setMessages(sortMessages(result.messages.map(normalizeMessage)));
+        setMessages(
+          mergeMessages(
+            contextMessages,
+            result.messages.map(normalizeMessage),
+          ),
+        );
       })
-      .catch((err) => setError(errorText(err)));
+      .catch((err) => {
+        if (alive) setError(errorText(err));
+      });
 
     return () => {
       alive = false;
@@ -168,14 +201,21 @@ export function useChannelScope(deps: ChannelScopeDeps) {
     }
 
     let alive = true;
-    setThreadMessages([]);
+    const contextMessages = contextMessagesForScope(
+      pendingMessageContextRef.current,
+      activeThreadScope,
+    );
+    setThreadMessages(contextMessages);
     void ipc.scopeSubscribe(activeThreadScope).catch(() => {});
     void ipc
       .messageList({ target: threadMessageTarget, limit: 100 })
       .then((result) => {
         if (!alive) return;
         setError(null);
-        const sorted = sortMessages(result.messages.map(normalizeMessage));
+        const sorted = mergeMessages(
+          contextMessages,
+          result.messages.map(normalizeMessage),
+        );
         setThreadMessages(sorted);
         setThreadStatsById((current) => ({
           ...current,
@@ -185,7 +225,9 @@ export function useChannelScope(deps: ChannelScopeDeps) {
           ),
         }));
       })
-      .catch((err) => setError(errorText(err)));
+      .catch((err) => {
+        if (alive) setError(errorText(err));
+      });
 
     return () => {
       alive = false;
@@ -210,16 +252,27 @@ export function useChannelScope(deps: ChannelScopeDeps) {
     }
 
     let alive = true;
-    setDirectMessages([]);
+    const contextMessages = contextMessagesForScope(
+      pendingMessageContextRef.current,
+      activeDirectScope,
+    );
+    setDirectMessages(contextMessages);
     void ipc.scopeSubscribe(activeDirectScope).catch(() => {});
     void ipc
       .messageList({ target: activeDirectTarget, limit: 150 })
       .then((result) => {
         if (!alive) return;
         setError(null);
-        setDirectMessages(sortMessages(result.messages.map(normalizeMessage)));
+        setDirectMessages(
+          mergeMessages(
+            contextMessages,
+            result.messages.map(normalizeMessage),
+          ),
+        );
       })
-      .catch((err) => setError(errorText(err)));
+      .catch((err) => {
+        if (alive) setError(errorText(err));
+      });
 
     return () => {
       alive = false;

@@ -31,6 +31,8 @@ import { ChannelsView } from "@/components/views/ChannelsView";
 import { DirectMessagesView } from "@/components/views/DirectMessagesView";
 import { InboxView } from "@/components/views/InboxView";
 import { TasksView } from "@/components/views/TasksView";
+import { RunsView } from "@/components/views/RunsView";
+import { RunDetailView } from "@/components/views/RunDetailView";
 import { SpacesView } from "@/components/views/SpacesView";
 import { AccountView } from "@/components/views/AccountView";
 import { SettingsView } from "@/components/views/SettingsView";
@@ -49,6 +51,7 @@ export interface MainContentProps {
   activeChannel: Channel | null;
   target: string | null;
   channelPanelTab: ChannelPanelTab | null;
+  searchPanelOpen: boolean;
   activeThread: Thread | null;
   activeThreadTask: Task | null;
   activeScope: ScopeRef | null;
@@ -79,6 +82,12 @@ export interface MainContentProps {
   inbox: InboxListEntry[];
   // Tasks view
   tasks: Task[];
+  // Runs view
+  runsList: Run[];
+  runsLoading: boolean;
+  runsError: string | null;
+  refreshRuns: () => Promise<void>;
+  selectedRun: Run | null;
   // Spaces view
   workspaceForm: WorkspaceFormState;
   workspaces: Workspace[];
@@ -96,6 +105,11 @@ export interface MainContentProps {
   setActiveChannelId: (id: string) => void;
   setActiveThreadId: (id: string | null) => void;
   setChannelPanelTab: (tab: ChannelPanelTab | null | ((current: ChannelPanelTab | null) => ChannelPanelTab | null)) => void;
+  setSearchPanelOpen: (open: boolean | ((prev: boolean) => boolean)) => void;
+  setSelectedRunId: (id: string | null) => void;
+  cancelRun: (runId: string) => Promise<void>;
+  openScope: (scope: ScopeRef) => Promise<void>;
+  messageAnchorId: string | null;
   setActiveDirectActorId: (id: string | null) => void;
   setDraft: (draft: string) => void;
   setThreadDraft: (draft: string) => void;
@@ -148,10 +162,16 @@ export function MainContent(props: MainContentProps) {
           activePanel={p.activeThread ? null : p.channelPanelTab}
           onOpenPanel={(panel) => {
             p.setActiveThreadId(null);
+            p.setSearchPanelOpen(false);
             p.setChannelPanelTab((current) => (current === panel ? null : panel));
           }}
+          searchOpen={p.searchPanelOpen}
+          onToggleSearch={() => p.setSearchPanelOpen((open) => !open)}
+          onStopRun={(runId) => void p.cancelRun(runId)}
+          busy={p.busy}
           runs={p.runs}
           agentActors={p.agentActors}
+          runScope={p.activeThreadScope ?? p.activeScope}
           scopeId={p.activeScope?.id}
           actors={p.actors}
           onOpenFolder={() => {
@@ -200,6 +220,7 @@ export function MainContent(props: MainContentProps) {
           onOpenAgentSettings={p.openAgentSettings}
           currentActorId={p.workspace?.actorId ?? null}
           busy={p.busy}
+          anchorMessageId={p.messageAnchorId}
         />
         <Composer
           draft={p.draft}
@@ -317,6 +338,7 @@ export function MainContent(props: MainContentProps) {
           machines={p.machines}
           runs={p.runs}
           messages={p.directMessages}
+          anchorMessageId={p.messageAnchorId}
           selectedAgent={p.activeDirectActor}
           setDraft={p.setDirectDraft}
           onOpenLinkedChannel={(channelId) => {
@@ -369,6 +391,41 @@ export function MainContent(props: MainContentProps) {
       <>
         <ErrorBanner error={p.error} />
         <TasksView tasks={p.tasks} channels={p.visibleChannels} />
+      </>
+    );
+  }
+
+  if (p.view === "runs") {
+    return (
+      <>
+        <ErrorBanner error={p.error} />
+        {p.selectedRun ? (
+          <RunDetailView
+            run={p.selectedRun}
+            actors={p.actors}
+            channels={p.visibleChannels}
+            connection={p.connection}
+            cancelBusy={p.busy === `run:cancel:${p.selectedRun.id}`}
+            onBack={() => p.setSelectedRunId(null)}
+            onCancel={p.cancelRun}
+            onOpenScope={(run) => {
+              void p.openScope(run.scope);
+            }}
+          />
+        ) : (
+          <RunsView
+            runs={p.runsList}
+            actors={p.actors}
+            channels={p.visibleChannels}
+            connection={p.connection}
+            busy={p.busy}
+            loading={p.runsLoading}
+            error={p.runsError}
+            onRefresh={p.refreshRuns}
+            onSelectRun={(run) => p.setSelectedRunId(run.id)}
+            onCancelRun={p.cancelRun}
+          />
+        )}
       </>
     );
   }

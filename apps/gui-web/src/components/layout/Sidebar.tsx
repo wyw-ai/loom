@@ -16,6 +16,7 @@ import {
   Home,
   MessageCircle,
   MessageSquare,
+  Play,
   Server,
 } from "lucide-react";
 import type { Actor, Channel, MachineInfo, Run, Thread } from "@/ipc/types";
@@ -120,6 +121,7 @@ export function Sidebar({
     { id: "threads" as const, label: "Threads", icon: MessageSquare },
     { id: "inbox" as const, label: "Inbox", icon: Bell },
     { id: "tasks" as const, label: "Tasks", icon: Check },
+    { id: "runs" as const, label: "Runs", icon: Play },
     { id: "settings" as const, label: "Actors", icon: Server },
   ];
   const closeCreateMenu = () => {

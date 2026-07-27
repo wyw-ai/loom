@@ -38,6 +38,9 @@ struct Args {
     /// Do not start the service host from this daemon.
     #[arg(long = "no-services")]
     no_services: bool,
+    /// Do not register this daemon machine as a server-visible service actor.
+    #[arg(long = "no-machine-actor")]
+    no_machine_actor: bool,
     /// Unix socket used by local `loom` CLI clients to reach this daemon.
     #[arg(long = "socket", env = "LOOM_DAEMON_SOCKET")]
     socket: Option<PathBuf>,
@@ -88,6 +91,7 @@ async fn main() -> Result<()> {
         args.services,
         args.allow_services,
         args.no_services,
+        args.no_machine_actor,
         args.socket,
         args.no_ipc,
         args.server,
@@ -128,6 +132,7 @@ mod tests {
             "--allow-services",
             "svc_a,svc_b",
             "--no-services",
+            "--no-machine-actor",
             "--socket",
             "/tmp/loom.sock",
             "--no-ipc",
@@ -148,6 +153,7 @@ mod tests {
         );
         assert_eq!(args.allow_services, ["svc_a", "svc_b"]);
         assert!(args.no_services);
+        assert!(args.no_machine_actor);
         assert_eq!(
             args.socket.as_deref(),
             Some(std::path::Path::new("/tmp/loom.sock"))

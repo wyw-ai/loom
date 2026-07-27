@@ -59,7 +59,8 @@ pub async fn dispatch(
     method: &str,
     params: Option<Value>,
 ) -> HandlerResult {
-    match method {
+    let started = std::time::Instant::now();
+    let result = match method {
         method::INITIALIZE => initialize(params),
         method::CONNECTION_OPEN => connection_open(state, connection_id, params),
         method::CONNECTION_CLOSE => connection_close(state, params),
@@ -188,7 +189,15 @@ pub async fn dispatch(
             ErrorCode::METHOD_NOT_FOUND,
             format!("unknown method `{}`", other),
         )),
-    }
+    };
+    tracing::info!(
+        connection_id,
+        method,
+        ok = result.is_ok(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "rpc handler dispatch complete"
+    );
+    result
 }
 
 // ---- initialize ----
@@ -428,11 +437,17 @@ fn channel_list(state: &AppState, connection_id: &str) -> HandlerResult {
 }
 
 fn channel_lookup(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
+    let started = std::time::Instant::now();
     let p: ChannelLookupParams = parse_params(params)?;
+    let actor_started = std::time::Instant::now();
     let caller = state.subscriptions.actor_for_connection(connection_id);
-    let channels = state
-        .store
-        .find_channels_by_title(&p.title)
+    let actor_lookup_elapsed_ms = actor_started.elapsed().as_millis();
+    let store_started = std::time::Instant::now();
+    let matched = state.store.find_channels_by_title(&p.title);
+    let store_lookup_elapsed_ms = store_started.elapsed().as_millis();
+    let matched_channels = matched.len();
+    let filter_started = std::time::Instant::now();
+    let channels: Vec<Channel> = matched
         .into_iter()
         .filter(|c| match c.visibility {
             ChannelVisibility::Public => true,
@@ -442,6 +457,18 @@ fn channel_lookup(state: &AppState, connection_id: &str, params: Option<Value>) 
             },
         })
         .collect();
+    tracing::info!(
+        connection_id,
+        title = %p.title,
+        caller = caller.as_deref().unwrap_or("<none>"),
+        matched_channels,
+        returned_channels = channels.len(),
+        actor_lookup_elapsed_ms,
+        store_lookup_elapsed_ms,
+        visibility_filter_elapsed_ms = filter_started.elapsed().as_millis(),
+        total_elapsed_ms = started.elapsed().as_millis(),
+        "channel lookup handler complete"
+    );
     ok(ChannelLookupResult { channels })
 }
 

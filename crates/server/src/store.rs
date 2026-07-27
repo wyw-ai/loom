@@ -109,6 +109,7 @@ impl StoreEvent {
 struct Inner {
     actors: HashMap<String, Actor>,
     channels: HashMap<String, Channel>,
+    channels_by_title: HashMap<String, HashSet<String>>,
     channel_member_configs: HashMap<(String, String), ChannelMemberConfig>,
     actor_groups: HashMap<String, ActorGroup>,
     actor_presences: HashMap<(String, String), ActorPresence>,
@@ -259,10 +260,7 @@ impl Store {
         };
         self.journal
             .append(&Mutation::ChannelCreate(channel.clone()))?;
-        self.inner
-            .write()
-            .channels
-            .insert(channel.id.clone(), channel.clone());
+        self.inner.write().insert_channel(channel.clone());
         self.emit(StoreEvent::ChannelCreated(channel.clone()));
         Ok(channel)
     }
@@ -378,13 +376,28 @@ impl Store {
     }
 
     pub fn find_channels_by_title(&self, title: &str) -> Vec<Channel> {
-        self.inner
-            .read()
-            .channels
-            .values()
-            .filter(|channel| channel.title == title)
-            .cloned()
-            .collect()
+        let lock_started = std::time::Instant::now();
+        let inner = self.inner.read();
+        let lock_wait_ms = lock_started.elapsed().as_millis();
+        let lookup_started = std::time::Instant::now();
+        let ids = inner
+            .channels_by_title
+            .get(title)
+            .map(|ids| ids.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let channels = ids
+            .iter()
+            .filter_map(|id| inner.channels.get(id).cloned())
+            .collect::<Vec<_>>();
+        tracing::info!(
+            title,
+            matched_ids = ids.len(),
+            returned_channels = channels.len(),
+            lock_wait_ms,
+            lookup_elapsed_ms = lookup_started.elapsed().as_millis(),
+            "channel title index lookup complete"
+        );
+        channels
     }
 
     pub fn get_channel(&self, id: &str) -> Option<Channel> {
@@ -716,20 +729,9 @@ impl Store {
             visibility,
         })?;
         let mut inner = self.inner.write();
-        let ch = inner
-            .channels
-            .get_mut(id)
+        let updated = inner
+            .update_channel(id, title, topic, visibility)
             .ok_or_else(|| StoreError::NotFound(format!("channel {id}")))?;
-        if let Some(title) = title {
-            ch.title = title;
-        }
-        if let Some(topic) = topic {
-            ch.topic = topic;
-        }
-        if let Some(visibility) = visibility {
-            ch.visibility = visibility;
-        }
-        let updated = ch.clone();
         drop(inner);
         self.emit(StoreEvent::ChannelUpdated(updated.clone()));
         Ok(updated)
@@ -826,7 +828,7 @@ impl Store {
         })?;
         let removed = {
             let mut inner = self.inner.write();
-            let removed = inner.channels.remove(id).is_some();
+            let removed = inner.remove_channel(id).is_some();
             inner.actor_groups.retain(|_, group| group.channel_id != id);
             let task_ids: std::collections::HashSet<String> = inner
                 .tasks
@@ -5234,6 +5236,69 @@ fn normalize_instructions(instructions: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+impl Inner {
+    fn index_channel_title(&mut self, title: &str, channel_id: &str) {
+        self.channels_by_title
+            .entry(title.to_string())
+            .or_default()
+            .insert(channel_id.to_string());
+    }
+
+    fn deindex_channel_title(&mut self, title: &str, channel_id: &str) {
+        let should_remove = if let Some(ids) = self.channels_by_title.get_mut(title) {
+            ids.remove(channel_id);
+            ids.is_empty()
+        } else {
+            false
+        };
+        if should_remove {
+            self.channels_by_title.remove(title);
+        }
+    }
+
+    fn insert_channel(&mut self, channel: Channel) {
+        if let Some(previous) = self.channels.remove(&channel.id) {
+            self.deindex_channel_title(&previous.title, &previous.id);
+        }
+        self.index_channel_title(&channel.title, &channel.id);
+        self.channels.insert(channel.id.clone(), channel);
+    }
+
+    fn update_channel(
+        &mut self,
+        id: &str,
+        title: Option<String>,
+        topic: Option<String>,
+        visibility: Option<ChannelVisibility>,
+    ) -> Option<Channel> {
+        let old_title = self.channels.get(id)?.title.clone();
+        let updated = {
+            let channel = self.channels.get_mut(id)?;
+            if let Some(title) = title {
+                channel.title = title;
+            }
+            if let Some(topic) = topic {
+                channel.topic = topic;
+            }
+            if let Some(visibility) = visibility {
+                channel.visibility = visibility;
+            }
+            channel.clone()
+        };
+        if updated.title != old_title {
+            self.deindex_channel_title(&old_title, id);
+            self.index_channel_title(&updated.title, id);
+        }
+        Some(updated)
+    }
+
+    fn remove_channel(&mut self, id: &str) -> Option<Channel> {
+        let removed = self.channels.remove(id)?;
+        self.deindex_channel_title(&removed.title, &removed.id);
+        Some(removed)
+    }
+}
+
 fn apply(inner: &mut Inner, m: Mutation) {
     match m {
         Mutation::ActorUpsert(a) => {
@@ -5272,7 +5337,7 @@ fn apply(inner: &mut Inner, m: Mutation) {
             });
         }
         Mutation::ChannelCreate(c) => {
-            inner.channels.insert(c.id.clone(), c);
+            inner.insert_channel(c);
         }
         Mutation::ChannelMemberConfigUpsert(config) => {
             inner
@@ -5447,17 +5512,7 @@ fn apply(inner: &mut Inner, m: Mutation) {
             topic,
             visibility,
         } => {
-            if let Some(c) = inner.channels.get_mut(&channel_id) {
-                if let Some(title) = title {
-                    c.title = title;
-                }
-                if let Some(topic) = topic {
-                    c.topic = topic;
-                }
-                if let Some(visibility) = visibility {
-                    c.visibility = visibility;
-                }
-            }
+            inner.update_channel(&channel_id, title, topic, visibility);
         }
         Mutation::ChannelInstructionSet {
             channel_id,
@@ -5472,7 +5527,7 @@ fn apply(inner: &mut Inner, m: Mutation) {
             }
         }
         Mutation::ChannelDelete { channel_id } => {
-            inner.channels.remove(&channel_id);
+            inner.remove_channel(&channel_id);
             inner
                 .channel_member_configs
                 .retain(|(config_channel_id, _), _| config_channel_id != &channel_id);
@@ -6455,6 +6510,43 @@ mod tests {
         let path: PathBuf = dir.join("journal.jsonl");
         let journal = Journal::open(path).expect("open journal");
         Store::open(journal).expect("open store")
+    }
+
+    #[test]
+    fn channel_title_index_updates_and_replays() {
+        let store = fresh_store();
+        let first = store
+            .create_channel("same".into(), None)
+            .expect("create first");
+        let second = store
+            .create_channel("same".into(), None)
+            .expect("create second");
+
+        let mut ids = store
+            .find_channels_by_title("same")
+            .into_iter()
+            .map(|channel| channel.id)
+            .collect::<Vec<_>>();
+        ids.sort();
+        let mut expected = vec![first.id.clone(), second.id.clone()];
+        expected.sort();
+        assert_eq!(ids, expected);
+
+        store
+            .update_channel(&first.id, Some("renamed".into()), None, None)
+            .expect("rename channel");
+        assert_eq!(store.find_channels_by_title("same").len(), 1);
+        assert_eq!(store.find_channels_by_title("renamed").len(), 1);
+
+        let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
+        let replayed = Store::open(journal).unwrap();
+        assert_eq!(replayed.find_channels_by_title("same").len(), 1);
+        assert_eq!(replayed.find_channels_by_title("renamed")[0].id, first.id);
+
+        replayed
+            .delete_channel(&second.id, false)
+            .expect("delete second");
+        assert!(replayed.find_channels_by_title("same").is_empty());
     }
 
     #[test]
@@ -7837,10 +7929,7 @@ mod tests {
             .set_thread_instructions(&thread.id, Some("thread guide".into()), "actor_owner")
             .expect("set thread instructions");
         assert_eq!(set.instructions.as_deref(), Some("thread guide"));
-        assert_eq!(
-            set.instructions_modified_by.as_deref(),
-            Some("actor_owner")
-        );
+        assert_eq!(set.instructions_modified_by.as_deref(), Some("actor_owner"));
         assert!(set.instructions_modified_at.is_some());
 
         let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();

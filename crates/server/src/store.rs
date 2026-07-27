@@ -377,6 +377,16 @@ impl Store {
         self.inner.read().channels.values().cloned().collect()
     }
 
+    pub fn find_channels_by_title(&self, title: &str) -> Vec<Channel> {
+        self.inner
+            .read()
+            .channels
+            .values()
+            .filter(|channel| channel.title == title)
+            .cloned()
+            .collect()
+    }
+
     pub fn get_channel(&self, id: &str) -> Option<Channel> {
         self.inner.read().channels.get(id).cloned()
     }

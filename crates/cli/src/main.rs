@@ -612,6 +612,11 @@ enum ChannelCmd {
     /// List channels visible to this caller (public channels + private
     /// channels the caller is a member of).
     List,
+    /// Lookup visible channels by exact title.
+    Lookup {
+        #[arg(long)]
+        title: String,
+    },
     /// Update channel metadata or visibility.
     Update {
         channel_id: String,
@@ -2226,6 +2231,7 @@ async fn async_main() -> Result<()> {
                 cmd::channel::create(client, cfg.actor_id.clone(), title, public).await?
             }
             ChannelCmd::List => cmd::channel::list(client).await?,
+            ChannelCmd::Lookup { title } => cmd::channel::lookup(client, title).await?,
             ChannelCmd::Update {
                 channel_id,
                 title,

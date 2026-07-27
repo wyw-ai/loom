@@ -42,6 +42,23 @@ pub async fn list(client: Arc<Client>) -> Result<()> {
     Ok(())
 }
 
+pub async fn lookup(client: Arc<Client>, title: String) -> Result<()> {
+    let res: ChannelLookupResult = client
+        .call(method::CHANNEL_LOOKUP, json!({ "title": title }))
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+        return Ok(());
+    }
+    if res.channels.is_empty() {
+        println!("(no channels)");
+    }
+    for c in res.channels {
+        println!("{}\t{}", c.id, c.title);
+    }
+    Ok(())
+}
+
 pub async fn update(
     client: Arc<Client>,
     channel_id: String,

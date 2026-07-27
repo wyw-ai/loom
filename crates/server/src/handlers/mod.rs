@@ -68,6 +68,7 @@ pub async fn dispatch(
         method::SCOPE_UNSUBSCRIBE => scope_unsubscribe(state, connection_id, params),
         method::CHANNEL_CREATE => channel_create(state, connection_id, params),
         method::CHANNEL_LIST => channel_list(state, connection_id),
+        method::CHANNEL_LOOKUP => channel_lookup(state, connection_id, params),
         method::CHANNEL_UPDATE => channel_update(state, params),
         method::CHANNEL_DELETE => channel_delete(state, connection_id, params),
         method::CHANNEL_INVITE => channel_invite(state, connection_id, params),
@@ -424,6 +425,24 @@ fn channel_list(state: &AppState, connection_id: &str) -> HandlerResult {
         })
         .collect();
     ok(ChannelListResult { channels })
+}
+
+fn channel_lookup(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
+    let p: ChannelLookupParams = parse_params(params)?;
+    let caller = state.subscriptions.actor_for_connection(connection_id);
+    let channels = state
+        .store
+        .find_channels_by_title(&p.title)
+        .into_iter()
+        .filter(|c| match c.visibility {
+            ChannelVisibility::Public => true,
+            ChannelVisibility::Private => match caller.as_deref() {
+                Some(actor) => c.members.iter().any(|m| m == actor),
+                None => false,
+            },
+        })
+        .collect();
+    ok(ChannelLookupResult { channels })
 }
 
 fn channel_invite(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
@@ -5486,6 +5505,38 @@ mod tests {
         assert_eq!(err.code, ErrorCode::APP_INVALID_STATE);
         assert!(state.store.get_channel(&channel.id).is_some());
         assert_eq!(state.store.list_threads(Some(&channel.id)).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn channel_lookup_filters_by_exact_title_and_visibility() {
+        let state = fresh_state("channel-lookup-title");
+        let public_match = state
+            .store
+            .create_channel("DingTalk cid-1".into(), None)
+            .expect("create public match");
+        state
+            .store
+            .create_channel("DingTalk cid-2".into(), None)
+            .expect("create public non-match");
+        state
+            .store
+            .create_channel("DingTalk cid-1".into(), Some("actor_owner".into()))
+            .expect("create private match");
+        open_conn(&state, "conn_caller", "actor_caller").await;
+
+        let value = dispatch(
+            &state,
+            "conn_caller",
+            method::CHANNEL_LOOKUP,
+            Some(json!({ "title": "DingTalk cid-1" })),
+        )
+        .await
+        .expect("lookup should succeed");
+        let result: ChannelLookupResult = serde_json::from_value(value).expect("lookup result");
+
+        assert_eq!(result.channels.len(), 1);
+        assert_eq!(result.channels[0].id, public_match.id);
+        assert_eq!(result.channels[0].title, "DingTalk cid-1");
     }
 
     #[tokio::test]

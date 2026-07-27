@@ -14,6 +14,7 @@ pub mod method {
     pub const SCOPE_UNSUBSCRIBE: &str = "scope/unsubscribe";
     pub const CHANNEL_CREATE: &str = "channel/create";
     pub const CHANNEL_LIST: &str = "channel/list";
+    pub const CHANNEL_LOOKUP: &str = "channel/lookup";
     pub const CHANNEL_UPDATE: &str = "channel/update";
     pub const CHANNEL_DELETE: &str = "channel/delete";
     pub const CHANNEL_INVITE: &str = "channel/invite";
@@ -265,6 +266,17 @@ pub struct ChannelCreateResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelListResult {
+    pub channels: Vec<Channel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelLookupParams {
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelLookupResult {
     pub channels: Vec<Channel>,
 }
 

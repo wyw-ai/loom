@@ -197,9 +197,27 @@ impl Store {
     // -------- Actors --------
 
     pub fn upsert_actor(&self, actor: Actor) -> StoreResult<Actor> {
+        let started = std::time::Instant::now();
+        let append_started = std::time::Instant::now();
         self.journal.append(&Mutation::ActorUpsert(actor.clone()))?;
+        let journal_append_ms = append_started.elapsed().as_millis();
+        let lock_started = std::time::Instant::now();
         let mut inner = self.inner.write();
+        let lock_wait_ms = lock_started.elapsed().as_millis();
+        let mutate_started = std::time::Instant::now();
         inner.actors.insert(actor.id.clone(), actor.clone());
+        let mutate_elapsed_ms = mutate_started.elapsed().as_millis();
+        let total_elapsed_ms = started.elapsed().as_millis();
+        if journal_append_ms > 50 || lock_wait_ms > 50 || total_elapsed_ms > 100 {
+            tracing::warn!(
+                actor_id = %actor.id,
+                journal_append_ms,
+                lock_wait_ms,
+                mutate_elapsed_ms,
+                total_elapsed_ms,
+                "slow actor upsert store operation"
+            );
+        }
         Ok(actor)
     }
 
@@ -219,7 +237,24 @@ impl Store {
     }
 
     pub fn list_actors(&self) -> Vec<Actor> {
-        self.inner.read().actors.values().cloned().collect()
+        let started = std::time::Instant::now();
+        let lock_started = std::time::Instant::now();
+        let inner = self.inner.read();
+        let lock_wait_ms = lock_started.elapsed().as_millis();
+        let collect_started = std::time::Instant::now();
+        let actors = inner.actors.values().cloned().collect::<Vec<_>>();
+        let collect_elapsed_ms = collect_started.elapsed().as_millis();
+        let total_elapsed_ms = started.elapsed().as_millis();
+        if lock_wait_ms > 50 || total_elapsed_ms > 100 {
+            tracing::warn!(
+                actors = actors.len(),
+                lock_wait_ms,
+                collect_elapsed_ms,
+                total_elapsed_ms,
+                "slow actor list store operation"
+            );
+        }
+        actors
     }
 
     // -------- Channels --------
@@ -372,7 +407,24 @@ impl Store {
     }
 
     pub fn list_channels(&self) -> Vec<Channel> {
-        self.inner.read().channels.values().cloned().collect()
+        let started = std::time::Instant::now();
+        let lock_started = std::time::Instant::now();
+        let inner = self.inner.read();
+        let lock_wait_ms = lock_started.elapsed().as_millis();
+        let collect_started = std::time::Instant::now();
+        let channels = inner.channels.values().cloned().collect::<Vec<_>>();
+        let collect_elapsed_ms = collect_started.elapsed().as_millis();
+        let total_elapsed_ms = started.elapsed().as_millis();
+        if lock_wait_ms > 50 || total_elapsed_ms > 100 {
+            tracing::warn!(
+                channels = channels.len(),
+                lock_wait_ms,
+                collect_elapsed_ms,
+                total_elapsed_ms,
+                "slow channel list store operation"
+            );
+        }
+        channels
     }
 
     pub fn find_channels_by_title(&self, title: &str) -> Vec<Channel> {
@@ -4904,12 +4956,33 @@ impl Store {
     // -------- Machine commands --------
 
     pub fn upsert_machine_command(&self, command: MachineCommand) -> StoreResult<MachineCommand> {
+        let started = std::time::Instant::now();
+        let append_started = std::time::Instant::now();
         self.journal
             .append(&Mutation::MachineCommandUpsert(command.clone()))?;
+        let journal_append_ms = append_started.elapsed().as_millis();
+        let lock_started = std::time::Instant::now();
         let mut inner = self.inner.write();
+        let lock_wait_ms = lock_started.elapsed().as_millis();
+        let mutate_started = std::time::Instant::now();
         apply(&mut inner, Mutation::MachineCommandUpsert(command.clone()));
+        let mutate_elapsed_ms = mutate_started.elapsed().as_millis();
         drop(inner);
+        let emit_started = std::time::Instant::now();
         self.emit(StoreEvent::MachineCommandUpdated(command.clone()));
+        let emit_elapsed_ms = emit_started.elapsed().as_millis();
+        let total_elapsed_ms = started.elapsed().as_millis();
+        if journal_append_ms > 50 || lock_wait_ms > 50 || total_elapsed_ms > 100 {
+            tracing::warn!(
+                command_id = %command.command_id,
+                journal_append_ms,
+                lock_wait_ms,
+                mutate_elapsed_ms,
+                emit_elapsed_ms,
+                total_elapsed_ms,
+                "slow machine command upsert store operation"
+            );
+        }
         Ok(command)
     }
 
@@ -4925,9 +4998,12 @@ impl Store {
         requested_by: Option<&str>,
         limit: usize,
     ) -> Vec<MachineCommand> {
-        let mut rows: Vec<MachineCommand> = self
-            .inner
-            .read()
+        let started = std::time::Instant::now();
+        let lock_started = std::time::Instant::now();
+        let inner = self.inner.read();
+        let lock_wait_ms = lock_started.elapsed().as_millis();
+        let filter_started = std::time::Instant::now();
+        let mut rows: Vec<MachineCommand> = inner
             .machine_commands
             .values()
             .filter(|command| machine_id.is_none_or(|id| command.machine_id == id))
@@ -4936,12 +5012,31 @@ impl Store {
             .filter(|command| statuses.is_empty() || statuses.contains(&command.status))
             .cloned()
             .collect();
+        let filter_elapsed_ms = filter_started.elapsed().as_millis();
+        let sort_started = std::time::Instant::now();
         rows.sort_by(|a, b| {
             a.created_at
                 .cmp(&b.created_at)
                 .then_with(|| a.command_id.cmp(&b.command_id))
         });
         rows.truncate(limit);
+        let sort_elapsed_ms = sort_started.elapsed().as_millis();
+        let total_elapsed_ms = started.elapsed().as_millis();
+        if lock_wait_ms > 50 || total_elapsed_ms > 100 {
+            tracing::warn!(
+                machine_id = machine_id.unwrap_or("<any>"),
+                machine_actor_id = machine_actor_id.unwrap_or("<any>"),
+                requested_by = requested_by.unwrap_or("<any>"),
+                statuses = statuses.len(),
+                limit,
+                returned_commands = rows.len(),
+                lock_wait_ms,
+                filter_elapsed_ms,
+                sort_elapsed_ms,
+                total_elapsed_ms,
+                "slow machine command list store operation"
+            );
+        }
         rows
     }
 

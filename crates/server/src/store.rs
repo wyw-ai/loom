@@ -162,6 +162,37 @@ pub struct Store {
     broadcaster: broadcast::Sender<StoreEvent>,
 }
 
+fn actors_equivalent_for_upsert(existing: &Actor, incoming: &Actor) -> bool {
+    if existing == incoming {
+        return true;
+    }
+    if existing.kind != ActorKind::Service || incoming.kind != ActorKind::Service {
+        return false;
+    }
+
+    let is_machine = |actor: &Actor| {
+        actor
+            ._meta
+            .as_ref()
+            .and_then(|meta| meta.get("role"))
+            .and_then(serde_json::Value::as_str)
+            == Some("machine")
+    };
+    if !is_machine(existing) || !is_machine(incoming) {
+        return false;
+    }
+
+    let mut existing = existing.clone();
+    let mut incoming = incoming.clone();
+    if let Some(meta) = existing._meta.as_mut() {
+        meta.remove("observedAt");
+    }
+    if let Some(meta) = incoming._meta.as_mut() {
+        meta.remove("observedAt");
+    }
+    existing == incoming
+}
+
 impl Store {
     pub fn open(journal: Arc<Journal>) -> StoreResult<Arc<Self>> {
         let (tx, _) = broadcast::channel(1024);
@@ -200,14 +231,14 @@ impl Store {
 
     pub fn upsert_actor(&self, actor: Actor) -> StoreResult<Actor> {
         if let Some(existing) = self.inner.read().actors.get(&actor.id) {
-            if existing == &actor {
+            if actors_equivalent_for_upsert(existing, &actor) {
                 return Ok(existing.clone());
             }
         }
 
         let _guard = self.actor_upsert_lock.lock();
         if let Some(existing) = self.inner.read().actors.get(&actor.id) {
-            if existing == &actor {
+            if actors_equivalent_for_upsert(existing, &actor) {
                 return Ok(existing.clone());
             }
         }
@@ -6655,6 +6686,51 @@ mod tests {
                 .display_name,
             "Renamed Agent"
         );
+    }
+
+    #[test]
+    fn machine_actor_observed_at_change_does_not_append_journal_record() {
+        let store = fresh_store();
+        let actor = Actor {
+            id: "actor_machine_stable".into(),
+            kind: ActorKind::Service,
+            display_name: "Stable Machine".into(),
+            capabilities: None,
+            _meta: Some(BTreeMap::from([
+                ("role".into(), serde_json::json!("machine")),
+                ("revision".into(), serde_json::json!(1)),
+                (
+                    "observedAt".into(),
+                    serde_json::json!("2026-07-28T00:00:00Z"),
+                ),
+            ])),
+        };
+
+        store.upsert_actor(actor.clone()).expect("first upsert");
+
+        let mut heartbeat = actor.clone();
+        heartbeat._meta.as_mut().expect("machine metadata").insert(
+            "observedAt".into(),
+            serde_json::json!("2026-07-28T00:00:15Z"),
+        );
+        let unchanged = store.upsert_actor(heartbeat).expect("heartbeat upsert");
+        assert_eq!(unchanged, actor);
+        let heartbeat_journal =
+            std::fs::read_to_string(store.journal.path()).expect("read heartbeat journal");
+        assert_eq!(heartbeat_journal.lines().count(), 1);
+
+        let mut changed = actor;
+        changed
+            ._meta
+            .as_mut()
+            .expect("machine metadata")
+            .insert("revision".into(), serde_json::json!(2));
+        store
+            .upsert_actor(changed)
+            .expect("changed inventory upsert");
+        let changed_journal =
+            std::fs::read_to_string(store.journal.path()).expect("read changed journal");
+        assert_eq!(changed_journal.lines().count(), 2);
     }
 
     #[test]

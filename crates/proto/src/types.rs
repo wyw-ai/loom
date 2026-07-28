@@ -48,7 +48,7 @@ pub enum ActorKind {
     Service,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Actor {
     pub id: String,

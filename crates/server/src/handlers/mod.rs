@@ -176,7 +176,7 @@ pub async fn dispatch(
         method::MACHINE_COMMAND_ACK => machine_command_ack(state, connection_id, params),
         method::MACHINE_COMMAND_RESULT => machine_command_result(state, connection_id, params),
         method::MACHINE_COMMAND_CANCEL => machine_command_cancel(state, connection_id, params),
-        method::ACTOR_LIST => actor_list(state),
+        method::ACTOR_LIST => actor_list(state, connection_id),
         method::ACTOR_UPSERT => actor_upsert(state, params),
         method::ACTOR_DELETE => actor_delete(state, params),
         method::ACTOR_GROUP_CREATE => actor_group_create(state, connection_id, params),
@@ -3309,9 +3309,17 @@ fn validate_machine_actor(
 
 // ---- actor / agent ----
 
-fn actor_list(state: &AppState) -> HandlerResult {
+fn actor_list(state: &AppState, connection_id: &str) -> HandlerResult {
+    let machine_heartbeat = state
+        .subscriptions
+        .actor_for_connection(connection_id)
+        .is_some_and(|actor_id| is_machine_actor(state, &actor_id));
     ok(ActorListResult {
-        actors: state.store.list_actors(),
+        actors: if machine_heartbeat {
+            Vec::new()
+        } else {
+            state.store.list_actors()
+        },
     })
 }
 
@@ -6340,6 +6348,48 @@ mod tests {
                 .and_then(|value| value.get("done").and_then(Value::as_bool).map(bool::from)),
             Some(true)
         );
+    }
+
+    #[tokio::test]
+    async fn machine_actor_list_heartbeat_does_not_return_global_actor_inventory() {
+        let state = fresh_state("machine-actor-list");
+        open_conn(&state, "conn_human", "actor_human").await;
+        dispatch(
+            &state,
+            "conn_human",
+            method::ACTOR_UPSERT,
+            Some(json!({
+                "actor": {
+                    "id": "actor_service_machine_remote",
+                    "kind": "service",
+                    "displayName": "Remote Machine",
+                    "_meta": {
+                        "role": "machine",
+                        "machineId": "machine_remote"
+                    }
+                }
+            })),
+        )
+        .await
+        .expect("actor/upsert machine");
+        open_service_conn(&state, "conn_machine", "actor_service_machine_remote").await;
+
+        let machine_value = dispatch(&state, "conn_machine", method::ACTOR_LIST, None)
+            .await
+            .expect("machine actor/list");
+        let machine_result: ActorListResult =
+            serde_json::from_value(machine_value).expect("decode machine actor/list");
+        assert!(machine_result.actors.is_empty());
+
+        let human_value = dispatch(&state, "conn_human", method::ACTOR_LIST, None)
+            .await
+            .expect("human actor/list");
+        let human_result: ActorListResult =
+            serde_json::from_value(human_value).expect("decode human actor/list");
+        assert!(human_result
+            .actors
+            .iter()
+            .any(|actor| actor.id == "actor_service_machine_remote"));
     }
 
     #[tokio::test]

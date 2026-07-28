@@ -44,7 +44,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::{interval, sleep, Duration};
+use tokio::time::{interval, interval_at, sleep, Duration, Instant, MissedTickBehavior};
 
 use agent_runtime::acp::{create_dir_all_unc, normalize_path_separators, AcpAdapter, AcpConfig};
 use agent_runtime::command::{CommandAdapter, CommandConfig};
@@ -62,6 +62,9 @@ use crate::daemon_ipc;
 
 const RECONNECT_BASE_DELAY_SECS: u64 = 2;
 const RECONNECT_MAX_DELAY_SECS: u64 = 30;
+const MACHINE_COMMAND_POLL_INTERVAL_SECS: u64 = 60;
+const MACHINE_COMMAND_POLL_BASE_DELAY_SECS: u64 = 15;
+const MACHINE_COMMAND_POLL_JITTER_SECS: u64 = 30;
 const LOOM_CLI_ENV: &str = "LOOM_CLI";
 const LOOM_NO_REPLY_FILE_ENV: &str = "LOOM_NO_REPLY_FILE";
 const LOCAL_ACTOR_INBOX_DELIVERY_META: &str = "__loom_local_actor_inbox_delivery";
@@ -550,14 +553,17 @@ async fn run_machine_host_once(host: &MachineHostSpec, server_url: &str) -> Resu
     );
 
     let mut notifications = client.notifications.lock().await;
-    let mut heartbeat = interval(Duration::from_secs(15));
     let mut in_progress = HashSet::new();
+    drain_machine_commands(&client, host, &mut in_progress).await?;
+    let mut command_poll = interval_at(
+        Instant::now() + machine_command_poll_initial_delay(&host.machine_id),
+        Duration::from_secs(MACHINE_COMMAND_POLL_INTERVAL_SECS),
+    );
+    command_poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tokio::select! {
-            _ = heartbeat.tick() => {
-                upsert_machine_actor(&client, host).await?;
+            _ = command_poll.tick() => {
                 drain_machine_commands(&client, host, &mut in_progress).await?;
-                let _: Value = client.call_raw(method::ACTOR_LIST, None).await?;
             }
             maybe_notification = notifications.recv() => {
                 let Some(notification) = maybe_notification else {
@@ -571,6 +577,15 @@ async fn run_machine_host_once(host: &MachineHostSpec, server_url: &str) -> Resu
             }
         }
     }
+}
+
+fn machine_command_poll_initial_delay(machine_id: &str) -> Duration {
+    let hash = machine_id.bytes().fold(0u64, |acc, byte| {
+        acc.wrapping_mul(1099511628211).wrapping_add(byte as u64)
+    });
+    Duration::from_secs(
+        MACHINE_COMMAND_POLL_BASE_DELAY_SECS + hash % MACHINE_COMMAND_POLL_JITTER_SECS,
+    )
 }
 
 async fn drain_machine_commands(
@@ -9382,6 +9397,25 @@ mod tests {
         AgentProviderRef, ProviderPromptOutputSpec, ProviderPromptSpec, TriggerSpec,
     };
     use proto::types::{Actor, ActorKind, MessageKind, Ref, Relation};
+
+    #[test]
+    fn machine_command_poll_delay_is_stable_and_jittered() {
+        let first = machine_command_poll_initial_delay("machine-alpha");
+        let repeated = machine_command_poll_initial_delay("machine-alpha");
+        let distinct_delays = (0..64)
+            .map(|index| machine_command_poll_initial_delay(&format!("machine-{index}")))
+            .collect::<HashSet<_>>();
+
+        assert_eq!(first, repeated);
+        assert!(first >= Duration::from_secs(MACHINE_COMMAND_POLL_BASE_DELAY_SECS));
+        assert!(
+            first
+                < Duration::from_secs(
+                    MACHINE_COMMAND_POLL_BASE_DELAY_SECS + MACHINE_COMMAND_POLL_JITTER_SECS
+                )
+        );
+        assert!(distinct_delays.len() > 1);
+    }
 
     fn sample_spec(bundle: Option<AgentBundleSpec>) -> AgentSpec {
         AgentSpec {

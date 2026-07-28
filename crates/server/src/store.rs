@@ -157,6 +157,7 @@ struct Inner {
 pub struct Store {
     journal: Arc<Journal>,
     inner: RwLock<Inner>,
+    actor_upsert_lock: Mutex<()>,
     structure_lock: Mutex<()>,
     broadcaster: broadcast::Sender<StoreEvent>,
 }
@@ -167,6 +168,7 @@ impl Store {
         let store = Arc::new(Self {
             journal: journal.clone(),
             inner: RwLock::new(Inner::default()),
+            actor_upsert_lock: Mutex::new(()),
             structure_lock: Mutex::new(()),
             broadcaster: tx,
         });
@@ -197,6 +199,19 @@ impl Store {
     // -------- Actors --------
 
     pub fn upsert_actor(&self, actor: Actor) -> StoreResult<Actor> {
+        if let Some(existing) = self.inner.read().actors.get(&actor.id) {
+            if existing == &actor {
+                return Ok(existing.clone());
+            }
+        }
+
+        let _guard = self.actor_upsert_lock.lock();
+        if let Some(existing) = self.inner.read().actors.get(&actor.id) {
+            if existing == &actor {
+                return Ok(existing.clone());
+            }
+        }
+
         let started = std::time::Instant::now();
         let append_started = std::time::Instant::now();
         self.journal.append(&Mutation::ActorUpsert(actor.clone()))?;
@@ -6605,6 +6620,71 @@ mod tests {
         let path: PathBuf = dir.join("journal.jsonl");
         let journal = Journal::open(path).expect("open journal");
         Store::open(journal).expect("open store")
+    }
+
+    #[test]
+    fn identical_actor_upsert_does_not_append_duplicate_journal_record() {
+        let store = fresh_store();
+        let actor = Actor {
+            id: "actor_agent_stable".into(),
+            kind: ActorKind::Agent,
+            display_name: "Stable Agent".into(),
+            capabilities: None,
+            _meta: None,
+        };
+
+        store.upsert_actor(actor.clone()).expect("first upsert");
+        let first_journal = std::fs::read_to_string(store.journal.path()).expect("read journal");
+        assert_eq!(first_journal.lines().count(), 1);
+
+        store.upsert_actor(actor.clone()).expect("identical upsert");
+        let unchanged_journal =
+            std::fs::read_to_string(store.journal.path()).expect("read unchanged journal");
+        assert_eq!(unchanged_journal.lines().count(), 1);
+
+        let mut changed = actor;
+        changed.display_name = "Renamed Agent".into();
+        store.upsert_actor(changed).expect("changed upsert");
+        let changed_journal =
+            std::fs::read_to_string(store.journal.path()).expect("read changed journal");
+        assert_eq!(changed_journal.lines().count(), 2);
+        assert_eq!(
+            store
+                .get_actor("actor_agent_stable")
+                .expect("stored actor")
+                .display_name,
+            "Renamed Agent"
+        );
+    }
+
+    #[test]
+    fn concurrent_identical_actor_upserts_append_once() {
+        let store = fresh_store();
+        let actor = Actor {
+            id: "actor_agent_concurrent".into(),
+            kind: ActorKind::Agent,
+            display_name: "Concurrent Agent".into(),
+            capabilities: None,
+            _meta: None,
+        };
+        let worker_count = 16;
+        let barrier = Arc::new(Barrier::new(worker_count));
+        let mut workers = Vec::new();
+        for _ in 0..worker_count {
+            let store = store.clone();
+            let actor = actor.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                store.upsert_actor(actor).expect("concurrent upsert");
+            }));
+        }
+        for worker in workers {
+            worker.join().expect("join concurrent upsert");
+        }
+
+        let journal = std::fs::read_to_string(store.journal.path()).expect("read journal");
+        assert_eq!(journal.lines().count(), 1);
     }
 
     #[test]

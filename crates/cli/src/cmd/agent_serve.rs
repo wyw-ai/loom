@@ -30,7 +30,7 @@ use proto::methods::{
     BundleInstallMode, ChannelListResult, ChannelMemberConfigGetResult, ChannelMembersResult,
     InboxListResult, MessageListResult, MessageSendResult, OnHumanMessageWhileBusy,
     PromptTemplateSpec, ReplyReminderMode, RunAppendResult, RunCloseResult, RunOpenResult,
-    RuntimeAwareness, TaskAssignmentContextResult, TaskAssignmentUpdateResult, ThreadListResult,
+    RuntimeAwareness, TaskAssignmentContextResult, TaskAssignmentUpdateResult, ThreadGetResult,
     TriggerPrefixApplyOn,
 };
 use proto::types::trace::TraceKind;
@@ -2468,9 +2468,9 @@ struct WorkerState {
     /// Per-scope first-turn set used by prompt templates that distinguish the
     /// first turn in a scope from later resumed turns.
     seeded: Mutex<HashSet<String>>,
-    /// thread_id → channel_id cache. Populated on miss by a single
-    /// `thread/list` RPC and reused from then on. Channel scopes don't need
-    /// resolution (scope.id IS the channel id) so those don't populate it.
+    /// thread_id → channel_id cache. Populated on miss by an exact `thread/get`
+    /// RPC and reused from then on. Channel scopes don't need resolution
+    /// (scope.id IS the channel id) so those don't populate it.
     scope_channel_cache: Mutex<HashMap<String, String>>,
     /// Trigger source ids already received from the server notification stream.
     /// The same source can arrive through both scope broadcast and actor-inbox
@@ -8055,14 +8055,23 @@ fn prompt_section_label(name: &str) -> &str {
     }
 }
 
+async fn get_thread_by_id(
+    client: &Arc<Client>,
+    thread_id: &str,
+) -> Result<Option<proto::types::Thread>> {
+    let res: ThreadGetResult = client
+        .call(method::THREAD_GET, json!({ "threadId": thread_id }))
+        .await
+        .context("thread/get")?;
+    Ok(res.thread)
+}
+
 /// Resolve a scope → channel_id. Channel scopes are identity — they are the
-/// channel. Thread scopes need a one-time `thread/list` sweep; the result is
-/// cached on `WorkerState` so we don't hit the server per turn. Archived
-/// threads are queried as a fallback because explicit routed messages can arrive from
-/// historical threads that are no longer in the active list. A lookup
-/// failure (network error, thread not visible, etc.) returns `None`, which
-/// the memory selector interprets as "no channel scope available" and falls
-/// open — slightly leakier but never-wedging.
+/// channel. Thread scopes use an exact `thread/get` lookup, then cache the
+/// result on `WorkerState` so we don't hit the server per turn. The lookup
+/// includes archived threads. A failure (network error, thread not visible,
+/// etc.) returns `None`, which the memory selector interprets as "no channel
+/// scope available" and falls open — slightly leakier but never-wedging.
 async fn resolve_channel_for_scope(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
@@ -8079,22 +8088,16 @@ async fn resolve_channel_for_scope(
             {
                 return Some(cached);
             }
-            for params in [json!({}), json!({ "archived": true })] {
-                let res: proto::methods::ThreadListResult =
-                    client.call(method::THREAD_LIST, params).await.ok()?;
-                let mut cache = state.scope_channel_cache.lock().ok()?;
-                let mut found: Option<String> = None;
-                for t in res.threads {
-                    if t.id == scope.id {
-                        found = Some(t.channel_id.clone());
-                    }
-                    cache.insert(t.id, t.channel_id);
-                }
-                if found.is_some() {
-                    return found;
-                }
-            }
-            None
+            let channel_id = get_thread_by_id(client, &scope.id)
+                .await
+                .ok()??
+                .channel_id;
+            state
+                .scope_channel_cache
+                .lock()
+                .ok()?
+                .insert(scope.id.clone(), channel_id.clone());
+            Some(channel_id)
         }
     }
 }
@@ -9207,14 +9210,8 @@ async fn message_target_for_scope(client: &Arc<Client>, scope: &ScopeRef) -> Res
     match scope.kind {
         ScopeKind::Channel => Ok(format!("#{}", scope.id)),
         ScopeKind::Thread => {
-            let res: ThreadListResult = client
-                .call(method::THREAD_LIST, json!({ "archived": false }))
-                .await
-                .context("thread/list")?;
-            let thread = res
-                .threads
-                .into_iter()
-                .find(|thread| thread.id == scope.id)
+            let thread = get_thread_by_id(client, &scope.id)
+                .await?
                 .ok_or_else(|| anyhow!("thread {} not found", scope.id))?;
             Ok(format!("#{}:{}", thread.channel_id, thread.root_message_id))
         }
@@ -9458,6 +9455,76 @@ mod tests {
             relations: Vec::new(),
             _meta: None,
         }
+    }
+
+    #[tokio::test]
+    async fn thread_message_target_uses_exact_thread_get_rpc() {
+        let rpc_root = tempfile::tempdir().expect("file rpc root");
+        let client =
+            Client::connect(&format!("file-rpc://{}", rpc_root.path().display()))
+                .await
+                .expect("connect file rpc client");
+        client.set_rpc_timeout_ms(2_000);
+
+        let client_dir = std::fs::read_dir(rpc_root.path().join("clients"))
+            .expect("read clients")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .next()
+            .expect("client directory");
+        let in_dir = client_dir.join("in");
+        let out_dir = client_dir.join("out");
+        let responder = tokio::spawn(async move {
+            for _ in 0..100 {
+                let request_file = std::fs::read_dir(&in_dir)
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(std::result::Result::ok)
+                    .map(|entry| entry.path())
+                    .find(|path| path.extension().and_then(OsStr::to_str) == Some("json"));
+                if let Some(request_file) = request_file {
+                    let request: proto::Request = serde_json::from_str(
+                        &std::fs::read_to_string(request_file).expect("read request"),
+                    )
+                    .expect("parse request");
+                    let response = proto::Response::ok(
+                        request.id.clone(),
+                        json!({
+                            "thread": {
+                                "id": "thread_demo",
+                                "channelId": "chan_demo",
+                                "title": "Demo",
+                                "rootMessageId": "msg_root"
+                            }
+                        }),
+                    );
+                    std::fs::write(
+                        out_dir.join("00000000000000000001.json"),
+                        serde_json::to_vec(&response).expect("serialize response"),
+                    )
+                    .expect("write response");
+                    return request;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+            panic!("file rpc request was not written");
+        });
+
+        let target = message_target_for_scope(
+            &client,
+            &ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_demo".into(),
+            },
+        )
+        .await
+        .expect("resolve message target");
+        let request = responder.await.expect("responder task");
+
+        assert_eq!(request.method, method::THREAD_GET);
+        assert_eq!(request.params, Some(json!({ "threadId": "thread_demo" })));
+        assert_eq!(target, "#chan_demo:msg_root");
     }
 
     #[test]

@@ -651,12 +651,20 @@ enum ChannelCmd {
         channel_id: String,
         actor_id: String,
     },
-    /// Set one member's workspace override.
+    /// Set one member's workspace override and/or external mention ids.
     MemberConfigSet {
         channel_id: String,
         actor_id: String,
         #[arg(long = "workspace-dir")]
-        workspace_dir: String,
+        workspace_dir: Option<String>,
+        #[arg(long = "mention-id")]
+        mention_ids: Vec<String>,
+    },
+    /// Resolve external mention ids against members of one channel.
+    MemberResolve {
+        channel_id: String,
+        #[arg(long = "mention-id", required = true)]
+        mention_ids: Vec<String>,
     },
     /// Clear one member's workspace override.
     MemberConfigClear {
@@ -2261,9 +2269,21 @@ async fn async_main() -> Result<()> {
                 channel_id,
                 actor_id,
                 workspace_dir,
+                mention_ids,
             } => {
-                cmd::channel::member_config_set(client, channel_id, actor_id, workspace_dir).await?
+                cmd::channel::member_config_set(
+                    client,
+                    channel_id,
+                    actor_id,
+                    workspace_dir,
+                    mention_ids,
+                )
+                .await?
             }
+            ChannelCmd::MemberResolve {
+                channel_id,
+                mention_ids,
+            } => cmd::channel::member_resolve(client, channel_id, mention_ids).await?,
             ChannelCmd::MemberConfigClear {
                 channel_id,
                 actor_id,

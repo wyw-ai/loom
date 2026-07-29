@@ -532,34 +532,93 @@ impl Store {
         Ok(configs)
     }
 
-    pub fn set_channel_member_workspace_dir(
+    pub fn set_channel_member_config(
         &self,
         channel_id: &str,
         actor_id: &str,
-        workspace_dir: String,
+        workspace_dir: Option<String>,
+        mention_ids: Option<Vec<String>>,
     ) -> StoreResult<ChannelMemberConfig> {
-        let workspace_dir = workspace_dir.trim().to_string();
-        if workspace_dir.is_empty() {
+        let _guard = self.structure_lock.lock();
+        let workspace_dir = match workspace_dir {
+            Some(value) => {
+                let value = value.trim().to_string();
+                if value.is_empty() {
+                    return Err(StoreError::InvalidState(
+                        "workspaceDir cannot be empty".into(),
+                    ));
+                }
+                if value.contains('\0') {
+                    return Err(StoreError::InvalidState(
+                        "workspaceDir cannot contain NUL bytes".into(),
+                    ));
+                }
+                Some(value)
+            }
+            None => None,
+        };
+        let mention_ids = mention_ids
+            .map(normalize_channel_member_mention_ids)
+            .transpose()?;
+        if workspace_dir.is_none() && mention_ids.is_none() {
             return Err(StoreError::InvalidState(
-                "workspaceDir cannot be empty".into(),
+                "workspaceDir or mentionIds is required".into(),
             ));
         }
-        if workspace_dir.contains('\0') {
-            return Err(StoreError::InvalidState(
-                "workspaceDir cannot contain NUL bytes".into(),
-            ));
-        }
-        {
+        let existing = {
             let inner = self.inner.read();
             if !inner.channels.contains_key(channel_id) {
                 return Err(StoreError::NotFound(format!("channel {channel_id}")));
             }
-            validate_channel_member_workspace_actor_inner(&inner, channel_id, actor_id)?;
+            if workspace_dir.is_some() {
+                validate_channel_member_workspace_actor_inner(&inner, channel_id, actor_id)?;
+            } else {
+                validate_channel_member_agent_inner(&inner, channel_id, actor_id)?;
+            }
+            if let Some(ref requested_ids) = mention_ids {
+                for config in inner.channel_member_configs.values() {
+                    if config.channel_id == channel_id
+                        && config.actor_id != actor_id
+                        && config
+                            .mention_ids
+                            .iter()
+                            .any(|id| requested_ids.iter().any(|requested| requested == id))
+                    {
+                        return Err(StoreError::Conflict(format!(
+                            "mentionId is already owned by actor {} in channel {}",
+                            config.actor_id, channel_id
+                        )));
+                    }
+                }
+            }
+            inner
+                .channel_member_configs
+                .get(&(channel_id.to_string(), actor_id.to_string()))
+                .cloned()
+        };
+        let effective_workspace_dir = workspace_dir.or_else(|| {
+            existing
+                .as_ref()
+                .and_then(|config| config.workspace_dir.clone())
+        });
+        let effective_mention_ids = mention_ids.unwrap_or_else(|| {
+            existing
+                .as_ref()
+                .map(|config| config.mention_ids.clone())
+                .unwrap_or_default()
+        });
+        if let Some(existing) = existing {
+            if existing.workspace_dir == effective_workspace_dir
+                && existing.mention_ids == effective_mention_ids
+            {
+                return Ok(existing);
+            }
         }
         let config = ChannelMemberConfig {
             channel_id: channel_id.to_string(),
             actor_id: actor_id.to_string(),
-            workspace_dir: Some(workspace_dir),
+            workspace_dir: effective_workspace_dir,
+            mention_ids: effective_mention_ids,
             updated_at: Utc::now(),
             _meta: None,
         };
@@ -572,6 +631,34 @@ impl Store {
         Ok(config)
     }
 
+    pub fn resolve_channel_member_mentions(
+        &self,
+        channel_id: &str,
+        mention_ids: &[String],
+    ) -> StoreResult<Vec<(String, Vec<String>)>> {
+        let requested = normalize_channel_member_mention_ids(mention_ids.to_vec())?;
+        let inner = self.inner.read();
+        if !inner.channels.contains_key(channel_id) {
+            return Err(StoreError::NotFound(format!("channel {channel_id}")));
+        }
+        let mut matches = inner
+            .channel_member_configs
+            .values()
+            .filter(|config| config.channel_id == channel_id)
+            .filter_map(|config| {
+                let matched = config
+                    .mention_ids
+                    .iter()
+                    .filter(|id| requested.iter().any(|requested_id| requested_id == *id))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (!matched.is_empty()).then(|| (config.actor_id.clone(), matched))
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(matches)
+    }
+
     pub fn clear_channel_member_config(
         &self,
         channel_id: &str,
@@ -582,7 +669,14 @@ impl Store {
             if !inner.channels.contains_key(channel_id) {
                 return Err(StoreError::NotFound(format!("channel {channel_id}")));
             }
-            validate_channel_member_workspace_actor_inner(&inner, channel_id, actor_id)?;
+            let existing = inner
+                .channel_member_configs
+                .get(&(channel_id.to_string(), actor_id.to_string()));
+            if existing.is_some_and(|config| config.workspace_dir.is_some()) {
+                validate_channel_member_workspace_actor_inner(&inner, channel_id, actor_id)?;
+            } else {
+                validate_channel_member_agent_inner(&inner, channel_id, actor_id)?;
+            }
         }
         let mutation = Mutation::ChannelMemberConfigDelete {
             channel_id: channel_id.to_string(),
@@ -927,7 +1021,13 @@ impl Store {
         let removed = {
             let mut inner = self.inner.write();
             let removed = inner.remove_channel(id).is_some();
+            inner
+                .channel_member_configs
+                .retain(|(config_channel_id, _), _| config_channel_id != id);
             inner.actor_groups.retain(|_, group| group.channel_id != id);
+            inner
+                .actor_presences
+                .retain(|_, presence| presence.channel_id != id);
             let task_ids: std::collections::HashSet<String> = inner
                 .tasks
                 .values()
@@ -5973,6 +6073,60 @@ fn validate_channel_member_workspace_actor_inner(
     Ok(())
 }
 
+fn validate_channel_member_agent_inner(
+    inner: &Inner,
+    channel_id: &str,
+    actor_id: &str,
+) -> StoreResult<()> {
+    if !is_channel_member_inner(inner, channel_id, actor_id) {
+        return Err(StoreError::InvalidState(format!(
+            "actor {actor_id} is not a member of channel {channel_id}"
+        )));
+    }
+    let actor = inner
+        .actors
+        .get(actor_id)
+        .ok_or_else(|| StoreError::NotFound(format!("actor {actor_id}")))?;
+    if actor.kind != ActorKind::Agent {
+        return Err(StoreError::InvalidState(format!(
+            "actor {actor_id} is not an agent"
+        )));
+    }
+    Ok(())
+}
+
+fn normalize_channel_member_mention_ids(values: Vec<String>) -> StoreResult<Vec<String>> {
+    const MAX_MENTION_IDS: usize = 32;
+    const MAX_MENTION_ID_BYTES: usize = 512;
+
+    let mut normalized = Vec::new();
+    for value in values {
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        if value.contains('\0') {
+            return Err(StoreError::InvalidState(
+                "mentionIds cannot contain NUL bytes".into(),
+            ));
+        }
+        if value.len() > MAX_MENTION_ID_BYTES {
+            return Err(StoreError::InvalidState(format!(
+                "mentionId exceeds {MAX_MENTION_ID_BYTES} bytes"
+            )));
+        }
+        if !normalized.iter().any(|existing| existing == value) {
+            normalized.push(value.to_string());
+        }
+    }
+    if normalized.len() > MAX_MENTION_IDS {
+        return Err(StoreError::InvalidState(format!(
+            "mentionIds cannot contain more than {MAX_MENTION_IDS} values"
+        )));
+    }
+    Ok(normalized)
+}
+
 fn scope_channel_id_inner<'a>(inner: &'a Inner, scope: &'a ScopeRef) -> Option<&'a str> {
     match scope.kind {
         ScopeKind::Channel => inner
@@ -6854,9 +7008,15 @@ mod tests {
             .expect("grant agent");
 
         let config = store
-            .set_channel_member_workspace_dir(&channel.id, "actor_agent", "F:/work/demo".into())
+            .set_channel_member_config(
+                &channel.id,
+                "actor_agent",
+                Some("F:/work/demo".into()),
+                Some(vec!["dingtalk-agent".into()]),
+            )
             .expect("set config");
         assert_eq!(config.workspace_dir.as_deref(), Some("F:/work/demo"));
+        assert_eq!(config.mention_ids, vec!["dingtalk-agent"]);
 
         let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
         let replayed = Store::open(journal).unwrap();
@@ -6865,6 +7025,12 @@ mod tests {
                 .get_channel_member_config(&channel.id, "actor_agent")
                 .and_then(|config| config.workspace_dir),
             Some("F:/work/demo".into())
+        );
+        assert_eq!(
+            replayed
+                .get_channel_member_config(&channel.id, "actor_agent")
+                .map(|config| config.mention_ids),
+            Some(vec!["dingtalk-agent".into()])
         );
 
         replayed

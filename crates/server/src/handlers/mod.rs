@@ -87,6 +87,7 @@ pub async fn dispatch(
         method::CHANNEL_MEMBER_CONFIG_CLEAR => {
             channel_member_config_clear(state, connection_id, params)
         }
+        method::CHANNEL_MEMBER_RESOLVE => channel_member_resolve(state, connection_id, params),
         method::CHANNEL_SET_INSTRUCTION => channel_set_instruction(state, connection_id, params),
         method::CHANNEL_GET_INSTRUCTION => channel_get_instruction(state, connection_id, params),
         method::CHANNEL_CLEAR_INSTRUCTION => {
@@ -613,16 +614,25 @@ fn channel_member_config_set(
 ) -> HandlerResult {
     let p: ChannelMemberConfigSetParams = parse_params(params)?;
     let caller = ensure_channel_config_reader(state, connection_id, &p.channel_id)?;
-    if p.workspace_dir.trim().is_empty() {
+    if p.workspace_dir.is_none() && p.mention_ids.is_none() {
         return Err(ErrorObject::new(
             ErrorCode::INVALID_PARAMS,
-            "workspaceDir cannot be empty",
+            "workspaceDir or mentionIds is required",
         ));
     }
-    if p.workspace_dir.contains('\0') {
+    if p.workspace_dir
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty() || value.contains('\0'))
+    {
         return Err(ErrorObject::new(
             ErrorCode::INVALID_PARAMS,
-            "workspaceDir cannot contain NUL bytes",
+            "workspaceDir must be non-empty and cannot contain NUL bytes",
+        ));
+    }
+    if p.mention_ids.is_some() && caller != p.actor_id {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            "an actor can only update its own mentionIds",
         ));
     }
     if state.store.get_actor(&p.actor_id).is_none() {
@@ -633,7 +643,7 @@ fn channel_member_config_set(
     }
     let config = state
         .store
-        .set_channel_member_workspace_dir(&p.channel_id, &p.actor_id, p.workspace_dir)
+        .set_channel_member_config(&p.channel_id, &p.actor_id, p.workspace_dir, p.mention_ids)
         .map_err(map_store_err)?;
     tracing::info!(
         channel = %p.channel_id,
@@ -651,6 +661,16 @@ fn channel_member_config_clear(
 ) -> HandlerResult {
     let p: ChannelMemberConfigClearParams = parse_params(params)?;
     let caller = ensure_channel_config_reader(state, connection_id, &p.channel_id)?;
+    if state
+        .store
+        .get_channel_member_config(&p.channel_id, &p.actor_id)
+        .is_some_and(|config| !config.mention_ids.is_empty() && caller != p.actor_id)
+    {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            "an actor can only clear its own mentionIds",
+        ));
+    }
     let cleared = state
         .store
         .clear_channel_member_config(&p.channel_id, &p.actor_id)
@@ -663,6 +683,43 @@ fn channel_member_config_clear(
         "channel member workspace config cleared"
     );
     ok(ChannelMemberConfigClearResult { cleared })
+}
+
+fn channel_member_resolve(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: ChannelMemberResolveParams = parse_params(params)?;
+    ensure_channel_config_reader(state, connection_id, &p.channel_id)?;
+    let mut requested = Vec::new();
+    for mention_id in p.mention_ids {
+        let mention_id = mention_id.trim();
+        if !mention_id.is_empty() && !requested.iter().any(|existing| existing == mention_id) {
+            requested.push(mention_id.to_string());
+        }
+    }
+    let matched = state
+        .store
+        .resolve_channel_member_mentions(&p.channel_id, &requested)
+        .map_err(map_store_err)?;
+    let mut resolved_ids = std::collections::HashSet::new();
+    let members = matched
+        .into_iter()
+        .filter_map(|(actor_id, mention_ids)| {
+            let actor = state.store.get_actor(&actor_id)?;
+            resolved_ids.extend(mention_ids.iter().cloned());
+            Some(ResolvedChannelMember { actor, mention_ids })
+        })
+        .collect::<Vec<_>>();
+    let unresolved_mention_ids = requested
+        .into_iter()
+        .filter(|id| !resolved_ids.contains(id))
+        .collect();
+    ok(ChannelMemberResolveResult {
+        members,
+        unresolved_mention_ids,
+    })
 }
 
 fn channel_update(state: &AppState, params: Option<Value>) -> HandlerResult {
@@ -3697,6 +3754,166 @@ mod tests {
             .store
             .get_channel_member_config(&created.channel.id, "actor_agent")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn channel_member_mentions_are_self_published_and_resolved_within_channel() {
+        let state = fresh_state("channel_member_mentions_are_self_published_and_resolved");
+        open_conn(&state, "conn_owner", "actor_owner").await;
+        open_agent_conn(&state, "conn_agent_a", "actor_agent_a").await;
+        open_agent_conn(&state, "conn_agent_b", "actor_agent_b").await;
+
+        let channel_value = dispatch(
+            &state,
+            "conn_owner",
+            method::CHANNEL_CREATE,
+            Some(json!({ "title": "dingtalk-group" })),
+        )
+        .await
+        .expect("channel/create");
+        let created: ChannelCreateResult =
+            serde_json::from_value(channel_value).expect("channel create result");
+        for actor_id in ["actor_agent_a", "actor_agent_b"] {
+            dispatch(
+                &state,
+                "conn_owner",
+                method::CHANNEL_INVITE,
+                Some(json!({
+                    "channelId": &created.channel.id,
+                    "actorId": actor_id,
+                })),
+            )
+            .await
+            .expect("channel/invite");
+        }
+
+        dispatch(
+            &state,
+            "conn_agent_a",
+            method::CHANNEL_MEMBER_CONFIG_SET,
+            Some(json!({
+                "channelId": &created.channel.id,
+                "actorId": "actor_agent_a",
+                "mentionIds": ["dingtalk-a"],
+            })),
+        )
+        .await
+        .expect("agent a publishes mention ids");
+        dispatch(
+            &state,
+            "conn_agent_b",
+            method::CHANNEL_MEMBER_CONFIG_SET,
+            Some(json!({
+                "channelId": &created.channel.id,
+                "actorId": "actor_agent_b",
+                "mentionIds": ["dingtalk-b", " dingtalk-b "],
+            })),
+        )
+        .await
+        .expect("agent b publishes mention ids");
+
+        let resolved_value = dispatch(
+            &state,
+            "conn_agent_a",
+            method::CHANNEL_MEMBER_RESOLVE,
+            Some(json!({
+                "channelId": &created.channel.id,
+                "mentionIds": ["dingtalk-b", "unknown", "dingtalk-a"],
+            })),
+        )
+        .await
+        .expect("resolve channel mentions");
+        let resolved: ChannelMemberResolveResult =
+            serde_json::from_value(resolved_value).expect("resolve result");
+        assert_eq!(resolved.members.len(), 2);
+        assert_eq!(resolved.members[0].actor.id, "actor_agent_a");
+        assert_eq!(resolved.members[0].mention_ids, vec!["dingtalk-a"]);
+        assert_eq!(resolved.members[1].actor.id, "actor_agent_b");
+        assert_eq!(resolved.members[1].mention_ids, vec!["dingtalk-b"]);
+        assert_eq!(resolved.unresolved_mention_ids, vec!["unknown"]);
+
+        let spoof_err = dispatch(
+            &state,
+            "conn_agent_a",
+            method::CHANNEL_MEMBER_CONFIG_SET,
+            Some(json!({
+                "channelId": &created.channel.id,
+                "actorId": "actor_agent_b",
+                "mentionIds": ["spoofed"],
+            })),
+        )
+        .await
+        .expect_err("mention ids cannot be published for another actor");
+        assert_eq!(spoof_err.code, ErrorCode::APP_INVALID_STATE);
+
+        let conflict_err = dispatch(
+            &state,
+            "conn_agent_b",
+            method::CHANNEL_MEMBER_CONFIG_SET,
+            Some(json!({
+                "channelId": &created.channel.id,
+                "actorId": "actor_agent_b",
+                "mentionIds": ["dingtalk-a"],
+            })),
+        )
+        .await
+        .expect_err("one mention id cannot route to two actors");
+        assert_eq!(conflict_err.code, ErrorCode::APP_CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn public_channel_agent_can_publish_its_own_mentions_without_explicit_invite() {
+        let state = fresh_state("public_channel_agent_can_publish_its_own_mentions");
+        open_agent_conn(&state, "conn_agent", "actor_agent").await;
+        let channel_value = dispatch(
+            &state,
+            "conn_agent",
+            method::CHANNEL_CREATE,
+            Some(json!({ "title": "public-dingtalk-group", "public": true })),
+        )
+        .await
+        .expect("public channel/create");
+        let created: ChannelCreateResult =
+            serde_json::from_value(channel_value).expect("channel create result");
+        assert!(created.channel.members.is_empty());
+
+        let first_value = dispatch(
+            &state,
+            "conn_agent",
+            method::CHANNEL_MEMBER_CONFIG_SET,
+            Some(json!({
+                "channelId": &created.channel.id,
+                "actorId": "actor_agent",
+                "mentionIds": ["dingtalk-agent"],
+            })),
+        )
+        .await
+        .expect("implicit public member publishes mention ids");
+        let first: ChannelMemberConfigSetResult =
+            serde_json::from_value(first_value).expect("first set result");
+        let second_value = dispatch(
+            &state,
+            "conn_agent",
+            method::CHANNEL_MEMBER_CONFIG_SET,
+            Some(json!({
+                "channelId": &created.channel.id,
+                "actorId": "actor_agent",
+                "mentionIds": ["dingtalk-agent"],
+            })),
+        )
+        .await
+        .expect("identical mention ids are idempotent");
+        let second: ChannelMemberConfigSetResult =
+            serde_json::from_value(second_value).expect("second set result");
+        assert_eq!(first.config.updated_at, second.config.updated_at);
+
+        assert_eq!(
+            state
+                .store
+                .get_channel_member_config(&created.channel.id, "actor_agent")
+                .map(|config| config.mention_ids),
+            Some(vec!["dingtalk-agent".into()])
+        );
     }
 
     #[tokio::test]

@@ -24,6 +24,7 @@ pub mod method {
     pub const CHANNEL_MEMBER_CONFIG_LIST: &str = "channel/member_config.list";
     pub const CHANNEL_MEMBER_CONFIG_SET: &str = "channel/member_config.set";
     pub const CHANNEL_MEMBER_CONFIG_CLEAR: &str = "channel/member_config.clear";
+    pub const CHANNEL_MEMBER_RESOLVE: &str = "channel/member.resolve";
     pub const CHANNEL_SET_INSTRUCTION: &str = "channel/set_instruction";
     pub const CHANNEL_GET_INSTRUCTION: &str = "channel/get_instruction";
     pub const CHANNEL_CLEAR_INSTRUCTION: &str = "channel/clear_instruction";
@@ -350,7 +351,10 @@ pub struct ChannelMemberConfigListResult {
 pub struct ChannelMemberConfigSetParams {
     pub channel_id: String,
     pub actor_id: String,
-    pub workspace_dir: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mention_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -368,6 +372,27 @@ pub struct ChannelMemberConfigClearParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelMemberConfigClearResult {
     pub cleared: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelMemberResolveParams {
+    pub channel_id: String,
+    pub mention_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedChannelMember {
+    pub actor: Actor,
+    pub mention_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelMemberResolveResult {
+    pub members: Vec<ResolvedChannelMember>,
+    pub unresolved_mention_ids: Vec<String>,
 }
 
 // ---- channel/update / delete ----

@@ -16,7 +16,7 @@
   (auto-start, crash recovery), see scripts/windows/install.ps1 instead.
 
 .PARAMETER Version
-  Release tag to install, for example v0.1.0. Defaults to the latest release.
+  Release tag to install, for example v0.1.1. Defaults to the latest release.
 
 .PARAMETER BinDir
   Directory to install the binaries into.
@@ -24,7 +24,7 @@
 
 .EXAMPLE
   .\install.ps1
-  .\install.ps1 -Version v0.1.0 -BinDir C:\tools\loom
+  .\install.ps1 -Version v0.1.1 -BinDir C:\tools\loom
 #>
 param(
   [string]$Version = "",

@@ -1,6 +1,6 @@
 [package]
 name = "loom-shell"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 description = "Windows 管理 GUI — 通过托盘+标签页管理 loom-server / loom-daemon 服务"
 license = "Apache-2.0"

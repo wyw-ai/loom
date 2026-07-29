@@ -44,6 +44,9 @@ git config core.hooksPath .githooks
 ## Pull requests
 
 - Keep PRs focused: one change per PR, with a clear description of what and why.
+- Target day-to-day feature and fix pull requests at `preview`.
+- Pull requests into `main` must come from a same-repository release branch
+  named `preview-X.Y.Z` or from a branch under `hotfix/`.
 - Link the related issue when there is one.
 - Follow the commit style used in the project history (conventional prefixes
   such as `feat:`, `fix:`, `docs:`, `refactor:`).

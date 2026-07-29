@@ -8,4 +8,8 @@ drafts and may change between releases.
 
 ## [Unreleased]
 
-- Preparing the first public open-source release.
+## [0.1.1] - 2026-07-30
+
+- Add repository guardrails for protected release branches.
+- Harden release packaging and GitHub Pages deployment.
+- Fix Windows runtime packaging and download metadata.

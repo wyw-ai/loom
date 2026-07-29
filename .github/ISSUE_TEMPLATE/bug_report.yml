@@ -16,7 +16,7 @@ body:
     attributes:
       label: Environment
       description: OS, Loom version or commit, how you installed/built it, and any agent CLIs involved.
-      placeholder: e.g. Windows 11, loom built from source at v0.1.0, Claude Code
+      placeholder: e.g. Windows 11, loom built from source at v0.1.1, Claude Code
     validations:
       required: true
   - type: textarea

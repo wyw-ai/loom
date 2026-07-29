@@ -11,6 +11,18 @@ LINUX_DIR="$DIST_DIR/release/x86_64-unknown-linux-gnu"
 WINDOWS_DIR="$DIST_DIR/release/x86_64-pc-windows-msvc"
 INSTALL_DIR="$TEST_DIR/install"
 
+MAKE_DRY_RUN="$(
+  make -C "$ROOT_DIR" -n linux-x86-release \
+    LINUX_BUILDER=cross \
+    CARGO_TARGET_DIR=target/release-linux-musl
+)"
+grep -Fq \
+  'cross build --release --target x86_64-unknown-linux-musl -p loom-cli -p loom-server --target-dir target/release-linux-musl' \
+  <<<"$MAKE_DRY_RUN"
+grep -Fq \
+  'cp target/release-linux-musl/x86_64-unknown-linux-musl/release/loom ' \
+  <<<"$MAKE_DRY_RUN"
+
 mkdir -p "$LINUX_DIR" "$WINDOWS_DIR"
 for binary in loom loom-daemon loom-server; do
   printf 'fake %s\n' "$binary" >"$LINUX_DIR/$binary"

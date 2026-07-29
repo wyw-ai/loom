@@ -156,7 +156,11 @@ jobs:
         run: cargo install cross --locked
 
       - name: Build Linux release binaries
-        run: make linux-x86-gnu-release linux-x86-release LINUX_BUILDER=cross
+        run: |
+          # Host and cross containers use different glibc baselines. Separate
+          # target dirs prevent Cargo from reusing incompatible build scripts.
+          make linux-x86-gnu-release CARGO_TARGET_DIR=target/release-linux-gnu
+          make linux-x86-release LINUX_BUILDER=cross CARGO_TARGET_DIR=target/release-linux-musl
 
       - name: Archive Linux dist
         run: tar -czf linux-dist.tar.gz -C dist release

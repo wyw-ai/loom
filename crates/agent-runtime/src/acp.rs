@@ -208,6 +208,10 @@ impl AcpAdapter {
                 shared.in_flight_prompts.lock().remove(&request_id);
                 return Err(err);
             }
+            let _ = shared.event_sender.send(AdapterEvent::Started {
+                scope: Some(scope_for_prompt),
+                pid: None,
+            });
             Ok(())
         })
         .await

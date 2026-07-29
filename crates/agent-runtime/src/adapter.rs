@@ -147,6 +147,15 @@ fn is_false(value: &bool) -> bool {
 /// Emitted by every adapter back into the runtime.
 #[derive(Debug, Clone)]
 pub enum AdapterEvent {
+    /// The provider has crossed the execution boundary for this prompt.
+    ///
+    /// Command transports emit this only after the configured child process
+    /// has been spawned successfully. ACP emits it after the prompt request
+    /// has been written to the already-running provider session.
+    Started {
+        scope: Option<ScopeRef>,
+        pid: Option<u32>,
+    },
     Text {
         scope: Option<ScopeRef>,
         content: String,
@@ -201,7 +210,8 @@ impl AdapterEvent {
     /// scope's open turn. Returns `None` for agent-wide events.
     pub fn scope(&self) -> Option<&ScopeRef> {
         match self {
-            AdapterEvent::Text { scope, .. }
+            AdapterEvent::Started { scope, .. }
+            | AdapterEvent::Text { scope, .. }
             | AdapterEvent::ToolUse { scope, .. }
             | AdapterEvent::ActionRequest { scope, .. }
             | AdapterEvent::StatusChange { scope, .. }

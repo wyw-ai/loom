@@ -833,6 +833,10 @@ fn spawn_and_collect(
             let _ = signal_child(pid);
         }
     }
+    let _ = sender.send(AdapterEvent::Started {
+        scope: Some(prompt.scope.clone()),
+        pid: Some(child.id()),
+    });
 
     // Take stdout/stderr handles FIRST and start reader threads BEFORE writing
     // stdin.  This prevents a deadlock where the parent blocks on stdin write
@@ -4333,11 +4337,44 @@ mod tests {
             !slot.lock().running,
             "Finished may dispatch the next prompt before RunSlotGuard drops"
         );
-        assert!(rx.try_recv().is_ok(), "expected a text event");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AdapterEvent::Started { pid: Some(_), .. })
+        ));
+        assert!(rx.try_recv().is_ok(), "expected a text event after Started");
         assert!(matches!(
             rx.try_recv(),
             Ok(AdapterEvent::Finished { success: true, .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn spawn_failure_never_emits_started() {
+        let mut cfg = cfg();
+        cfg.command = "__loom_provider_that_does_not_exist__".into();
+        let adapter = Arc::new(CommandAdapter::new(cfg));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        adapter.start(tx).await.expect("start");
+
+        adapter
+            .send_prompt(prompt("ignored"))
+            .await
+            .expect("dispatch worker");
+
+        let mut saw_started = false;
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("provider failure event timeout")
+                .expect("event channel");
+            if matches!(event, AdapterEvent::Started { .. }) {
+                saw_started = true;
+            }
+            if matches!(event, AdapterEvent::Finished { .. }) {
+                break;
+            }
+        }
+        assert!(!saw_started, "failed provider spawn must not confirm start");
     }
 
     #[cfg(unix)]

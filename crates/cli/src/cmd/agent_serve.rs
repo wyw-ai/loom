@@ -2499,6 +2499,10 @@ struct WorkerState {
     /// Runtime warning de-dupe by `run_id:category`. These warnings surface
     /// system/RPC failures without blocking the active turn or flooding chat.
     reported_runtime_warnings: Mutex<HashSet<String>>,
+    /// Run ids whose provider-start event has already been consumed. Provider
+    /// transports may retry internally, but a run-start acknowledgement must be
+    /// emitted at most once.
+    provider_started_runs: Mutex<HashSet<String>>,
     /// Currently selected model id for this actor. Loaded from profile state
     /// first, then from `spec.models.default`.
     selected_model: Mutex<Option<String>>,
@@ -2702,6 +2706,7 @@ impl WorkerState {
             action_map: Mutex::new(HashMap::new()),
             model_action_map: Mutex::new(HashMap::new()),
             reported_runtime_warnings: Mutex::new(HashSet::new()),
+            provider_started_runs: Mutex::new(HashSet::new()),
             selected_model: Mutex::new(selected_model),
         }
     }
@@ -2723,6 +2728,17 @@ impl WorkerState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(turn.scope.id.clone(), turn);
+    }
+
+    fn mark_provider_started(&self, scope_id: &str, run_id: &str) -> bool {
+        let active = self.active_turns.lock().unwrap_or_else(|e| e.into_inner());
+        if active.get(scope_id).map(|turn| turn.run_id.as_str()) != Some(run_id) {
+            return false;
+        }
+        self.provider_started_runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(run_id.to_string())
     }
 
     fn mark_cancel_requested(&self, scope_id: &str, turn_id: &str) -> Option<ActiveTurn> {
@@ -2878,15 +2894,19 @@ impl WorkerState {
     /// into one batch so a burst becomes a single turn instead of one full
     /// provider turn per message.
     fn finish_and_next_batch(&self, scope_id: &str, coalesce: bool) -> Vec<AgentTrigger> {
-        let Some(turn_key) = self
+        let Some(turn) = self
             .active_turns
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(scope_id)
-            .map(|turn| turn.turn_key)
         else {
             return Vec::new();
         };
+        self.provider_started_runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&turn.run_id);
+        let turn_key = turn.turn_key;
         let mut busy = self
             .busy_turn_keys
             .lock()
@@ -5106,9 +5126,6 @@ async fn dispatch_trigger_batch(
         };
         state.set_turn(active.clone());
         mark_assignment_running_if_needed(client, state, &primary).await;
-        if run_started_ack_enabled() {
-            append_run_started_ack(client, state, &active, &primary).await;
-        }
 
         let adapter_prompt = build_adapter_prompt(
             client,
@@ -8163,6 +8180,39 @@ async fn translate_one(
         .and_then(|s| state.current_turn(&s.id));
 
     match ev {
+        AdapterEvent::Started { scope: _, pid } => {
+            let Some(active) = active else {
+                tracing::warn!(
+                    actor = %actor_id,
+                    ?pid,
+                    "Started event without matching active turn; dropping"
+                );
+                return Ok(());
+            };
+            if active.cancel_requested
+                || !state.mark_provider_started(&active.scope.id, &active.run_id)
+            {
+                return Ok(());
+            }
+            tracing::info!(
+                actor = %actor_id,
+                run = %active.run_id,
+                scope = %active.scope.id,
+                ?pid,
+                "provider started for agent turn"
+            );
+            if run_started_ack_enabled() {
+                let Some(trigger) = active.trigger_batch.last() else {
+                    tracing::warn!(
+                        actor = %actor_id,
+                        run = %active.run_id,
+                        "provider started without a trigger; acknowledgement skipped"
+                    );
+                    return Ok(());
+                };
+                append_run_started_ack(client, state, &active, trigger).await;
+            }
+        }
         AdapterEvent::Text {
             scope: _,
             content,
@@ -12546,6 +12596,36 @@ mod tests {
         assert!(marked.cancel_requested);
         assert!(state.current_turn(&scope.id).unwrap().cancel_requested);
 
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn provider_started_is_confirmed_once_for_the_current_run() {
+        let root = temp_path("provider-started");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        let state = WorkerState::new(
+            "actor_demo".into(),
+            sample_spec(None),
+            paths.profile.clone(),
+            paths,
+            "ws://127.0.0.1:0".into(),
+        );
+        let active = sample_active_turn("actor_human");
+        let scope_id = active.scope.id.clone();
+        let run_id = active.run_id.clone();
+        state.set_turn(active.clone());
+
+        assert!(!state.mark_provider_started("wrong_scope", &run_id));
+        assert!(!state.mark_provider_started(&scope_id, "wrong_run"));
+        assert!(state.mark_provider_started(&scope_id, &run_id));
+        assert!(!state.mark_provider_started(&scope_id, &run_id));
+
+        state.clear_turn(&scope_id);
+        state.set_turn(active);
+        assert!(
+            state.mark_provider_started(&scope_id, &run_id),
+            "finishing a run must clear its start de-duplication marker"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 

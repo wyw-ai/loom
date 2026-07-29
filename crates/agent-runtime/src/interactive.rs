@@ -376,6 +376,10 @@ fn run_prompt_inner(
             let _ = apply_kill_policy(&cfg.spec.kill.on_cancel, pid);
         }
     }
+    let _ = sender.send(AdapterEvent::Started {
+        scope: Some(prompt.scope.clone()),
+        pid: Some(child.id()),
+    });
 
     let stdout = child.stdout.take().ok_or("failed to open child stdout")?;
     let stderr = child.stderr.take().ok_or("failed to open child stderr")?;

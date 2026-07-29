@@ -121,7 +121,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6.0.3
         with:
-          ref: ${{ needs.version.outputs.source_ref }}
+          ref: ${{ needs.version.outputs.source_sha }}
 
       - name: Checkout official Loom guide content
         uses: actions/checkout@v6.0.3
@@ -179,7 +179,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6.0.3
         with:
-          ref: ${{ needs.version.outputs.source_ref }}
+          ref: ${{ needs.version.outputs.source_sha }}
 
       - name: Checkout official Loom guide content
         uses: actions/checkout@v6.0.3
@@ -234,7 +234,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6.0.3
         with:
-          ref: ${{ needs.version.outputs.source_ref }}
+          ref: ${{ needs.version.outputs.source_sha }}
 
       - name: Checkout official Loom guide content
         uses: actions/checkout@v6.0.3
@@ -327,7 +327,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6.0.3
         with:
-          ref: ${{ needs.version.outputs.source_ref }}
+          ref: ${{ needs.version.outputs.source_sha }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

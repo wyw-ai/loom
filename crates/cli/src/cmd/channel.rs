@@ -27,6 +27,23 @@ pub async fn create(
     Ok(())
 }
 
+pub async fn ensure_public(client: Arc<Client>, title: String) -> Result<()> {
+    let res: ChannelEnsurePublicResult = client
+        .call(method::CHANNEL_ENSURE_PUBLIC, json!({ "title": title }))
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+    } else {
+        println!(
+            "channel {}\t{}\t{}",
+            res.channel.id,
+            res.channel.title,
+            if res.created { "created" } else { "existing" }
+        );
+    }
+    Ok(())
+}
+
 pub async fn list(client: Arc<Client>) -> Result<()> {
     let res: ChannelListResult = client.call(method::CHANNEL_LIST, json!({})).await?;
     if render::is_json() {

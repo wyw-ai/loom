@@ -609,6 +609,11 @@ enum ChannelCmd {
         #[arg(long)]
         public: bool,
     },
+    /// Return the exact-title public channel, creating it atomically if absent.
+    EnsurePublic {
+        #[arg(long)]
+        title: String,
+    },
     /// List channels visible to this caller (public channels + private
     /// channels the caller is a member of).
     List,
@@ -2237,6 +2242,9 @@ async fn async_main() -> Result<()> {
         Cmd::Channel { sub } => match sub {
             ChannelCmd::Create { title, public } => {
                 cmd::channel::create(client, cfg.actor_id.clone(), title, public).await?
+            }
+            ChannelCmd::EnsurePublic { title } => {
+                cmd::channel::ensure_public(client, title).await?
             }
             ChannelCmd::List => cmd::channel::list(client).await?,
             ChannelCmd::Lookup { title } => cmd::channel::lookup(client, title).await?,

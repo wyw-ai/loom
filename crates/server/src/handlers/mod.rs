@@ -68,6 +68,7 @@ pub async fn dispatch(
         method::SCOPE_SUBSCRIBE => scope_subscribe(state, connection_id, params),
         method::SCOPE_UNSUBSCRIBE => scope_unsubscribe(state, connection_id, params),
         method::CHANNEL_CREATE => channel_create(state, connection_id, params),
+        method::CHANNEL_ENSURE_PUBLIC => channel_ensure_public(state, params),
         method::CHANNEL_LIST => channel_list(state, connection_id),
         method::CHANNEL_LOOKUP => channel_lookup(state, connection_id, params),
         method::CHANNEL_UPDATE => channel_update(state, params),
@@ -414,6 +415,21 @@ fn channel_create(state: &AppState, connection_id: &str, params: Option<Value>) 
         }
     }
     ok(ChannelCreateResult { channel })
+}
+
+fn channel_ensure_public(state: &AppState, params: Option<Value>) -> HandlerResult {
+    let p: ChannelEnsurePublicParams = parse_params(params)?;
+    if p.title.trim().is_empty() {
+        return Err(ErrorObject::new(
+            ErrorCode::INVALID_PARAMS,
+            "channel title must not be blank",
+        ));
+    }
+    let (channel, created) = state
+        .store
+        .ensure_public_channel(p.title, p.topic)
+        .map_err(map_store_err)?;
+    ok(ChannelEnsurePublicResult { channel, created })
 }
 
 fn channel_list(state: &AppState, connection_id: &str) -> HandlerResult {
@@ -3659,6 +3675,39 @@ mod tests {
                 .expect_err("legacy method should be rejected");
             assert_eq!(err.code, ErrorCode::METHOD_NOT_FOUND);
         }
+    }
+
+    #[tokio::test]
+    async fn channel_ensure_public_rpc_is_idempotent() {
+        let state = fresh_state("channel_ensure_public_rpc_is_idempotent");
+        open_conn(&state, "conn_alice", "actor_alice").await;
+
+        let first_value = dispatch(
+            &state,
+            "conn_alice",
+            method::CHANNEL_ENSURE_PUBLIC,
+            Some(json!({ "title": "DingTalk group" })),
+        )
+        .await
+        .expect("first channel ensure");
+        let first: ChannelEnsurePublicResult =
+            serde_json::from_value(first_value).expect("first result");
+
+        let second_value = dispatch(
+            &state,
+            "conn_alice",
+            method::CHANNEL_ENSURE_PUBLIC,
+            Some(json!({ "title": "DingTalk group" })),
+        )
+        .await
+        .expect("second channel ensure");
+        let second: ChannelEnsurePublicResult =
+            serde_json::from_value(second_value).expect("second result");
+
+        assert!(first.created);
+        assert!(!second.created);
+        assert_eq!(second.channel.id, first.channel.id);
+        assert_eq!(second.channel.visibility, ChannelVisibility::Public);
     }
 
     #[tokio::test]

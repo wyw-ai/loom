@@ -346,6 +346,37 @@ impl Store {
         Ok(channel)
     }
 
+    /// Return the existing public channel with this exact title, or create it.
+    ///
+    /// The structure lock keeps the lookup and append+apply pair atomic for
+    /// callers using this API. If historical duplicates exist, the lowest id
+    /// wins deterministically so every caller converges on the same channel.
+    pub fn ensure_public_channel(
+        &self,
+        title: String,
+        topic: String,
+    ) -> StoreResult<(Channel, bool)> {
+        let _guard = self.structure_lock.lock();
+        let existing = {
+            let inner = self.inner.read();
+            inner
+                .channels_by_title
+                .get(&title)
+                .into_iter()
+                .flat_map(|ids| ids.iter())
+                .filter_map(|id| inner.channels.get(id))
+                .filter(|channel| channel.visibility == ChannelVisibility::Public)
+                .min_by(|left, right| left.id.cmp(&right.id))
+                .cloned()
+        };
+        if let Some(channel) = existing {
+            return Ok((channel, false));
+        }
+
+        self.create_channel_with_topic(title, topic, None)
+            .map(|channel| (channel, true))
+    }
+
     /// `true` when `actor_id` is allowed to read/write `channel_id`.
     /// Public channels always return `true`; private channels check the
     /// `members` set. Returns `false` if the channel doesn't exist.
@@ -6915,6 +6946,61 @@ mod tests {
 
         let journal = std::fs::read_to_string(store.journal.path()).expect("read journal");
         assert_eq!(journal.lines().count(), 1);
+    }
+
+    #[test]
+    fn concurrent_public_channel_ensure_creates_once() {
+        let store = fresh_store();
+        let worker_count = 16;
+        let barrier = Arc::new(Barrier::new(worker_count));
+        let mut workers = Vec::new();
+        for _ in 0..worker_count {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                store
+                    .ensure_public_channel("shared group".into(), String::new())
+                    .expect("ensure public channel")
+            }));
+        }
+
+        let mut channel_ids = Vec::new();
+        let mut created_count = 0;
+        for worker in workers {
+            let (channel, created) = worker.join().expect("join channel ensure");
+            channel_ids.push(channel.id);
+            created_count += usize::from(created);
+        }
+
+        channel_ids.sort();
+        channel_ids.dedup();
+        assert_eq!(channel_ids.len(), 1);
+        assert_eq!(created_count, 1);
+        assert_eq!(store.find_channels_by_title("shared group").len(), 1);
+        let journal = std::fs::read_to_string(store.journal.path()).expect("read journal");
+        assert_eq!(journal.lines().count(), 1);
+    }
+
+    #[test]
+    fn public_channel_ensure_ignores_same_title_private_channel() {
+        let store = fresh_store();
+        let private = store
+            .create_channel("shared group".into(), Some("actor_owner".into()))
+            .expect("create private channel");
+
+        let (public, created) = store
+            .ensure_public_channel("shared group".into(), String::new())
+            .expect("ensure public channel");
+        let (same_public, created_again) = store
+            .ensure_public_channel("shared group".into(), "ignored topic".into())
+            .expect("ensure existing public channel");
+
+        assert!(created);
+        assert!(!created_again);
+        assert_ne!(public.id, private.id);
+        assert_eq!(same_public.id, public.id);
+        assert_eq!(public.visibility, ChannelVisibility::Public);
     }
 
     #[test]

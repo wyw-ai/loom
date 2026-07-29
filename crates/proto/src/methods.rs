@@ -13,6 +13,7 @@ pub mod method {
     pub const SCOPE_SUBSCRIBE: &str = "scope/subscribe";
     pub const SCOPE_UNSUBSCRIBE: &str = "scope/unsubscribe";
     pub const CHANNEL_CREATE: &str = "channel/create";
+    pub const CHANNEL_ENSURE_PUBLIC: &str = "channel/ensure_public";
     pub const CHANNEL_LIST: &str = "channel/list";
     pub const CHANNEL_LOOKUP: &str = "channel/lookup";
     pub const CHANNEL_UPDATE: &str = "channel/update";
@@ -263,6 +264,20 @@ pub struct ChannelCreateParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelCreateResult {
     pub channel: Channel,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelEnsurePublicParams {
+    pub title: String,
+    #[serde(default)]
+    pub topic: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelEnsurePublicResult {
+    pub channel: Channel,
+    pub created: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

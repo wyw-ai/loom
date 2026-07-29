@@ -429,19 +429,20 @@ jobs:
           IS_PRERELEASE: ${{ needs.version.outputs.is_prerelease }}
         run: |
           set -euo pipefail
-          flags=()
-          if [[ "$IS_PRERELEASE" == "true" ]]; then
-            flags+=(--prerelease)
-          fi
 
           if gh release view "$TAG_NAME" >/dev/null 2>&1; then
             gh release upload "$TAG_NAME" dist/packages/* --clobber
-          else
+          elif [[ "$IS_PRERELEASE" == "true" ]]; then
             gh release create "$TAG_NAME" dist/packages/* \
               --verify-tag \
               --title "$TAG_NAME" \
               --generate-notes \
-              "${flags[@]}"
+              --prerelease
+          else
+            gh release create "$TAG_NAME" dist/packages/* \
+              --verify-tag \
+              --title "$TAG_NAME" \
+              --generate-notes
           fi
 
   deploy-pages:

@@ -45,7 +45,7 @@ use proto::methods::{
 use proto::types::ScopeRef;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use super::adapter::{Adapter, AdapterEvent, AdapterPrompt, AdapterStartInfo};
 use crate::acp::create_dir_all_unc;
@@ -60,6 +60,10 @@ enum ProcessOutput {
     Stderr(String),
 }
 
+const STARTUP_HANDSHAKE_ENV: &str = "LOOM_PROVIDER_STARTUP_HANDSHAKE";
+const STARTUP_ACK_FILE_ENV: &str = "LOOM_PROVIDER_STARTUP_ACK_FILE";
+const STARTUP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Per-scope handle to an in-flight subprocess. The PID is set after spawn
 /// and cleared on wait; `cancel_requested` is flipped on by `cancel()` so
 /// the post-wait flow can label the Finished summary as "cancelled" rather
@@ -69,6 +73,37 @@ struct InFlight {
     pid: Option<u32>,
     cancel_requested: bool,
     running: bool,
+    provider_started: bool,
+    start_sender: Option<oneshot::Sender<Result<u32, String>>>,
+}
+
+fn confirm_provider_start(slot: &Arc<Mutex<InFlight>>, pid: u32) {
+    let sender = {
+        let mut state = slot.lock();
+        state.provider_started = true;
+        state.start_sender.take()
+    };
+    if let Some(sender) = sender {
+        let _ = sender.send(Ok(pid));
+    }
+}
+
+fn fail_provider_start(slot: &Arc<Mutex<InFlight>>, message: String) -> bool {
+    let sender = {
+        let mut state = slot.lock();
+        if state.provider_started {
+            return false;
+        }
+        state.start_sender.take()
+    };
+    if let Some(sender) = sender {
+        let _ = sender.send(Err(message));
+    }
+    true
+}
+
+fn provider_start_confirmed(slot: &Arc<Mutex<InFlight>>) -> bool {
+    slot.lock().provider_started
 }
 
 struct RunSlotGuard {
@@ -87,6 +122,7 @@ impl RunSlotGuard {
         state.running = true;
         state.pid = None;
         state.cancel_requested = false;
+        state.provider_started = false;
         drop(state);
         Ok(Self { slot })
     }
@@ -103,6 +139,8 @@ fn release_run_slot(slot: &Arc<Mutex<InFlight>>) {
     state.pid = None;
     state.cancel_requested = false;
     state.running = false;
+    state.provider_started = false;
+    state.start_sender = None;
 }
 
 /// Snapshot of the bits of `AgentTransport` the command adapter cares about.
@@ -289,21 +327,13 @@ impl Adapter for CommandAdapter {
 
     async fn send_prompt(&self, prompt: AdapterPrompt) -> Result<(), String> {
         if prompt.content.is_empty() {
-            let _ = self.sender()?.send(AdapterEvent::Error {
-                scope: Some(prompt.scope.clone()),
-                message: "empty prompt".into(),
-            });
-            let _ = self.sender()?.send(AdapterEvent::Finished {
-                scope: Some(prompt.scope),
-                success: false,
-                summary: "empty prompt".into(),
-                usage: None,
-            });
-            return Ok(());
+            return Err("empty prompt".into());
         }
         let sender = self.sender()?;
         let cfg = self.cfg.clone();
         let slot = self.slot_for(&prompt.scope.id);
+        let (start_tx, start_rx) = oneshot::channel();
+        slot.lock().start_sender = Some(start_tx);
         // Detach the command turn so the actor worker can keep processing
         // other scopes while a long-running provider command is active. The
         // blocking worker reports completion through AdapterEvent::Finished.
@@ -312,7 +342,10 @@ impl Adapter for CommandAdapter {
                 tracing::debug!(error = %e, "command run_prompt returned err (already reported via AdapterEvent)");
             }
         });
-        Ok(())
+        start_rx
+            .await
+            .map_err(|_| "provider startup worker stopped unexpectedly".to_string())?
+            .map(|_| ())
     }
 
     async fn respond_action(&self, _request_id: String, _option_id: String) -> Result<(), String> {
@@ -385,16 +418,7 @@ fn run_prompt(
     let _run_slot = match RunSlotGuard::acquire(slot.clone(), &scope) {
         Ok(guard) => guard,
         Err(e) => {
-            let _ = sender.send(AdapterEvent::Error {
-                scope: Some(scope.clone()),
-                message: e.clone(),
-            });
-            let _ = sender.send(AdapterEvent::Finished {
-                scope: Some(scope.clone()),
-                success: false,
-                summary: e.clone(),
-                usage: None,
-            });
+            fail_provider_start(&slot, e);
             return Ok(());
         }
     };
@@ -402,17 +426,8 @@ fn run_prompt(
         Ok(lock) => lock,
         Err(e) => {
             let message = format!("command adapter session lock error: {e}");
+            fail_provider_start(&slot, message.clone());
             release_run_slot(&slot);
-            let _ = sender.send(AdapterEvent::Error {
-                scope: Some(scope.clone()),
-                message: message.clone(),
-            });
-            let _ = sender.send(AdapterEvent::Finished {
-                scope: Some(scope.clone()),
-                success: false,
-                summary: message.clone(),
-                usage: None,
-            });
             return Err(message);
         }
     };
@@ -465,17 +480,19 @@ fn run_prompt(
     let mut outcome = match result {
         Ok(o) => o,
         Err(e) => {
+            if !fail_provider_start(&slot, e.clone()) {
+                let _ = sender.send(AdapterEvent::Error {
+                    scope: Some(scope.clone()),
+                    message: format!("command adapter runtime error: {e}"),
+                });
+                let _ = sender.send(AdapterEvent::Finished {
+                    scope: Some(scope.clone()),
+                    success: false,
+                    summary: e.clone(),
+                    usage: None,
+                });
+            }
             release_run_slot(&slot);
-            let _ = sender.send(AdapterEvent::Error {
-                scope: Some(scope.clone()),
-                message: format!("command adapter spawn error: {e}"),
-            });
-            let _ = sender.send(AdapterEvent::Finished {
-                scope: Some(scope.clone()),
-                success: false,
-                summary: e.clone(),
-                usage: None,
-            });
             return Err(e);
         }
     };
@@ -505,17 +522,19 @@ fn run_prompt(
         ) {
             Ok(o) => o,
             Err(e) => {
+                if !fail_provider_start(&slot, e.clone()) {
+                    let _ = sender.send(AdapterEvent::Error {
+                        scope: Some(scope.clone()),
+                        message: format!("command adapter retry runtime error: {e}"),
+                    });
+                    let _ = sender.send(AdapterEvent::Finished {
+                        scope: Some(scope.clone()),
+                        success: false,
+                        summary: e.clone(),
+                        usage: None,
+                    });
+                }
                 release_run_slot(&slot);
-                let _ = sender.send(AdapterEvent::Error {
-                    scope: Some(scope.clone()),
-                    message: format!("command adapter retry spawn error: {e}"),
-                });
-                let _ = sender.send(AdapterEvent::Finished {
-                    scope: Some(scope.clone()),
-                    success: false,
-                    summary: e.clone(),
-                    usage: None,
-                });
                 return Err(e);
             }
         };
@@ -798,6 +817,23 @@ fn spawn_and_collect(
         argv
     };
 
+    let startup_handshake_required = cfg
+        .env
+        .get(STARTUP_HANDSHAKE_ENV)
+        .is_some_and(|value| value == "required");
+    let startup_ack_path = if startup_handshake_required {
+        let dir = cfg.sessions_dir.join(".startup");
+        crate::acp::create_dir_all_unc(&dir).map_err(|e| {
+            format!(
+                "failed to create provider startup handshake directory `{}`: {e}",
+                dir.display()
+            )
+        })?;
+        Some(dir.join(format!("{}.ack", uuid::Uuid::new_v4())))
+    } else {
+        None
+    };
+
     let mut cmd = Command::new(&command_path);
     let stdin = if cfg.stdin_template.is_some() || matches!(cfg.prompt_via, PromptVia::Stdin) {
         Stdio::piped()
@@ -811,6 +847,10 @@ fn spawn_and_collect(
         .stderr(Stdio::piped());
     for (k, v) in expanded_env(cfg, prompt, session_id) {
         cmd.env(k, v);
+    }
+    if let Some(path) = startup_ack_path.as_ref() {
+        let _ = std::fs::remove_file(path);
+        cmd.env(STARTUP_ACK_FILE_ENV, path);
     }
     if matches!(cfg.prompt_via, PromptVia::Env) {
         cmd.env("LOOM_PROMPT", &prompt.content);
@@ -833,11 +873,6 @@ fn spawn_and_collect(
             let _ = signal_child(pid);
         }
     }
-    let _ = sender.send(AdapterEvent::Started {
-        scope: Some(prompt.scope.clone()),
-        pid: Some(child.id()),
-    });
-
     // Take stdout/stderr handles FIRST and start reader threads BEFORE writing
     // stdin.  This prevents a deadlock where the parent blocks on stdin write
     // (pipe buffer full because the child hasn't started reading yet) while the
@@ -888,7 +923,7 @@ fn spawn_and_collect(
     // large prompt (> pipe buffer) can block; the readers keep the child from
     // deadlocking on full stdout/stderr pipes.
     let needs_stdin = cfg.stdin_template.is_some() || matches!(cfg.prompt_via, PromptVia::Stdin);
-    let stdin_handle = if needs_stdin {
+    let mut stdin_handle = if needs_stdin {
         if let Some(mut stdin_writer) = child.stdin.take() {
             let stdin_body = cfg
                 .stdin_template
@@ -911,7 +946,7 @@ fn spawn_and_collect(
             });
             Some(done_rx)
         } else {
-            None
+            return Err("failed to open child stdin".into());
         }
     } else {
         None
@@ -938,9 +973,82 @@ fn spawn_and_collect(
     let mut timed_out = false;
     let mut idle_timed_out = false;
     let mut early_runtime_error: Option<String> = None;
+    let mut stdin_write_error: Option<String> = None;
+    let mut stdin_delivered = !needs_stdin;
+    let startup_deadline =
+        startup_handshake_required.then(|| Instant::now() + STARTUP_HANDSHAKE_TIMEOUT);
     let mut health_observer = HealthObserver::new(prompt.scope.clone());
 
     loop {
+        if !stdin_delivered {
+            if let Some(done_rx) = stdin_handle.as_ref() {
+                match done_rx.try_recv() {
+                    Ok(Ok(())) => {
+                        stdin_delivered = true;
+                        stdin_handle = None;
+                    }
+                    Ok(Err(error)) => {
+                        stdin_write_error = Some(error);
+                        if force_kill_child(child.id()).is_err() {
+                            let _ = child.kill();
+                        }
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        stdin_write_error =
+                            Some("provider stdin writer stopped unexpectedly".into());
+                        if force_kill_child(child.id()).is_err() {
+                            let _ = child.kill();
+                        }
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                }
+            }
+        }
+        let handshake_confirmed = startup_ack_path
+            .as_ref()
+            .map(|path| {
+                std::fs::read_to_string(path)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u32>().ok())
+                    .is_some()
+            })
+            .unwrap_or(true);
+        if !provider_start_confirmed(slot) && stdin_delivered && handshake_confirmed {
+            confirm_provider_start(slot, child.id());
+            if let Some(path) = startup_ack_path.as_ref() {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        if !provider_start_confirmed(slot) {
+            if slot.lock().cancel_requested {
+                let _ = signal_child(child.id());
+            }
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|e| format!("failed to poll child during startup: {e}"))?
+            {
+                exit = Some(status);
+                break;
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                timed_out = true;
+                if force_kill_child(child.id()).is_err() {
+                    let _ = child.kill();
+                }
+                break;
+            }
+            if startup_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                if force_kill_child(child.id()).is_err() {
+                    let _ = child.kill();
+                }
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+
         health_observer.tick(sender);
         while let Ok(output) = output_rx.try_recv() {
             last_output_at = Instant::now();
@@ -1081,11 +1189,50 @@ fn spawn_and_collect(
     // Check the background stdin write result. If the child exits early after
     // emitting a provider/runtime error, the writer can see BrokenPipe; keep
     // that as a fallback so it does not mask the more actionable child output.
-    let mut stdin_write_error = None;
     if let Some(done_rx) = stdin_handle {
         if let Ok(Err(e)) = done_rx.recv() {
             stdin_write_error = Some(e);
         }
+    }
+    if !provider_start_confirmed(slot) {
+        for output in output_rx.try_iter() {
+            match output {
+                ProcessOutput::Stdout(line) => collected_stdout.push_str(&line),
+                ProcessOutput::Stderr(line) => collected_stderr.push_str(&line),
+            }
+        }
+        if let Some(path) = startup_ack_path.as_ref() {
+            let _ = std::fs::remove_file(path);
+        }
+        let reason = stdin_write_error.unwrap_or_else(|| {
+            if timed_out {
+                cfg.timeout_ms
+                    .map(|ms| format!("provider startup timed out after {ms}ms"))
+                    .unwrap_or_else(|| "provider startup timed out".to_string())
+            } else if startup_handshake_required {
+                if exit.code().is_some() {
+                    "provider exited before startup handshake".to_string()
+                } else {
+                    format!(
+                        "provider startup handshake timed out after {}ms",
+                        STARTUP_HANDSHAKE_TIMEOUT.as_millis()
+                    )
+                }
+            } else {
+                "provider exited before prompt delivery completed".to_string()
+            }
+        });
+        let detail = extract_runtime_error_from_text(&collected_stderr)
+            .or_else(|| extract_runtime_error_from_text(&collected_stdout))
+            .unwrap_or_else(|| truncate_for_summary(&collected_stderr));
+        return Err(if detail.is_empty() {
+            reason
+        } else {
+            format!("{reason}: {detail}")
+        });
+    }
+    if let Some(path) = startup_ack_path.as_ref() {
+        let _ = std::fs::remove_file(path);
     }
     for output in output_rx.try_iter() {
         let (raw_line, is_stdout) = match &output {
@@ -4295,28 +4442,14 @@ mod tests {
         let slot = Arc::new(Mutex::new(InFlight::default()));
         let long_prompt = "ignored".repeat(256 * 1024);
 
-        let outcome = spawn_and_collect(&cfg, &prompt(&long_prompt), &cfg.args, None, &tx, &slot)
-            .expect("spawn sh");
+        let error = spawn_and_collect(&cfg, &prompt(&long_prompt), &cfg.args, None, &tx, &slot)
+            .expect_err("stdin failure must reject provider startup");
 
-        assert_ne!(outcome.exit_code, 0);
-        let mut summary = None;
-        while let Ok(event) = rx.try_recv() {
-            if let AdapterEvent::Finished {
-                success,
-                summary: value,
-                ..
-            } = event
-            {
-                assert!(!success);
-                summary = Some(value);
-                break;
-            }
-        }
-        let summary = summary.expect("missing Finished event");
-        assert!(summary.contains("429"), "{summary}");
-        assert!(summary.contains("FreeUsageLimitError"), "{summary}");
-        assert!(summary.contains("Rate limit exceeded"), "{summary}");
-        assert!(summary.contains("retry-after: 59140s"), "{summary}");
+        assert!(error.contains("429"), "{error}");
+        assert!(error.contains("FreeUsageLimitError"), "{error}");
+        assert!(error.contains("Rate limit exceeded"), "{error}");
+        assert!(error.contains("retry-after: 59140s"), "{error}");
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -4337,11 +4470,7 @@ mod tests {
             !slot.lock().running,
             "Finished may dispatch the next prompt before RunSlotGuard drops"
         );
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(AdapterEvent::Started { pid: Some(_), .. })
-        ));
-        assert!(rx.try_recv().is_ok(), "expected a text event after Started");
+        assert!(rx.try_recv().is_ok(), "expected a text event");
         assert!(matches!(
             rx.try_recv(),
             Ok(AdapterEvent::Finished { success: true, .. })
@@ -4349,32 +4478,108 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_failure_never_emits_started() {
+    async fn spawn_failure_is_returned_before_provider_start() {
         let mut cfg = cfg();
         cfg.command = "__loom_provider_that_does_not_exist__".into();
         let adapter = Arc::new(CommandAdapter::new(cfg));
         let (tx, mut rx) = mpsc::unbounded_channel();
         adapter.start(tx).await.expect("start");
 
-        adapter
+        let error = adapter
             .send_prompt(prompt("ignored"))
             .await
-            .expect("dispatch worker");
+            .expect_err("missing provider must fail startup");
 
-        let mut saw_started = false;
-        loop {
-            let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-                .await
-                .expect("provider failure event timeout")
-                .expect("event channel");
-            if matches!(event, AdapterEvent::Started { .. }) {
-                saw_started = true;
+        assert!(error.contains("failed to spawn"), "{error}");
+        assert!(rx.try_recv().is_err(), "startup failure is owned by caller");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn required_startup_handshake_blocks_until_real_provider_ack() {
+        let mut cfg = cfg();
+        cfg.command = "sh".into();
+        cfg.args = vec![
+            "-c".into(),
+            "printf '%s\\n' $$ > \"$LOOM_PROVIDER_STARTUP_ACK_FILE\"; sleep 0.2; printf 'done\\n'"
+                .into(),
+        ];
+        cfg.env
+            .insert(STARTUP_HANDSHAKE_ENV.into(), "required".into());
+        let startup_dir = cfg.sessions_dir.join(".startup");
+        let adapter = Arc::new(CommandAdapter::new(cfg));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        adapter.start(tx).await.expect("start");
+
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            adapter.send_prompt(prompt("ignored")),
+        )
+        .await
+        .expect("startup confirmation timeout")
+        .expect("startup confirmation");
+        let remaining = std::fs::read_dir(&startup_dir)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(
+            remaining, 0,
+            "startup ack should be removed immediately after confirmation"
+        );
+
+        let finished = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(AdapterEvent::Finished { success, .. }) = rx.recv().await {
+                    break success;
+                }
             }
-            if matches!(event, AdapterEvent::Finished { .. }) {
-                break;
-            }
-        }
-        assert!(!saw_started, "failed provider spawn must not confirm start");
+        })
+        .await
+        .expect("provider finish timeout");
+        assert!(finished);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn wrapper_exit_without_handshake_fails_before_start_confirmation() {
+        let mut cfg = cfg();
+        cfg.command = "sh".into();
+        cfg.args = vec!["-c".into(), "echo provider-missing >&2; exit 127".into()];
+        cfg.env
+            .insert(STARTUP_HANDSHAKE_ENV.into(), "required".into());
+        let adapter = Arc::new(CommandAdapter::new(cfg));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        adapter.start(tx).await.expect("start");
+
+        let error = adapter
+            .send_prompt(prompt("ignored"))
+            .await
+            .expect_err("missing handshake must fail startup");
+
+        assert!(error.contains("before startup handshake"), "{error}");
+        assert!(error.contains("provider-missing"), "{error}");
+        assert!(rx.try_recv().is_err(), "startup failure is owned by caller");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stdin_write_failure_is_returned_before_start_confirmation() {
+        let mut cfg = cfg();
+        cfg.command = "sh".into();
+        cfg.args = vec!["-c".into(), "exit 0".into()];
+        cfg.prompt_via = PromptVia::Stdin;
+        let adapter = Arc::new(CommandAdapter::new(cfg));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        adapter.start(tx).await.expect("start");
+
+        let error = adapter
+            .send_prompt(prompt(&"x".repeat(16 * 1024 * 1024)))
+            .await
+            .expect_err("broken provider stdin must fail startup");
+
+        assert!(
+            error.contains("stdin") || error.contains("prompt delivery"),
+            "{error}"
+        );
     }
 
     #[cfg(unix)]
@@ -5183,8 +5388,8 @@ mod tests {
     #[tokio::test]
     async fn send_prompt_returns_before_command_finishes() {
         let mut cfg = cfg();
-        cfg.command = "sleep".into();
-        cfg.args = vec!["30".into()];
+        cfg.command = "sh".into();
+        cfg.args = vec!["-c".into(), "cat >/dev/null; sleep 5".into()];
         cfg.prompt_via = PromptVia::Stdin;
         let adapter = Arc::new(CommandAdapter::new(cfg));
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -5192,14 +5397,14 @@ mod tests {
 
         let started = std::time::Instant::now();
         tokio::time::timeout(
-            std::time::Duration::from_millis(250),
+            std::time::Duration::from_secs(2),
             adapter.send_prompt(prompt("ignored")),
         )
         .await
         .expect("send_prompt should return promptly")
         .expect("send_prompt ok");
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
+            started.elapsed() < std::time::Duration::from_secs(3),
             "send_prompt blocked on the child command"
         );
 

@@ -29,10 +29,12 @@ pub trait Adapter: Send + Sync {
         events: mpsc::UnboundedSender<AdapterEvent>,
     ) -> Result<AdapterStartInfo, String>;
 
-    /// Forward a single prompt to the agent in the given scope. Each distinct
-    /// `scope` is conceptually its own conversation: ACP allocates one
-    /// `session/new` per scope with the supplied `cwd`; command transport
-    /// starts its one-shot subprocess in the supplied `cwd`.
+    /// Forward a single prompt to the agent in the given scope. Returns only
+    /// after the provider has accepted the prompt execution boundary, not when
+    /// the provider eventually finishes it. Each distinct `scope` is
+    /// conceptually its own conversation: ACP allocates one `session/new` per
+    /// scope with the supplied `cwd`; command transport starts its one-shot
+    /// subprocess in the supplied `cwd`.
     async fn send_prompt(&self, prompt: AdapterPrompt) -> Result<(), String>;
 
     /// Reply to an `AdapterEvent::ActionRequest` previously emitted by the agent.
@@ -147,15 +149,6 @@ fn is_false(value: &bool) -> bool {
 /// Emitted by every adapter back into the runtime.
 #[derive(Debug, Clone)]
 pub enum AdapterEvent {
-    /// The provider has crossed the execution boundary for this prompt.
-    ///
-    /// Command transports emit this only after the configured child process
-    /// has been spawned successfully. ACP emits it after the prompt request
-    /// has been written to the already-running provider session.
-    Started {
-        scope: Option<ScopeRef>,
-        pid: Option<u32>,
-    },
     Text {
         scope: Option<ScopeRef>,
         content: String,
@@ -210,8 +203,7 @@ impl AdapterEvent {
     /// scope's open turn. Returns `None` for agent-wide events.
     pub fn scope(&self) -> Option<&ScopeRef> {
         match self {
-            AdapterEvent::Started { scope, .. }
-            | AdapterEvent::Text { scope, .. }
+            AdapterEvent::Text { scope, .. }
             | AdapterEvent::ToolUse { scope, .. }
             | AdapterEvent::ActionRequest { scope, .. }
             | AdapterEvent::StatusChange { scope, .. }

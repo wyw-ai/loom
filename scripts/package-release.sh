@@ -69,6 +69,16 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+absolute_path() {
+  case "$1" in
+    /*) printf '%s\n' "$1" ;;
+    *) printf '%s/%s\n' "$ROOT_DIR" "${1#./}" ;;
+  esac
+}
+
+DIST_DIR="$(absolute_path "$DIST_DIR")"
+PACKAGE_OUT_DIR="$(absolute_path "$PACKAGE_OUT_DIR")"
+
 VERSION="$(awk -F\" '/^version/ { print $2; exit }' Cargo.toml)"
 if [[ -z "$VERSION" ]]; then
   echo "failed to read workspace version from Cargo.toml" >&2
@@ -234,7 +244,14 @@ EOF
   fi
 
   if [[ "$archive_ext" == "zip" ]]; then
-    (cd "$TMP_DIR" && zip -qr "$archive" "$package_name")
+    if command -v zip >/dev/null 2>&1; then
+      (cd "$TMP_DIR" && zip -qr "$archive" "$package_name")
+    elif command -v 7z >/dev/null 2>&1; then
+      (cd "$TMP_DIR" && 7z a -tzip "$archive" "$package_name" >/dev/null)
+    else
+      echo "no zip command found: install zip or 7z" >&2
+      exit 1
+    fi
   else
     tar -C "$TMP_DIR" -czf "$archive" "$package_name"
   fi
@@ -662,7 +679,11 @@ done
 [ -n "\$package_root" ] || die "runtime package did not extract correctly"
 
 for module in \$modules; do
-  install_one "\$module" "\$package_root/bin/\$module" "\$bin_dir"
+  executable="\$module"
+  if [ "\$target" = "x86_64-pc-windows-msvc" ]; then
+    executable="\$module.exe"
+  fi
+  install_one "\$executable" "\$package_root/bin/\$executable" "\$bin_dir"
 done
 
 printf 'done. Add %s to PATH if needed.\n' "\$bin_dir"

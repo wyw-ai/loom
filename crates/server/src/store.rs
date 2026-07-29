@@ -8380,7 +8380,10 @@ mod tests {
             .set_channel_instructions(&ch.id, Some("  ".into()), "actor_owner")
             .expect("clear instructions");
         assert!(cleared.instructions.is_none());
-        assert_eq!(cleared.instructions_modified_by.as_deref(), Some("actor_owner"));
+        assert_eq!(
+            cleared.instructions_modified_by.as_deref(),
+            Some("actor_owner")
+        );
 
         // Re-open from journal: the last (cleared) state must replay.
         let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
@@ -8419,10 +8422,7 @@ mod tests {
             .set_thread_instructions(&thread.id, Some("thread guide".into()), "actor_owner")
             .expect("set thread instructions");
         assert_eq!(set.instructions.as_deref(), Some("thread guide"));
-        assert_eq!(
-            set.instructions_modified_by.as_deref(),
-            Some("actor_owner")
-        );
+        assert_eq!(set.instructions_modified_by.as_deref(), Some("actor_owner"));
         assert!(set.instructions_modified_at.is_some());
 
         let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
@@ -8497,10 +8497,20 @@ mod tests {
         let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
         let replayed = Store::open(journal).unwrap();
         let v_replay_channel = replayed.get_channel(&ch.id).unwrap().instructions.clone();
-        let v_replay_thread = replayed.get_thread(&thread.id).unwrap().instructions.clone();
+        let v_replay_thread = replayed
+            .get_thread(&thread.id)
+            .unwrap()
+            .instructions
+            .clone();
 
-        assert_eq!(v_online_channel, v_replay_channel, "channel V_online != V_replay");
-        assert_eq!(v_online_thread, v_replay_thread, "thread V_online != V_replay");
+        assert_eq!(
+            v_online_channel, v_replay_channel,
+            "channel V_online != V_replay"
+        );
+        assert_eq!(
+            v_online_thread, v_replay_thread,
+            "thread V_online != V_replay"
+        );
         assert_eq!(v_online_channel.as_deref(), Some("final"));
         assert_eq!(v_online_thread.as_deref(), Some("final"));
     }
@@ -8523,7 +8533,10 @@ mod tests {
                 .set_channel_instructions(&ch.id, Some("v1".into()), "actor_owner")
                 .expect("set channel v1");
             let ts = ch_updated.instructions_modified_at.expect("ts stamped");
-            assert_eq!(ch_updated.instructions_modified_by.as_deref(), Some("actor_owner"));
+            assert_eq!(
+                ch_updated.instructions_modified_by.as_deref(),
+                Some("actor_owner")
+            );
             store
                 .set_thread_instructions(&thread.id, Some("v1".into()), "actor_owner")
                 .expect("set thread v1");
@@ -8537,7 +8550,10 @@ mod tests {
                 .set_channel_instructions(&ch.id, Some("v2".into()), "actor_bob")
                 .expect("set channel v2");
             let ts = ch_updated.instructions_modified_at.expect("ts stamped");
-            assert_eq!(ch_updated.instructions_modified_by.as_deref(), Some("actor_bob"));
+            assert_eq!(
+                ch_updated.instructions_modified_by.as_deref(),
+                Some("actor_bob")
+            );
             assert!(ts > first_ts, "timestamp must advance on second edit");
             store
                 .set_thread_instructions(&thread.id, Some("v2".into()), "actor_bob")
@@ -8549,21 +8565,33 @@ mod tests {
         // Live state reflects the latest caller.
         let live_ch = store.get_channel(&ch.id).unwrap();
         assert_eq!(live_ch.instructions.as_deref(), Some("v2"));
-        assert_eq!(live_ch.instructions_modified_by.as_deref(), Some("actor_bob"));
+        assert_eq!(
+            live_ch.instructions_modified_by.as_deref(),
+            Some("actor_bob")
+        );
         let live_th = store.get_thread(&thread.id).unwrap();
         assert_eq!(live_th.instructions.as_deref(), Some("v2"));
-        assert_eq!(live_th.instructions_modified_by.as_deref(), Some("actor_bob"));
+        assert_eq!(
+            live_th.instructions_modified_by.as_deref(),
+            Some("actor_bob")
+        );
 
         // Audit fields survive journal replay.
         let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
         let replayed = Store::open(journal).unwrap();
         let replayed_ch = replayed.get_channel(&ch.id).unwrap();
         assert_eq!(replayed_ch.instructions.as_deref(), Some("v2"));
-        assert_eq!(replayed_ch.instructions_modified_by.as_deref(), Some("actor_bob"));
+        assert_eq!(
+            replayed_ch.instructions_modified_by.as_deref(),
+            Some("actor_bob")
+        );
         assert!(replayed_ch.instructions_modified_at.is_some());
         let replayed_th = replayed.get_thread(&thread.id).unwrap();
         assert_eq!(replayed_th.instructions.as_deref(), Some("v2"));
-        assert_eq!(replayed_th.instructions_modified_by.as_deref(), Some("actor_bob"));
+        assert_eq!(
+            replayed_th.instructions_modified_by.as_deref(),
+            Some("actor_bob")
+        );
         assert!(replayed_th.instructions_modified_at.is_some());
 
         // Clear also stamps the audit fields with the clearing caller.
@@ -8571,7 +8599,10 @@ mod tests {
             .set_channel_instructions(&ch.id, None, "actor_carol")
             .expect("clear channel");
         assert!(cleared.instructions.is_none());
-        assert_eq!(cleared.instructions_modified_by.as_deref(), Some("actor_carol"));
+        assert_eq!(
+            cleared.instructions_modified_by.as_deref(),
+            Some("actor_carol")
+        );
     }
 
     /// Regression for issue #7 (concurrency): multiple threads concurrently
@@ -8610,7 +8641,10 @@ mod tests {
         let replayed = Store::open(journal).unwrap();
         let v_replay = replayed.get_channel(&ch.id).unwrap().instructions.clone();
 
-        assert_eq!(v_online, v_replay, "V_online != V_replay after concurrent sets");
+        assert_eq!(
+            v_online, v_replay,
+            "V_online != V_replay after concurrent sets"
+        );
         assert!(v_online.is_some(), "some writer must have won");
     }
 

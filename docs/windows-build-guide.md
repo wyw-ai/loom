@@ -1,7 +1,7 @@
 # Windows 环境下构建 Loom 项目指南
 
 > **最后更新**: 2026-06-17  
-> **适用版本**: Loom Desktop v0.1.0 (dev 分支)  
+> **适用版本**: Loom Desktop v0.1.1
 > **本文档独立可读**，无需依赖 thread 对话历史即可完成构建。
 
 ---
@@ -202,7 +202,7 @@ cargo tauri build --ci --bundles nsis
 
 | 产物 | 路径 |
 |------|------|
-| 安装包 (.exe) | `target/release/bundle/nsis/Loom Desktop_0.1.0_x64-setup.exe` |
+| 安装包 (.exe) | `target/release/bundle/nsis/Loom Desktop_0.1.1_x64-setup.exe` |
 | 可执行文件 | `target/release/loom-gui.exe` |
 
 ---
@@ -361,7 +361,7 @@ winget install NSIS.NSIS
 | CLI | `loom-cli` | `cargo build -p loom-cli --release` | `target/release/loom.exe` |
 | Daemon | `loom-cli` | `cargo build -p loom-cli --release` | `target/release/loom-daemon.exe` |
 | Shell | `loom-shell` | `cargo build -p loom-shell --release` | `target/release/loom-shell.exe` |
-| GUI 安装包 | `loom-gui` | `cd crates/gui && cargo tauri build --ci --bundles nsis` | `target/release/bundle/nsis/Loom Desktop_0.1.0_x64-setup.exe` |
+| GUI 安装包 | `loom-gui` | `cd crates/gui && cargo tauri build --ci --bundles nsis` | `target/release/bundle/nsis/Loom Desktop_0.1.1_x64-setup.exe` |
 | GUI 可执行 | `loom-gui` | （同上） | `target/release/loom-gui.exe` |
 
 > **注意**：`loom` 和 `loom-daemon` 是同一个 Rust 包 `loom-cli` 下的两个二进制。构建 `loom-cli` 会同时产出两个 .exe。

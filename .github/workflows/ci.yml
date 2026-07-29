@@ -115,5 +115,8 @@ jobs:
       - name: Check release metadata script syntax
         run: node --check scripts/write-release-downloads.mjs
 
+      - name: Test release packaging scripts
+        run: bash scripts/tests/release-scripts.test.sh
+
       - name: Build Pages portal
         run: bash pages/build.sh

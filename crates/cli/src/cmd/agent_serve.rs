@@ -14116,8 +14116,7 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(&inner_target, &legit_link).expect("symlink legit");
         #[cfg(windows)]
-        std::os::windows::fs::symlink_dir(&inner_target, &legit_link)
-            .expect("symlink legit");
+        std::os::windows::fs::symlink_dir(&inner_target, &legit_link).expect("symlink legit");
 
         // reconcile with an empty desired set (no skills wanted).
         let targets: BTreeMap<String, PathBuf> = BTreeMap::new();

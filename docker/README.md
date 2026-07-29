@@ -45,7 +45,7 @@ Notes:
 - OAuth-style CLIs (e.g. Copilot device flow) need a mounted config dir —
   API-key agents are the smooth path in containers.
 - Images download Loom binaries via the release `install.sh`, so building
-  requires a published release (pin with `LOOM_VERSION=v0.1.0`).
+  requires a published release (pin with `LOOM_VERSION=v0.1.1`).
 
 ## Layout
 

@@ -121,7 +121,7 @@ jobs:
         with:
           name: loom-shell-windows
           path: target/debug/loom-shell.exe
-          retention-days: 30
+          retention-days: 7
           if-no-files-found: error
 
   # ── Frontend web build ─────────────────────────────────────────────────
@@ -221,7 +221,7 @@ jobs:
           path: |
             target/release/bundle/deb/*.deb
             target/release/bundle/appimage/*.AppImage
-          retention-days: 90
+          retention-days: 7
           if-no-files-found: error
 
   # ── macOS GUI bundle (tag / workflow_dispatch only) ────────────────────
@@ -266,7 +266,7 @@ jobs:
         with:
           name: gui-bundle-macos
           path: target/release/bundle/dmg/*.dmg
-          retention-days: 90
+          retention-days: 7
           if-no-files-found: error
 
   # ── Windows GUI bundle (tag / workflow_dispatch only) ──────────────────
@@ -316,7 +316,7 @@ jobs:
           path: |
             target/release/bundle/nsis/*.exe
             target/release/loom-shell.exe
-          retention-days: 90
+          retention-days: 7
           if-no-files-found: error
 
   # ── Summary ────────────────────────────────────────────────────────────

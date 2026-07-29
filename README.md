@@ -276,9 +276,9 @@ Release packaging entry points are available through `make release`,
 GitHub Actions publishes public artifacts from version tags:
 
 ```bash
-node scripts/check-release-version.mjs v0.1.0
-git tag v0.1.0
-git push origin v0.1.0
+node scripts/check-release-version.mjs v0.1.1
+git tag v0.1.1
+git push origin v0.1.1
 ```
 
 The release workflow builds x86_64 Linux and macOS runtime packages, packages

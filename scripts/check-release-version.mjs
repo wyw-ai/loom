@@ -34,6 +34,34 @@ function workspaceVersion() {
   return match[1];
 }
 
+function cargoPackageVersion(relativePath, rootVersion) {
+  const cargoToml = readText(relativePath);
+  const section = cargoToml
+    .split(/\r?\n(?=\[)/)
+    .find((part) => part.trimStart().startsWith("[package]"));
+  if (!section) {
+    throw new Error(`${relativePath} is missing [package]`);
+  }
+
+  const explicitVersion = section.match(/^version\s*=\s*"([^"]+)"/m);
+  if (explicitVersion) {
+    return explicitVersion[1];
+  }
+  if (/^version\.workspace\s*=\s*true\s*$/m.test(section)) {
+    return rootVersion;
+  }
+  throw new Error(`${relativePath} [package] is missing a version`);
+}
+
+function releaseDownloadsVersion() {
+  const source = readText("pages/portal/release-downloads.js");
+  const match = source.match(/\bversion\s*:\s*"([^"]+)"/);
+  if (!match) {
+    throw new Error("pages/portal/release-downloads.js is missing version");
+  }
+  return match[1];
+}
+
 function normalizeTag(tag) {
   return tag.replace(/^refs\/tags\//, "").replace(/^v/, "");
 }
@@ -41,8 +69,10 @@ function normalizeTag(tag) {
 const rootVersion = workspaceVersion();
 const versions = [
   ["Cargo.toml", rootVersion],
+  ["crates/loom-shell/Cargo.toml", cargoPackageVersion("crates/loom-shell/Cargo.toml", rootVersion)],
   ["crates/gui/tauri.conf.json", readJson("crates/gui/tauri.conf.json").version],
   ["apps/gui-web/package.json", readJson("apps/gui-web/package.json").version],
+  ["pages/portal/release-downloads.js", releaseDownloadsVersion()],
 ];
 
 const mismatches = versions.filter(([, version]) => version !== rootVersion);

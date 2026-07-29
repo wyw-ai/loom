@@ -259,9 +259,9 @@ make gui-dev
 GitHub Actions 会从版本 tag 发布公开产物:
 
 ```bash
-node scripts/check-release-version.mjs v0.1.0
-git tag v0.1.0
-git push origin v0.1.0
+node scripts/check-release-version.mjs v0.1.1
+git tag v0.1.1
+git push origin v0.1.1
 ```
 
 发布工作流会构建 x86_64 Linux 和 macOS runtime 包、打包 macOS Desktop DMG、

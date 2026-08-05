@@ -1249,6 +1249,9 @@ impl AgentPaths {
             if let Some(path) = active.no_reply_file.as_ref() {
                 env.insert(LOOM_NO_REPLY_FILE_ENV.into(), path.display().to_string());
             }
+            if let Some(assignment_id) = active.assignment_id.as_ref() {
+                env.insert("LOOM_ASSIGNMENT_ID".into(), assignment_id.clone());
+            }
         }
         env.insert(
             "LOOM_AGENT_PROFILE".into(),
@@ -10416,7 +10419,7 @@ mod tests {
             trigger_batch: Vec::new(),
             ack_on_finish: true,
             trigger_is_message: true,
-            assignment_id: None,
+            assignment_id: Some("asgn_demo".into()),
             reply_target: Some("#chan_demo".into()),
             prompt_stats: empty_prompt_stats(),
             prompt_breakdown: empty_prompt_breakdown(),
@@ -10455,6 +10458,10 @@ mod tests {
             Some("chan_demo")
         );
         assert_eq!(env.get("LOOM_RUN_ID").map(String::as_str), Some("run_demo"));
+        assert_eq!(
+            env.get("LOOM_ASSIGNMENT_ID").map(String::as_str),
+            Some("asgn_demo")
+        );
         assert_eq!(
             env.get("LOOM_REPLY_TARGET").map(String::as_str),
             Some("#chan_demo")

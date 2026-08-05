@@ -521,17 +521,22 @@ fn write_config_agent_spec(spec: &AgentSpec) -> Result<PathBuf> {
     // annotate_machine_agent_specs() on every load and would cause fingerprint
     // drift. User-configured _meta (avatarUrl, description, ...) must persist.
     let mut clean_spec = spec.clone();
-    if let Some(meta) = clean_spec.actor._meta.as_mut() {
-        for key in ["machineId", "workspaceId", "ownerActorId"] {
-            meta.remove(key);
-        }
-        if meta.is_empty() {
-            clean_spec.actor._meta = None;
-        }
-    }
+    strip_runtime_actor_meta(&mut clean_spec.actor._meta);
     let text = serde_json::to_string_pretty(&clean_spec)?;
     atomic_write(&path, &text).with_context(|| format!("write {}", path.display()))?;
     Ok(path)
+}
+
+fn strip_runtime_actor_meta(meta: &mut Option<BTreeMap<String, Value>>) {
+    let Some(values) = meta.as_mut() else {
+        return;
+    };
+    for key in ["machineId", "workspaceId", "ownerActorId"] {
+        values.remove(key);
+    }
+    if values.is_empty() {
+        *meta = None;
+    }
 }
 
 fn remove_config_agent_spec(actor_id: &str) -> Result<bool> {
@@ -2949,6 +2954,28 @@ mod tests {
         assert_eq!(meta["workspaceId"], json!("ws_main"));
         assert_eq!(meta["ownerActorId"], json!("actor_human_88084"));
         assert_eq!(meta["providerId"], json!("codex"));
+    }
+
+    #[test]
+    fn strip_runtime_actor_meta_preserves_user_agent_metadata() {
+        let mut meta = Some(BTreeMap::from([
+            ("machineId".into(), json!("machine_2eabfd47")),
+            ("workspaceId".into(), json!("ws_main")),
+            ("ownerActorId".into(), json!("actor_human_88084")),
+            ("avatarUrl".into(), json!("/avatars/avatar-07.png")),
+            ("description".into(), json!("friendly delivery agent")),
+            ("providerId".into(), json!("claude")),
+        ]));
+
+        strip_runtime_actor_meta(&mut meta);
+
+        let meta = meta.expect("persistent meta remains");
+        assert_eq!(meta.get("machineId"), None);
+        assert_eq!(meta.get("workspaceId"), None);
+        assert_eq!(meta.get("ownerActorId"), None);
+        assert_eq!(meta["avatarUrl"], json!("/avatars/avatar-07.png"));
+        assert_eq!(meta["description"], json!("friendly delivery agent"));
+        assert_eq!(meta["providerId"], json!("claude"));
     }
 
     #[test]

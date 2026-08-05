@@ -1168,6 +1168,10 @@ enum MessageCmd {
         /// Allow literal backslash-n sequences in --text from an agent run.
         #[arg(long = "allow-escaped-newlines")]
         allow_escaped_newlines: bool,
+        /// Allow a deliberate message after this run was marked no-reply or
+        /// completed its assignment handoff.
+        #[arg(long = "allow-after-no-reply")]
+        allow_after_no_reply: bool,
         /// Message intent: chat, ask, request_action, assign_task, status_update, review, notify.
         #[arg(long)]
         intent: Option<String>,
@@ -1199,6 +1203,10 @@ enum MessageCmd {
         /// Allow literal backslash-n sequences in --text from an agent run.
         #[arg(long = "allow-escaped-newlines")]
         allow_escaped_newlines: bool,
+        /// Allow a deliberate message after this run was marked no-reply or
+        /// completed its assignment handoff.
+        #[arg(long = "allow-after-no-reply")]
+        allow_after_no_reply: bool,
         /// Only send if this is still the latest message in the target scope.
         #[arg(long = "if-latest")]
         if_latest: Option<String>,
@@ -2313,6 +2321,7 @@ async fn async_main() -> Result<()> {
                 idempotency_key,
                 attachment_ids,
                 allow_escaped_newlines,
+                allow_after_no_reply,
             } => {
                 cmd::message::send(
                     client,
@@ -2328,6 +2337,7 @@ async fn async_main() -> Result<()> {
                     idempotency_key,
                     attachment_ids,
                     allow_escaped_newlines,
+                    allow_after_no_reply,
                 )
                 .await?
             }
@@ -2340,6 +2350,7 @@ async fn async_main() -> Result<()> {
                 idempotency_key,
                 attachment_ids,
                 allow_escaped_newlines,
+                allow_after_no_reply,
             } => {
                 cmd::message::ask(
                     client,
@@ -2352,6 +2363,7 @@ async fn async_main() -> Result<()> {
                     idempotency_key,
                     attachment_ids,
                     allow_escaped_newlines,
+                    allow_after_no_reply,
                 )
                 .await?
             }
@@ -3184,6 +3196,7 @@ mod tests {
             "msg_latest",
             "--idempotency-key",
             "review-request-42",
+            "--allow-after-no-reply",
             "--text",
             "please review",
         ])
@@ -3200,6 +3213,7 @@ mod tests {
                         delivery_policy,
                         if_latest,
                         idempotency_key,
+                        allow_after_no_reply,
                         text,
                         ..
                     },
@@ -3211,6 +3225,7 @@ mod tests {
                 assert_eq!(delivery_policy.as_deref(), Some("wake_agent"));
                 assert_eq!(if_latest.as_deref(), Some("msg_latest"));
                 assert_eq!(idempotency_key.as_deref(), Some("review-request-42"));
+                assert!(allow_after_no_reply);
                 assert_eq!(text.as_deref(), Some("please review"));
             }
             other => panic!("unexpected command: {other:?}"),
@@ -3233,6 +3248,7 @@ mod tests {
             "msg_latest",
             "--idempotency-key",
             "ask-reviewers-42",
+            "--allow-after-no-reply",
             "--text",
             "please respond",
         ])
@@ -3247,6 +3263,7 @@ mod tests {
                         text,
                         if_latest,
                         idempotency_key,
+                        allow_after_no_reply,
                         ..
                     },
             } => {
@@ -3254,6 +3271,7 @@ mod tests {
                 assert_eq!(target.as_deref(), Some("#chan_123:msg_root"));
                 assert_eq!(if_latest.as_deref(), Some("msg_latest"));
                 assert_eq!(idempotency_key.as_deref(), Some("ask-reviewers-42"));
+                assert!(allow_after_no_reply);
                 assert_eq!(text.as_deref(), Some("please respond"));
             }
             other => panic!("unexpected command: {other:?}"),

@@ -1,10 +1,12 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use loom_cli::client::Client;
 use loom_cli::render::OutputMode;
 use loom_cli::{cmd, config, daemon_ipc, render};
+use proto::methods::AgentSpec;
+use proto::types::ActorKind;
 
 /// Resolve the instruction payload for `set-instruction` CLI commands.
 /// Exactly one of `file` or `text` must be provided.
@@ -35,12 +37,40 @@ struct Args {
     /// Override the configured local display name.
     #[arg(long = "display", global = true, env = "LOOM_DISPLAY")]
     display: Option<String>,
+    /// Bind the CLI connection with an explicit actor kind.
+    #[arg(
+        long = "actor-kind",
+        global = true,
+        env = "LOOM_ACTOR_KIND",
+        value_enum
+    )]
+    actor_kind: Option<ConnectionActorKind>,
+    /// Bind as an observer without claiming the actor inbox.
+    #[arg(long, global = true, env = "LOOM_OBSERVER")]
+    observer: bool,
     /// Emit machine-readable JSON instead of human-friendly text.
     #[arg(long, global = true, env = "LOOM_JSON")]
     json: bool,
 
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ConnectionActorKind {
+    Human,
+    Agent,
+    Service,
+}
+
+impl ConnectionActorKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Agent => "agent",
+            Self::Service => "service",
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -2163,9 +2193,31 @@ async fn async_main() -> Result<()> {
 
     let client = connect_client(&cfg.server_url, explicit_server_arg_present()).await?;
     client.initialize().await?;
-    let _ = client
-        .open_connection(&cfg.actor_id, Some(&cfg.display_name))
-        .await?;
+    let inferred_actor_kind = local_agent_spec_actor_kind(&cfg.actor_id)?;
+    let connection_actor_kind = args.actor_kind.or(inferred_actor_kind);
+    let observer = args.observer || (args.actor_kind.is_none() && inferred_actor_kind.is_some());
+    let _ = match (connection_actor_kind, observer) {
+        (Some(kind), true) => {
+            client
+                .open_observer_connection_as(&cfg.actor_id, kind.as_str(), Some(&cfg.display_name))
+                .await?
+        }
+        (Some(kind), false) => {
+            client
+                .open_connection_as(&cfg.actor_id, kind.as_str(), Some(&cfg.display_name))
+                .await?
+        }
+        (None, true) => {
+            client
+                .open_observer_connection_as(&cfg.actor_id, "human", Some(&cfg.display_name))
+                .await?
+        }
+        (None, false) => {
+            client
+                .open_connection(&cfg.actor_id, Some(&cfg.display_name))
+                .await?
+        }
+    };
 
     match args.cmd {
         Cmd::Who => unreachable!(),
@@ -3165,6 +3217,49 @@ fn explicit_server_arg_present() -> bool {
     })
 }
 
+fn local_agent_spec_actor_kind(actor_id: &str) -> Result<Option<ConnectionActorKind>> {
+    local_agent_spec_actor_kind_at(&config::config_dir(), actor_id)
+}
+
+fn local_agent_spec_actor_kind_at(
+    config_dir: &Path,
+    actor_id: &str,
+) -> Result<Option<ConnectionActorKind>> {
+    let actor_path = Path::new(actor_id);
+    if actor_id.trim().is_empty()
+        || actor_path.is_absolute()
+        || actor_path.components().count() != 1
+    {
+        return Ok(None);
+    }
+    let agents_dir = config_dir.join("agents");
+    let nested = agents_dir.join(actor_id).join("spec.json");
+    let flat = agents_dir.join(format!("{actor_id}.json"));
+    let path = if nested.is_file() {
+        nested
+    } else if flat.is_file() {
+        flat
+    } else {
+        return Ok(None);
+    };
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("read local AgentSpec {}", path.display()))?;
+    let spec: AgentSpec = serde_json::from_str(&text)
+        .with_context(|| format!("parse local AgentSpec {}", path.display()))?;
+    if spec.actor.id != actor_id {
+        anyhow::bail!(
+            "local AgentSpec {} declares actor `{}`, expected `{actor_id}`",
+            path.display(),
+            spec.actor.id
+        );
+    }
+    Ok(Some(match spec.actor.kind {
+        ActorKind::Human => ConnectionActorKind::Human,
+        ActorKind::Agent => ConnectionActorKind::Agent,
+        ActorKind::Service => ConnectionActorKind::Service,
+    }))
+}
+
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
     let _ = tracing_subscriber::fmt()
@@ -3178,6 +3273,65 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_actor_flags_parse_globally() {
+        let args = Args::try_parse_from([
+            "loom",
+            "--as",
+            "am.robot-a",
+            "--actor-kind",
+            "agent",
+            "--observer",
+            "channel",
+            "list",
+        ])
+        .expect("parse agent observer connection flags");
+
+        assert_eq!(args.actor.as_deref(), Some("am.robot-a"));
+        assert_eq!(args.actor_kind, Some(ConnectionActorKind::Agent));
+        assert!(args.observer);
+    }
+
+    #[test]
+    fn local_agent_spec_infers_agent_observer_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let spec_dir = temp.path().join("agents").join("am.robot-a");
+        std::fs::create_dir_all(&spec_dir).expect("create spec dir");
+        std::fs::write(
+            spec_dir.join("spec.json"),
+            r#"{
+                "actor": {
+                    "id": "am.robot-a",
+                    "kind": "agent",
+                    "displayName": "Robot A"
+                },
+                "providerRef": {
+                    "id": "qoder",
+                    "mode": "print"
+                }
+            }"#,
+        )
+        .expect("write AgentSpec");
+
+        assert_eq!(
+            local_agent_spec_actor_kind_at(temp.path(), "am.robot-a").expect("infer actor kind"),
+            Some(ConnectionActorKind::Agent)
+        );
+    }
+
+    #[test]
+    fn malformed_local_agent_spec_fails_before_human_fallback() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let spec_dir = temp.path().join("agents").join("am.robot-a");
+        std::fs::create_dir_all(&spec_dir).expect("create spec dir");
+        std::fs::write(spec_dir.join("spec.json"), "{not-json").expect("write malformed spec");
+
+        let error = local_agent_spec_actor_kind_at(temp.path(), "am.robot-a")
+            .expect_err("malformed local AgentSpec must not fall back to human");
+
+        assert!(error.to_string().contains("parse local AgentSpec"));
+    }
 
     #[test]
     fn message_send_accepts_direct_recipient_and_delivery_options() {

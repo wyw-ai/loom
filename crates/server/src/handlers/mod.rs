@@ -91,6 +91,7 @@ pub async fn dispatch(
             channel_clear_instruction(state, connection_id, params)
         }
         method::THREAD_CREATE => thread_create(state, connection_id, params),
+        method::THREAD_GET => thread_get(state, connection_id, params),
         method::THREAD_LIST => thread_list(state, connection_id, params),
         method::THREAD_UPDATE => thread_update(state, connection_id, params),
         method::THREAD_ARCHIVE => thread_archive(state, connection_id, params),
@@ -797,6 +798,23 @@ fn thread_list(state: &AppState, connection_id: &str, params: Option<Value>) -> 
         .collect();
     let threads = state.store.attach_thread_activity_meta(threads);
     ok(ThreadListResult { threads })
+}
+
+fn thread_get(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
+    let p: ThreadGetParams = parse_params(params)?;
+    let caller = state.subscriptions.actor_for_connection(connection_id);
+    let thread = state
+        .store
+        .get_thread(&p.thread_id)
+        .filter(|thread| match caller.as_deref() {
+            Some(actor) => state.store.is_channel_member(&thread.channel_id, actor),
+            None => state
+                .store
+                .get_channel(&thread.channel_id)
+                .map(|channel| matches!(channel.visibility, ChannelVisibility::Public))
+                .unwrap_or(false),
+        });
+    ok(ThreadGetResult { thread })
 }
 
 fn thread_update(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
@@ -5595,6 +5613,86 @@ mod tests {
         assert!(
             titles.contains(&"in-a") && !titles.contains(&"in-b"),
             "alice must see in-a but not in-b; got {titles:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_get_returns_visible_archived_thread_without_activity_projection() {
+        let state = fresh_state("thread-get-visible");
+        let channel = state
+            .store
+            .create_channel("private".into(), Some("actor_alice".into()))
+            .expect("create channel");
+        let thread = create_thread_under(&state, &channel.id, "actor_alice", "visible");
+        state
+            .store
+            .archive_thread(&thread.id, true)
+            .expect("archive thread");
+        open_conn(&state, "conn_alice", "actor_alice").await;
+
+        let value = dispatch(
+            &state,
+            "conn_alice",
+            method::THREAD_GET,
+            Some(json!({ "threadId": thread.id })),
+        )
+        .await
+        .expect("thread/get");
+        let result: ThreadGetResult = serde_json::from_value(value).expect("get result");
+        let resolved = result.thread.expect("visible thread");
+
+        assert_eq!(resolved.id, thread.id);
+        assert_eq!(resolved.channel_id, channel.id);
+        assert!(resolved.archived_at.is_some());
+        assert!(resolved._meta.is_none());
+    }
+
+    #[tokio::test]
+    async fn thread_get_hides_private_thread_like_missing_thread() {
+        let state = fresh_state("thread-get-hidden");
+        let channel = state
+            .store
+            .create_channel("private".into(), Some("actor_alice".into()))
+            .expect("create channel");
+        let thread = create_thread_under(&state, &channel.id, "actor_alice", "hidden");
+        open_conn(&state, "conn_intruder", "actor_intruder").await;
+
+        for thread_id in [thread.id.as_str(), "thread_missing"] {
+            let value = dispatch(
+                &state,
+                "conn_intruder",
+                method::THREAD_GET,
+                Some(json!({ "threadId": thread_id })),
+            )
+            .await
+            .expect("thread/get");
+            let result: ThreadGetResult = serde_json::from_value(value).expect("get result");
+            assert!(result.thread.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn thread_get_allows_unbound_client_to_resolve_public_thread() {
+        let state = fresh_state("thread-get-public");
+        let channel = state
+            .store
+            .create_channel("public".into(), None)
+            .expect("create channel");
+        let thread = create_thread_under(&state, &channel.id, "actor_alice", "public");
+
+        let value = dispatch(
+            &state,
+            "conn_unbound",
+            method::THREAD_GET,
+            Some(json!({ "threadId": thread.id })),
+        )
+        .await
+        .expect("thread/get");
+        let result: ThreadGetResult = serde_json::from_value(value).expect("get result");
+
+        assert_eq!(
+            result.thread.map(|resolved| resolved.channel_id),
+            Some(channel.id)
         );
     }
 

@@ -27,6 +27,7 @@ pub mod method {
     pub const CHANNEL_GET_INSTRUCTION: &str = "channel/get_instruction";
     pub const CHANNEL_CLEAR_INSTRUCTION: &str = "channel/clear_instruction";
     pub const THREAD_CREATE: &str = "thread/create";
+    pub const THREAD_GET: &str = "thread/get";
     pub const THREAD_LIST: &str = "thread/list";
     pub const THREAD_UPDATE: &str = "thread/update";
     pub const THREAD_ARCHIVE: &str = "thread/archive";
@@ -447,6 +448,17 @@ pub struct ThreadCreateParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadCreateResult {
     pub thread: Thread,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadGetParams {
+    pub thread_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadGetResult {
+    pub thread: Option<Thread>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

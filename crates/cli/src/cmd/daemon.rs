@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 
-use crate::cmd::agent_serve::{self, MachineHostSpec};
+use crate::cmd::agent_serve::{self, MachineCommandTask, MachineHostSpec};
 use crate::cmd::service;
 use crate::daemon_ipc;
 use crate::{config, render};
@@ -43,6 +43,7 @@ pub async fn run(
     services_dir: Option<PathBuf>,
     allow_services: Vec<String>,
     no_services: bool,
+    no_machine_actor: bool,
     socket_path: Option<PathBuf>,
     no_ipc: bool,
     server_url: Option<String>,
@@ -115,13 +116,19 @@ pub async fn run(
         &annotated_initial_service_specs,
         inventory_revision,
     )));
-    let (machine_command_tx, mut machine_command_rx) = mpsc::unbounded_channel();
-    let machine_host = MachineHostSpec {
-        machine_id: machine.id.clone(),
-        actor_id: machine_connection_actor_id(&machine),
-        display_name: machine.name.clone(),
-        metadata: machine_inventory.clone(),
-        command_tx: Some(machine_command_tx),
+    let (machine_host, mut machine_command_rx) = if no_machine_actor {
+        tracing::info!("loom-daemon: machine actor disabled by --no-machine-actor");
+        (None, None)
+    } else {
+        let (machine_command_tx, machine_command_rx) = mpsc::unbounded_channel();
+        let machine_host = MachineHostSpec {
+            machine_id: machine.id.clone(),
+            actor_id: machine_connection_actor_id(&machine),
+            display_name: machine.name.clone(),
+            metadata: machine_inventory.clone(),
+            command_tx: Some(machine_command_tx),
+        };
+        (Some(machine_host), Some(machine_command_rx))
     };
 
     let (socket_path, proxy_handle) = if no_ipc {
@@ -145,7 +152,7 @@ pub async fn run(
     }
 
     let machine_host_handle =
-        agent_serve::spawn_machine_host_loop(machine_host, server_url.clone());
+        machine_host.map(|host| agent_serve::spawn_machine_host_loop(host, server_url.clone()));
     let mut running_agents = HashMap::new();
     let mut warned_missing = HashSet::new();
 
@@ -199,7 +206,7 @@ pub async fn run(
 
         tokio::select! {
             _ = shutdown_signal() => break,
-            maybe_command = machine_command_rx.recv() => {
+            maybe_command = recv_machine_command(&mut machine_command_rx) => {
                 let Some(command) = maybe_command else {
                     // Channel closed — the server-side machine command sender was
                     // dropped. Log once and add a sleep so we don't tight-loop
@@ -286,7 +293,9 @@ pub async fn run(
     if let Some(proxy_handle) = proxy_handle {
         proxy_handle.abort();
     }
-    machine_host_handle.abort();
+    if let Some(machine_host_handle) = machine_host_handle {
+        machine_host_handle.abort();
+    }
     for (_, running) in running_agents {
         running.handle.abort();
     }
@@ -295,6 +304,15 @@ pub async fn run(
         daemon_ipc::cleanup_socket(&socket_path).await;
     }
     Ok(())
+}
+
+async fn recv_machine_command(
+    rx: &mut Option<mpsc::UnboundedReceiver<MachineCommandTask>>,
+) -> Option<MachineCommandTask> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending::<Option<MachineCommandTask>>().await,
+    }
 }
 
 async fn shutdown_signal() {

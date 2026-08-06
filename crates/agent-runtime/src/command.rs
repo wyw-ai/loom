@@ -45,7 +45,7 @@ use proto::methods::{
 use proto::types::ScopeRef;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use super::adapter::{Adapter, AdapterEvent, AdapterPrompt, AdapterStartInfo};
 use crate::acp::create_dir_all_unc;
@@ -60,6 +60,12 @@ enum ProcessOutput {
     Stderr(String),
 }
 
+const STARTUP_HANDSHAKE_ENV: &str = "LOOM_PROVIDER_STARTUP_HANDSHAKE";
+const STARTUP_ACK_FILE_ENV: &str = "LOOM_PROVIDER_STARTUP_ACK_FILE";
+const STARTUP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const STOP_GRACE_PERIOD: Duration = Duration::from_secs(2);
+const STOP_FORCE_PERIOD: Duration = Duration::from_secs(3);
+
 /// Per-scope handle to an in-flight subprocess. The PID is set after spawn
 /// and cleared on wait; `cancel_requested` is flipped on by `cancel()` so
 /// the post-wait flow can label the Finished summary as "cancelled" rather
@@ -69,10 +75,50 @@ struct InFlight {
     pid: Option<u32>,
     cancel_requested: bool,
     running: bool,
+    provider_started: bool,
+    start_sender: Option<oneshot::Sender<Result<u32, String>>>,
+    generation: u64,
+}
+
+fn confirm_provider_start(slot: &Arc<Mutex<InFlight>>, generation: u64, pid: u32) {
+    let sender = {
+        let mut state = slot.lock();
+        if state.generation != generation {
+            return;
+        }
+        state.provider_started = true;
+        state.start_sender.take()
+    };
+    if let Some(sender) = sender {
+        let _ = sender.send(Ok(pid));
+    }
+}
+
+fn fail_provider_start(slot: &Arc<Mutex<InFlight>>, generation: u64, message: String) -> bool {
+    let sender = {
+        let mut state = slot.lock();
+        if state.generation != generation {
+            return true;
+        }
+        if state.provider_started {
+            return false;
+        }
+        state.start_sender.take()
+    };
+    if let Some(sender) = sender {
+        let _ = sender.send(Err(message));
+    }
+    true
+}
+
+fn provider_start_confirmed(slot: &Arc<Mutex<InFlight>>, generation: u64) -> bool {
+    let state = slot.lock();
+    state.generation == generation && state.provider_started
 }
 
 struct RunSlotGuard {
     slot: Arc<Mutex<InFlight>>,
+    generation: u64,
 }
 
 impl RunSlotGuard {
@@ -87,22 +133,38 @@ impl RunSlotGuard {
         state.running = true;
         state.pid = None;
         state.cancel_requested = false;
+        state.provider_started = false;
+        state.start_sender = None;
+        state.generation = state.generation.wrapping_add(1);
+        if state.generation == 0 {
+            state.generation = 1;
+        }
+        let generation = state.generation;
         drop(state);
-        Ok(Self { slot })
+        Ok(Self { slot, generation })
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation
     }
 }
 
 impl Drop for RunSlotGuard {
     fn drop(&mut self) {
-        release_run_slot(&self.slot);
+        release_run_slot(&self.slot, self.generation);
     }
 }
 
-fn release_run_slot(slot: &Arc<Mutex<InFlight>>) {
+fn release_run_slot(slot: &Arc<Mutex<InFlight>>, generation: u64) {
     let mut state = slot.lock();
+    if state.generation != generation {
+        return;
+    }
     state.pid = None;
     state.cancel_requested = false;
     state.running = false;
+    state.provider_started = false;
+    state.start_sender = None;
 }
 
 /// Snapshot of the bits of `AgentTransport` the command adapter cares about.
@@ -234,6 +296,7 @@ pub struct CommandAdapter {
 
 struct CommandInner {
     event_sender: Option<mpsc::UnboundedSender<AdapterEvent>>,
+    stopping: bool,
     /// scope.id → in-flight subprocess slot. Lives across the spawn_blocking
     /// boundary so `cancel()` (called from the async runtime) can read the
     /// PID and signal it.
@@ -246,21 +309,15 @@ impl CommandAdapter {
             cfg,
             inner: Mutex::new(CommandInner {
                 event_sender: None,
+                stopping: false,
                 in_flight: HashMap::new(),
             }),
         }
     }
 
-    fn sender(&self) -> Result<mpsc::UnboundedSender<AdapterEvent>, String> {
-        self.inner
-            .lock()
-            .event_sender
-            .clone()
-            .ok_or_else(|| "command adapter not started".to_string())
-    }
-
     /// Get or create the per-scope in-flight slot. Reused across resume calls
     /// for the same scope so we don't leak entries.
+    #[cfg(test)]
     fn slot_for(&self, scope_id: &str) -> Arc<Mutex<InFlight>> {
         let mut inner = self.inner.lock();
         inner
@@ -280,7 +337,12 @@ impl Adapter for CommandAdapter {
         &self,
         events: mpsc::UnboundedSender<AdapterEvent>,
     ) -> Result<AdapterStartInfo, String> {
-        self.inner.lock().event_sender = Some(events);
+        let mut inner = self.inner.lock();
+        if inner.stopping {
+            return Err("command adapter is still stopping".to_string());
+        }
+        inner.stopping = false;
+        inner.event_sender = Some(events);
         Ok(AdapterStartInfo {
             pid: None,
             session_id: Some(format!("cmd:{}", self.cfg.actor_id)),
@@ -289,30 +351,40 @@ impl Adapter for CommandAdapter {
 
     async fn send_prompt(&self, prompt: AdapterPrompt) -> Result<(), String> {
         if prompt.content.is_empty() {
-            let _ = self.sender()?.send(AdapterEvent::Error {
-                scope: Some(prompt.scope.clone()),
-                message: "empty prompt".into(),
-            });
-            let _ = self.sender()?.send(AdapterEvent::Finished {
-                scope: Some(prompt.scope),
-                success: false,
-                summary: "empty prompt".into(),
-                usage: None,
-            });
-            return Ok(());
+            return Err("empty prompt".into());
         }
-        let sender = self.sender()?;
         let cfg = self.cfg.clone();
-        let slot = self.slot_for(&prompt.scope.id);
+        let (start_tx, start_rx) = oneshot::channel();
+        let (sender, slot, run_slot) = {
+            let mut inner = self.inner.lock();
+            if inner.stopping {
+                return Err("command adapter is stopping".to_string());
+            }
+            let sender = inner
+                .event_sender
+                .clone()
+                .ok_or_else(|| "command adapter not started".to_string())?;
+            let slot = inner
+                .in_flight
+                .entry(prompt.scope.id.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(InFlight::default())))
+                .clone();
+            let run_slot = RunSlotGuard::acquire(slot.clone(), &prompt.scope)?;
+            slot.lock().start_sender = Some(start_tx);
+            (sender, slot, run_slot)
+        };
         // Detach the command turn so the actor worker can keep processing
         // other scopes while a long-running provider command is active. The
         // blocking worker reports completion through AdapterEvent::Finished.
         tokio::task::spawn_blocking(move || {
-            if let Err(e) = run_prompt(cfg, prompt, sender, slot) {
+            if let Err(e) = run_prompt_with_slot(cfg, prompt, sender, slot, run_slot) {
                 tracing::debug!(error = %e, "command run_prompt returned err (already reported via AdapterEvent)");
             }
         });
-        Ok(())
+        start_rx
+            .await
+            .map_err(|_| "provider startup worker stopped unexpectedly".to_string())?
+            .map(|_| ())
     }
 
     async fn respond_action(&self, _request_id: String, _option_id: String) -> Result<(), String> {
@@ -339,20 +411,66 @@ impl Adapter for CommandAdapter {
         let Some(pid) = pid else {
             // Slot exists but no PID — either we're between prompts, or the
             // child hasn't been spawned yet. Setting cancel_requested is
-            // enough; if a spawn is in flight it'll be killed once it lands
-            // (handled by send_prompt's spawn_and_collect on the next
-            // wait iteration only if we extend that — for now, no-op).
+            // enough; if a spawn is in flight, spawn_and_collect terminates it
+            // as soon as the PID is registered.
             return Ok(());
         };
         signal_child(pid)
     }
 
     async fn stop(&self) -> Result<(), String> {
-        // Nothing to stop — each prompt's subprocess exits on its own. Drop the
-        // sender so the runtime's event consumer can close cleanly.
-        self.inner.lock().event_sender = None;
-        self.inner.lock().in_flight.clear();
+        let slots = {
+            let mut inner = self.inner.lock();
+            if inner.stopping {
+                return Err("command adapter is already stopping".to_string());
+            }
+            inner.stopping = true;
+            inner.event_sender = None;
+            inner.in_flight.values().cloned().collect::<Vec<_>>()
+        };
+
+        for slot in &slots {
+            let pid = {
+                let mut state = slot.lock();
+                state.cancel_requested = true;
+                state.pid
+            };
+            if let Some(pid) = pid {
+                let _ = signal_child(pid);
+            }
+        }
+
+        if !wait_for_slots_to_stop(&slots, STOP_GRACE_PERIOD).await {
+            for slot in &slots {
+                if let Some(pid) = slot.lock().pid {
+                    let _ = force_kill_child(pid);
+                }
+            }
+            if !wait_for_slots_to_stop(&slots, STOP_FORCE_PERIOD).await {
+                let active = slots.iter().filter(|slot| slot.lock().running).count();
+                return Err(format!(
+                    "{active} command provider process(es) remained active after forced stop"
+                ));
+            }
+        }
+
+        let mut inner = self.inner.lock();
+        inner.in_flight.clear();
+        inner.stopping = false;
         Ok(())
+    }
+}
+
+async fn wait_for_slots_to_stop(slots: &[Arc<Mutex<InFlight>>], timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if slots.iter().all(|slot| !slot.lock().running) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -375,44 +493,21 @@ fn force_kill_child(pid: u32) -> Result<(), String> {
     loom_platform::signal::force_kill_pid(pid).map_err(|e| format!("force_kill({pid}) failed: {e}"))
 }
 
-fn run_prompt(
+fn run_prompt_with_slot(
     cfg: CommandConfig,
     prompt: AdapterPrompt,
     sender: mpsc::UnboundedSender<AdapterEvent>,
     slot: Arc<Mutex<InFlight>>,
+    run_slot: RunSlotGuard,
 ) -> Result<(), String> {
     let scope = prompt.scope.clone();
-    let _run_slot = match RunSlotGuard::acquire(slot.clone(), &scope) {
-        Ok(guard) => guard,
-        Err(e) => {
-            let _ = sender.send(AdapterEvent::Error {
-                scope: Some(scope.clone()),
-                message: e.clone(),
-            });
-            let _ = sender.send(AdapterEvent::Finished {
-                scope: Some(scope.clone()),
-                success: false,
-                summary: e.clone(),
-                usage: None,
-            });
-            return Ok(());
-        }
-    };
+    let mut run_slot = run_slot;
+    let mut generation = run_slot.generation();
     let _session_lock = match acquire_session_lock(&cfg, &scope) {
         Ok(lock) => lock,
         Err(e) => {
             let message = format!("command adapter session lock error: {e}");
-            release_run_slot(&slot);
-            let _ = sender.send(AdapterEvent::Error {
-                scope: Some(scope.clone()),
-                message: message.clone(),
-            });
-            let _ = sender.send(AdapterEvent::Finished {
-                scope: Some(scope.clone()),
-                success: false,
-                summary: message.clone(),
-                usage: None,
-            });
+            fail_provider_start(&slot, generation, message.clone());
             return Err(message);
         }
     };
@@ -461,21 +556,30 @@ fn run_prompt(
     let active_session_id = resume_session_id
         .as_deref()
         .or(first_run_session_id.as_deref());
-    let result = spawn_and_collect(&cfg, &prompt, &argv, active_session_id, &sender, &slot);
+    let result = spawn_and_collect_for_generation(
+        &cfg,
+        &prompt,
+        &argv,
+        active_session_id,
+        &sender,
+        &slot,
+        generation,
+    );
     let mut outcome = match result {
         Ok(o) => o,
         Err(e) => {
-            release_run_slot(&slot);
-            let _ = sender.send(AdapterEvent::Error {
-                scope: Some(scope.clone()),
-                message: format!("command adapter spawn error: {e}"),
-            });
-            let _ = sender.send(AdapterEvent::Finished {
-                scope: Some(scope.clone()),
-                success: false,
-                summary: e.clone(),
-                usage: None,
-            });
+            if !fail_provider_start(&slot, generation, e.clone()) {
+                let _ = sender.send(AdapterEvent::Error {
+                    scope: Some(scope.clone()),
+                    message: format!("command adapter runtime error: {e}"),
+                });
+                let _ = sender.send(AdapterEvent::Finished {
+                    scope: Some(scope.clone()),
+                    success: false,
+                    summary: e.clone(),
+                    usage: None,
+                });
+            }
             return Err(e);
         }
     };
@@ -495,27 +599,38 @@ fn run_prompt(
         };
         let first_run_argv =
             expand_first_run_argv(&cfg, &prompt, retry_session_id.as_deref(), &content);
-        outcome = match spawn_and_collect(
+        run_slot = match RunSlotGuard::acquire(slot.clone(), &scope) {
+            Ok(guard) => guard,
+            Err(e) => {
+                tracing::warn!(actor = %cfg.actor_id, scope = %scope.id, %e,
+                    "command transport: skipped stale-session retry because a new turn is active");
+                return Ok(());
+            }
+        };
+        generation = run_slot.generation();
+        outcome = match spawn_and_collect_for_generation(
             &cfg,
             &prompt,
             &first_run_argv,
             retry_session_id.as_deref(),
             &sender,
             &slot,
+            generation,
         ) {
             Ok(o) => o,
             Err(e) => {
-                release_run_slot(&slot);
-                let _ = sender.send(AdapterEvent::Error {
-                    scope: Some(scope.clone()),
-                    message: format!("command adapter retry spawn error: {e}"),
-                });
-                let _ = sender.send(AdapterEvent::Finished {
-                    scope: Some(scope.clone()),
-                    success: false,
-                    summary: e.clone(),
-                    usage: None,
-                });
+                if !fail_provider_start(&slot, generation, e.clone()) {
+                    let _ = sender.send(AdapterEvent::Error {
+                        scope: Some(scope.clone()),
+                        message: format!("command adapter retry runtime error: {e}"),
+                    });
+                    let _ = sender.send(AdapterEvent::Finished {
+                        scope: Some(scope.clone()),
+                        success: false,
+                        summary: e.clone(),
+                        usage: None,
+                    });
+                }
                 return Err(e);
             }
         };
@@ -590,6 +705,17 @@ fn run_prompt(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+fn run_prompt(
+    cfg: CommandConfig,
+    prompt: AdapterPrompt,
+    sender: mpsc::UnboundedSender<AdapterEvent>,
+    slot: Arc<Mutex<InFlight>>,
+) -> Result<(), String> {
+    let run_slot = RunSlotGuard::acquire(slot.clone(), &prompt.scope)?;
+    run_prompt_with_slot(cfg, prompt, sender, slot, run_slot)
 }
 
 #[derive(Debug)]
@@ -761,13 +887,14 @@ fn hash_line(line: &str) -> u64 {
     h.finish()
 }
 
-fn spawn_and_collect(
+fn spawn_and_collect_for_generation(
     cfg: &CommandConfig,
     prompt: &AdapterPrompt,
     argv: &[String],
     session_id: Option<&str>,
     sender: &mpsc::UnboundedSender<AdapterEvent>,
     slot: &Arc<Mutex<InFlight>>,
+    generation: u64,
 ) -> Result<SpawnOutcome, String> {
     crate::acp::create_dir_all_unc(&prompt.cwd).map_err(|e| {
         format!(
@@ -798,6 +925,23 @@ fn spawn_and_collect(
         argv
     };
 
+    let startup_handshake_required = cfg
+        .env
+        .get(STARTUP_HANDSHAKE_ENV)
+        .is_some_and(|value| value == "required");
+    let startup_ack_path = if startup_handshake_required {
+        let dir = cfg.sessions_dir.join(".startup");
+        crate::acp::create_dir_all_unc(&dir).map_err(|e| {
+            format!(
+                "failed to create provider startup handshake directory `{}`: {e}",
+                dir.display()
+            )
+        })?;
+        Some(dir.join(format!("{}.ack", uuid::Uuid::new_v4())))
+    } else {
+        None
+    };
+
     let mut cmd = Command::new(&command_path);
     let stdin = if cfg.stdin_template.is_some() || matches!(cfg.prompt_via, PromptVia::Stdin) {
         Stdio::piped()
@@ -811,6 +955,10 @@ fn spawn_and_collect(
         .stderr(Stdio::piped());
     for (k, v) in expanded_env(cfg, prompt, session_id) {
         cmd.env(k, v);
+    }
+    if let Some(path) = startup_ack_path.as_ref() {
+        let _ = std::fs::remove_file(path);
+        cmd.env(STARTUP_ACK_FILE_ENV, path);
     }
     if matches!(cfg.prompt_via, PromptVia::Env) {
         cmd.env("LOOM_PROMPT", &prompt.content);
@@ -826,6 +974,13 @@ fn spawn_and_collect(
     // child immediately; the wait below will pick up the SIGTERM exit.
     {
         let mut s = slot.lock();
+        if s.generation != generation {
+            drop(s);
+            let pid = child.id();
+            let _ = force_kill_child(pid);
+            let _ = child.wait();
+            return Err("command transport run slot was superseded before startup".into());
+        }
         s.pid = Some(child.id());
         if s.cancel_requested {
             let pid = child.id();
@@ -833,7 +988,6 @@ fn spawn_and_collect(
             let _ = signal_child(pid);
         }
     }
-
     // Take stdout/stderr handles FIRST and start reader threads BEFORE writing
     // stdin.  This prevents a deadlock where the parent blocks on stdin write
     // (pipe buffer full because the child hasn't started reading yet) while the
@@ -884,7 +1038,7 @@ fn spawn_and_collect(
     // large prompt (> pipe buffer) can block; the readers keep the child from
     // deadlocking on full stdout/stderr pipes.
     let needs_stdin = cfg.stdin_template.is_some() || matches!(cfg.prompt_via, PromptVia::Stdin);
-    let stdin_handle = if needs_stdin {
+    let mut stdin_handle = if needs_stdin {
         if let Some(mut stdin_writer) = child.stdin.take() {
             let stdin_body = cfg
                 .stdin_template
@@ -907,7 +1061,7 @@ fn spawn_and_collect(
             });
             Some(done_rx)
         } else {
-            None
+            return Err("failed to open child stdin".into());
         }
     } else {
         None
@@ -934,9 +1088,82 @@ fn spawn_and_collect(
     let mut timed_out = false;
     let mut idle_timed_out = false;
     let mut early_runtime_error: Option<String> = None;
+    let mut stdin_write_error: Option<String> = None;
+    let mut stdin_delivered = !needs_stdin;
+    let startup_deadline =
+        startup_handshake_required.then(|| Instant::now() + STARTUP_HANDSHAKE_TIMEOUT);
     let mut health_observer = HealthObserver::new(prompt.scope.clone());
 
     loop {
+        if !stdin_delivered {
+            if let Some(done_rx) = stdin_handle.as_ref() {
+                match done_rx.try_recv() {
+                    Ok(Ok(())) => {
+                        stdin_delivered = true;
+                        stdin_handle = None;
+                    }
+                    Ok(Err(error)) => {
+                        stdin_write_error = Some(error);
+                        if force_kill_child(child.id()).is_err() {
+                            let _ = child.kill();
+                        }
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        stdin_write_error =
+                            Some("provider stdin writer stopped unexpectedly".into());
+                        if force_kill_child(child.id()).is_err() {
+                            let _ = child.kill();
+                        }
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                }
+            }
+        }
+        let handshake_confirmed = startup_ack_path
+            .as_ref()
+            .map(|path| {
+                std::fs::read_to_string(path)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u32>().ok())
+                    .is_some()
+            })
+            .unwrap_or(true);
+        if !provider_start_confirmed(slot, generation) && stdin_delivered && handshake_confirmed {
+            confirm_provider_start(slot, generation, child.id());
+            if let Some(path) = startup_ack_path.as_ref() {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        if !provider_start_confirmed(slot, generation) {
+            if slot.lock().cancel_requested {
+                let _ = signal_child(child.id());
+            }
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|e| format!("failed to poll child during startup: {e}"))?
+            {
+                exit = Some(status);
+                break;
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                timed_out = true;
+                if force_kill_child(child.id()).is_err() {
+                    let _ = child.kill();
+                }
+                break;
+            }
+            if startup_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                if force_kill_child(child.id()).is_err() {
+                    let _ = child.kill();
+                }
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+
         health_observer.tick(sender);
         while let Ok(output) = output_rx.try_recv() {
             last_output_at = Instant::now();
@@ -1077,11 +1304,50 @@ fn spawn_and_collect(
     // Check the background stdin write result. If the child exits early after
     // emitting a provider/runtime error, the writer can see BrokenPipe; keep
     // that as a fallback so it does not mask the more actionable child output.
-    let mut stdin_write_error = None;
     if let Some(done_rx) = stdin_handle {
         if let Ok(Err(e)) = done_rx.recv() {
             stdin_write_error = Some(e);
         }
+    }
+    if !provider_start_confirmed(slot, generation) {
+        for output in output_rx.try_iter() {
+            match output {
+                ProcessOutput::Stdout(line) => collected_stdout.push_str(&line),
+                ProcessOutput::Stderr(line) => collected_stderr.push_str(&line),
+            }
+        }
+        if let Some(path) = startup_ack_path.as_ref() {
+            let _ = std::fs::remove_file(path);
+        }
+        let reason = stdin_write_error.unwrap_or_else(|| {
+            if timed_out {
+                cfg.timeout_ms
+                    .map(|ms| format!("provider startup timed out after {ms}ms"))
+                    .unwrap_or_else(|| "provider startup timed out".to_string())
+            } else if startup_handshake_required {
+                if exit.code().is_some() {
+                    "provider exited before startup handshake".to_string()
+                } else {
+                    format!(
+                        "provider startup handshake timed out after {}ms",
+                        STARTUP_HANDSHAKE_TIMEOUT.as_millis()
+                    )
+                }
+            } else {
+                "provider exited before prompt delivery completed".to_string()
+            }
+        });
+        let detail = extract_runtime_error_from_text(&collected_stderr)
+            .or_else(|| extract_runtime_error_from_text(&collected_stdout))
+            .unwrap_or_else(|| truncate_for_summary(&collected_stderr));
+        return Err(if detail.is_empty() {
+            reason
+        } else {
+            format!("{reason}: {detail}")
+        });
+    }
+    if let Some(path) = startup_ack_path.as_ref() {
+        let _ = std::fs::remove_file(path);
     }
     for output in output_rx.try_iter() {
         let (raw_line, is_stdout) = match &output {
@@ -1239,19 +1505,34 @@ fn spawn_and_collect(
     }
     let usage = extract_token_usage_from_text(&collected_stdout)
         .or_else(|| extract_token_usage_from_text(&collected_stderr));
-    release_run_slot(slot);
-    let _ = sender.send(AdapterEvent::Finished {
-        scope: Some(prompt.scope.clone()),
-        success,
-        summary,
-        usage,
-    });
+    release_run_slot(slot, generation);
+    if !emitted_finish || !success {
+        let _ = sender.send(AdapterEvent::Finished {
+            scope: Some(prompt.scope.clone()),
+            success,
+            summary,
+            usage,
+        });
+    }
 
     Ok(SpawnOutcome {
         exit_code,
         stdout: collected_stdout,
         stderr: collected_stderr,
     })
+}
+
+#[cfg(test)]
+fn spawn_and_collect(
+    cfg: &CommandConfig,
+    prompt: &AdapterPrompt,
+    argv: &[String],
+    session_id: Option<&str>,
+    sender: &mpsc::UnboundedSender<AdapterEvent>,
+    slot: &Arc<Mutex<InFlight>>,
+) -> Result<SpawnOutcome, String> {
+    let generation = slot.lock().generation;
+    spawn_and_collect_for_generation(cfg, prompt, argv, session_id, sender, slot, generation)
 }
 
 /// Check if the command path is a Windows batch file (.CMD or .BAT).
@@ -1399,7 +1680,13 @@ fn truncate_for_summary(s: &str) -> String {
     if s.len() <= MAX {
         s.trim().to_string()
     } else {
-        let mut t = s[..MAX].trim().to_string();
+        let cut = s
+            .char_indices()
+            .map(|(idx, _)| idx)
+            .take_while(|idx| *idx <= MAX)
+            .last()
+            .unwrap_or(0);
+        let mut t = s[..cut].trim().to_string();
         t.push('…');
         t
     }
@@ -3280,6 +3567,17 @@ mod tests {
     use proto::methods::{ProviderDecoderEventSpec, ProviderJsonlReduceSpec};
     use proto::types::ScopeKind;
 
+    #[test]
+    fn summary_truncation_is_utf8_boundary_safe() {
+        let text = format!("{}中文错误详情", "x".repeat(499));
+
+        let truncated = truncate_for_summary(&text);
+
+        assert!(truncated.ends_with('…'));
+        assert!(truncated.is_char_boundary(truncated.len()));
+        assert!(truncated.len() <= 503);
+    }
+
     fn cfg() -> CommandConfig {
         CommandConfig {
             actor_id: "actor_demo".into(),
@@ -4291,28 +4589,14 @@ mod tests {
         let slot = Arc::new(Mutex::new(InFlight::default()));
         let long_prompt = "ignored".repeat(256 * 1024);
 
-        let outcome = spawn_and_collect(&cfg, &prompt(&long_prompt), &cfg.args, None, &tx, &slot)
-            .expect("spawn sh");
+        let error = spawn_and_collect(&cfg, &prompt(&long_prompt), &cfg.args, None, &tx, &slot)
+            .expect_err("stdin failure must reject provider startup");
 
-        assert_ne!(outcome.exit_code, 0);
-        let mut summary = None;
-        while let Ok(event) = rx.try_recv() {
-            if let AdapterEvent::Finished {
-                success,
-                summary: value,
-                ..
-            } = event
-            {
-                assert!(!success);
-                summary = Some(value);
-                break;
-            }
-        }
-        let summary = summary.expect("missing Finished event");
-        assert!(summary.contains("429"), "{summary}");
-        assert!(summary.contains("FreeUsageLimitError"), "{summary}");
-        assert!(summary.contains("Rate limit exceeded"), "{summary}");
-        assert!(summary.contains("retry-after: 59140s"), "{summary}");
+        assert!(error.contains("429"), "{error}");
+        assert!(error.contains("FreeUsageLimitError"), "{error}");
+        assert!(error.contains("Rate limit exceeded"), "{error}");
+        assert!(error.contains("retry-after: 59140s"), "{error}");
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -4338,6 +4622,210 @@ mod tests {
             rx.try_recv(),
             Ok(AdapterEvent::Finished { success: true, .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn spawn_failure_is_returned_before_provider_start() {
+        let mut cfg = cfg();
+        cfg.command = "__loom_provider_that_does_not_exist__".into();
+        let adapter = Arc::new(CommandAdapter::new(cfg));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        adapter.start(tx).await.expect("start");
+
+        let error = adapter
+            .send_prompt(prompt("ignored"))
+            .await
+            .expect_err("missing provider must fail startup");
+
+        assert!(error.contains("failed to spawn"), "{error}");
+        assert!(rx.try_recv().is_err(), "startup failure is owned by caller");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn required_startup_handshake_blocks_until_real_provider_ack() {
+        let mut cfg = cfg();
+        cfg.command = "sh".into();
+        cfg.args = vec![
+            "-c".into(),
+            "printf '%s\\n' $$ > \"$LOOM_PROVIDER_STARTUP_ACK_FILE\"; sleep 0.2; printf 'done\\n'"
+                .into(),
+        ];
+        cfg.env
+            .insert(STARTUP_HANDSHAKE_ENV.into(), "required".into());
+        let startup_dir = cfg.sessions_dir.join(".startup");
+        let adapter = Arc::new(CommandAdapter::new(cfg));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        adapter.start(tx).await.expect("start");
+
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            adapter.send_prompt(prompt("ignored")),
+        )
+        .await
+        .expect("startup confirmation timeout")
+        .expect("startup confirmation");
+        let remaining = std::fs::read_dir(&startup_dir)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(
+            remaining, 0,
+            "startup ack should be removed immediately after confirmation"
+        );
+
+        let finished = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(AdapterEvent::Finished { success, .. }) = rx.recv().await {
+                    break success;
+                }
+            }
+        })
+        .await
+        .expect("provider finish timeout");
+        assert!(finished);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stop_terminates_and_reaps_in_flight_provider() {
+        let mut cfg = cfg();
+        cfg.command = "sh".into();
+        cfg.args = vec!["-c".into(), "sleep 30".into()];
+        cfg.prompt_via = PromptVia::Stdin;
+        let adapter = Arc::new(CommandAdapter::new(cfg));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        adapter.start(tx).await.expect("start");
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            adapter.send_prompt(prompt("ignored")),
+        )
+        .await
+        .expect("provider startup timeout")
+        .expect("provider startup");
+
+        tokio::time::timeout(Duration::from_secs(5), adapter.stop())
+            .await
+            .expect("adapter stop timeout")
+            .expect("adapter stop");
+
+        let inner = adapter.inner.lock();
+        assert!(!inner.stopping);
+        assert!(inner.event_sender.is_none());
+        assert!(inner.in_flight.is_empty());
+        drop(inner);
+
+        let finished = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(AdapterEvent::Finished {
+                    success, summary, ..
+                }) = rx.recv().await
+                {
+                    break (success, summary);
+                }
+            }
+        })
+        .await
+        .expect("provider finish timeout");
+        assert!(!finished.0);
+        assert_eq!(finished.1, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn stopped_adapter_rejects_new_prompt_before_reserving_a_slot() {
+        let adapter = CommandAdapter::new(cfg());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        adapter.start(tx).await.expect("start");
+        adapter.stop().await.expect("stop");
+
+        let error = adapter
+            .send_prompt(prompt("ignored"))
+            .await
+            .expect_err("stopped adapter must reject prompts");
+
+        assert_eq!(error, "command adapter not started");
+        assert!(adapter.inner.lock().in_flight.is_empty());
+    }
+
+    #[tokio::test]
+    async fn start_is_rejected_until_stop_finishes() {
+        let adapter = Arc::new(CommandAdapter::new(cfg()));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        adapter.start(tx).await.expect("start");
+        let slot = adapter.slot_for("scope-stop-race");
+        let guard = RunSlotGuard::acquire(slot, &named_scope(ScopeKind::Thread, "scope-stop-race"))
+            .expect("reserve slot");
+
+        let stopping_adapter = adapter.clone();
+        let stop_task = tokio::spawn(async move { stopping_adapter.stop().await });
+        loop {
+            if adapter.inner.lock().stopping {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let (restart_tx, _restart_rx) = mpsc::unbounded_channel();
+        let error = adapter
+            .start(restart_tx)
+            .await
+            .expect_err("start must wait for stop");
+        assert_eq!(error, "command adapter is still stopping");
+        let error = adapter
+            .stop()
+            .await
+            .expect_err("a concurrent stop must be rejected");
+        assert_eq!(error, "command adapter is already stopping");
+
+        drop(guard);
+        stop_task
+            .await
+            .expect("join stop")
+            .expect("stop succeeds after slot release");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn wrapper_exit_without_handshake_fails_before_start_confirmation() {
+        let mut cfg = cfg();
+        cfg.command = "sh".into();
+        cfg.args = vec!["-c".into(), "echo provider-missing >&2; exit 127".into()];
+        cfg.env
+            .insert(STARTUP_HANDSHAKE_ENV.into(), "required".into());
+        let adapter = Arc::new(CommandAdapter::new(cfg));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        adapter.start(tx).await.expect("start");
+
+        let error = adapter
+            .send_prompt(prompt("ignored"))
+            .await
+            .expect_err("missing handshake must fail startup");
+
+        assert!(error.contains("before startup handshake"), "{error}");
+        assert!(error.contains("provider-missing"), "{error}");
+        assert!(rx.try_recv().is_err(), "startup failure is owned by caller");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stdin_write_failure_is_returned_before_start_confirmation() {
+        let mut cfg = cfg();
+        cfg.command = "sh".into();
+        cfg.args = vec!["-c".into(), "exit 0".into()];
+        cfg.prompt_via = PromptVia::Stdin;
+        let adapter = Arc::new(CommandAdapter::new(cfg));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        adapter.start(tx).await.expect("start");
+
+        let error = adapter
+            .send_prompt(prompt(&"x".repeat(16 * 1024 * 1024)))
+            .await
+            .expect_err("broken provider stdin must fail startup");
+
+        assert!(
+            error.contains("stdin") || error.contains("prompt delivery"),
+            "{error}"
+        );
     }
 
     #[cfg(unix)]
@@ -4800,6 +5288,29 @@ mod tests {
     }
 
     #[test]
+    fn stale_run_slot_guard_cannot_release_a_new_generation() {
+        let slot = Arc::new(Mutex::new(InFlight::default()));
+        let scope = scope();
+        let old_guard = RunSlotGuard::acquire(slot.clone(), &scope).expect("old acquire");
+        let old_generation = old_guard.generation();
+        release_run_slot(&slot, old_generation);
+
+        let new_guard = RunSlotGuard::acquire(slot.clone(), &scope).expect("new acquire");
+        let new_generation = new_guard.generation();
+        slot.lock().pid = Some(4242);
+
+        drop(old_guard);
+
+        let state = slot.lock();
+        assert!(state.running);
+        assert_eq!(state.generation, new_generation);
+        assert_eq!(state.pid, Some(4242));
+        drop(state);
+        drop(new_guard);
+        assert!(!slot.lock().running);
+    }
+
+    #[test]
     fn session_path_distinguishes_thread_and_channel() {
         let cfg = cfg();
         let thread = session_path(&cfg, &named_scope(ScopeKind::Thread, "same")).unwrap();
@@ -5146,8 +5657,8 @@ mod tests {
     #[tokio::test]
     async fn send_prompt_returns_before_command_finishes() {
         let mut cfg = cfg();
-        cfg.command = "sleep".into();
-        cfg.args = vec!["30".into()];
+        cfg.command = "sh".into();
+        cfg.args = vec!["-c".into(), "cat >/dev/null; sleep 5".into()];
         cfg.prompt_via = PromptVia::Stdin;
         let adapter = Arc::new(CommandAdapter::new(cfg));
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -5155,14 +5666,14 @@ mod tests {
 
         let started = std::time::Instant::now();
         tokio::time::timeout(
-            std::time::Duration::from_millis(250),
+            std::time::Duration::from_secs(2),
             adapter.send_prompt(prompt("ignored")),
         )
         .await
         .expect("send_prompt should return promptly")
         .expect("send_prompt ok");
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
+            started.elapsed() < std::time::Duration::from_secs(3),
             "send_prompt blocked on the child command"
         );
 

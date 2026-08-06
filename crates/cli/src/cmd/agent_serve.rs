@@ -30,7 +30,7 @@ use proto::methods::{
     BundleInstallMode, ChannelListResult, ChannelMemberConfigGetResult, ChannelMembersResult,
     InboxListResult, MessageListResult, MessageSendResult, OnHumanMessageWhileBusy,
     PromptTemplateSpec, ReplyReminderMode, RunAppendResult, RunCloseResult, RunOpenResult,
-    RuntimeAwareness, TaskAssignmentContextResult, TaskAssignmentUpdateResult, ThreadListResult,
+    RuntimeAwareness, TaskAssignmentContextResult, TaskAssignmentUpdateResult, ThreadGetResult,
     TriggerPrefixApplyOn,
 };
 use proto::types::trace::TraceKind;
@@ -44,7 +44,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::{interval, sleep, Duration};
+use tokio::time::{interval, interval_at, sleep, Duration, Instant, MissedTickBehavior};
 
 use agent_runtime::acp::{create_dir_all_unc, normalize_path_separators, AcpAdapter, AcpConfig};
 use agent_runtime::command::{CommandAdapter, CommandConfig};
@@ -62,6 +62,9 @@ use crate::daemon_ipc;
 
 const RECONNECT_BASE_DELAY_SECS: u64 = 2;
 const RECONNECT_MAX_DELAY_SECS: u64 = 30;
+const MACHINE_COMMAND_POLL_INTERVAL_SECS: u64 = 60;
+const MACHINE_COMMAND_POLL_BASE_DELAY_SECS: u64 = 15;
+const MACHINE_COMMAND_POLL_JITTER_SECS: u64 = 30;
 const LOOM_CLI_ENV: &str = "LOOM_CLI";
 const LOOM_NO_REPLY_FILE_ENV: &str = "LOOM_NO_REPLY_FILE";
 const LOCAL_ACTOR_INBOX_DELIVERY_META: &str = "__loom_local_actor_inbox_delivery";
@@ -550,14 +553,17 @@ async fn run_machine_host_once(host: &MachineHostSpec, server_url: &str) -> Resu
     );
 
     let mut notifications = client.notifications.lock().await;
-    let mut heartbeat = interval(Duration::from_secs(15));
     let mut in_progress = HashSet::new();
+    drain_machine_commands(&client, host, &mut in_progress).await?;
+    let mut command_poll = interval_at(
+        Instant::now() + machine_command_poll_initial_delay(&host.machine_id),
+        Duration::from_secs(MACHINE_COMMAND_POLL_INTERVAL_SECS),
+    );
+    command_poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tokio::select! {
-            _ = heartbeat.tick() => {
-                upsert_machine_actor(&client, host).await?;
+            _ = command_poll.tick() => {
                 drain_machine_commands(&client, host, &mut in_progress).await?;
-                let _: Value = client.call_raw(method::ACTOR_LIST, None).await?;
             }
             maybe_notification = notifications.recv() => {
                 let Some(notification) = maybe_notification else {
@@ -571,6 +577,15 @@ async fn run_machine_host_once(host: &MachineHostSpec, server_url: &str) -> Resu
             }
         }
     }
+}
+
+fn machine_command_poll_initial_delay(machine_id: &str) -> Duration {
+    let hash = machine_id.bytes().fold(0u64, |acc, byte| {
+        acc.wrapping_mul(1099511628211).wrapping_add(byte as u64)
+    });
+    Duration::from_secs(
+        MACHINE_COMMAND_POLL_BASE_DELAY_SECS + hash % MACHINE_COMMAND_POLL_JITTER_SECS,
+    )
 }
 
 async fn drain_machine_commands(
@@ -2468,9 +2483,9 @@ struct WorkerState {
     /// Per-scope first-turn set used by prompt templates that distinguish the
     /// first turn in a scope from later resumed turns.
     seeded: Mutex<HashSet<String>>,
-    /// thread_id → channel_id cache. Populated on miss by a single
-    /// `thread/list` RPC and reused from then on. Channel scopes don't need
-    /// resolution (scope.id IS the channel id) so those don't populate it.
+    /// thread_id → channel_id cache. Populated on miss by an exact `thread/get`
+    /// RPC and reused from then on. Channel scopes don't need resolution
+    /// (scope.id IS the channel id) so those don't populate it.
     scope_channel_cache: Mutex<HashMap<String, String>>,
     /// Trigger source ids already received from the server notification stream.
     /// The same source can arrive through both scope broadcast and actor-inbox
@@ -2484,6 +2499,11 @@ struct WorkerState {
     /// Runtime warning de-dupe by `run_id:category`. These warnings surface
     /// system/RPC failures without blocking the active turn or flooding chat.
     reported_runtime_warnings: Mutex<HashSet<String>>,
+    /// Adapter events that raced ahead of provider-start confirmation.
+    prestart_events: Mutex<HashMap<String, VecDeque<AdapterEvent>>>,
+    /// Run ids whose provider-start acknowledgement has been published. Until
+    /// a run appears here, scoped adapter events remain behind the start gate.
+    provider_event_released_runs: Mutex<HashSet<String>>,
     /// Currently selected model id for this actor. Loaded from profile state
     /// first, then from `spec.models.default`.
     selected_model: Mutex<Option<String>>,
@@ -2533,6 +2553,9 @@ struct ActiveTurn {
     /// Finished(cancelled) arrives so that stale completion cannot close the
     /// next turn in the same scope.
     cancel_requested: bool,
+    /// Set only after Adapter::send_prompt confirms that the provider accepted
+    /// this prompt's execution boundary.
+    provider_started: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2687,6 +2710,8 @@ impl WorkerState {
             action_map: Mutex::new(HashMap::new()),
             model_action_map: Mutex::new(HashMap::new()),
             reported_runtime_warnings: Mutex::new(HashSet::new()),
+            prestart_events: Mutex::new(HashMap::new()),
+            provider_event_released_runs: Mutex::new(HashSet::new()),
             selected_model: Mutex::new(selected_model),
         }
     }
@@ -2708,6 +2733,74 @@ impl WorkerState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(turn.scope.id.clone(), turn);
+    }
+
+    fn confirm_provider_started(&self, scope_id: &str, run_id: &str) -> Option<ActiveTurn> {
+        let mut active = self.active_turns.lock().unwrap_or_else(|e| e.into_inner());
+        let turn = active.get_mut(scope_id)?;
+        if turn.run_id != run_id || turn.cancel_requested || turn.provider_started {
+            return None;
+        }
+        turn.provider_started = true;
+        Some(turn.clone())
+    }
+
+    fn defer_prestart_event(&self, scope_id: &str, event: &AdapterEvent) -> bool {
+        let active = self.active_turns.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(turn) = active.get(scope_id) else {
+            return false;
+        };
+        if turn.cancel_requested
+            || self
+                .provider_event_released_runs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&turn.run_id)
+        {
+            return false;
+        }
+        self.prestart_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(scope_id.to_string())
+            .or_default()
+            .push_back(event.clone());
+        true
+    }
+
+    /// Drain every event that arrived before the provider-start acknowledgement
+    /// became visible. The gate is released only while both the active-turn and
+    /// deferred-event locks prove the queue empty, so a fast Finished event
+    /// cannot overtake run.started.
+    fn drain_prestart_events_or_release(
+        &self,
+        scope_id: &str,
+        run_id: &str,
+    ) -> Option<VecDeque<AdapterEvent>> {
+        let active = self.active_turns.lock().unwrap_or_else(|e| e.into_inner());
+        let turn = active.get(scope_id)?;
+        if turn.run_id != run_id || turn.cancel_requested || !turn.provider_started {
+            return None;
+        }
+        let mut released = self
+            .provider_event_released_runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if released.contains(run_id) {
+            return None;
+        }
+        let mut deferred = self
+            .prestart_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(events) = deferred
+            .remove(scope_id)
+            .filter(|events| !events.is_empty())
+        {
+            return Some(events);
+        }
+        released.insert(run_id.to_string());
+        None
     }
 
     fn mark_cancel_requested(&self, scope_id: &str, turn_id: &str) -> Option<ActiveTurn> {
@@ -2863,15 +2956,24 @@ impl WorkerState {
     /// into one batch so a burst becomes a single turn instead of one full
     /// provider turn per message.
     fn finish_and_next_batch(&self, scope_id: &str, coalesce: bool) -> Vec<AgentTrigger> {
-        let Some(turn_key) = self
+        let Some(turn) = self
             .active_turns
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(scope_id)
-            .map(|turn| turn.turn_key)
         else {
             return Vec::new();
         };
+        // Match defer/drain lock order: release marker before deferred queue.
+        self.provider_event_released_runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&turn.run_id);
+        self.prestart_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(scope_id);
+        let turn_key = turn.turn_key;
         let mut busy = self
             .busy_turn_keys
             .lock()
@@ -5010,9 +5112,10 @@ async fn rebase_queued_batch_or_release(
 
 /// Open a turn, mark the scope busy, send the prompt to the adapter. Used by
 /// both the initial trigger and the Finished handler when it pops the next
-/// queued batch. On `send_prompt` failure we iteratively drain the queue
-/// (rather than spawn-recursing) so a single bad prompt can't strand the rest
-/// and the future stays Send for `tokio::spawn`.
+/// queued batch. On `send_prompt` failure we leave the durable delivery pending
+/// for a later inbox retry and iteratively drain the local queue (rather than
+/// spawn-recursing) so a single bad prompt can't strand the rest and the future
+/// stays Send for `tokio::spawn`.
 ///
 /// `batch` holds one or more triggers merged into a single turn. All batch
 /// members share the same scope, reply target, and visibility (see
@@ -5088,12 +5191,9 @@ async fn dispatch_trigger_batch(
             no_reply_file,
             no_reply_requested: false,
             cancel_requested: false,
+            provider_started: false,
         };
         state.set_turn(active.clone());
-        mark_assignment_running_if_needed(client, state, &primary).await;
-        if run_started_ack_enabled() {
-            append_run_started_ack(client, state, &active, &primary).await;
-        }
 
         let adapter_prompt = build_adapter_prompt(
             client,
@@ -5106,7 +5206,40 @@ async fn dispatch_trigger_batch(
         .await?;
 
         match adapter.send_prompt(adapter_prompt).await {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                let Some(confirmed) =
+                    state.confirm_provider_started(&active.scope.id, &active.run_id)
+                else {
+                    return Ok(());
+                };
+                mark_assignment_running_if_needed(client, state, &primary).await;
+                if run_started_ack_enabled() {
+                    append_run_started_ack(client, state, &confirmed, &primary).await;
+                }
+                while let Some(mut deferred) =
+                    state.drain_prestart_events_or_release(&active.scope.id, &active.run_id)
+                {
+                    while let Some(event) = deferred.pop_front() {
+                        if let Err(error) = Box::pin(translate_one_with_gate(
+                            client,
+                            state,
+                            adapter,
+                            &state.actor_id,
+                            event,
+                            false,
+                        ))
+                        .await
+                        {
+                            tracing::error!(
+                                actor = %state.actor_id,
+                                %error,
+                                "failed to translate deferred provider event"
+                            );
+                        }
+                    }
+                }
+                return Ok(());
+            }
             Err(e) => {
                 publish_failed_turn_notice(
                     client,
@@ -5118,18 +5251,11 @@ async fn dispatch_trigger_batch(
                 )
                 .await;
                 let _ = close_run(client, &active.run_id, RunStatus::Failed).await;
-                for source_id in &source_ids {
-                    if let Err(ack_err) =
-                        record_delivery_seen_by_id(client, &state.actor_id, source_id).await
-                    {
-                        tracing::warn!(
-                            actor = %state.actor_id,
-                            event = %source_id,
-                            %ack_err,
-                            "failed to record delivery ack for failed trigger dispatch"
-                        );
-                    }
-                }
+                tracing::warn!(
+                    actor = %state.actor_id,
+                    sources = ?source_ids,
+                    "provider did not accept prompt; leaving delivery pending for retry"
+                );
                 let scope_id = primary.scope().id.clone();
                 let next =
                     state.finish_and_next_batch(&scope_id, wake_coalesce_enabled(&state.spec));
@@ -8055,14 +8181,23 @@ fn prompt_section_label(name: &str) -> &str {
     }
 }
 
+async fn get_thread_by_id(
+    client: &Arc<Client>,
+    thread_id: &str,
+) -> Result<Option<proto::types::Thread>> {
+    let res: ThreadGetResult = client
+        .call(method::THREAD_GET, json!({ "threadId": thread_id }))
+        .await
+        .context("thread/get")?;
+    Ok(res.thread)
+}
+
 /// Resolve a scope → channel_id. Channel scopes are identity — they are the
-/// channel. Thread scopes need a one-time `thread/list` sweep; the result is
-/// cached on `WorkerState` so we don't hit the server per turn. Archived
-/// threads are queried as a fallback because explicit routed messages can arrive from
-/// historical threads that are no longer in the active list. A lookup
-/// failure (network error, thread not visible, etc.) returns `None`, which
-/// the memory selector interprets as "no channel scope available" and falls
-/// open — slightly leakier but never-wedging.
+/// channel. Thread scopes use an exact `thread/get` lookup, then cache the
+/// result on `WorkerState` so we don't hit the server per turn. The lookup
+/// includes archived threads. A failure (network error, thread not visible,
+/// etc.) returns `None`, which the memory selector interprets as "no channel
+/// scope available" and falls open — slightly leakier but never-wedging.
 async fn resolve_channel_for_scope(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
@@ -8079,22 +8214,13 @@ async fn resolve_channel_for_scope(
             {
                 return Some(cached);
             }
-            for params in [json!({}), json!({ "archived": true })] {
-                let res: proto::methods::ThreadListResult =
-                    client.call(method::THREAD_LIST, params).await.ok()?;
-                let mut cache = state.scope_channel_cache.lock().ok()?;
-                let mut found: Option<String> = None;
-                for t in res.threads {
-                    if t.id == scope.id {
-                        found = Some(t.channel_id.clone());
-                    }
-                    cache.insert(t.id, t.channel_id);
-                }
-                if found.is_some() {
-                    return found;
-                }
-            }
-            None
+            let channel_id = get_thread_by_id(client, &scope.id).await.ok()??.channel_id;
+            state
+                .scope_channel_cache
+                .lock()
+                .ok()?
+                .insert(scope.id.clone(), channel_id.clone());
+            Some(channel_id)
         }
     }
 }
@@ -8135,6 +8261,17 @@ async fn translate_one(
     actor_id: &str,
     ev: AdapterEvent,
 ) -> Result<()> {
+    translate_one_with_gate(client, state, adapter, actor_id, ev, true).await
+}
+
+async fn translate_one_with_gate(
+    client: &Arc<Client>,
+    state: &Arc<WorkerState>,
+    adapter: &Arc<dyn Adapter>,
+    actor_id: &str,
+    ev: AdapterEvent,
+    apply_start_gate: bool,
+) -> Result<()> {
     // Resolve the scope this event belongs to and look up the active turn for
     // it. Per-scope variants (Text/ToolUse/ActionRequest/Finished) require a
     // scope tag; agent-wide ones (StatusChange/Error with `scope: None`) are
@@ -8143,6 +8280,13 @@ async fn translate_one(
     let active = scope_for_event
         .as_ref()
         .and_then(|s| state.current_turn(&s.id));
+    if apply_start_gate {
+        if let Some(scope) = scope_for_event.as_ref() {
+            if state.defer_prestart_event(&scope.id, &ev) {
+                return Ok(());
+            }
+        }
+    }
 
     match ev {
         AdapterEvent::Text {
@@ -9207,14 +9351,8 @@ async fn message_target_for_scope(client: &Arc<Client>, scope: &ScopeRef) -> Res
     match scope.kind {
         ScopeKind::Channel => Ok(format!("#{}", scope.id)),
         ScopeKind::Thread => {
-            let res: ThreadListResult = client
-                .call(method::THREAD_LIST, json!({ "archived": false }))
-                .await
-                .context("thread/list")?;
-            let thread = res
-                .threads
-                .into_iter()
-                .find(|thread| thread.id == scope.id)
+            let thread = get_thread_by_id(client, &scope.id)
+                .await?
                 .ok_or_else(|| anyhow!("thread {} not found", scope.id))?;
             Ok(format!("#{}:{}", thread.channel_id, thread.root_message_id))
         }
@@ -9386,6 +9524,25 @@ mod tests {
     };
     use proto::types::{Actor, ActorKind, MessageKind, Ref, Relation};
 
+    #[test]
+    fn machine_command_poll_delay_is_stable_and_jittered() {
+        let first = machine_command_poll_initial_delay("machine-alpha");
+        let repeated = machine_command_poll_initial_delay("machine-alpha");
+        let distinct_delays = (0..64)
+            .map(|index| machine_command_poll_initial_delay(&format!("machine-{index}")))
+            .collect::<HashSet<_>>();
+
+        assert_eq!(first, repeated);
+        assert!(first >= Duration::from_secs(MACHINE_COMMAND_POLL_BASE_DELAY_SECS));
+        assert!(
+            first
+                < Duration::from_secs(
+                    MACHINE_COMMAND_POLL_BASE_DELAY_SECS + MACHINE_COMMAND_POLL_JITTER_SECS
+                )
+        );
+        assert!(distinct_delays.len() > 1);
+    }
+
     fn sample_spec(bundle: Option<AgentBundleSpec>) -> AgentSpec {
         AgentSpec {
             actor: Actor {
@@ -9458,6 +9615,75 @@ mod tests {
             relations: Vec::new(),
             _meta: None,
         }
+    }
+
+    #[tokio::test]
+    async fn thread_message_target_uses_exact_thread_get_rpc() {
+        let rpc_root = tempfile::tempdir().expect("file rpc root");
+        let client = Client::connect(&format!("file-rpc://{}", rpc_root.path().display()))
+            .await
+            .expect("connect file rpc client");
+        client.set_rpc_timeout_ms(2_000);
+
+        let client_dir = std::fs::read_dir(rpc_root.path().join("clients"))
+            .expect("read clients")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .next()
+            .expect("client directory");
+        let in_dir = client_dir.join("in");
+        let out_dir = client_dir.join("out");
+        let responder = tokio::spawn(async move {
+            for _ in 0..100 {
+                let request_file = std::fs::read_dir(&in_dir)
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(std::result::Result::ok)
+                    .map(|entry| entry.path())
+                    .find(|path| path.extension().and_then(OsStr::to_str) == Some("json"));
+                if let Some(request_file) = request_file {
+                    let request: proto::Request = serde_json::from_str(
+                        &std::fs::read_to_string(request_file).expect("read request"),
+                    )
+                    .expect("parse request");
+                    let response = proto::Response::ok(
+                        request.id.clone(),
+                        json!({
+                            "thread": {
+                                "id": "thread_demo",
+                                "channelId": "chan_demo",
+                                "title": "Demo",
+                                "rootMessageId": "msg_root"
+                            }
+                        }),
+                    );
+                    std::fs::write(
+                        out_dir.join("00000000000000000001.json"),
+                        serde_json::to_vec(&response).expect("serialize response"),
+                    )
+                    .expect("write response");
+                    return request;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+            panic!("file rpc request was not written");
+        });
+
+        let target = message_target_for_scope(
+            &client,
+            &ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_demo".into(),
+            },
+        )
+        .await
+        .expect("resolve message target");
+        let request = responder.await.expect("responder task");
+
+        assert_eq!(request.method, method::THREAD_GET);
+        assert_eq!(request.params, Some(json!({ "threadId": "thread_demo" })));
+        assert_eq!(target, "#chan_demo:msg_root");
     }
 
     #[test]
@@ -9573,6 +9799,7 @@ mod tests {
             no_reply_file: None,
             no_reply_requested: false,
             cancel_requested: false,
+            provider_started: false,
         }
     }
 
@@ -10422,6 +10649,7 @@ mod tests {
             no_reply_file: Some(root.join("no-reply.json")),
             no_reply_requested: false,
             cancel_requested: false,
+            provider_started: false,
         };
         let env = paths.scope_env(
             "actor_demo",
@@ -11115,6 +11343,7 @@ mod tests {
             no_reply_file: None,
             no_reply_requested: false,
             cancel_requested: false,
+            provider_started: false,
         };
 
         assert_eq!(
@@ -11172,6 +11401,7 @@ mod tests {
             no_reply_file: Some(marker),
             no_reply_requested: false,
             cancel_requested: false,
+            provider_started: false,
         };
 
         assert_eq!(
@@ -12432,6 +12662,7 @@ mod tests {
             no_reply_file: None,
             no_reply_requested: false,
             cancel_requested: false,
+            provider_started: false,
         });
 
         assert!(state
@@ -12445,6 +12676,81 @@ mod tests {
         assert!(marked.cancel_requested);
         assert!(state.current_turn(&scope.id).unwrap().cancel_requested);
 
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn provider_started_is_confirmed_once_for_the_current_run() {
+        let root = temp_path("provider-started");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        let state = WorkerState::new(
+            "actor_demo".into(),
+            sample_spec(None),
+            paths.profile.clone(),
+            paths,
+            "ws://127.0.0.1:0".into(),
+        );
+        let active = sample_active_turn("actor_human");
+        let scope_id = active.scope.id.clone();
+        let run_id = active.run_id.clone();
+        state.set_turn(active.clone());
+
+        assert!(state
+            .confirm_provider_started("wrong_scope", &run_id)
+            .is_none());
+        assert!(state
+            .confirm_provider_started(&scope_id, "wrong_run")
+            .is_none());
+        let deferred = AdapterEvent::Text {
+            scope: Some(active.scope.clone()),
+            content: "ready".into(),
+            is_partial: false,
+        };
+        assert!(state.defer_prestart_event(&scope_id, &deferred));
+        state
+            .confirm_provider_started(&scope_id, &run_id)
+            .expect("current provider start should be confirmed");
+        assert!(state.confirm_provider_started(&scope_id, &run_id).is_none());
+        assert!(
+            state.defer_prestart_event(&scope_id, &deferred),
+            "events must stay gated until run.started is visible"
+        );
+        let queued = state
+            .drain_prestart_events_or_release(&scope_id, &run_id)
+            .expect("deferred events should drain before releasing the gate");
+        assert_eq!(queued.len(), 2);
+        assert!(
+            state
+                .drain_prestart_events_or_release(&scope_id, &run_id)
+                .is_none(),
+            "an empty queue should release the event gate"
+        );
+        assert!(
+            !state.defer_prestart_event(&scope_id, &deferred),
+            "events after release must flow directly to translation"
+        );
+
+        state.clear_turn(&scope_id);
+        state.set_turn(active);
+        assert!(
+            state.confirm_provider_started(&scope_id, &run_id).is_some(),
+            "finishing a run must clear its start de-duplication marker"
+        );
+
+        state.clear_turn(&scope_id);
+        let cancelled = sample_active_turn("actor_human");
+        let cancelled_id = cancelled.id.clone();
+        let cancelled_run = cancelled.run_id.clone();
+        state.set_turn(cancelled);
+        state
+            .mark_cancel_requested(&scope_id, &cancelled_id)
+            .expect("cancel current run");
+        assert!(
+            state
+                .confirm_provider_started(&scope_id, &cancelled_run)
+                .is_none(),
+            "cancelled run must never be confirmed as provider-started"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -12651,6 +12957,54 @@ mod tests {
     }
 
     #[test]
+    fn failed_provider_start_makes_remembered_delivery_retryable() {
+        let root = temp_path("provider-start-retry");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        let state = WorkerState::new(
+            "actor_demo".into(),
+            sample_spec(None),
+            paths.profile.clone(),
+            paths,
+            "ws://127.0.0.1:0".into(),
+        );
+        let source_id = "msg_provider_start_failed";
+        let scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: "chan_provider_start_failed".into(),
+        };
+        let turn_key = turn_key_for_scope(&scope);
+        assert!(state.remember_source(source_id));
+        assert!(state.begin_or_enqueue(
+            &turn_key,
+            AgentTrigger::Message(sample_message(
+                source_id,
+                scope.clone(),
+                "#chan_provider_start_failed",
+                None,
+                None,
+            ))
+        ));
+        let mut active = sample_active_turn("actor_agent_sender");
+        active.id = "run_provider_start_failed".into();
+        active.run_id = active.id.clone();
+        active.scope = scope.clone();
+        active.turn_key = turn_key;
+        active.trigger_source_id = source_id.into();
+        active.trigger_source_ids = vec![source_id.into()];
+        state.set_turn(active);
+
+        assert!(state.has_active_trigger(source_id));
+        assert!(state.finish_and_next_batch(&scope.id, true).is_empty());
+
+        // The durable inbox sees an already-remembered source again after the
+        // failed turn is gone and must retry it instead of suppressing it.
+        assert!(!state.remember_source(source_id));
+        assert!(!state.has_active_trigger(source_id));
+        assert!(!state.has_pending_source(source_id));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn missing_scope_error_matches_stale_thread_delivery() {
         let err = anyhow!("rpc `run.open` failed: thread thread_f247db3313b9 (code -32000)");
 
@@ -12729,6 +13083,7 @@ mod tests {
             no_reply_file: None,
             no_reply_requested: false,
             cancel_requested: false,
+            provider_started: false,
         });
         let queued_channel = Event {
             id: "evt_channel_route".into(),
@@ -12817,6 +13172,7 @@ mod tests {
             no_reply_file: None,
             no_reply_requested: false,
             cancel_requested: false,
+            provider_started: false,
         });
 
         let service = Event {
@@ -12899,6 +13255,7 @@ mod tests {
             no_reply_file: None,
             no_reply_requested: false,
             cancel_requested: false,
+            provider_started: false,
         });
         assert_eq!(
             state
@@ -12926,6 +13283,7 @@ mod tests {
             no_reply_file: None,
             no_reply_requested: false,
             cancel_requested: false,
+            provider_started: false,
         });
         assert_eq!(
             state
@@ -12953,6 +13311,7 @@ mod tests {
             no_reply_file: None,
             no_reply_requested: false,
             cancel_requested: false,
+            provider_started: false,
         });
         assert!(state.clear_turn(&active_scope.id).is_none());
         std::fs::remove_dir_all(root).ok();
@@ -13009,6 +13368,7 @@ mod tests {
                 no_reply_file: None,
                 no_reply_requested: false,
                 cancel_requested: false,
+                provider_started: false,
             });
         };
 
@@ -13100,6 +13460,7 @@ mod tests {
             no_reply_file: None,
             no_reply_requested: false,
             cancel_requested: false,
+            provider_started: false,
         });
 
         assert!(!state.begin_or_enqueue(&turn_key, mk("msg_folded")));
@@ -13236,6 +13597,7 @@ mod tests {
             no_reply_file: None,
             no_reply_requested: false,
             cancel_requested: false,
+            provider_started: false,
         });
         assert!(!state.begin_or_enqueue(&turn_key, mk("msg_new")));
 
@@ -13302,6 +13664,7 @@ mod tests {
             no_reply_file: None,
             no_reply_requested: false,
             cancel_requested: false,
+            provider_started: false,
         });
         // A burst arrives while busy, followed by a non-coalescible event.
         assert!(!state.begin_or_enqueue(&turn_key, mk("msg_2")));
@@ -13339,6 +13702,7 @@ mod tests {
             no_reply_file: None,
             no_reply_requested: false,
             cancel_requested: false,
+            provider_started: false,
         });
         // Batched sources are visible for inbox dedupe.
         assert!(state.has_active_trigger("msg_3"));
@@ -13369,6 +13733,7 @@ mod tests {
             no_reply_file: None,
             no_reply_requested: false,
             cancel_requested: false,
+            provider_started: false,
         });
         assert!(state.finish_and_next_batch(&scope.id, true).is_empty());
         assert!(state.begin_or_enqueue(&turn_key, mk("msg_5")));

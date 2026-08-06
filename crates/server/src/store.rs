@@ -109,6 +109,7 @@ impl StoreEvent {
 struct Inner {
     actors: HashMap<String, Actor>,
     channels: HashMap<String, Channel>,
+    channels_by_title: HashMap<String, HashSet<String>>,
     channel_member_configs: HashMap<(String, String), ChannelMemberConfig>,
     actor_groups: HashMap<String, ActorGroup>,
     actor_presences: HashMap<(String, String), ActorPresence>,
@@ -156,8 +157,40 @@ struct Inner {
 pub struct Store {
     journal: Arc<Journal>,
     inner: RwLock<Inner>,
+    actor_upsert_lock: Mutex<()>,
     structure_lock: Mutex<()>,
     broadcaster: broadcast::Sender<StoreEvent>,
+}
+
+fn actors_equivalent_for_upsert(existing: &Actor, incoming: &Actor) -> bool {
+    if existing == incoming {
+        return true;
+    }
+    if existing.kind != ActorKind::Service || incoming.kind != ActorKind::Service {
+        return false;
+    }
+
+    let is_machine = |actor: &Actor| {
+        actor
+            ._meta
+            .as_ref()
+            .and_then(|meta| meta.get("role"))
+            .and_then(serde_json::Value::as_str)
+            == Some("machine")
+    };
+    if !is_machine(existing) || !is_machine(incoming) {
+        return false;
+    }
+
+    let mut existing = existing.clone();
+    let mut incoming = incoming.clone();
+    if let Some(meta) = existing._meta.as_mut() {
+        meta.remove("observedAt");
+    }
+    if let Some(meta) = incoming._meta.as_mut() {
+        meta.remove("observedAt");
+    }
+    existing == incoming
 }
 
 impl Store {
@@ -166,6 +199,7 @@ impl Store {
         let store = Arc::new(Self {
             journal: journal.clone(),
             inner: RwLock::new(Inner::default()),
+            actor_upsert_lock: Mutex::new(()),
             structure_lock: Mutex::new(()),
             broadcaster: tx,
         });
@@ -196,9 +230,40 @@ impl Store {
     // -------- Actors --------
 
     pub fn upsert_actor(&self, actor: Actor) -> StoreResult<Actor> {
+        if let Some(existing) = self.inner.read().actors.get(&actor.id) {
+            if actors_equivalent_for_upsert(existing, &actor) {
+                return Ok(existing.clone());
+            }
+        }
+
+        let _guard = self.actor_upsert_lock.lock();
+        if let Some(existing) = self.inner.read().actors.get(&actor.id) {
+            if actors_equivalent_for_upsert(existing, &actor) {
+                return Ok(existing.clone());
+            }
+        }
+
+        let started = std::time::Instant::now();
+        let append_started = std::time::Instant::now();
         self.journal.append(&Mutation::ActorUpsert(actor.clone()))?;
+        let journal_append_ms = append_started.elapsed().as_millis();
+        let lock_started = std::time::Instant::now();
         let mut inner = self.inner.write();
+        let lock_wait_ms = lock_started.elapsed().as_millis();
+        let mutate_started = std::time::Instant::now();
         inner.actors.insert(actor.id.clone(), actor.clone());
+        let mutate_elapsed_ms = mutate_started.elapsed().as_millis();
+        let total_elapsed_ms = started.elapsed().as_millis();
+        if journal_append_ms > 50 || lock_wait_ms > 50 || total_elapsed_ms > 100 {
+            tracing::warn!(
+                actor_id = %actor.id,
+                journal_append_ms,
+                lock_wait_ms,
+                mutate_elapsed_ms,
+                total_elapsed_ms,
+                "slow actor upsert store operation"
+            );
+        }
         Ok(actor)
     }
 
@@ -218,7 +283,24 @@ impl Store {
     }
 
     pub fn list_actors(&self) -> Vec<Actor> {
-        self.inner.read().actors.values().cloned().collect()
+        let started = std::time::Instant::now();
+        let lock_started = std::time::Instant::now();
+        let inner = self.inner.read();
+        let lock_wait_ms = lock_started.elapsed().as_millis();
+        let collect_started = std::time::Instant::now();
+        let actors = inner.actors.values().cloned().collect::<Vec<_>>();
+        let collect_elapsed_ms = collect_started.elapsed().as_millis();
+        let total_elapsed_ms = started.elapsed().as_millis();
+        if lock_wait_ms > 50 || total_elapsed_ms > 100 {
+            tracing::warn!(
+                actors = actors.len(),
+                lock_wait_ms,
+                collect_elapsed_ms,
+                total_elapsed_ms,
+                "slow actor list store operation"
+            );
+        }
+        actors
     }
 
     // -------- Channels --------
@@ -259,12 +341,40 @@ impl Store {
         };
         self.journal
             .append(&Mutation::ChannelCreate(channel.clone()))?;
-        self.inner
-            .write()
-            .channels
-            .insert(channel.id.clone(), channel.clone());
+        self.inner.write().insert_channel(channel.clone());
         self.emit(StoreEvent::ChannelCreated(channel.clone()));
         Ok(channel)
+    }
+
+    /// Return the existing public channel with this exact title, or create it.
+    ///
+    /// The structure lock keeps the lookup and append+apply pair atomic for
+    /// callers using this API. If historical duplicates exist, the lowest id
+    /// wins deterministically so every caller converges on the same channel.
+    pub fn ensure_public_channel(
+        &self,
+        title: String,
+        topic: String,
+    ) -> StoreResult<(Channel, bool)> {
+        let _guard = self.structure_lock.lock();
+        let existing = {
+            let inner = self.inner.read();
+            inner
+                .channels_by_title
+                .get(&title)
+                .into_iter()
+                .flat_map(|ids| ids.iter())
+                .filter_map(|id| inner.channels.get(id))
+                .filter(|channel| channel.visibility == ChannelVisibility::Public)
+                .min_by(|left, right| left.id.cmp(&right.id))
+                .cloned()
+        };
+        if let Some(channel) = existing {
+            return Ok((channel, false));
+        }
+
+        self.create_channel_with_topic(title, topic, None)
+            .map(|channel| (channel, true))
     }
 
     /// `true` when `actor_id` is allowed to read/write `channel_id`.
@@ -374,7 +484,38 @@ impl Store {
     }
 
     pub fn list_channels(&self) -> Vec<Channel> {
-        self.inner.read().channels.values().cloned().collect()
+        let started = std::time::Instant::now();
+        let lock_started = std::time::Instant::now();
+        let inner = self.inner.read();
+        let lock_wait_ms = lock_started.elapsed().as_millis();
+        let collect_started = std::time::Instant::now();
+        let channels = inner.channels.values().cloned().collect::<Vec<_>>();
+        let collect_elapsed_ms = collect_started.elapsed().as_millis();
+        let total_elapsed_ms = started.elapsed().as_millis();
+        if lock_wait_ms > 50 || total_elapsed_ms > 100 {
+            tracing::warn!(
+                channels = channels.len(),
+                lock_wait_ms,
+                collect_elapsed_ms,
+                total_elapsed_ms,
+                "slow channel list store operation"
+            );
+        }
+        channels
+    }
+
+    pub fn find_channels_by_title(&self, title: &str) -> Vec<Channel> {
+        let inner = self.inner.read();
+        let mut channels = inner
+            .channels_by_title
+            .get(title)
+            .into_iter()
+            .flat_map(|ids| ids.iter())
+            .filter_map(|id| inner.channels.get(id).cloned())
+            .collect::<Vec<_>>();
+        drop(inner);
+        channels.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+        channels
     }
 
     pub fn get_channel(&self, id: &str) -> Option<Channel> {
@@ -411,34 +552,93 @@ impl Store {
         Ok(configs)
     }
 
-    pub fn set_channel_member_workspace_dir(
+    pub fn set_channel_member_config(
         &self,
         channel_id: &str,
         actor_id: &str,
-        workspace_dir: String,
+        workspace_dir: Option<String>,
+        mention_ids: Option<Vec<String>>,
     ) -> StoreResult<ChannelMemberConfig> {
-        let workspace_dir = workspace_dir.trim().to_string();
-        if workspace_dir.is_empty() {
+        let _guard = self.structure_lock.lock();
+        let workspace_dir = match workspace_dir {
+            Some(value) => {
+                let value = value.trim().to_string();
+                if value.is_empty() {
+                    return Err(StoreError::InvalidState(
+                        "workspaceDir cannot be empty".into(),
+                    ));
+                }
+                if value.contains('\0') {
+                    return Err(StoreError::InvalidState(
+                        "workspaceDir cannot contain NUL bytes".into(),
+                    ));
+                }
+                Some(value)
+            }
+            None => None,
+        };
+        let mention_ids = mention_ids
+            .map(normalize_channel_member_mention_ids)
+            .transpose()?;
+        if workspace_dir.is_none() && mention_ids.is_none() {
             return Err(StoreError::InvalidState(
-                "workspaceDir cannot be empty".into(),
+                "workspaceDir or mentionIds is required".into(),
             ));
         }
-        if workspace_dir.contains('\0') {
-            return Err(StoreError::InvalidState(
-                "workspaceDir cannot contain NUL bytes".into(),
-            ));
-        }
-        {
+        let existing = {
             let inner = self.inner.read();
             if !inner.channels.contains_key(channel_id) {
                 return Err(StoreError::NotFound(format!("channel {channel_id}")));
             }
-            validate_channel_member_workspace_actor_inner(&inner, channel_id, actor_id)?;
+            if workspace_dir.is_some() {
+                validate_channel_member_workspace_actor_inner(&inner, channel_id, actor_id)?;
+            } else {
+                validate_channel_member_agent_inner(&inner, channel_id, actor_id)?;
+            }
+            if let Some(ref requested_ids) = mention_ids {
+                for config in inner.channel_member_configs.values() {
+                    if config.channel_id == channel_id
+                        && config.actor_id != actor_id
+                        && config
+                            .mention_ids
+                            .iter()
+                            .any(|id| requested_ids.iter().any(|requested| requested == id))
+                    {
+                        return Err(StoreError::Conflict(format!(
+                            "mentionId is already owned by actor {} in channel {}",
+                            config.actor_id, channel_id
+                        )));
+                    }
+                }
+            }
+            inner
+                .channel_member_configs
+                .get(&(channel_id.to_string(), actor_id.to_string()))
+                .cloned()
+        };
+        let effective_workspace_dir = workspace_dir.or_else(|| {
+            existing
+                .as_ref()
+                .and_then(|config| config.workspace_dir.clone())
+        });
+        let effective_mention_ids = mention_ids.unwrap_or_else(|| {
+            existing
+                .as_ref()
+                .map(|config| config.mention_ids.clone())
+                .unwrap_or_default()
+        });
+        if let Some(existing) = existing {
+            if existing.workspace_dir == effective_workspace_dir
+                && existing.mention_ids == effective_mention_ids
+            {
+                return Ok(existing);
+            }
         }
         let config = ChannelMemberConfig {
             channel_id: channel_id.to_string(),
             actor_id: actor_id.to_string(),
-            workspace_dir: Some(workspace_dir),
+            workspace_dir: effective_workspace_dir,
+            mention_ids: effective_mention_ids,
             updated_at: Utc::now(),
             _meta: None,
         };
@@ -451,6 +651,34 @@ impl Store {
         Ok(config)
     }
 
+    pub fn resolve_channel_member_mentions(
+        &self,
+        channel_id: &str,
+        mention_ids: &[String],
+    ) -> StoreResult<Vec<(String, Vec<String>)>> {
+        let requested = normalize_channel_member_mention_ids(mention_ids.to_vec())?;
+        let inner = self.inner.read();
+        if !inner.channels.contains_key(channel_id) {
+            return Err(StoreError::NotFound(format!("channel {channel_id}")));
+        }
+        let mut matches = inner
+            .channel_member_configs
+            .values()
+            .filter(|config| config.channel_id == channel_id)
+            .filter_map(|config| {
+                let matched = config
+                    .mention_ids
+                    .iter()
+                    .filter(|id| requested.iter().any(|requested_id| requested_id == *id))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (!matched.is_empty()).then(|| (config.actor_id.clone(), matched))
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(matches)
+    }
+
     pub fn clear_channel_member_config(
         &self,
         channel_id: &str,
@@ -461,7 +689,14 @@ impl Store {
             if !inner.channels.contains_key(channel_id) {
                 return Err(StoreError::NotFound(format!("channel {channel_id}")));
             }
-            validate_channel_member_workspace_actor_inner(&inner, channel_id, actor_id)?;
+            let existing = inner
+                .channel_member_configs
+                .get(&(channel_id.to_string(), actor_id.to_string()));
+            if existing.is_some_and(|config| config.workspace_dir.is_some()) {
+                validate_channel_member_workspace_actor_inner(&inner, channel_id, actor_id)?;
+            } else {
+                validate_channel_member_agent_inner(&inner, channel_id, actor_id)?;
+            }
         }
         let mutation = Mutation::ChannelMemberConfigDelete {
             channel_id: channel_id.to_string(),
@@ -706,20 +941,9 @@ impl Store {
             visibility,
         })?;
         let mut inner = self.inner.write();
-        let ch = inner
-            .channels
-            .get_mut(id)
+        let updated = inner
+            .update_channel(id, title, topic, visibility)
             .ok_or_else(|| StoreError::NotFound(format!("channel {id}")))?;
-        if let Some(title) = title {
-            ch.title = title;
-        }
-        if let Some(topic) = topic {
-            ch.topic = topic;
-        }
-        if let Some(visibility) = visibility {
-            ch.visibility = visibility;
-        }
-        let updated = ch.clone();
         drop(inner);
         self.emit(StoreEvent::ChannelUpdated(updated.clone()));
         Ok(updated)
@@ -816,8 +1040,14 @@ impl Store {
         })?;
         let removed = {
             let mut inner = self.inner.write();
-            let removed = inner.channels.remove(id).is_some();
+            let removed = inner.remove_channel(id).is_some();
+            inner
+                .channel_member_configs
+                .retain(|(config_channel_id, _), _| config_channel_id != id);
             inner.actor_groups.retain(|_, group| group.channel_id != id);
+            inner
+                .actor_presences
+                .retain(|_, presence| presence.channel_id != id);
             let task_ids: std::collections::HashSet<String> = inner
                 .tasks
                 .values()
@@ -4892,12 +5122,33 @@ impl Store {
     // -------- Machine commands --------
 
     pub fn upsert_machine_command(&self, command: MachineCommand) -> StoreResult<MachineCommand> {
+        let started = std::time::Instant::now();
+        let append_started = std::time::Instant::now();
         self.journal
             .append(&Mutation::MachineCommandUpsert(command.clone()))?;
+        let journal_append_ms = append_started.elapsed().as_millis();
+        let lock_started = std::time::Instant::now();
         let mut inner = self.inner.write();
+        let lock_wait_ms = lock_started.elapsed().as_millis();
+        let mutate_started = std::time::Instant::now();
         apply(&mut inner, Mutation::MachineCommandUpsert(command.clone()));
+        let mutate_elapsed_ms = mutate_started.elapsed().as_millis();
         drop(inner);
+        let emit_started = std::time::Instant::now();
         self.emit(StoreEvent::MachineCommandUpdated(command.clone()));
+        let emit_elapsed_ms = emit_started.elapsed().as_millis();
+        let total_elapsed_ms = started.elapsed().as_millis();
+        if journal_append_ms > 50 || lock_wait_ms > 50 || total_elapsed_ms > 100 {
+            tracing::warn!(
+                command_id = %command.command_id,
+                journal_append_ms,
+                lock_wait_ms,
+                mutate_elapsed_ms,
+                emit_elapsed_ms,
+                total_elapsed_ms,
+                "slow machine command upsert store operation"
+            );
+        }
         Ok(command)
     }
 
@@ -4913,9 +5164,12 @@ impl Store {
         requested_by: Option<&str>,
         limit: usize,
     ) -> Vec<MachineCommand> {
-        let mut rows: Vec<MachineCommand> = self
-            .inner
-            .read()
+        let started = std::time::Instant::now();
+        let lock_started = std::time::Instant::now();
+        let inner = self.inner.read();
+        let lock_wait_ms = lock_started.elapsed().as_millis();
+        let filter_started = std::time::Instant::now();
+        let mut rows: Vec<MachineCommand> = inner
             .machine_commands
             .values()
             .filter(|command| machine_id.is_none_or(|id| command.machine_id == id))
@@ -4924,12 +5178,31 @@ impl Store {
             .filter(|command| statuses.is_empty() || statuses.contains(&command.status))
             .cloned()
             .collect();
+        let filter_elapsed_ms = filter_started.elapsed().as_millis();
+        let sort_started = std::time::Instant::now();
         rows.sort_by(|a, b| {
             a.created_at
                 .cmp(&b.created_at)
                 .then_with(|| a.command_id.cmp(&b.command_id))
         });
         rows.truncate(limit);
+        let sort_elapsed_ms = sort_started.elapsed().as_millis();
+        let total_elapsed_ms = started.elapsed().as_millis();
+        if lock_wait_ms > 50 || total_elapsed_ms > 100 {
+            tracing::warn!(
+                machine_id = machine_id.unwrap_or("<any>"),
+                machine_actor_id = machine_actor_id.unwrap_or("<any>"),
+                requested_by = requested_by.unwrap_or("<any>"),
+                statuses = statuses.len(),
+                limit,
+                returned_commands = rows.len(),
+                lock_wait_ms,
+                filter_elapsed_ms,
+                sort_elapsed_ms,
+                total_elapsed_ms,
+                "slow machine command list store operation"
+            );
+        }
         rows
     }
 
@@ -5224,6 +5497,69 @@ fn normalize_instructions(instructions: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+impl Inner {
+    fn index_channel_title(&mut self, title: &str, channel_id: &str) {
+        self.channels_by_title
+            .entry(title.to_string())
+            .or_default()
+            .insert(channel_id.to_string());
+    }
+
+    fn deindex_channel_title(&mut self, title: &str, channel_id: &str) {
+        let should_remove = if let Some(ids) = self.channels_by_title.get_mut(title) {
+            ids.remove(channel_id);
+            ids.is_empty()
+        } else {
+            false
+        };
+        if should_remove {
+            self.channels_by_title.remove(title);
+        }
+    }
+
+    fn insert_channel(&mut self, channel: Channel) {
+        if let Some(previous) = self.channels.remove(&channel.id) {
+            self.deindex_channel_title(&previous.title, &previous.id);
+        }
+        self.index_channel_title(&channel.title, &channel.id);
+        self.channels.insert(channel.id.clone(), channel);
+    }
+
+    fn update_channel(
+        &mut self,
+        id: &str,
+        title: Option<String>,
+        topic: Option<String>,
+        visibility: Option<ChannelVisibility>,
+    ) -> Option<Channel> {
+        let old_title = self.channels.get(id)?.title.clone();
+        let updated = {
+            let channel = self.channels.get_mut(id)?;
+            if let Some(title) = title {
+                channel.title = title;
+            }
+            if let Some(topic) = topic {
+                channel.topic = topic;
+            }
+            if let Some(visibility) = visibility {
+                channel.visibility = visibility;
+            }
+            channel.clone()
+        };
+        if updated.title != old_title {
+            self.deindex_channel_title(&old_title, id);
+            self.index_channel_title(&updated.title, id);
+        }
+        Some(updated)
+    }
+
+    fn remove_channel(&mut self, id: &str) -> Option<Channel> {
+        let removed = self.channels.remove(id)?;
+        self.deindex_channel_title(&removed.title, &removed.id);
+        Some(removed)
+    }
+}
+
 fn apply(inner: &mut Inner, m: Mutation) {
     match m {
         Mutation::ActorUpsert(a) => {
@@ -5262,7 +5598,7 @@ fn apply(inner: &mut Inner, m: Mutation) {
             });
         }
         Mutation::ChannelCreate(c) => {
-            inner.channels.insert(c.id.clone(), c);
+            inner.insert_channel(c);
         }
         Mutation::ChannelMemberConfigUpsert(config) => {
             inner
@@ -5437,17 +5773,7 @@ fn apply(inner: &mut Inner, m: Mutation) {
             topic,
             visibility,
         } => {
-            if let Some(c) = inner.channels.get_mut(&channel_id) {
-                if let Some(title) = title {
-                    c.title = title;
-                }
-                if let Some(topic) = topic {
-                    c.topic = topic;
-                }
-                if let Some(visibility) = visibility {
-                    c.visibility = visibility;
-                }
-            }
+            inner.update_channel(&channel_id, title, topic, visibility);
         }
         Mutation::ChannelInstructionSet {
             channel_id,
@@ -5462,7 +5788,7 @@ fn apply(inner: &mut Inner, m: Mutation) {
             }
         }
         Mutation::ChannelDelete { channel_id } => {
-            inner.channels.remove(&channel_id);
+            inner.remove_channel(&channel_id);
             inner
                 .channel_member_configs
                 .retain(|(config_channel_id, _), _| config_channel_id != &channel_id);
@@ -5765,6 +6091,60 @@ fn validate_channel_member_workspace_actor_inner(
         )));
     }
     Ok(())
+}
+
+fn validate_channel_member_agent_inner(
+    inner: &Inner,
+    channel_id: &str,
+    actor_id: &str,
+) -> StoreResult<()> {
+    if !is_channel_member_inner(inner, channel_id, actor_id) {
+        return Err(StoreError::InvalidState(format!(
+            "actor {actor_id} is not a member of channel {channel_id}"
+        )));
+    }
+    let actor = inner
+        .actors
+        .get(actor_id)
+        .ok_or_else(|| StoreError::NotFound(format!("actor {actor_id}")))?;
+    if actor.kind != ActorKind::Agent {
+        return Err(StoreError::InvalidState(format!(
+            "actor {actor_id} is not an agent"
+        )));
+    }
+    Ok(())
+}
+
+fn normalize_channel_member_mention_ids(values: Vec<String>) -> StoreResult<Vec<String>> {
+    const MAX_MENTION_IDS: usize = 32;
+    const MAX_MENTION_ID_BYTES: usize = 512;
+
+    let mut normalized = Vec::new();
+    for value in values {
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        if value.contains('\0') {
+            return Err(StoreError::InvalidState(
+                "mentionIds cannot contain NUL bytes".into(),
+            ));
+        }
+        if value.len() > MAX_MENTION_ID_BYTES {
+            return Err(StoreError::InvalidState(format!(
+                "mentionId exceeds {MAX_MENTION_ID_BYTES} bytes"
+            )));
+        }
+        if !normalized.iter().any(|existing| existing == value) {
+            normalized.push(value.to_string());
+        }
+    }
+    if normalized.len() > MAX_MENTION_IDS {
+        return Err(StoreError::InvalidState(format!(
+            "mentionIds cannot contain more than {MAX_MENTION_IDS} values"
+        )));
+    }
+    Ok(normalized)
 }
 
 fn scope_channel_id_inner<'a>(inner: &'a Inner, scope: &'a ScopeRef) -> Option<&'a str> {
@@ -6448,6 +6828,215 @@ mod tests {
     }
 
     #[test]
+    fn identical_actor_upsert_does_not_append_duplicate_journal_record() {
+        let store = fresh_store();
+        let actor = Actor {
+            id: "actor_agent_stable".into(),
+            kind: ActorKind::Agent,
+            display_name: "Stable Agent".into(),
+            capabilities: None,
+            _meta: None,
+        };
+
+        store.upsert_actor(actor.clone()).expect("first upsert");
+        let first_journal = std::fs::read_to_string(store.journal.path()).expect("read journal");
+        assert_eq!(first_journal.lines().count(), 1);
+
+        store.upsert_actor(actor.clone()).expect("identical upsert");
+        let unchanged_journal =
+            std::fs::read_to_string(store.journal.path()).expect("read unchanged journal");
+        assert_eq!(unchanged_journal.lines().count(), 1);
+
+        let mut changed = actor;
+        changed.display_name = "Renamed Agent".into();
+        store.upsert_actor(changed).expect("changed upsert");
+        let changed_journal =
+            std::fs::read_to_string(store.journal.path()).expect("read changed journal");
+        assert_eq!(changed_journal.lines().count(), 2);
+        assert_eq!(
+            store
+                .get_actor("actor_agent_stable")
+                .expect("stored actor")
+                .display_name,
+            "Renamed Agent"
+        );
+    }
+
+    #[test]
+    fn machine_actor_observed_at_change_does_not_append_journal_record() {
+        let store = fresh_store();
+        let actor = Actor {
+            id: "actor_machine_stable".into(),
+            kind: ActorKind::Service,
+            display_name: "Stable Machine".into(),
+            capabilities: None,
+            _meta: Some(BTreeMap::from([
+                ("role".into(), serde_json::json!("machine")),
+                ("revision".into(), serde_json::json!(1)),
+                (
+                    "observedAt".into(),
+                    serde_json::json!("2026-07-28T00:00:00Z"),
+                ),
+            ])),
+        };
+
+        store.upsert_actor(actor.clone()).expect("first upsert");
+
+        let mut heartbeat = actor.clone();
+        heartbeat._meta.as_mut().expect("machine metadata").insert(
+            "observedAt".into(),
+            serde_json::json!("2026-07-28T00:00:15Z"),
+        );
+        let unchanged = store.upsert_actor(heartbeat).expect("heartbeat upsert");
+        assert_eq!(unchanged, actor);
+        let heartbeat_journal =
+            std::fs::read_to_string(store.journal.path()).expect("read heartbeat journal");
+        assert_eq!(heartbeat_journal.lines().count(), 1);
+
+        let mut changed = actor;
+        changed
+            ._meta
+            .as_mut()
+            .expect("machine metadata")
+            .insert("revision".into(), serde_json::json!(2));
+        store
+            .upsert_actor(changed)
+            .expect("changed inventory upsert");
+        let changed_journal =
+            std::fs::read_to_string(store.journal.path()).expect("read changed journal");
+        assert_eq!(changed_journal.lines().count(), 2);
+    }
+
+    #[test]
+    fn concurrent_identical_actor_upserts_append_once() {
+        let store = fresh_store();
+        let actor = Actor {
+            id: "actor_agent_concurrent".into(),
+            kind: ActorKind::Agent,
+            display_name: "Concurrent Agent".into(),
+            capabilities: None,
+            _meta: None,
+        };
+        let worker_count = 16;
+        let barrier = Arc::new(Barrier::new(worker_count));
+        let mut workers = Vec::new();
+        for _ in 0..worker_count {
+            let store = store.clone();
+            let actor = actor.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                store.upsert_actor(actor).expect("concurrent upsert");
+            }));
+        }
+        for worker in workers {
+            worker.join().expect("join concurrent upsert");
+        }
+
+        let journal = std::fs::read_to_string(store.journal.path()).expect("read journal");
+        assert_eq!(journal.lines().count(), 1);
+    }
+
+    #[test]
+    fn concurrent_public_channel_ensure_creates_once() {
+        let store = fresh_store();
+        let worker_count = 16;
+        let barrier = Arc::new(Barrier::new(worker_count));
+        let mut workers = Vec::new();
+        for _ in 0..worker_count {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                store
+                    .ensure_public_channel("shared group".into(), String::new())
+                    .expect("ensure public channel")
+            }));
+        }
+
+        let mut channel_ids = Vec::new();
+        let mut created_count = 0;
+        for worker in workers {
+            let (channel, created) = worker.join().expect("join channel ensure");
+            channel_ids.push(channel.id);
+            created_count += usize::from(created);
+        }
+
+        channel_ids.sort();
+        channel_ids.dedup();
+        assert_eq!(channel_ids.len(), 1);
+        assert_eq!(created_count, 1);
+        assert_eq!(store.find_channels_by_title("shared group").len(), 1);
+        let journal = std::fs::read_to_string(store.journal.path()).expect("read journal");
+        assert_eq!(journal.lines().count(), 1);
+    }
+
+    #[test]
+    fn public_channel_ensure_ignores_same_title_private_channel() {
+        let store = fresh_store();
+        let private = store
+            .create_channel("shared group".into(), Some("actor_owner".into()))
+            .expect("create private channel");
+
+        let (public, created) = store
+            .ensure_public_channel("shared group".into(), String::new())
+            .expect("ensure public channel");
+        let (same_public, created_again) = store
+            .ensure_public_channel("shared group".into(), "ignored topic".into())
+            .expect("ensure existing public channel");
+
+        assert!(created);
+        assert!(!created_again);
+        assert_ne!(public.id, private.id);
+        assert_eq!(same_public.id, public.id);
+        assert_eq!(public.visibility, ChannelVisibility::Public);
+    }
+
+    #[test]
+    fn channel_title_index_updates_and_replays() {
+        let store = fresh_store();
+        let first = store
+            .create_channel("same".into(), None)
+            .expect("create first");
+        let second = store
+            .create_channel("same".into(), None)
+            .expect("create second");
+
+        let ids = store
+            .find_channels_by_title("same")
+            .into_iter()
+            .map(|channel| channel.id)
+            .collect::<Vec<_>>();
+        let mut expected = vec![first.id.clone(), second.id.clone()];
+        expected.sort();
+        assert_eq!(ids, expected);
+        assert_eq!(
+            store
+                .find_channels_by_title("same")
+                .into_iter()
+                .map(|channel| channel.id)
+                .collect::<Vec<_>>(),
+            expected
+        );
+
+        store
+            .update_channel(&first.id, Some("renamed".into()), None, None)
+            .expect("rename channel");
+        assert_eq!(store.find_channels_by_title("same").len(), 1);
+        assert_eq!(store.find_channels_by_title("renamed").len(), 1);
+
+        let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
+        let replayed = Store::open(journal).unwrap();
+        assert_eq!(replayed.find_channels_by_title("same").len(), 1);
+        assert_eq!(replayed.find_channels_by_title("renamed")[0].id, first.id);
+
+        replayed
+            .delete_channel(&second.id, false)
+            .expect("delete second");
+        assert!(replayed.find_channels_by_title("same").is_empty());
+    }
+
+    #[test]
     fn delete_actor_removes_actor_and_channel_membership_on_replay() {
         let store = fresh_store();
         let actor = Actor {
@@ -6501,9 +7090,15 @@ mod tests {
             .expect("grant agent");
 
         let config = store
-            .set_channel_member_workspace_dir(&channel.id, "actor_agent", "F:/work/demo".into())
+            .set_channel_member_config(
+                &channel.id,
+                "actor_agent",
+                Some("F:/work/demo".into()),
+                Some(vec!["external-agent".into()]),
+            )
             .expect("set config");
         assert_eq!(config.workspace_dir.as_deref(), Some("F:/work/demo"));
+        assert_eq!(config.mention_ids, vec!["external-agent"]);
 
         let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
         let replayed = Store::open(journal).unwrap();
@@ -6512,6 +7107,12 @@ mod tests {
                 .get_channel_member_config(&channel.id, "actor_agent")
                 .and_then(|config| config.workspace_dir),
             Some("F:/work/demo".into())
+        );
+        assert_eq!(
+            replayed
+                .get_channel_member_config(&channel.id, "actor_agent")
+                .map(|config| config.mention_ids),
+            Some(vec!["external-agent".into()])
         );
 
         replayed
@@ -7827,10 +8428,7 @@ mod tests {
             .set_thread_instructions(&thread.id, Some("thread guide".into()), "actor_owner")
             .expect("set thread instructions");
         assert_eq!(set.instructions.as_deref(), Some("thread guide"));
-        assert_eq!(
-            set.instructions_modified_by.as_deref(),
-            Some("actor_owner")
-        );
+        assert_eq!(set.instructions_modified_by.as_deref(), Some("actor_owner"));
         assert!(set.instructions_modified_at.is_some());
 
         let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();

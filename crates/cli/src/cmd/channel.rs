@@ -27,8 +27,42 @@ pub async fn create(
     Ok(())
 }
 
+pub async fn ensure_public(client: Arc<Client>, title: String) -> Result<()> {
+    let res: ChannelEnsurePublicResult = client
+        .call(method::CHANNEL_ENSURE_PUBLIC, json!({ "title": title }))
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+    } else {
+        println!(
+            "channel {}\t{}\t{}",
+            res.channel.id,
+            res.channel.title,
+            if res.created { "created" } else { "existing" }
+        );
+    }
+    Ok(())
+}
+
 pub async fn list(client: Arc<Client>) -> Result<()> {
     let res: ChannelListResult = client.call(method::CHANNEL_LIST, json!({})).await?;
+    if render::is_json() {
+        render::print_json(&res);
+        return Ok(());
+    }
+    if res.channels.is_empty() {
+        println!("(no channels)");
+    }
+    for c in res.channels {
+        println!("{}\t{}", c.id, c.title);
+    }
+    Ok(())
+}
+
+pub async fn lookup(client: Arc<Client>, title: String) -> Result<()> {
+    let res: ChannelLookupResult = client
+        .call(method::CHANNEL_LOOKUP, json!({ "title": title }))
+        .await?;
     if render::is_json() {
         render::print_json(&res);
         return Ok(());
@@ -200,8 +234,10 @@ pub async fn member_config_set(
     client: Arc<Client>,
     channel_id: String,
     actor_id: String,
-    workspace_dir: String,
+    workspace_dir: Option<String>,
+    mention_ids: Vec<String>,
 ) -> Result<()> {
+    let mention_ids = (!mention_ids.is_empty()).then_some(mention_ids);
     let res: ChannelMemberConfigSetResult = client
         .call(
             method::CHANNEL_MEMBER_CONFIG_SET,
@@ -209,6 +245,7 @@ pub async fn member_config_set(
                 "channelId": channel_id,
                 "actorId": actor_id,
                 "workspaceDir": workspace_dir,
+                "mentionIds": mention_ids,
             }),
         )
         .await?;
@@ -216,10 +253,43 @@ pub async fn member_config_set(
         render::print_json(&res);
     } else {
         println!(
-            "workspace override set for {}: {}",
+            "member config set for {}: workspace={}, mentionIds={}",
             res.config.actor_id,
-            res.config.workspace_dir.as_deref().unwrap_or("(default)")
+            res.config.workspace_dir.as_deref().unwrap_or("(default)"),
+            res.config.mention_ids.len()
         );
+    }
+    Ok(())
+}
+
+pub async fn member_resolve(
+    client: Arc<Client>,
+    channel_id: String,
+    mention_ids: Vec<String>,
+) -> Result<()> {
+    let res: ChannelMemberResolveResult = client
+        .call(
+            method::CHANNEL_MEMBER_RESOLVE,
+            json!({
+                "channelId": channel_id,
+                "mentionIds": mention_ids,
+            }),
+        )
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+        return Ok(());
+    }
+    for member in res.members {
+        println!(
+            "{}\t{}\t{}",
+            member.actor.id,
+            member.actor.display_name,
+            member.mention_ids.join(",")
+        );
+    }
+    if !res.unresolved_mention_ids.is_empty() {
+        println!("unresolved\t{}", res.unresolved_mention_ids.join(","));
     }
     Ok(())
 }

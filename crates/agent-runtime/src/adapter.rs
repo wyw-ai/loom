@@ -29,10 +29,12 @@ pub trait Adapter: Send + Sync {
         events: mpsc::UnboundedSender<AdapterEvent>,
     ) -> Result<AdapterStartInfo, String>;
 
-    /// Forward a single prompt to the agent in the given scope. Each distinct
-    /// `scope` is conceptually its own conversation: ACP allocates one
-    /// `session/new` per scope with the supplied `cwd`; command transport
-    /// starts its one-shot subprocess in the supplied `cwd`.
+    /// Forward a single prompt to the agent in the given scope. Returns only
+    /// after the provider has accepted the prompt execution boundary, not when
+    /// the provider eventually finishes it. Each distinct `scope` is
+    /// conceptually its own conversation: ACP allocates one `session/new` per
+    /// scope with the supplied `cwd`; command transport starts its one-shot
+    /// subprocess in the supplied `cwd`.
     async fn send_prompt(&self, prompt: AdapterPrompt) -> Result<(), String>;
 
     /// Reply to an `AdapterEvent::ActionRequest` previously emitted by the agent.

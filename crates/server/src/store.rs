@@ -506,13 +506,16 @@ impl Store {
 
     pub fn find_channels_by_title(&self, title: &str) -> Vec<Channel> {
         let inner = self.inner.read();
-        inner
+        let mut channels = inner
             .channels_by_title
             .get(title)
             .into_iter()
             .flat_map(|ids| ids.iter())
             .filter_map(|id| inner.channels.get(id).cloned())
-            .collect()
+            .collect::<Vec<_>>();
+        drop(inner);
+        channels.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+        channels
     }
 
     pub fn get_channel(&self, id: &str) -> Option<Channel> {
@@ -6999,15 +7002,22 @@ mod tests {
             .create_channel("same".into(), None)
             .expect("create second");
 
-        let mut ids = store
+        let ids = store
             .find_channels_by_title("same")
             .into_iter()
             .map(|channel| channel.id)
             .collect::<Vec<_>>();
-        ids.sort();
         let mut expected = vec![first.id.clone(), second.id.clone()];
         expected.sort();
         assert_eq!(ids, expected);
+        assert_eq!(
+            store
+                .find_channels_by_title("same")
+                .into_iter()
+                .map(|channel| channel.id)
+                .collect::<Vec<_>>(),
+            expected
+        );
 
         store
             .update_channel(&first.id, Some("renamed".into()), None, None)

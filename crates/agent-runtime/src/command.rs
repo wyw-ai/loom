@@ -4253,6 +4253,24 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn large_prompt_is_delivered_via_stdin_without_e2big() {
+        let mut cfg = cfg();
+        cfg.command = "sh".into();
+        cfg.args = vec!["-c".into(), "wc -c".into()];
+        cfg.prompt_via = PromptVia::Stdin;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let slot = Arc::new(Mutex::new(InFlight::default()));
+        let long_prompt = "x".repeat(256 * 1024);
+
+        let outcome = spawn_and_collect(&cfg, &prompt(&long_prompt), &cfg.args, None, &tx, &slot)
+            .expect("large stdin prompt must spawn");
+
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(outcome.stdout.trim(), long_prompt.len().to_string());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn failed_command_summary_prefers_runtime_error_over_stdin_write_error() {
         let error_line = serde_json::json!({
             "statusCode": 429,

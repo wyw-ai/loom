@@ -131,8 +131,7 @@
           ],
           "when": "model"
         },
-        "-p",
-        "{prompt.full}"
+        "--print"
       ],
       "command": "{bin}",
       "session": {
@@ -156,11 +155,11 @@
             ],
             "when": "model"
           },
-          "-p",
-          "{prompt.full}"
+          "--print"
         ],
         "scope": "actor_scope"
       },
+      "stdin": "{prompt.full}",
       "stdout": {
         "events": [],
         "format": "builtin",

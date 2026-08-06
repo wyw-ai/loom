@@ -2399,8 +2399,7 @@ fn claude_manifest() -> ProviderManifest {
         lit("--session-id"),
         lit("{session.id}"),
         when("model", vec![lit("--model"), lit("{model}")]),
-        lit("-p"),
-        lit("{prompt.full}"),
+        lit("--print"),
     ];
     let resume_args = vec![
         lit("--add-dir"),
@@ -2415,15 +2414,19 @@ fn claude_manifest() -> ProviderManifest {
         lit("--resume"),
         lit("{session.id}"),
         when("model", vec![lit("--model"), lit("{model}")]),
-        lit("-p"),
-        lit("{prompt.full}"),
+        lit("--print"),
     ];
     let session = ProviderSessionSpec {
         id_source: Some(ProviderSessionIdSource::LoomUuid),
         resume_args,
         scope: Some("actor_scope".into()),
     };
-    let print_mode = mode("{bin}", first_args, "claude_stream_json", Some(session));
+    let mut print_mode = mode("{bin}", first_args, "claude_stream_json", Some(session));
+    // Claude's --print mode reads the prompt from stdin when no positional
+    // prompt is supplied. Keep large Loom turn contexts out of argv: Linux
+    // limits each execve argument to roughly 128 KiB even when ARG_MAX is
+    // much larger.
+    print_mode.stdin = Some("{prompt.full}".into());
     let nonprint_mode = ProviderModeSpec {
         transport: "interactive_command".into(),
         command: "{bin}".into(),
@@ -3955,7 +3958,7 @@ mod tests {
     }
 
     #[test]
-    fn builtin_claude_uses_full_prompt_without_system_append() {
+    fn builtin_claude_uses_full_prompt_via_stdin_without_system_append() {
         let dir = temp_dir("path");
         make_executable(&dir.join("claude"));
         let registry = ProviderRegistry::load(&temp_dir("config")).expect("registry");
@@ -3981,7 +3984,9 @@ mod tests {
         assert!(!transport.args.contains(&"--append-system-prompt".into()));
         assert!(!transport.args.contains(&"{prompt.system}".into()));
         assert!(!transport.args.contains(&"{prompt.user}".into()));
-        assert!(transport.args.contains(&"{prompt.full}".into()));
+        assert!(!transport.args.contains(&"{prompt.full}".into()));
+        assert!(transport.args.contains(&"--print".into()));
+        assert_eq!(transport.stdin.as_deref(), Some("{prompt.full}"));
         assert!(transport.args.contains(&"{agent.configDir}".into()));
         assert!(transport.args.contains(&"{agent.skillWorkspace}".into()));
         assert!(!transport.args.contains(&"{loom.configDir}".into()));

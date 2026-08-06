@@ -8214,10 +8214,7 @@ async fn resolve_channel_for_scope(
             {
                 return Some(cached);
             }
-            let channel_id = get_thread_by_id(client, &scope.id)
-                .await
-                .ok()??
-                .channel_id;
+            let channel_id = get_thread_by_id(client, &scope.id).await.ok()??.channel_id;
             state
                 .scope_channel_cache
                 .lock()
@@ -9623,10 +9620,9 @@ mod tests {
     #[tokio::test]
     async fn thread_message_target_uses_exact_thread_get_rpc() {
         let rpc_root = tempfile::tempdir().expect("file rpc root");
-        let client =
-            Client::connect(&format!("file-rpc://{}", rpc_root.path().display()))
-                .await
-                .expect("connect file rpc client");
+        let client = Client::connect(&format!("file-rpc://{}", rpc_root.path().display()))
+            .await
+            .expect("connect file rpc client");
         client.set_rpc_timeout_ms(2_000);
 
         let client_dir = std::fs::read_dir(rpc_root.path().join("clients"))

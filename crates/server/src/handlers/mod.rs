@@ -59,8 +59,7 @@ pub async fn dispatch(
     method: &str,
     params: Option<Value>,
 ) -> HandlerResult {
-    let started = std::time::Instant::now();
-    let result = match method {
+    match method {
         method::INITIALIZE => initialize(params),
         method::CONNECTION_OPEN => connection_open(state, connection_id, params),
         method::CONNECTION_CLOSE => connection_close(state, params),
@@ -68,7 +67,7 @@ pub async fn dispatch(
         method::SCOPE_SUBSCRIBE => scope_subscribe(state, connection_id, params),
         method::SCOPE_UNSUBSCRIBE => scope_unsubscribe(state, connection_id, params),
         method::CHANNEL_CREATE => channel_create(state, connection_id, params),
-        method::CHANNEL_ENSURE_PUBLIC => channel_ensure_public(state, params),
+        method::CHANNEL_ENSURE_PUBLIC => channel_ensure_public(state, connection_id, params),
         method::CHANNEL_LIST => channel_list(state, connection_id),
         method::CHANNEL_LOOKUP => channel_lookup(state, connection_id, params),
         method::CHANNEL_UPDATE => channel_update(state, params),
@@ -191,15 +190,7 @@ pub async fn dispatch(
             ErrorCode::METHOD_NOT_FOUND,
             format!("unknown method `{}`", other),
         )),
-    };
-    tracing::info!(
-        connection_id,
-        method,
-        ok = result.is_ok(),
-        elapsed_ms = started.elapsed().as_millis(),
-        "rpc handler dispatch complete"
-    );
-    result
+    }
 }
 
 // ---- initialize ----
@@ -417,8 +408,13 @@ fn channel_create(state: &AppState, connection_id: &str, params: Option<Value>) 
     ok(ChannelCreateResult { channel })
 }
 
-fn channel_ensure_public(state: &AppState, params: Option<Value>) -> HandlerResult {
+fn channel_ensure_public(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
     let p: ChannelEnsurePublicParams = parse_params(params)?;
+    caller_actor(state, connection_id)?;
     if p.title.trim().is_empty() {
         return Err(ErrorObject::new(
             ErrorCode::INVALID_PARAMS,
@@ -454,17 +450,11 @@ fn channel_list(state: &AppState, connection_id: &str) -> HandlerResult {
 }
 
 fn channel_lookup(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
-    let started = std::time::Instant::now();
     let p: ChannelLookupParams = parse_params(params)?;
-    let actor_started = std::time::Instant::now();
     let caller = state.subscriptions.actor_for_connection(connection_id);
-    let actor_lookup_elapsed_ms = actor_started.elapsed().as_millis();
-    let store_started = std::time::Instant::now();
-    let matched = state.store.find_channels_by_title(&p.title);
-    let store_lookup_elapsed_ms = store_started.elapsed().as_millis();
-    let matched_channels = matched.len();
-    let filter_started = std::time::Instant::now();
-    let channels: Vec<Channel> = matched
+    let channels = state
+        .store
+        .find_channels_by_title(&p.title)
         .into_iter()
         .filter(|c| match c.visibility {
             ChannelVisibility::Public => true,
@@ -474,18 +464,6 @@ fn channel_lookup(state: &AppState, connection_id: &str, params: Option<Value>) 
             },
         })
         .collect();
-    tracing::info!(
-        connection_id,
-        title = %p.title,
-        caller = caller.as_deref().unwrap_or("<none>"),
-        matched_channels,
-        returned_channels = channels.len(),
-        actor_lookup_elapsed_ms,
-        store_lookup_elapsed_ms,
-        visibility_filter_elapsed_ms = filter_started.elapsed().as_millis(),
-        total_elapsed_ms = started.elapsed().as_millis(),
-        "channel lookup handler complete"
-    );
     ok(ChannelLookupResult { channels })
 }
 
@@ -3686,7 +3664,7 @@ mod tests {
             &state,
             "conn_alice",
             method::CHANNEL_ENSURE_PUBLIC,
-            Some(json!({ "title": "DingTalk group" })),
+            Some(json!({ "title": "External group" })),
         )
         .await
         .expect("first channel ensure");
@@ -3697,7 +3675,7 @@ mod tests {
             &state,
             "conn_alice",
             method::CHANNEL_ENSURE_PUBLIC,
-            Some(json!({ "title": "DingTalk group" })),
+            Some(json!({ "title": "External group" })),
         )
         .await
         .expect("second channel ensure");
@@ -3708,6 +3686,26 @@ mod tests {
         assert!(!second.created);
         assert_eq!(second.channel.id, first.channel.id);
         assert_eq!(second.channel.visibility, ChannelVisibility::Public);
+    }
+
+    #[tokio::test]
+    async fn channel_ensure_public_requires_bound_actor() {
+        let state = fresh_state("channel_ensure_public_requires_bound_actor");
+
+        let error = dispatch(
+            &state,
+            "conn_unbound",
+            method::CHANNEL_ENSURE_PUBLIC,
+            Some(json!({ "title": "External group" })),
+        )
+        .await
+        .expect_err("unbound callers must not create public channels");
+
+        assert_eq!(error.code, ErrorCode::APP_INVALID_STATE);
+        assert!(state
+            .store
+            .find_channels_by_title("External group")
+            .is_empty());
     }
 
     #[tokio::test]
@@ -3816,7 +3814,7 @@ mod tests {
             &state,
             "conn_owner",
             method::CHANNEL_CREATE,
-            Some(json!({ "title": "dingtalk-group" })),
+            Some(json!({ "title": "external-group" })),
         )
         .await
         .expect("channel/create");
@@ -3843,7 +3841,7 @@ mod tests {
             Some(json!({
                 "channelId": &created.channel.id,
                 "actorId": "actor_agent_a",
-                "mentionIds": ["dingtalk-a"],
+                "mentionIds": ["external-a"],
             })),
         )
         .await
@@ -3855,7 +3853,7 @@ mod tests {
             Some(json!({
                 "channelId": &created.channel.id,
                 "actorId": "actor_agent_b",
-                "mentionIds": ["dingtalk-b", " dingtalk-b "],
+                "mentionIds": ["external-b", " external-b "],
             })),
         )
         .await
@@ -3867,7 +3865,7 @@ mod tests {
             method::CHANNEL_MEMBER_RESOLVE,
             Some(json!({
                 "channelId": &created.channel.id,
-                "mentionIds": ["dingtalk-b", "unknown", "dingtalk-a"],
+                "mentionIds": ["external-b", "unknown", "external-a"],
             })),
         )
         .await
@@ -3876,9 +3874,9 @@ mod tests {
             serde_json::from_value(resolved_value).expect("resolve result");
         assert_eq!(resolved.members.len(), 2);
         assert_eq!(resolved.members[0].actor.id, "actor_agent_a");
-        assert_eq!(resolved.members[0].mention_ids, vec!["dingtalk-a"]);
+        assert_eq!(resolved.members[0].mention_ids, vec!["external-a"]);
         assert_eq!(resolved.members[1].actor.id, "actor_agent_b");
-        assert_eq!(resolved.members[1].mention_ids, vec!["dingtalk-b"]);
+        assert_eq!(resolved.members[1].mention_ids, vec!["external-b"]);
         assert_eq!(resolved.unresolved_mention_ids, vec!["unknown"]);
 
         let spoof_err = dispatch(
@@ -3902,7 +3900,7 @@ mod tests {
             Some(json!({
                 "channelId": &created.channel.id,
                 "actorId": "actor_agent_b",
-                "mentionIds": ["dingtalk-a"],
+                "mentionIds": ["external-a"],
             })),
         )
         .await
@@ -3918,7 +3916,7 @@ mod tests {
             &state,
             "conn_agent",
             method::CHANNEL_CREATE,
-            Some(json!({ "title": "public-dingtalk-group", "public": true })),
+            Some(json!({ "title": "public-external-group", "public": true })),
         )
         .await
         .expect("public channel/create");
@@ -3933,7 +3931,7 @@ mod tests {
             Some(json!({
                 "channelId": &created.channel.id,
                 "actorId": "actor_agent",
-                "mentionIds": ["dingtalk-agent"],
+                "mentionIds": ["external-agent"],
             })),
         )
         .await
@@ -3947,7 +3945,7 @@ mod tests {
             Some(json!({
                 "channelId": &created.channel.id,
                 "actorId": "actor_agent",
-                "mentionIds": ["dingtalk-agent"],
+                "mentionIds": ["external-agent"],
             })),
         )
         .await
@@ -3961,7 +3959,7 @@ mod tests {
                 .store
                 .get_channel_member_config(&created.channel.id, "actor_agent")
                 .map(|config| config.mention_ids),
-            Some(vec!["dingtalk-agent".into()])
+            Some(vec!["external-agent".into()])
         );
     }
 
@@ -5813,15 +5811,15 @@ mod tests {
         let state = fresh_state("channel-lookup-title");
         let public_match = state
             .store
-            .create_channel("DingTalk cid-1".into(), None)
+            .create_channel("External cid-1".into(), None)
             .expect("create public match");
         state
             .store
-            .create_channel("DingTalk cid-2".into(), None)
+            .create_channel("External cid-2".into(), None)
             .expect("create public non-match");
         state
             .store
-            .create_channel("DingTalk cid-1".into(), Some("actor_owner".into()))
+            .create_channel("External cid-1".into(), Some("actor_owner".into()))
             .expect("create private match");
         open_conn(&state, "conn_caller", "actor_caller").await;
 
@@ -5829,7 +5827,7 @@ mod tests {
             &state,
             "conn_caller",
             method::CHANNEL_LOOKUP,
-            Some(json!({ "title": "DingTalk cid-1" })),
+            Some(json!({ "title": "External cid-1" })),
         )
         .await
         .expect("lookup should succeed");
@@ -5837,7 +5835,7 @@ mod tests {
 
         assert_eq!(result.channels.len(), 1);
         assert_eq!(result.channels[0].id, public_match.id);
-        assert_eq!(result.channels[0].title, "DingTalk cid-1");
+        assert_eq!(result.channels[0].title, "External cid-1");
     }
 
     #[tokio::test]
@@ -6746,6 +6744,49 @@ mod tests {
             connections.actor_ids,
             vec!["actor_service_machine_remote".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn agent_observer_connection_creates_agent_without_claiming_inbox() {
+        let state = fresh_state("agent-observer");
+        open_conn(&state, "conn_owner", "actor_human").await;
+
+        let (observer_tx, _observer_rx) = mpsc::unbounded_channel();
+        state.subscriptions.add_connection(Connection {
+            id: "conn_agent_observer".into(),
+            actor_id: None,
+            tx: observer_tx,
+        });
+        dispatch(
+            &state,
+            "conn_agent_observer",
+            method::CONNECTION_OPEN,
+            Some(json!({
+                "actorId": "actor_agent",
+                "actorKind": "agent",
+                "claimInbox": false
+            })),
+        )
+        .await
+        .expect("agent observer connection/open");
+
+        let actor = state
+            .store
+            .get_actor("actor_agent")
+            .expect("agent actor created");
+        assert_eq!(actor.kind, ActorKind::Agent);
+
+        let value = dispatch(
+            &state,
+            "conn_owner",
+            method::CONNECTION_LIST,
+            Some(json!({ "actorIds": ["actor_agent"] })),
+        )
+        .await
+        .expect("connection/list without inbox owner");
+        let connections: ConnectionListResult =
+            serde_json::from_value(value).expect("decode connection/list");
+        assert!(connections.actor_ids.is_empty());
     }
 
     #[tokio::test]

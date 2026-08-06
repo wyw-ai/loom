@@ -505,28 +505,14 @@ impl Store {
     }
 
     pub fn find_channels_by_title(&self, title: &str) -> Vec<Channel> {
-        let lock_started = std::time::Instant::now();
         let inner = self.inner.read();
-        let lock_wait_ms = lock_started.elapsed().as_millis();
-        let lookup_started = std::time::Instant::now();
-        let ids = inner
+        inner
             .channels_by_title
             .get(title)
-            .map(|ids| ids.iter().cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
-        let channels = ids
-            .iter()
+            .into_iter()
+            .flat_map(|ids| ids.iter())
             .filter_map(|id| inner.channels.get(id).cloned())
-            .collect::<Vec<_>>();
-        tracing::info!(
-            title,
-            matched_ids = ids.len(),
-            returned_channels = channels.len(),
-            lock_wait_ms,
-            lookup_elapsed_ms = lookup_started.elapsed().as_millis(),
-            "channel title index lookup complete"
-        );
-        channels
+            .collect()
     }
 
     pub fn get_channel(&self, id: &str) -> Option<Channel> {
@@ -7098,11 +7084,11 @@ mod tests {
                 &channel.id,
                 "actor_agent",
                 Some("F:/work/demo".into()),
-                Some(vec!["dingtalk-agent".into()]),
+                Some(vec!["external-agent".into()]),
             )
             .expect("set config");
         assert_eq!(config.workspace_dir.as_deref(), Some("F:/work/demo"));
-        assert_eq!(config.mention_ids, vec!["dingtalk-agent"]);
+        assert_eq!(config.mention_ids, vec!["external-agent"]);
 
         let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
         let replayed = Store::open(journal).unwrap();
@@ -7116,7 +7102,7 @@ mod tests {
             replayed
                 .get_channel_member_config(&channel.id, "actor_agent")
                 .map(|config| config.mention_ids),
-            Some(vec!["dingtalk-agent".into()])
+            Some(vec!["external-agent".into()])
         );
 
         replayed

@@ -242,9 +242,6 @@ async fn handle_text_frame(
     tx: &mpsc::UnboundedSender<String>,
     text: String,
 ) {
-    let frame_started = std::time::Instant::now();
-    let inbound_bytes = text.len();
-    let parse_started = std::time::Instant::now();
     let envelope = match serde_json::from_str::<RpcEnvelope>(&text) {
         Ok(e) => e,
         Err(e) => {
@@ -252,79 +249,24 @@ async fn handle_text_frame(
                 Value::Null,
                 ErrorObject::new(ErrorCode::PARSE_ERROR, e.to_string()),
             );
-            let serialize_started = std::time::Instant::now();
-            let frame = serde_json::to_string(&err).unwrap_or_default();
-            let serialize_elapsed_ms = serialize_started.elapsed().as_millis();
-            let enqueue_started = std::time::Instant::now();
-            let sent = tx.send(frame).is_ok();
-            tracing::warn!(
-                connection_id,
-                inbound_bytes,
-                parse_elapsed_ms = parse_started.elapsed().as_millis(),
-                response_serialize_elapsed_ms = serialize_elapsed_ms,
-                response_enqueue_elapsed_ms = enqueue_started.elapsed().as_millis(),
-                total_elapsed_ms = frame_started.elapsed().as_millis(),
-                sent,
-                error = %e,
-                "rpc frame parse failed"
-            );
+            let _ = tx.send(serde_json::to_string(&err).unwrap_or_default());
             return;
         }
     };
-    let parse_elapsed_ms = parse_started.elapsed().as_millis();
     match envelope {
         RpcEnvelope::Request(req) => {
-            let method = req.method.clone();
-            let request_id = format!("{:?}", req.id);
-            let dispatch_started = std::time::Instant::now();
             let result = handlers::dispatch(state, connection_id, &req.method, req.params).await;
-            let dispatch_elapsed_ms = dispatch_started.elapsed().as_millis();
-            let ok = result.is_ok();
             let response = match result {
                 Ok(value) => proto::Response::ok(req.id, value),
                 Err(err) => proto::Response::err(req.id, err),
             };
-            let serialize_started = std::time::Instant::now();
-            let frame = serde_json::to_string(&response).unwrap_or_default();
-            let response_serialize_elapsed_ms = serialize_started.elapsed().as_millis();
-            let response_bytes = frame.len();
-            let enqueue_started = std::time::Instant::now();
-            let sent = tx.send(frame).is_ok();
-            tracing::info!(
-                connection_id,
-                method,
-                request_id,
-                inbound_bytes,
-                response_bytes,
-                ok,
-                sent,
-                parse_elapsed_ms,
-                dispatch_elapsed_ms,
-                response_serialize_elapsed_ms,
-                response_enqueue_elapsed_ms = enqueue_started.elapsed().as_millis(),
-                total_elapsed_ms = frame_started.elapsed().as_millis(),
-                "rpc request processed"
-            );
+            let _ = tx.send(serde_json::to_string(&response).unwrap_or_default());
         }
         RpcEnvelope::Notification(_) => {
             // v0 has no inbound notifications; ignore silently.
-            tracing::debug!(
-                connection_id,
-                inbound_bytes,
-                parse_elapsed_ms,
-                total_elapsed_ms = frame_started.elapsed().as_millis(),
-                "rpc notification ignored"
-            );
         }
         RpcEnvelope::Response(_) => {
             // Server doesn't currently make outbound requests, so ignore.
-            tracing::debug!(
-                connection_id,
-                inbound_bytes,
-                parse_elapsed_ms,
-                total_elapsed_ms = frame_started.elapsed().as_millis(),
-                "rpc response ignored"
-            );
         }
     }
 }

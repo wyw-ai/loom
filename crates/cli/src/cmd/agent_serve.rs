@@ -5603,18 +5603,12 @@ fn render_agent_prompt_output(
 fn agent_prompt_preset_parts(preset: &str) -> Result<Vec<&'static str>> {
     match preset {
         "loom_system" => Ok(vec!["bootstrap_memory", PROFILE_PROMPT_FILES_PART_KEY]),
-        "loom_turn" => Ok(vec![
-            "turn_memory",
-            "runtime_context",
-            "assignment_context",
-            "user_message",
-        ]),
+        "loom_turn" => Ok(vec!["turn_memory", "runtime_context", "user_message"]),
         "loom_full" => Ok(vec![
             "bootstrap_memory",
             PROFILE_PROMPT_FILES_PART_KEY,
             "turn_memory",
             "runtime_context",
-            "assignment_context",
             "user_message",
         ]),
         other => Err(anyhow!("unknown prompt preset `{other}`")),
@@ -11982,6 +11976,41 @@ mod tests {
             .parts
             .iter()
             .any(|part| part.key == "turn_input" && part.content == "latest\n\nassignment"));
+    }
+
+    #[test]
+    fn default_prompt_outputs_do_not_duplicate_assignment_context() {
+        let assignment = "assignment payload";
+        let parts = vec![
+            PromptPart {
+                key: "runtime_context".into(),
+                title: "Runtime".into(),
+                content: "runtime".into(),
+                rendered_content: "runtime".into(),
+                role_hint: PromptRoleHint::User,
+            },
+            PromptPart {
+                key: "assignment_context".into(),
+                title: "Assignment".into(),
+                content: assignment.into(),
+                rendered_content: assignment.into(),
+                role_hint: PromptRoleHint::User,
+            },
+            PromptPart {
+                key: "user_message".into(),
+                title: "User".into(),
+                content: format!("latest\n\n{assignment}"),
+                rendered_content: format!("latest\n\n{assignment}"),
+                role_hint: PromptRoleHint::User,
+            },
+        ];
+
+        let legacy_full = format!("runtime\n\nlatest\n\n{assignment}");
+        let outputs =
+            render_agent_prompt_outputs(None, &parts, &legacy_full).expect("default outputs");
+
+        assert_eq!(outputs["user"].matches(assignment).count(), 1);
+        assert_eq!(outputs["full"].matches(assignment).count(), 1);
     }
 
     #[test]

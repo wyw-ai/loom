@@ -126,8 +126,9 @@ inventory 的是目标 daemon。即使 GUI 和 daemon 在同一台机器，也�
         "--session-id", "{session.id}",
         { "when": "model", "args": ["--model", "{model}"] },
         "--append-system-prompt", "{prompt.system}",
-        "-p", "{prompt.user}"
+        "--print"
       ],
+      "stdin": "{prompt.user}",
       "stdout": {
         "format": "builtin",
         "name": "claude_stream_json"
@@ -148,9 +149,11 @@ inventory 的是目标 daemon。即使 GUI 和 daemon 在同一台机器，也�
 }
 ```
 
-关键点是 `modes.print.args` 表达完整 argv 模板。manifest 可以把 `{prompt.system}`、
-`{prompt.user}`、`{prompt.full}` 放在任意位置，因此 Loom 不再需要对 `-p`、末尾追加
-prompt、stdin 或 env prompt 做 provider 特殊逻辑。prompt parts 的组合方式不在
+关键点是 `modes.print.args` 表达完整 argv 模板，`stdin` 表达标准输入模板。manifest
+可以把 `{prompt.system}`、`{prompt.user}`、`{prompt.full}` 放进适合 provider 的
+args、env 或 stdin；长 prompt 应优先使用 stdin，避免操作系统的单参数长度限制。
+因此 Loom 不再需要对 `-p`、末尾追加 prompt、stdin 或 env prompt 做 provider
+特殊逻辑。prompt parts 的组合方式不在
 ProviderManifest 中维护，而由具体 AgentSpec 的 `promptAssembly` 维护。
 
 `models` 只描述 UI 和默认模型选择；模型是否进入 CLI 参数，也由 mode 的
@@ -676,8 +679,9 @@ Claude Code 支持非交互 `-p/--print`、`--output-format stream-json`、
     "--session-id", "{session.id}",
     { "when": "model", "args": ["--model", "{model}"] },
     "--append-system-prompt", "{prompt.system}",
-    "-p", "{prompt.user}"
+    "--print"
   ],
+  "stdin": "{prompt.user}",
   "stdout": { "format": "builtin", "name": "claude_stream_json" },
   "session": {
     "idSource": "loom_uuid",

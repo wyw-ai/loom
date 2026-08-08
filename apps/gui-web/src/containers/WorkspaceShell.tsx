@@ -195,6 +195,7 @@ export function WorkspaceShell(props: WorkspaceShellProps) {
           activeChannelId={p.activeChannelId}
           activeDirectActorId={p.activeDirectActorId}
           activeThreadId={p.activeThreadId}
+          inboxCount={p.inbox.length}
           directAgents={p.agentActors}
           runs={p.runs}
           machines={p.machines}

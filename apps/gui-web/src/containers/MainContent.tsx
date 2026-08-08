@@ -36,6 +36,8 @@ import { RunDetailView } from "@/components/views/RunDetailView";
 import { SpacesView } from "@/components/views/SpacesView";
 import { AccountView } from "@/components/views/AccountView";
 import { SettingsView } from "@/components/views/SettingsView";
+import { CoachMarkTooltip } from "@/components/ui/CoachMark";
+import { useCoachMark } from "@/hooks/useCoachMark";
 import { actorName } from "@/lib/format-utils";
 import { channelFromMessage, threadIdForMessage } from "@/lib/message-utils";
 import { directPeerForMessage } from "@/lib/channel-utils";
@@ -151,6 +153,11 @@ export function MainContent(props: MainContentProps) {
     channelId: string;
     target: string;
   } | null>(null);
+  const actorsCoach = useCoachMark("actors", p.view === "settings");
+  const channelCoach = useCoachMark(
+    "channel",
+    p.view === "chat" && Boolean(p.activeChannel),
+  );
 
   if (p.view === "chat") {
     return (
@@ -198,6 +205,17 @@ export function MainContent(props: MainContentProps) {
             {p.error}
           </div>
         )}
+        {channelCoach.visible && (
+          <div className="border-b border-[#edf0f5] bg-white px-5 py-3">
+            <CoachMarkTooltip
+              title="Channel tip"
+              onDismiss={channelCoach.dismiss}
+              className="mx-auto max-w-4xl"
+            >
+              @ mention an agent in the composer to wake it for this channel.
+            </CoachMarkTooltip>
+          </div>
+        )}
         <MessageFeed
           actors={p.actors}
           feedKey={p.target ?? "channel:none"}
@@ -209,8 +227,17 @@ export function MainContent(props: MainContentProps) {
           threadStatsById={p.threadStatsById}
           emptyText={p.chatEmpty}
           emptyAction={
-            p.connection === "open" ? null : (
-              <NoSpaceConnectionGuide onUseLocalServer={p.prepareLocalServerSpace} />
+            p.activeChannel ? (
+              <>
+                <ChannelEmptyGuide />
+                {p.connection === "open" ? null : (
+                  <NoSpaceConnectionGuide onUseLocalServer={p.prepareLocalServerSpace} />
+                )}
+              </>
+            ) : (
+              p.connection === "open" ? null : (
+                <NoSpaceConnectionGuide onUseLocalServer={p.prepareLocalServerSpace} />
+              )
             )
           }
           onReply={p.setReplyTo}
@@ -467,6 +494,17 @@ export function MainContent(props: MainContentProps) {
   return (
     <>
       <ErrorBanner error={p.error} />
+      {actorsCoach.visible && (
+        <div className="border-b border-[#edf0f5] bg-white px-5 py-3">
+          <CoachMarkTooltip
+            title="Actors"
+            onDismiss={actorsCoach.dismiss}
+            className="mx-auto max-w-5xl"
+          >
+            Configure agent wake strategies and providers here.
+          </CoachMarkTooltip>
+        </div>
+      )}
       <SettingsView
         actors={p.actors}
         busy={p.busy}
@@ -486,5 +524,25 @@ export function MainContent(props: MainContentProps) {
         onOpenLocalPath={p.openLocalPath}
       />
     </>
+  );
+}
+
+function ChannelEmptyGuide() {
+  const steps = [
+    "① Type @ in the composer below and say hello to your agent.",
+    "② The agent wakes up and replies in this channel.",
+    "③ When needed, you will be able to stop or jump in from the banner above the composer.",
+  ];
+  return (
+    <div className="mt-5 grid gap-3 text-left">
+      {steps.map((step) => (
+        <div
+          key={step}
+          className="rounded-lg border border-[#e6e9f0] bg-white px-4 py-3 text-sm font-medium leading-6 text-[#485063] shadow-sm"
+        >
+          {step}
+        </div>
+      ))}
+    </div>
   );
 }

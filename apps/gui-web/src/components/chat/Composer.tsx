@@ -29,7 +29,7 @@ export function Composer({
   onClearReply,
   onSend,
   mentionAgents,
-  placeholder = "Message",
+  placeholder = "Message — type @ to wake an agent",
   disabledPlaceholder = "Connect and select a channel",
   busy,
 }: {

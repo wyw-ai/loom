@@ -168,6 +168,15 @@ enum JournalStorage {
     Sqlite { conn: Mutex<Connection> },
 }
 
+/// Outcome of a [`Journal::replay`]: how many records were restored from the
+/// latest snapshot vs. replayed from the journal tail. `Store::open` uses the
+/// tail size to decide whether to write a fresh snapshot (compaction).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReplayStats {
+    pub snapshot_records: usize,
+    pub tail_records: usize,
+}
+
 pub struct Journal {
     path: PathBuf,
     storage: JournalStorage,
@@ -240,14 +249,19 @@ impl Journal {
     /// Replay persisted mutations in order without retaining the full journal
     /// in memory. The visitor receives one owned mutation at a time.
     ///
+    /// For SQLite storage the replay starts from the most recent snapshot
+    /// (if any) and then applies only the journal tail appended after it,
+    /// so startup cost is bounded by state size + activity since the last
+    /// compaction instead of the full journal history.
+    ///
     /// For SQLite storage the visitor runs while the journal connection is
     /// locked, so it must not call back into this journal.
-    pub fn replay<F>(&self, mut apply: F) -> std::io::Result<usize>
+    pub fn replay<F>(&self, mut apply: F) -> std::io::Result<ReplayStats>
     where
         F: FnMut(Mutation),
     {
         let started = std::time::Instant::now();
-        let mut count = 0usize;
+        let mut stats = ReplayStats::default();
         match &self.storage {
             JournalStorage::Jsonl { .. } => {
                 let file = OpenOptions::new().read(true).open(&self.path)?;
@@ -259,8 +273,8 @@ impl Journal {
                     match serde_json::from_str::<Mutation>(&line) {
                         Ok(m) => {
                             apply(m);
-                            count += 1;
-                            log_replay_progress(count, started);
+                            stats.tail_records += 1;
+                            log_replay_progress(stats.tail_records, started);
                         }
                         Err(err) => {
                             tracing::warn!(line = idx + 1, %err, "skipping unreadable journal line");
@@ -270,11 +284,63 @@ impl Journal {
             }
             JournalStorage::Sqlite { conn } => {
                 let conn = conn.lock();
+                let snapshot: Option<(i64, i64)> = conn
+                    .query_row(
+                        "select snapshot_id, upto_record_id from snapshot_meta
+                         order by snapshot_id desc limit 1",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map(Some)
+                    .or_else(|e| match e {
+                        rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                        other => Err(other),
+                    })
+                    .map_err(sqlite_io)?;
+                let mut tail_from = 0i64;
+                if let Some((snapshot_id, upto_record_id)) = snapshot {
+                    tail_from = upto_record_id;
+                    let mut stmt = conn
+                        .prepare(
+                            "select seq, record_json from snapshot_records
+                             where snapshot_id = ?1 order by seq",
+                        )
+                        .map_err(sqlite_io)?;
+                    let rows = stmt
+                        .query_map(params![snapshot_id], |row| {
+                            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                        })
+                        .map_err(sqlite_io)?;
+                    for row in rows {
+                        let (seq, line) = row.map_err(sqlite_io)?;
+                        match serde_json::from_str::<Mutation>(&line) {
+                            Ok(m) => {
+                                apply(m);
+                                stats.snapshot_records += 1;
+                                log_replay_progress(
+                                    stats.snapshot_records + stats.tail_records,
+                                    started,
+                                );
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    snapshot = snapshot_id,
+                                    seq,
+                                    %err,
+                                    "skipping unreadable snapshot record"
+                                );
+                            }
+                        }
+                    }
+                }
                 let mut stmt = conn
-                    .prepare("select id, record_json from journal_records order by id")
+                    .prepare(
+                        "select id, record_json from journal_records
+                         where id > ?1 order by id",
+                    )
                     .map_err(sqlite_io)?;
                 let rows = stmt
-                    .query_map([], |row| {
+                    .query_map(params![tail_from], |row| {
                         Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
                     })
                     .map_err(sqlite_io)?;
@@ -283,8 +349,11 @@ impl Journal {
                     match serde_json::from_str::<Mutation>(&line) {
                         Ok(m) => {
                             apply(m);
-                            count += 1;
-                            log_replay_progress(count, started);
+                            stats.tail_records += 1;
+                            log_replay_progress(
+                                stats.snapshot_records + stats.tail_records,
+                                started,
+                            );
                         }
                         Err(err) => {
                             tracing::warn!(rowid = id, %err, "skipping unreadable sqlite journal record");
@@ -294,11 +363,82 @@ impl Journal {
             }
         }
         tracing::info!(
-            records = count,
+            snapshot_records = stats.snapshot_records,
+            tail_records = stats.tail_records,
             elapsed_ms = started.elapsed().as_millis(),
             "journal replay complete"
         );
-        Ok(count)
+        Ok(stats)
+    }
+
+    /// Persist a compacted snapshot of the current state (expressed as the
+    /// minimal mutation sequence that reconstructs it). Subsequent replays
+    /// restore from this snapshot and only apply journal records appended
+    /// after it. Older snapshots are dropped in the same transaction. The
+    /// full journal history is retained untouched, so a defective snapshot
+    /// can always be bypassed by deleting the snapshot tables.
+    ///
+    /// No-op for JSONL storage (used by tests and legacy deployments).
+    ///
+    /// Must only be called while no concurrent journal appends can happen
+    /// (e.g. during `Store::open`, before the server starts serving).
+    pub fn write_snapshot(&self, mutations: &[Mutation]) -> std::io::Result<()> {
+        let conn = match &self.storage {
+            JournalStorage::Jsonl { .. } => {
+                tracing::debug!("journal snapshot skipped: JSONL storage");
+                return Ok(());
+            }
+            JournalStorage::Sqlite { conn } => conn,
+        };
+        let started = std::time::Instant::now();
+        let mut conn = conn.lock();
+        let tx = conn.transaction().map_err(sqlite_io)?;
+        let upto: i64 = tx
+            .query_row(
+                "select coalesce(max(id), 0) from journal_records",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sqlite_io)?;
+        tx.execute(
+            "insert into snapshot_meta (upto_record_id, record_count) values (?1, ?2)",
+            params![upto, mutations.len() as i64],
+        )
+        .map_err(sqlite_io)?;
+        let snapshot_id = tx.last_insert_rowid();
+        {
+            let mut stmt = tx
+                .prepare(
+                    "insert into snapshot_records (snapshot_id, seq, record_json)
+                     values (?1, ?2, ?3)",
+                )
+                .map_err(sqlite_io)?;
+            for (seq, mutation) in mutations.iter().enumerate() {
+                let line = serde_json::to_string(mutation)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                stmt.execute(params![snapshot_id, seq as i64, line])
+                    .map_err(sqlite_io)?;
+            }
+        }
+        tx.execute(
+            "delete from snapshot_records where snapshot_id != ?1",
+            params![snapshot_id],
+        )
+        .map_err(sqlite_io)?;
+        tx.execute(
+            "delete from snapshot_meta where snapshot_id != ?1",
+            params![snapshot_id],
+        )
+        .map_err(sqlite_io)?;
+        tx.commit().map_err(sqlite_io)?;
+        tracing::info!(
+            snapshot_id,
+            upto_record_id = upto,
+            records = mutations.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "journal snapshot written"
+        );
+        Ok(())
     }
 }
 
@@ -314,6 +454,14 @@ fn log_replay_progress(count: usize, started: std::time::Instant) {
 
 fn init_sqlite_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
+    // WAL + synchronous=NORMAL keeps durability at the checkpoint boundary
+    // while removing the per-commit fsync that dominated append latency
+    // under synchronous=FULL (the SQLite default). A power loss can only
+    // drop the most recent transactions, never corrupt the database.
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    // Wait for concurrent readers/writers instead of failing immediately
+    // with SQLITE_BUSY (e.g. external tooling inspecting the journal).
+    conn.pragma_update(None, "busy_timeout", 5000)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.execute_batch(
         r#"
@@ -328,6 +476,18 @@ fn init_sqlite_schema(conn: &Connection) -> rusqlite::Result<()> {
             id integer primary key autoincrement,
             record_json text not null,
             created_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        );
+        create table if not exists snapshot_meta (
+            snapshot_id integer primary key autoincrement,
+            upto_record_id integer not null,
+            record_count integer not null,
+            created_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        );
+        create table if not exists snapshot_records (
+            snapshot_id integer not null,
+            seq integer not null,
+            record_json text not null,
+            primary key (snapshot_id, seq)
         );
         create table if not exists actors (
             id text primary key,
@@ -585,13 +745,82 @@ mod tests {
             .expect("append");
 
         let mut replayed = Vec::new();
-        let count = journal
+        let stats = journal
             .replay(|mutation| replayed.push(mutation))
             .expect("replay");
-        assert_eq!(count, replayed.len());
+        assert_eq!(stats.tail_records, replayed.len());
+        assert_eq!(stats.snapshot_records, 0);
         assert!(matches!(
             replayed.as_slice(),
             [Mutation::ActorDelete { actor_id }] if actor_id == "actor_old"
+        ));
+    }
+
+    #[test]
+    fn sqlite_snapshot_replays_snapshot_plus_tail_only() {
+        let dir = std::env::temp_dir().join(format!(
+            "loom-sqlite-snapshot-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let journal = Journal::open_sqlite(dir.join("loom.sqlite3")).expect("open sqlite journal");
+        // Two records that predate the snapshot: they must NOT be replayed
+        // once a snapshot covers them.
+        journal
+            .append(&Mutation::ActorDelete {
+                actor_id: "actor_pre_1".into(),
+            })
+            .expect("append");
+        journal
+            .append(&Mutation::ActorDelete {
+                actor_id: "actor_pre_2".into(),
+            })
+            .expect("append");
+        // Compacted state: a single mutation standing in for both.
+        journal
+            .write_snapshot(&[Mutation::ActorDelete {
+                actor_id: "actor_compacted".into(),
+            }])
+            .expect("write snapshot");
+        // One tail record after the snapshot.
+        journal
+            .append(&Mutation::ActorDelete {
+                actor_id: "actor_tail".into(),
+            })
+            .expect("append tail");
+
+        let mut replayed = Vec::new();
+        let stats = journal
+            .replay(|mutation| replayed.push(mutation))
+            .expect("replay");
+        assert_eq!(stats.snapshot_records, 1);
+        assert_eq!(stats.tail_records, 1);
+        let ids: Vec<&str> = replayed
+            .iter()
+            .map(|m| match m {
+                Mutation::ActorDelete { actor_id } => actor_id.as_str(),
+                other => panic!("unexpected mutation {other:?}"),
+            })
+            .collect();
+        assert_eq!(ids, vec!["actor_compacted", "actor_tail"]);
+
+        // A newer snapshot replaces the old one entirely.
+        journal
+            .write_snapshot(&[Mutation::ActorDelete {
+                actor_id: "actor_compacted_2".into(),
+            }])
+            .expect("write snapshot 2");
+        let mut replayed = Vec::new();
+        let stats = journal
+            .replay(|mutation| replayed.push(mutation))
+            .expect("replay 2");
+        assert_eq!(stats.snapshot_records, 1);
+        assert_eq!(stats.tail_records, 0);
+        assert!(matches!(
+            replayed.as_slice(),
+            [Mutation::ActorDelete { actor_id }] if actor_id == "actor_compacted_2"
         ));
     }
 }

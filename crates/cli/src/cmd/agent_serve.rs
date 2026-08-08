@@ -3783,7 +3783,18 @@ async fn notification_loop(
     actor_id: &str,
 ) -> Result<()> {
     let mut started = false;
-    let inbox_poll_every = Duration::from_secs(15);
+    // Durable-inbox polling is a reconciliation safety net behind the WS
+    // notification stream, not the primary wake path, so a relaxed default
+    // keeps N idle agents from generating constant background load on the
+    // server. Override with LOOM_INBOX_POLL_SECS (min 5s) when a deployment
+    // needs tighter recovery after missed notifications.
+    let inbox_poll_every = Duration::from_secs(
+        std::env::var("LOOM_INBOX_POLL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.max(5))
+            .unwrap_or(60),
+    );
     let mut inbox_poll = interval(inbox_poll_every);
     if let Err(e) =
         drain_pending_inbox(&client, &state, &adapter, &event_tx, &mut started, actor_id).await

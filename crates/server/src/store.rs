@@ -149,6 +149,13 @@ struct Inner {
     coordination_steps: HashMap<String, CoordinationStep>,
     memberships: HashMap<(String, ScopeRef), Membership>,
     deliveries: HashMap<(String, String), Delivery>,
+    /// actor_id -> source_ids with a delivery row for that actor. Secondary
+    /// index for `list_deliveries` (agent inbox polling is a hot path).
+    deliveries_by_actor: HashMap<String, HashSet<String>>,
+    /// source_id -> actor_ids with a delivery row for that source. Secondary
+    /// index for `delivery_recipients_for_source` (called on every message /
+    /// event broadcast fanout).
+    deliveries_by_source: HashMap<String, HashSet<String>>,
     machine_commands: HashMap<String, MachineCommand>,
     reminders: HashMap<String, Reminder>,
     artifacts: HashMap<String, Artifact>,
@@ -165,6 +172,44 @@ pub struct Store {
     broadcaster: broadcast::Sender<StoreEvent>,
 }
 
+impl Inner {
+    /// Insert (or update) a delivery row and keep the by-actor / by-source
+    /// secondary indexes in sync. Every write to `deliveries` must go
+    /// through here.
+    fn insert_delivery(&mut self, delivery: Delivery) {
+        self.deliveries_by_actor
+            .entry(delivery.actor_id.clone())
+            .or_default()
+            .insert(delivery.source_id.clone());
+        self.deliveries_by_source
+            .entry(delivery.source_id.clone())
+            .or_default()
+            .insert(delivery.actor_id.clone());
+        self.deliveries.insert(
+            (delivery.source_id.clone(), delivery.actor_id.clone()),
+            delivery,
+        );
+    }
+
+    /// Drop every delivery row addressed to `actor_id`, updating both
+    /// secondary indexes.
+    fn remove_actor_deliveries(&mut self, actor_id: &str) {
+        let Some(sources) = self.deliveries_by_actor.remove(actor_id) else {
+            return;
+        };
+        for source_id in sources {
+            self.deliveries
+                .remove(&(source_id.clone(), actor_id.to_string()));
+            if let Some(set) = self.deliveries_by_source.get_mut(&source_id) {
+                set.remove(actor_id);
+                if set.is_empty() {
+                    self.deliveries_by_source.remove(&source_id);
+                }
+            }
+        }
+    }
+}
+
 impl Store {
     pub fn open(journal: Arc<Journal>) -> StoreResult<Arc<Self>> {
         let (tx, _) = broadcast::channel(1024);
@@ -174,7 +219,8 @@ impl Store {
             structure_lock: Mutex::new(()),
             broadcaster: tx,
         });
-        store.replay()?;
+        let stats = store.replay()?;
+        store.compact_journal_if_needed(&stats);
         Ok(store)
     }
 
@@ -186,11 +232,220 @@ impl Store {
         let _ = self.broadcaster.send(event);
     }
 
-    fn replay(&self) -> StoreResult<()> {
-        self.journal.replay(|m| {
+    fn replay(&self) -> StoreResult<crate::journal::ReplayStats> {
+        let stats = self.journal.replay(|m| {
             self.apply_replay(m);
         })?;
-        Ok(())
+        Ok(stats)
+    }
+
+    /// Startup compaction: when the journal tail replayed after the last
+    /// snapshot exceeds the threshold, persist a fresh snapshot so the next
+    /// start replays a bounded record count instead of the full history.
+    /// Runs before the server begins serving, so no concurrent appends can
+    /// race the snapshot. Disable with `LOOM_JOURNAL_SNAPSHOT=off`.
+    fn compact_journal_if_needed(&self, stats: &crate::journal::ReplayStats) {
+        if std::env::var("LOOM_JOURNAL_SNAPSHOT")
+            .map(|v| matches!(v.as_str(), "off" | "0" | "false"))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let threshold = std::env::var("LOOM_SNAPSHOT_TAIL_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(SNAPSHOT_TAIL_THRESHOLD);
+        if stats.tail_records < threshold {
+            return;
+        }
+        let mutations = self.snapshot_mutations();
+        if let Err(err) = self.journal.write_snapshot(&mutations) {
+            tracing::warn!(%err, "journal compaction failed; full tail will be replayed next start");
+        }
+    }
+
+    /// Serialize the current in-memory state as the minimal mutation
+    /// sequence that reconstructs it through `apply`. Every `Inner` field
+    /// must be covered here (or be derivable from covered records, like the
+    /// `*_seq` counters and the idempotency/usage indexes).
+    fn snapshot_mutations(&self) -> Vec<Mutation> {
+        let inner = self.inner.read();
+        let mut out: Vec<Mutation> = Vec::new();
+        out.extend(inner.actors.values().cloned().map(Mutation::ActorUpsert));
+        out.extend(
+            inner
+                .channels
+                .values()
+                .cloned()
+                .map(Mutation::ChannelCreate),
+        );
+        out.extend(
+            inner
+                .channel_member_configs
+                .values()
+                .cloned()
+                .map(Mutation::ChannelMemberConfigUpsert),
+        );
+        out.extend(
+            inner
+                .actor_groups
+                .values()
+                .cloned()
+                .map(Mutation::ActorGroupUpsert),
+        );
+        out.extend(
+            inner
+                .actor_presences
+                .values()
+                .cloned()
+                .map(Mutation::ActorPresenceUpsert),
+        );
+        out.extend(inner.threads.values().cloned().map(Mutation::ThreadCreate));
+        out.extend(
+            inner
+                .memberships
+                .values()
+                .cloned()
+                .map(Mutation::MembershipUpsert),
+        );
+        // Messages must be appended in their per-scope order so the
+        // `messages_by_scope` vectors are rebuilt identically.
+        for ids in inner.messages_by_scope.values() {
+            for id in ids {
+                if let Some(m) = inner.messages.get(id) {
+                    out.push(Mutation::MessageAppend(m.clone()));
+                }
+            }
+        }
+        for ids in inner.events_by_scope.values() {
+            for id in ids {
+                if let Some(e) = inner.events.get(id) {
+                    out.push(Mutation::EventAppend(e.clone()));
+                }
+            }
+        }
+        out.extend(inner.tasks.values().cloned().map(Mutation::TaskUpsert));
+        out.extend(
+            inner
+                .assignments
+                .values()
+                .cloned()
+                .map(Mutation::TaskAssignmentUpsert),
+        );
+        out.extend(
+            inner
+                .task_refs
+                .values()
+                .cloned()
+                .map(Mutation::TaskRefUpsert),
+        );
+        out.extend(
+            inner
+                .task_artifact_links
+                .values()
+                .cloned()
+                .map(Mutation::TaskArtifactLinkUpsert),
+        );
+        out.extend(
+            inner
+                .task_facts
+                .values()
+                .cloned()
+                .map(Mutation::TaskFactUpsert),
+        );
+        out.extend(
+            inner
+                .task_projections
+                .values()
+                .cloned()
+                .map(Mutation::TaskProjectionUpsert),
+        );
+        out.extend(
+            inner
+                .workspace_leases
+                .values()
+                .cloned()
+                .map(Mutation::WorkspaceLeaseUpsert),
+        );
+        out.extend(
+            inner
+                .task_changes
+                .values()
+                .cloned()
+                .map(Mutation::TaskChangeUpsert),
+        );
+        out.extend(
+            inner
+                .task_change_deliveries
+                .values()
+                .cloned()
+                .map(Mutation::TaskChangeDeliveryUpsert),
+        );
+        out.extend(inner.turns.values().cloned().map(Mutation::TurnOpen));
+        out.extend(inner.runs.values().cloned().map(Mutation::RunUpsert));
+        for frames in inner.run_frames.values() {
+            out.extend(frames.iter().cloned().map(Mutation::RunFrameAppend));
+        }
+        out.extend(
+            inner
+                .agent_config_versions
+                .values()
+                .cloned()
+                .map(Mutation::AgentConfigVersionPublish),
+        );
+        out.extend(
+            inner
+                .agent_config_activations
+                .values()
+                .cloned()
+                .map(Mutation::AgentConfigActivationUpsert),
+        );
+        out.extend(
+            inner
+                .coordination_sessions
+                .values()
+                .cloned()
+                .map(Mutation::CoordinationSessionUpsert),
+        );
+        out.extend(
+            inner
+                .coordination_steps
+                .values()
+                .cloned()
+                .map(Mutation::CoordinationStepAppend),
+        );
+        out.extend(
+            inner
+                .deliveries
+                .values()
+                .cloned()
+                .map(Mutation::DeliveryUpsert),
+        );
+        out.extend(
+            inner
+                .machine_commands
+                .values()
+                .cloned()
+                .map(Mutation::MachineCommandUpsert),
+        );
+        out.extend(
+            inner
+                .reminders
+                .values()
+                .cloned()
+                .map(Mutation::ReminderUpsert),
+        );
+        out.extend(
+            inner
+                .artifacts
+                .values()
+                .cloned()
+                .map(Mutation::ArtifactCreate),
+        );
+        for frames in inner.trace_by_turn.values() {
+            out.extend(frames.iter().cloned().map(Mutation::TraceAppend));
+        }
+        out
     }
 
     fn apply_replay(&self, m: Mutation) {
@@ -3892,10 +4147,7 @@ impl Store {
             };
             self.journal
                 .append(&Mutation::DeliveryUpsert(delivery.clone()))?;
-            self.inner.write().deliveries.insert(
-                (delivery.source_id.clone(), delivery.actor_id.clone()),
-                delivery.clone(),
-            );
+            self.inner.write().insert_delivery(delivery.clone());
             self.emit(StoreEvent::DeliveryUpdated(delivery));
         }
 
@@ -4808,10 +5060,7 @@ impl Store {
                 };
                 self.journal
                     .append(&Mutation::DeliveryUpsert(delivery.clone()))?;
-                self.inner.write().deliveries.insert(
-                    (delivery.source_id.clone(), delivery.actor_id.clone()),
-                    delivery.clone(),
-                );
+                self.inner.write().insert_delivery(delivery.clone());
                 self.emit(StoreEvent::DeliveryUpdated(delivery));
             }
         }
@@ -4864,10 +5113,7 @@ impl Store {
             };
             self.journal
                 .append(&Mutation::DeliveryUpsert(delivery.clone()))?;
-            self.inner.write().deliveries.insert(
-                (delivery.source_id.clone(), delivery.actor_id.clone()),
-                delivery.clone(),
-            );
+            self.inner.write().insert_delivery(delivery.clone());
             self.emit(StoreEvent::DeliveryUpdated(delivery));
         }
 
@@ -4983,10 +5229,18 @@ impl Store {
         after: Option<(Timestamp, String)>,
     ) -> Vec<Delivery> {
         let inner = self.inner.read();
-        let mut rows: Vec<Delivery> = inner
-            .deliveries
-            .values()
-            .filter(|d| d.actor_id == actor_id)
+        // Indexed lookup: agents poll their inbox continuously, so this must
+        // not scan the full delivery table.
+        let Some(source_ids) = inner.deliveries_by_actor.get(actor_id) else {
+            return Vec::new();
+        };
+        let mut rows: Vec<Delivery> = source_ids
+            .iter()
+            .filter_map(|source_id| {
+                inner
+                    .deliveries
+                    .get(&(source_id.clone(), actor_id.to_string()))
+            })
             .filter(|d| state_filter.is_none_or(|s| d.state == s))
             .filter(|d| match &after {
                 None => true,
@@ -5011,14 +5265,13 @@ impl Store {
 
     pub fn delivery_recipients_for_source(&self, source_id: &str) -> Vec<String> {
         let inner = self.inner.read();
+        // Indexed lookup: called on every message/event broadcast fanout.
         let mut recipients: Vec<String> = inner
-            .deliveries
-            .values()
-            .filter(|delivery| delivery.source_id == source_id)
-            .map(|delivery| delivery.actor_id.clone())
-            .collect();
+            .deliveries_by_source
+            .get(source_id)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default();
         recipients.sort();
-        recipients.dedup();
         recipients
     }
 
@@ -5406,9 +5659,7 @@ fn apply(inner: &mut Inner, m: Mutation) {
             inner
                 .actor_presences
                 .retain(|(presence_actor_id, _), _| presence_actor_id != &actor_id);
-            inner
-                .deliveries
-                .retain(|(_, target_actor_id), _| target_actor_id != &actor_id);
+            inner.remove_actor_deliveries(&actor_id);
             inner.assignments.retain(|_, assignment| {
                 assignment.from_actor_id != actor_id && assignment.to_actor_id != actor_id
             });
@@ -5564,9 +5815,7 @@ fn apply(inner: &mut Inner, m: Mutation) {
                 .insert((m.actor_id.clone(), m.scope.clone()), m);
         }
         Mutation::DeliveryUpsert(d) => {
-            inner
-                .deliveries
-                .insert((d.source_id.clone(), d.actor_id.clone()), d);
+            inner.insert_delivery(d);
         }
         Mutation::MachineCommandUpsert(command) => {
             inner
@@ -5968,6 +6217,11 @@ fn is_terminal_run_status(status: RunStatus) -> bool {
 /// inlining it, which keeps the journal, broadcast fanout, and agent turn
 /// inputs bounded.
 pub const MESSAGE_BODY_MAX_BYTES: usize = 64 * 1024;
+
+/// When the journal tail replayed after the last snapshot exceeds this many
+/// records, `Store::open` writes a fresh snapshot so the next start is fast.
+/// Override with `LOOM_SNAPSHOT_TAIL_THRESHOLD`.
+const SNAPSHOT_TAIL_THRESHOLD: usize = 20_000;
 
 /// Extract the per-turn usage increment a closed run carries in
 /// `metadata.token_usage.increment` (written by `close_run`). Used on replay
@@ -6620,6 +6874,71 @@ mod tests {
         let path: PathBuf = dir.join("journal.jsonl");
         let journal = Journal::open(path).expect("open journal");
         Store::open(journal).expect("open store")
+    }
+
+    #[test]
+    fn snapshot_round_trip_reconstructs_state() {
+        // Build a store exercising most Inner maps, snapshot it into a fresh
+        // SQLite journal, and verify a store opened from the snapshot alone
+        // answers the same queries.
+        let dir = std::env::temp_dir().join(format!(
+            "loom-store-snapshot-test-{}",
+            Uuid::new_v4().simple()
+        ));
+        let journal = Journal::open_sqlite(dir.join("loom.sqlite3")).expect("open sqlite");
+        let store = Store::open(journal.clone()).expect("open store");
+
+        store
+            .upsert_actor(test_actor("actor_h", ActorKind::Human, "H"))
+            .unwrap();
+        store
+            .upsert_actor(test_actor("actor_a", ActorKind::Agent, "A"))
+            .unwrap();
+        let channel = store
+            .create_channel("snap".into(), Some("actor_h".into()))
+            .unwrap();
+        store.grant_channel(&channel.id, "actor_a").unwrap();
+        let root = send_test_message(&store, "actor_h", &format!("#{}", channel.id), "root msg");
+        store
+            .append_message(
+                "actor_h".into(),
+                format!("#{}", channel.id),
+                MessageKind::Human,
+                "@actor_a do things".into(),
+                Vec::new(),
+                vec![AudienceRef {
+                    kind: AudienceKind::Actor,
+                    id: "actor_a".into(),
+                    display: None,
+                }],
+                MessageIntent::RequestAction,
+                DeliveryPolicy::WakeAgent,
+                None,
+                None,
+                Vec::new(),
+                Meta::default(),
+                None,
+            )
+            .expect("wake message");
+
+        // Snapshot current state into the journal.
+        journal
+            .write_snapshot(&store.snapshot_mutations())
+            .expect("write snapshot");
+
+        // Reopen: replay must come from the snapshot (tail = 0).
+        let reopened = Store::open(journal.clone()).expect("reopen store");
+        let (messages, _) = reopened
+            .read_messages_for_target("actor_h", &format!("#{}", channel.id), 10, None)
+            .expect("read messages");
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().any(|m| m.id == root.id));
+        let deliveries =
+            reopened.list_deliveries("actor_a", Some(DeliveryState::Pending), 10, None);
+        assert_eq!(deliveries.len(), 1, "delivery index must survive snapshot");
+        let recipients = reopened.delivery_recipients_for_source(&deliveries[0].source_id);
+        assert_eq!(recipients, vec!["actor_a".to_string()]);
+        assert!(reopened.get_channel(&channel.id).is_some());
     }
 
     #[test]

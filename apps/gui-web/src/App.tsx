@@ -473,6 +473,7 @@ export function App() {
         onRemoveWorkspace={removeWorkspace}
         onCheckMachines={checkMachines}
         onStartLocalHost={startLocalHost}
+        onCreateAgent={createAgent}
         onFinish={finishOnboarding}
       />
       </ErrorBoundary>

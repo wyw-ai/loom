@@ -3,6 +3,7 @@ import type { FormEvent, ReactNode } from "react";
 import {
   ArrowLeft,
   ArrowRight,
+  Bot,
   Check,
   Github,
   Loader2,
@@ -26,15 +27,21 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { localServerCommand } from "@/lib/constants";
-import { accountName, workspaceInitials } from "@/lib/format-utils";
+import { accountName, machineCanCreateAgent, workspaceInitials } from "@/lib/format-utils";
 import {
   normalizeWorkspaceFormServerUrl,
   serverUrlPreviewPlaceholder,
 } from "@/lib/server-url";
 import { cn } from "@/lib/utils";
-import type { ConnectionState, WorkspaceFormState } from "@/lib/types";
+import { defaultWakeSpec } from "@/lib/wake-utils";
+import type { AgentFormState, ConnectionState, WorkspaceFormState } from "@/lib/types";
 
-type OnboardingStep = "prep" | "identity" | "server" | "host";
+type OnboardingStep = "prep" | "identity" | "server" | "host" | "agent";
+type AgentProviderChoice = {
+  key: string;
+  machine: MachineInfo;
+  provider: MachineAgentProviderInfo;
+};
 
 const localActorPrefix = "actor_human_local_";
 const fallbackIdentityDefaults = {
@@ -61,6 +68,7 @@ export function OnboardingView({
   onRemoveWorkspace,
   onCheckMachines,
   onStartLocalHost,
+  onCreateAgent,
   onFinish,
 }: {
   account: HumanAccount | null;
@@ -78,6 +86,7 @@ export function OnboardingView({
   onRemoveWorkspace: (workspaceId: string) => Promise<void> | void;
   onCheckMachines: () => void;
   onStartLocalHost: () => Promise<boolean> | boolean;
+  onCreateAgent: (form?: AgentFormState) => Promise<boolean> | boolean;
   onFinish: () => void;
 }) {
   const [step, setStep] = useState<OnboardingStep>(
@@ -91,6 +100,11 @@ export function OnboardingView({
   const [providers, setProviders] = useState<MachineAgentProviderInfo[]>([]);
   const [localProviderStatus, setLocalProviderStatus] =
     useState<"loading" | "ready" | "error">("loading");
+  const [agentMachines, setAgentMachines] = useState<MachineInfo[]>(machines);
+  const [agentProviderStatus, setAgentProviderStatus] =
+    useState<"idle" | "loading" | "ready" | "error">("idle");
+  const [selectedAgentProviderKey, setSelectedAgentProviderKey] =
+    useState<string | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -144,15 +158,40 @@ export function OnboardingView({
 
   useEffect(() => {
     if (!account) {
-      if (step === "server" || step === "host") {
+      if (step === "server" || step === "host" || step === "agent") {
         setStep("prep");
       }
       return;
     }
-    if (step === "host" && connection !== "open") {
+    if ((step === "host" || step === "agent") && connection !== "open") {
       setStep("server");
     }
   }, [account, connection, step]);
+
+  useEffect(() => {
+    setAgentMachines(machines);
+  }, [machines]);
+
+  useEffect(() => {
+    if (step !== "agent") return;
+    let alive = true;
+    setAgentProviderStatus("loading");
+    void ipc
+      .machineList()
+      .then((result) => {
+        if (!alive) return;
+        setAgentMachines(result.machines);
+        setAgentProviderStatus("ready");
+      })
+      .catch(() => {
+        if (!alive) return;
+        setAgentMachines(machines);
+        setAgentProviderStatus("error");
+      });
+    return () => {
+      alive = false;
+    };
+  }, [machines, step]);
 
   useEffect(() => {
     if (!account || workspaces.length > 0) return;
@@ -174,6 +213,7 @@ export function OnboardingView({
   const canSaveIdentity = userIdValid && actorIdValid && busy !== "account:set-local";
   const canVisitServer = Boolean(account);
   const canVisitHost = Boolean(account && connection === "open");
+  const canVisitAgent = canVisitHost;
   const hasServerTarget = Boolean(
     workspaceForm.advanced
       ? workspaceForm.serverUrl.trim()
@@ -200,6 +240,39 @@ export function OnboardingView({
     ) ?? null;
   const hasLocalProvider = providers.length > 0;
   const hostBusy = busy === "machine:create" || busy === "machine:start";
+  const agentProviderChoices = useMemo<AgentProviderChoice[]>(
+    () =>
+      agentMachines.flatMap((machine) =>
+        machineCanCreateAgent(machine)
+          ? machine.providers.map((provider) => ({
+              key: `${machine.id}::${provider.id}`,
+              machine,
+              provider,
+            }))
+          : [],
+      ),
+    [agentMachines],
+  );
+  const agentCount = agentMachines.reduce(
+    (count, machine) => count + machine.agentCount,
+    0,
+  );
+  const selectedAgentProvider =
+    agentProviderChoices.find((choice) => choice.key === selectedAgentProviderKey) ??
+    agentProviderChoices[0] ??
+    null;
+
+  useEffect(() => {
+    if (agentProviderChoices.length === 0) {
+      setSelectedAgentProviderKey(null);
+      return;
+    }
+    setSelectedAgentProviderKey((current) =>
+      current && agentProviderChoices.some((choice) => choice.key === current)
+        ? current
+        : agentProviderChoices[0].key,
+    );
+  }, [agentProviderChoices]);
 
   async function submitIdentity(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -239,6 +312,29 @@ export function OnboardingView({
   function startSetup() {
     setPrepComplete(true);
     setStep("identity");
+  }
+
+  async function startLocalHostAndContinue() {
+    const started = await onStartLocalHost();
+    if (started) setStep("agent");
+  }
+
+  async function createDefaultAgent() {
+    if (!selectedAgentProvider || busy === "agent:create") return;
+    const { machine, provider } = selectedAgentProvider;
+    const created = await onCreateAgent({
+      machineId: machine.id,
+      providerId: provider.id,
+      actorId: "",
+      name: "Assistant",
+      description: "Default assistant for this workspace.",
+      instructions: "Reply concisely and help with workspace messages.",
+      model: provider.defaultModel || provider.modelChoices[0]?.id || "",
+      autostart: true,
+      env: {},
+      wake: defaultWakeSpec(),
+    });
+    if (created) onFinish();
   }
 
   return (
@@ -293,10 +389,27 @@ export function OnboardingView({
                 ? liveHost.name
                 : hasLocalProvider
                   ? `${providers.length} runtime${providers.length === 1 ? "" : "s"} detected`
-                  : "Optional"
+                  : "Recommended"
             }
             onSelect={() => {
               if (canVisitHost) setStep("host");
+            }}
+          />
+          <StepRow
+            active={step === "agent"}
+            complete={agentCount > 0}
+            disabled={!canVisitAgent}
+            icon={Bot}
+            title="Agent"
+            detail={
+              agentCount > 0
+                ? `${agentCount} configured`
+                : agentProviderChoices.length > 0
+                  ? `${agentProviderChoices.length} runtime${agentProviderChoices.length === 1 ? "" : "s"} ready`
+                  : "Create or skip"
+            }
+            onSelect={() => {
+              if (canVisitAgent) setStep("agent");
             }}
           />
         </div>
@@ -604,7 +717,7 @@ export function OnboardingView({
                 </div>
               </form>
             </section>
-          ) : (
+          ) : step === "host" ? (
             <section className="flex flex-1 flex-col py-2">
               <Button
                 type="button"
@@ -619,10 +732,10 @@ export function OnboardingView({
                 <div>
                   <StepEyebrow icon={MonitorCog}>Step 3</StepEyebrow>
                   <h1 className="mt-4 text-3xl font-bold tracking-normal text-[#111827]">
-                    Start a Host (optional)
+                    Start your local Host
                   </h1>
                   <p className="mt-3 max-w-xl text-sm leading-6 text-[#667085]">
-                    A Host is the machine that runs agent CLIs. Start it here if the agents run on this computer. If they run elsewhere, open Loom on that machine, connect to the same server, then run the generated Host command there.
+                    Recommended for this setup: start a Host on this computer so Loom can create and run local agents. You can skip this if agents run on another machine.
                   </p>
                 </div>
                 <Button variant="outline" onClick={onCheckMachines} disabled={busy === "machine:check"}>
@@ -653,7 +766,7 @@ export function OnboardingView({
                             ? `${pendingHost.name} is prepared.`
                             : hasLocalProvider
                               ? "Loom can start a local Host for this server."
-                              : "You can finish now and connect agents later."}
+                            : "You can continue and add an agent later."}
                       </div>
                     </div>
                     {liveHost ? (
@@ -680,22 +793,26 @@ export function OnboardingView({
                   <div className="mt-5 flex flex-wrap gap-3">
                     <Button
                       onClick={() => {
-                        void onStartLocalHost();
+                        if (liveHost) {
+                          setStep("agent");
+                          return;
+                        }
+                        void startLocalHostAndContinue();
                       }}
-                      disabled={!hasLocalProvider || Boolean(liveHost) || hostBusy}
+                      disabled={hostBusy || (!hasLocalProvider && !liveHost)}
                       className="rounded-lg"
                     >
                       {hostBusy ? (
                         <Loader2 className="animate-spin" size={15} />
                       ) : liveHost ? (
-                        <Check size={15} />
+                        <ArrowRight size={15} />
                       ) : (
                         <Power size={15} />
                       )}
-                      {liveHost ? "Host Online" : "Start Local Host"}
+                      {liveHost ? "Continue to agent" : "Start Local Host"}
                     </Button>
-                    <Button variant="outline" onClick={onFinish} className="rounded-lg">
-                      Finish
+                    <Button variant="outline" onClick={() => setStep("agent")} className="rounded-lg">
+                      Skip host
                     </Button>
                   </div>
                 </div>
@@ -720,6 +837,176 @@ export function OnboardingView({
                 </div>
               </div>
             </section>
+          ) : (
+            <section className="flex flex-1 flex-col py-2">
+              <Button
+                type="button"
+                variant="outline"
+                className="mb-5 w-fit rounded-lg"
+                onClick={() => setStep("host")}
+              >
+                <ArrowLeft size={15} />
+                Back to Host
+              </Button>
+              <div className="flex flex-wrap items-start justify-between gap-4">
+                <div>
+                  <StepEyebrow icon={Bot}>Step 4</StepEyebrow>
+                  <h1 className="mt-4 text-3xl font-bold tracking-normal text-[#111827]">
+                    Create your first agent
+                  </h1>
+                  <p className="mt-3 max-w-xl text-sm leading-6 text-[#667085]">
+                    Pick a detected runtime and Loom will create a default Assistant with the recommended queued wake policy. You can skip this and configure agents later.
+                  </p>
+                </div>
+                <Button
+                  variant="outline"
+                  onClick={() => {
+                    setAgentProviderStatus("loading");
+                    void ipc
+                      .machineList()
+                      .then((result) => {
+                        setAgentMachines(result.machines);
+                        setAgentProviderStatus("ready");
+                      })
+                      .catch(() => {
+                        setAgentMachines(machines);
+                        setAgentProviderStatus("error");
+                      });
+                  }}
+                  disabled={agentProviderStatus === "loading"}
+                >
+                  {agentProviderStatus === "loading" ? (
+                    <Loader2 className="animate-spin" size={15} />
+                  ) : (
+                    <RefreshCw size={15} />
+                  )}
+                  Refresh
+                </Button>
+              </div>
+
+              <div className="mt-7 grid gap-4 lg:grid-cols-[minmax(0,1fr)_280px]">
+                <div className="rounded-lg border border-[#dfe3ec] bg-[#fbfbfd] p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <div className="text-sm font-bold text-[#111827]">
+                        {agentProviderStatus === "loading"
+                          ? "Checking host runtimes"
+                          : agentProviderChoices.length > 0
+                            ? "Runtime ready"
+                            : "No runtime ready"}
+                      </div>
+                      <div className="mt-1 text-sm text-[#667085]">
+                        {agentProviderChoices.length > 0
+                          ? "Choose a provider for the default Assistant."
+                          : "Start a local Host with a detected runtime, or skip and add agents later."}
+                      </div>
+                    </div>
+                    <Badge
+                      variant={agentProviderChoices.length > 0 ? "success" : "secondary"}
+                    >
+                      {agentProviderChoices.length > 0
+                        ? `${agentProviderChoices.length} ready`
+                        : "Optional"}
+                    </Badge>
+                  </div>
+
+                  {agentProviderStatus === "error" && (
+                    <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-medium text-amber-700">
+                      Could not refresh host runtimes. Showing the last known host list.
+                    </div>
+                  )}
+
+                  <div className="mt-4 grid gap-2">
+                    {agentProviderStatus === "loading" ? (
+                      <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-white p-4 text-sm text-[#667085]">
+                        Scanning registered hosts…
+                      </div>
+                    ) : agentProviderChoices.length > 0 ? (
+                      agentProviderChoices.map((choice) => {
+                        const selected = choice.key === selectedAgentProvider?.key;
+                        return (
+                          <button
+                            key={choice.key}
+                            type="button"
+                            className={cn(
+                              "flex min-h-[68px] items-center gap-3 rounded-xl border bg-white px-3 py-3 text-left transition-colors",
+                              selected
+                                ? "border-[#8f82ff] bg-[#f7f5ff] ring-2 ring-[#ece8ff]"
+                                : "border-[#e2e6ef] hover:border-[#c8c1ff]",
+                            )}
+                            onClick={() => setSelectedAgentProviderKey(choice.key)}
+                          >
+                            <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-[#edf0f5] bg-white text-[#503ed4]">
+                              <Bot size={18} />
+                            </span>
+                            <span className="min-w-0 flex-1">
+                              <span className="block truncate text-sm font-bold text-[#111827]">
+                                {choice.provider.name}
+                              </span>
+                              <span className="mt-0.5 block truncate text-xs text-[#667085]">
+                                {choice.machine.name}
+                                {choice.provider.defaultModel
+                                  ? ` / ${choice.provider.defaultModel}`
+                                  : ""}
+                              </span>
+                            </span>
+                            {selected && <Check size={16} className="shrink-0 text-[#503ed4]" />}
+                          </button>
+                        );
+                      })
+                    ) : (
+                      <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-white p-4 text-sm text-[#667085]">
+                        No provider is available on an online Host yet.
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="mt-5 flex flex-wrap gap-3">
+                    <Button
+                      onClick={() => {
+                        void createDefaultAgent();
+                      }}
+                      disabled={
+                        !selectedAgentProvider ||
+                        busy === "agent:create" ||
+                        agentProviderStatus === "loading"
+                      }
+                      className="rounded-lg"
+                    >
+                      {busy === "agent:create" ? (
+                        <Loader2 className="animate-spin" size={15} />
+                      ) : (
+                        <Bot size={15} />
+                      )}
+                      Create Assistant
+                    </Button>
+                    <Button variant="outline" onClick={onFinish} className="rounded-lg">
+                      Skip
+                    </Button>
+                  </div>
+                </div>
+
+                <div className="rounded-lg border border-[#dfe3ec] bg-white p-4">
+                  <div className="text-xs font-semibold text-[#667085]">
+                    Default agent
+                  </div>
+                  <div className="mt-3 rounded-lg border border-[#edf0f5] bg-[#fbfbfd] p-3">
+                    <div className="flex items-center gap-2 text-sm font-bold text-[#111827]">
+                      <Bot size={16} className="text-[#503ed4]" />
+                      Assistant
+                    </div>
+                    <div className="mt-2 text-sm leading-6 text-[#667085]">
+                      Queues human messages while busy, coalesces bursts, and autostarts with the selected provider.
+                    </div>
+                  </div>
+                  {agentCount > 0 && (
+                    <div className="mt-4 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs font-medium text-emerald-700">
+                      {agentCount} agent{agentCount === 1 ? "" : "s"} already configured. You can still create Assistant or skip.
+                    </div>
+                  )}
+                </div>
+              </div>
+            </section>
           )}
         </div>
       </main>
@@ -736,7 +1023,7 @@ function PrepStep({ onContinue }: { onContinue: () => void }) {
           A quick map before setup
         </h1>
         <p className="mt-3 max-w-2xl text-sm leading-6 text-[#667085]">
-          First run has three jobs: identify yourself, connect to a server, and decide whether this computer should run agents as a Host.
+          First run has four jobs: identify yourself, connect to a server, decide whether this computer should run agents as a Host, and create an Assistant.
         </p>
 
         <div className="mt-8 overflow-hidden rounded-lg border border-[#dfe3ec] bg-white">
@@ -757,6 +1044,12 @@ function PrepStep({ onContinue }: { onContinue: () => void }) {
             title="Host"
             body="A Host is a computer that runs agents. If this machine runs agents, start the local Host after connecting. If agents live on another machine, connect that machine to the same server and run its generated Host command there."
             detail="Run locally, or run the Host command on the agent machine"
+          />
+          <ConceptRow
+            icon={Bot}
+            title="Agent"
+            body="An agent is the assistant you @ mention in a channel. Loom can create a default Assistant after it detects a runtime provider."
+            detail="@Assistant wakes it in channel messages"
           />
         </div>
 

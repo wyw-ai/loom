@@ -1,4 +1,4 @@
-const CACHE_NAME = "loom-gui-web-v1";
+const CACHE_NAME = "loom-gui-web-v2";
 const APP_SHELL = ["/", "/index.html", "/manifest.webmanifest", "/icon.png"];
 
 self.addEventListener("install", (event) => {
@@ -20,6 +20,9 @@ self.addEventListener("activate", (event) => {
 self.addEventListener("fetch", (event) => {
   const request = event.request;
   if (request.method !== "GET") return;
+  const url = new URL(request.url);
+  // Never intercept cross-origin requests (RPC, avatars, etc.).
+  if (url.origin !== self.location.origin) return;
 
   event.respondWith(
     fetch(request)
@@ -31,7 +34,13 @@ self.addEventListener("fetch", (event) => {
         return response;
       })
       .catch(() =>
-        caches.match(request).then((cached) => cached || caches.match("/index.html")),
+        caches.match(request).then((cached) => {
+          if (cached) return cached;
+          // Only navigations may fall back to the app shell; assets must
+          // fail loudly instead of being served HTML.
+          if (request.mode === "navigate") return caches.match("/index.html");
+          return Response.error();
+        }),
       ),
   );
 });

@@ -496,7 +496,7 @@ export function App() {
     threadMessages, threadStatsById, tasksBySourceMessageId, channelThreads,
     chatEmpty, draft, threadDraft, replyTo, channelAgentActors,
     prepareLocalServerSpace, allThreads, threadMessageTarget, activeDirectActor,
-    activeDirectTarget, directMessages, directDraft, inbox, tasks, workspaceForm,
+    activeDirectScope, activeDirectTarget, directMessages, directDraft, inbox, tasks, workspaceForm,
     agentForm, settingsAgentId, actors, setDraft, setThreadDraft, setDirectDraft,
     setReplyTo, setWorkspaceForm, setAgentForm, sendMessage, sendThreadMessage,
     sendDirectMessage, startThread, toggleMessageReaction, answerAction,

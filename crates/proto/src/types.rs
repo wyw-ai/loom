@@ -1095,6 +1095,11 @@ pub enum DeliveryState {
     Pending,
     Delivered,
     Failed,
+    /// Withdrawn before consumption (e.g. a human revoked a queued wake from
+    /// the GUI). Terminal; workers drop matching queued triggers. Additive
+    /// variant: servers only emit it for clients that requested cancellation
+    /// flows, and state-filtered queries never leak it to legacy pollers.
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -109,6 +109,7 @@ export interface WorkspaceShellProps {
   allThreads: (Thread & { channel: Channel })[];
   threadMessageTarget: string | null;
   activeDirectActor: Actor | null;
+  activeDirectScope: ScopeRef | null;
   activeDirectTarget: string | null;
   directMessages: Message[];
   directDraft: string;
@@ -270,6 +271,7 @@ export function WorkspaceShell(props: WorkspaceShellProps) {
           threadMessageTarget={p.threadMessageTarget}
           agentActors={p.agentActors}
           activeDirectActor={p.activeDirectActor}
+          activeDirectScope={p.activeDirectScope}
           activeDirectTarget={p.activeDirectTarget}
           directMessages={p.directMessages}
           directDraft={p.directDraft}

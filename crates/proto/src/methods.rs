@@ -98,6 +98,17 @@ pub mod method {
     /// host can resume after restart without losing directed events.
     pub const INBOX_LIST: &str = "inbox.list";
     pub const DELIVERY_ACK: &str = "delivery.ack";
+    /// Aggregate pending-delivery status for a set of actors (counts +
+    /// optional source-id entries, never message bodies). Powers the GUI
+    /// agent-activity banner. Callers may query themselves and agent/service
+    /// actors; human inboxes stay private.
+    pub const INBOX_STATUS: &str = "inbox.status";
+    /// Withdraw pending deliveries before an agent consumes them. The worker
+    /// drops matching queued triggers when it sees the state change.
+    pub const DELIVERY_CANCEL: &str = "delivery.cancel";
+    /// Ask the target actor's worker to move a pending delivery to the front
+    /// of its queue (and dispatch immediately if the scope is idle).
+    pub const DELIVERY_EXPEDITE: &str = "delivery.expedite";
     /// Compatibility create-and-wait wrapper around the durable command API.
     pub const MACHINE_COMMAND: &str = "machine/command";
     pub const MACHINE_COMMAND_CREATE: &str = "machine/command.create";
@@ -1873,6 +1884,80 @@ pub struct DeliveryAckResult {
     pub delivery: Delivery,
 }
 
+// ---- inbox.status / delivery.cancel / delivery.expedite (agent-activity banner) ----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InboxStatusParams {
+    /// Actors to report on. Callers may name themselves and agent/service
+    /// actors; entries for other humans are silently omitted.
+    pub actor_ids: Vec<String>,
+    /// Include per-delivery source-id entries (capped). Off by default so the
+    /// collapsed banner can poll counts cheaply.
+    #[serde(default)]
+    pub include_entries: bool,
+    /// Cap for `entries` per actor (default 50, hard cap 200).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InboxStatusEntry {
+    pub source_id: String,
+    pub updated_at: Timestamp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InboxActorStatus {
+    pub actor_id: String,
+    /// Pending (unconsumed) delivery count.
+    pub pending: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_pending_at: Option<Timestamp>,
+    /// Pending deliveries oldest-first (only when `include_entries`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<InboxStatusEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct InboxStatusResult {
+    pub actors: Vec<InboxActorStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliveryCancelParams {
+    /// Target actor whose pending deliveries are withdrawn.
+    pub actor_id: String,
+    /// Specific deliveries to cancel. Ignored when `all_pending` is set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_ids: Vec<String>,
+    /// Cancel every pending delivery for `actor_id`.
+    #[serde(default)]
+    pub all_pending: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliveryCancelResult {
+    pub cancelled: Vec<Delivery>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliveryExpediteParams {
+    pub actor_id: String,
+    pub source_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeliveryExpediteResult {
+    pub delivery: Delivery,
+}
+
 // ---- machine command durable lifecycle ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3087,6 +3172,25 @@ pub struct WakeSpec {
     /// injected outside the structured wake body. Default is runtime-defined.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_token_budget: Option<u64>,
+    /// How the per-turn user message is rendered. `minimal` (default) is a
+    /// compact plain-text list of the delivered messages plus a one-line
+    /// queue summary; `structured` keeps the turn-input-contract v1 JSON
+    /// header + fenced bodies for strong/programmatic agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_input_style: Option<TurnInputStyle>,
+}
+
+/// Turn-input rendering style. See `WakeSpec.turn_input_style`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum TurnInputStyle {
+    /// Compact plain-text digest: numbered pending-message list (each body
+    /// capped and pointing at `loom message get` for the full text) plus a
+    /// one-line scope/queue summary. Default.
+    #[default]
+    Minimal,
+    /// Turn-input-contract v1: fenced JSON wake header + fenced raw bodies.
+    Structured,
 }
 
 /// Reply-reminder frequency. See `WakeSpec.reply_reminder`.
@@ -3629,6 +3733,10 @@ pub mod stream_kind {
     /// Mirror of `CHANNEL_INVITED`: the recipient was removed from a
     /// channel. Carries `{ channelId, actorId }`.
     pub const CHANNEL_REVOKED: &str = "channel.revoked";
+    /// Broadcast when an agent/service actor's canonical worker connection
+    /// comes online or goes away. Carries `{ actorId, online }`. Human
+    /// connections never emit this.
+    pub const PRESENCE_CHANGED: &str = "presence.changed";
 }
 
 #[cfg(test)]

@@ -5294,6 +5294,121 @@ impl Store {
         Ok(delivery)
     }
 
+    /// Aggregate pending-delivery status for `actor_id` (agent-activity
+    /// banner). Uses the by-actor index; never exposes message bodies.
+    pub fn inbox_status_for_actor(
+        &self,
+        actor_id: &str,
+        include_entries: bool,
+        entry_limit: usize,
+    ) -> proto::methods::InboxActorStatus {
+        let inner = self.inner.read();
+        let mut pending: Vec<(&String, Timestamp)> = inner
+            .deliveries_by_actor
+            .get(actor_id)
+            .map(|sources| {
+                sources
+                    .iter()
+                    .filter_map(|source_id| {
+                        inner
+                            .deliveries
+                            .get(&(source_id.clone(), actor_id.to_string()))
+                            .filter(|d| d.state == DeliveryState::Pending)
+                            .map(|d| (source_id, d.updated_at))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        pending.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(b.0)));
+        let entries = if include_entries {
+            pending
+                .iter()
+                .take(entry_limit)
+                .map(|(source_id, updated_at)| proto::methods::InboxStatusEntry {
+                    source_id: (*source_id).clone(),
+                    updated_at: *updated_at,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        proto::methods::InboxActorStatus {
+            actor_id: actor_id.to_string(),
+            pending: pending.len() as u32,
+            oldest_pending_at: pending.first().map(|(_, at)| *at),
+            entries,
+        }
+    }
+
+    /// Withdraw pending deliveries for `actor_id` before the worker consumes
+    /// them. `source_ids = None` cancels every pending delivery. Returns the
+    /// cancelled rows (each also broadcast as `delivery.updated` so the
+    /// worker can drop its queued triggers).
+    pub fn cancel_pending_deliveries(
+        &self,
+        actor_id: &str,
+        source_ids: Option<&[String]>,
+    ) -> StoreResult<Vec<Delivery>> {
+        let now = Utc::now();
+        let mut cancelled = Vec::new();
+        {
+            let mut inner = self.inner.write();
+            let candidates: Vec<String> = match source_ids {
+                Some(ids) => ids.to_vec(),
+                None => inner
+                    .deliveries_by_actor
+                    .get(actor_id)
+                    .map(|set| set.iter().cloned().collect())
+                    .unwrap_or_default(),
+            };
+            for source_id in candidates {
+                let key = (source_id.clone(), actor_id.to_string());
+                if let Some(delivery) = inner.deliveries.get_mut(&key) {
+                    if delivery.state != DeliveryState::Pending {
+                        continue;
+                    }
+                    delivery.state = DeliveryState::Cancelled;
+                    delivery.updated_at = now;
+                    cancelled.push(delivery.clone());
+                }
+            }
+        }
+        for delivery in &cancelled {
+            self.journal
+                .append(&Mutation::DeliveryUpsert(delivery.clone()))?;
+            self.emit(StoreEvent::DeliveryUpdated(delivery.clone()));
+        }
+        Ok(cancelled)
+    }
+
+    /// Flag a pending delivery so the target worker promotes it to the front
+    /// of its queue. The state stays `pending`; only `_meta.expedite` is set
+    /// and the row is re-broadcast.
+    pub fn expedite_delivery(&self, actor_id: &str, source_id: &str) -> StoreResult<Delivery> {
+        let now = Utc::now();
+        let mut inner = self.inner.write();
+        let key = (source_id.to_string(), actor_id.to_string());
+        let Some(delivery) = inner.deliveries.get_mut(&key) else {
+            return Err(StoreError::NotFound(format!(
+                "delivery source={source_id} actor={actor_id}"
+            )));
+        };
+        if delivery.state != DeliveryState::Pending {
+            return Err(StoreError::InvalidState(format!(
+                "delivery source={source_id} actor={actor_id} is not pending"
+            )));
+        }
+        delivery.updated_at = now;
+        let meta = delivery._meta.get_or_insert_with(Default::default);
+        meta.insert("expedite".into(), serde_json::json!(true));
+        let delivery = delivery.clone();
+        drop(inner);
+        self.journal
+            .append(&Mutation::DeliveryUpsert(delivery.clone()))?;
+        self.emit(StoreEvent::DeliveryUpdated(delivery.clone()));
+        Ok(delivery)
+    }
+
     // -------- Machine commands --------
 
     pub fn upsert_machine_command(&self, command: MachineCommand) -> StoreResult<MachineCommand> {

@@ -1082,6 +1082,39 @@ pub async fn delivery_ack(state: State<'_, AppState>, params: Value) -> Result<V
 }
 
 #[tauri::command]
+pub async fn inbox_status(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::INBOX_STATUS, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn delivery_cancel(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::DELIVERY_CANCEL, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn delivery_expedite(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::DELIVERY_EXPEDITE, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
 pub async fn task_workspace_lease_acquire(
     state: State<'_, AppState>,
     params: Value,

@@ -167,6 +167,9 @@ pub async fn dispatch(
         method::REMINDER_UPDATE => reminder_update(state, params),
         method::INBOX_LIST => inbox_list(state, connection_id, params),
         method::DELIVERY_ACK => delivery_ack(state, connection_id, params),
+        method::INBOX_STATUS => inbox_status(state, connection_id, params),
+        method::DELIVERY_CANCEL => delivery_cancel(state, connection_id, params),
+        method::DELIVERY_EXPEDITE => delivery_expedite(state, connection_id, params),
         method::MACHINE_COMMAND => machine_command(state, connection_id, params).await,
         method::MACHINE_COMMAND_CREATE => {
             machine_command_create(state, connection_id, params).await
@@ -248,16 +251,28 @@ fn connection_open(state: &AppState, connection_id: &str, params: Option<Value>)
             "actor-kind mismatch bound as observer",
         );
     }
-    state.subscriptions.bind_actor(
+    let effective_kind = if human_observer {
+        actor.kind
+    } else {
+        claim_kind
+    };
+    let came_online = state.subscriptions.bind_actor(
         connection_id,
         actor_id.clone(),
-        if human_observer {
-            actor.kind
-        } else {
-            claim_kind
-        },
+        effective_kind,
         claim_inbox,
     );
+    // Presence broadcast: agent/service runtimes becoming the canonical
+    // inbox owner is what "online" means for the GUI activity banner.
+    if came_online && matches!(effective_kind, ActorKind::Agent | ActorKind::Service) {
+        state.subscriptions.broadcast_to_all(
+            method::STREAM_UPDATE,
+            serde_json::json!({
+                "kind": proto::methods::stream_kind::PRESENCE_CHANGED,
+                "data": { "actorId": actor_id, "online": true },
+            }),
+        );
+    }
     let endpoint_id = format!(
         "ep_{}",
         p.endpoint
@@ -2704,6 +2719,91 @@ fn delivery_ack(state: &AppState, connection_id: &str, params: Option<Value>) ->
         .ack_delivery(&p.actor_id, &p.source_id)
         .map_err(map_store_err)?;
     ok(DeliveryAckResult { delivery })
+}
+
+/// True when `caller` may inspect/manage the delivery queue of `target`:
+/// itself, or any agent/service actor (their queues are operational state
+/// the humans steering them need to see). Other humans' inboxes stay
+/// private.
+fn may_manage_actor_inbox(state: &AppState, caller: &str, target: &str) -> bool {
+    if caller == target {
+        return true;
+    }
+    state
+        .store
+        .get_actor(target)
+        .map(|actor| matches!(actor.kind, ActorKind::Agent | ActorKind::Service))
+        .unwrap_or(false)
+}
+
+fn inbox_status(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
+    let p: InboxStatusParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let entry_limit = p.entry_limit.unwrap_or(50).min(200) as usize;
+    let actors = p
+        .actor_ids
+        .iter()
+        .filter(|target| may_manage_actor_inbox(state, &caller, target))
+        .map(|target| {
+            state
+                .store
+                .inbox_status_for_actor(target, p.include_entries, entry_limit)
+        })
+        .collect();
+    ok(InboxStatusResult { actors })
+}
+
+fn delivery_cancel(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
+    let p: DeliveryCancelParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    if !may_manage_actor_inbox(state, &caller, &p.actor_id) {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!(
+                "delivery.cancel: caller actor `{caller}` cannot manage inbox of `{}`",
+                p.actor_id
+            ),
+        ));
+    }
+    if !p.all_pending && p.source_ids.is_empty() {
+        return Err(ErrorObject::new(
+            ErrorCode::INVALID_PARAMS,
+            "delivery.cancel requires sourceIds or allPending",
+        ));
+    }
+    let source_filter = if p.all_pending {
+        None
+    } else {
+        Some(p.source_ids.as_slice())
+    };
+    let cancelled = state
+        .store
+        .cancel_pending_deliveries(&p.actor_id, source_filter)
+        .map_err(map_store_err)?;
+    ok(DeliveryCancelResult { cancelled })
+}
+
+fn delivery_expedite(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: DeliveryExpediteParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    if !may_manage_actor_inbox(state, &caller, &p.actor_id) {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!(
+                "delivery.expedite: caller actor `{caller}` cannot manage inbox of `{}`",
+                p.actor_id
+            ),
+        ));
+    }
+    let delivery = state
+        .store
+        .expedite_delivery(&p.actor_id, &p.source_id)
+        .map_err(map_store_err)?;
+    ok(DeliveryExpediteResult { delivery })
 }
 
 async fn machine_command(
@@ -6867,12 +6967,19 @@ mod tests {
             .await
         });
 
-        let frame = service_rx
-            .recv()
-            .await
-            .expect("machine command notification");
-        let notification: proto::Notification =
-            serde_json::from_str(&frame).expect("notification frame");
+        // Skip any presence.changed stream frames that precede the machine
+        // command notification (the service actor binding broadcasts one).
+        let notification: proto::Notification = loop {
+            let frame = service_rx
+                .recv()
+                .await
+                .expect("machine command notification");
+            let notification: proto::Notification =
+                serde_json::from_str(&frame).expect("notification frame");
+            if notification.method != method::STREAM_UPDATE {
+                break notification;
+            }
+        };
         assert_eq!(notification.method, method::MACHINE_COMMAND_NOTIFY);
         let params = notification.params.expect("notification params");
         let command_id = params

@@ -2,6 +2,7 @@ import {
   useState,
 } from "react";
 import { ActorAvatar } from "@/components/agent/ActorAvatar";
+import { AgentActivityBanner } from "@/components/chat/AgentActivityBanner";
 import { Composer } from "@/components/chat/Composer";
 import { MessageFeed } from "@/components/chat/MessageFeed";
 import { EmptyState } from "@/components/shared/EmptyState";
@@ -9,7 +10,7 @@ import { Button } from "@/components/ui/button";
 import { displayName, shortActorAlias } from "@/lib/format-utils";
 import { cn } from "@/lib/utils";
 import { Bot, Hash, MessageCircle, Search } from "lucide-react";
-import type { Actor, Channel, MachineInfo, Message, Run } from "@/ipc/types";
+import type { Actor, Channel, MachineInfo, Message, Run, ScopeRef } from "@/ipc/types";
 
 export function DirectMessagesView({
   actors,
@@ -22,6 +23,7 @@ export function DirectMessagesView({
   machines,
   runs,
   messages,
+  directScope,
   anchorMessageId,
   selectedAgent,
   setDraft,
@@ -42,6 +44,7 @@ export function DirectMessagesView({
   machines: MachineInfo[];
   runs: Record<string, Run>;
   messages: Message[];
+  directScope: ScopeRef | null;
   anchorMessageId?: string | null;
   selectedAgent: Actor | null;
   setDraft: (value: string) => void;
@@ -161,6 +164,13 @@ export function DirectMessagesView({
               busy={busy}
               anchorMessageId={anchorMessageId}
             />
+            <AgentActivityBanner
+              actors={actors}
+              agentActorIds={[selectedAgent.id]}
+              runs={runs}
+              scope={directScope}
+              enabled={!disabled}
+            />
             <Composer
               draft={draft}
               setDraft={setDraft}
@@ -180,5 +190,3 @@ export function DirectMessagesView({
     </section>
   );
 }
-
-

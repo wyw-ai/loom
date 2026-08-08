@@ -231,7 +231,20 @@ async fn cleanup_connection(
     tx: mpsc::UnboundedSender<String>,
     writer: JoinHandle<()>,
 ) {
-    subscriptions.remove_connection(connection_id);
+    if let Some(actor_id) = subscriptions.remove_connection(connection_id) {
+        if matches!(
+            subscriptions.actor_kind(&actor_id),
+            Some(proto::types::ActorKind::Agent | proto::types::ActorKind::Service)
+        ) {
+            subscriptions.broadcast_to_all(
+                method::STREAM_UPDATE,
+                json!({
+                    "kind": proto::methods::stream_kind::PRESENCE_CHANGED,
+                    "data": { "actorId": actor_id, "online": false },
+                }),
+            );
+        }
+    }
     drop(tx);
     let _ = writer.await;
 }

@@ -375,6 +375,35 @@ export async function deliveryAck(params: {
   return invoke("delivery_ack", { params });
 }
 
+export async function inboxStatus(params: {
+  actorIds: string[];
+  includeEntries?: boolean;
+  entryLimit?: number;
+}): Promise<import("./types").InboxStatusResult> {
+  return invoke("inbox_status", { params });
+}
+
+export async function deliveryCancel(params: {
+  actorId: string;
+  sourceIds?: string[];
+  allPending?: boolean;
+}): Promise<{ cancelled: import("./types").Delivery[] }> {
+  return invoke("delivery_cancel", { params });
+}
+
+export async function deliveryExpedite(params: {
+  actorId: string;
+  sourceId: string;
+}): Promise<{ delivery: import("./types").Delivery }> {
+  return invoke("delivery_expedite", { params });
+}
+
+export async function connectionList(params?: {
+  actorIds?: string[];
+}): Promise<{ actorIds: string[] }> {
+  return invoke("connection_list", { params: params ?? {} });
+}
+
 export async function artifactGet(params: {
   artifactId?: string;
   artifactUri?: string;

@@ -8,8 +8,10 @@ import type {
   Thread,
   ScopeRef,
   InboxListEntry,
+  PresenceChangedData,
 } from "@/ipc/types";
 import { applyMessageToUsageStore, applyRunToUsageStore } from "@/store/usageStore";
+import { applyPresenceChanged, bumpDeliveryTick } from "@/store/presenceStore";
 import {
   directChannelPeerId,
   isDirectChannel,
@@ -271,6 +273,13 @@ export function useStreamHandler(deps: StreamHandlerDeps) {
           }
           return;
         }
+        case "presence.changed": {
+          const data = update.data as Partial<PresenceChangedData>;
+          if (typeof data.actorId === "string" && typeof data.online === "boolean") {
+            applyPresenceChanged({ actorId: data.actorId, online: data.online });
+          }
+          return;
+        }
         case "task.changed": {
           const task = update.data.task as Task | undefined;
           if (task) d.setTasks((current) => sortTasks(upsert(current, task)));
@@ -282,6 +291,7 @@ export function useStreamHandler(deps: StreamHandlerDeps) {
           return;
         }
         case "delivery.updated": {
+          bumpDeliveryTick();
           const actorId = d.actorIdRef.current;
           if (actorId) void d.refreshInbox(actorId).catch(() => {});
           return;

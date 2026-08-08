@@ -103,7 +103,7 @@ impl Subscriptions {
         actor_id: String,
         actor_kind: ActorKind,
         claim_inbox: bool,
-    ) {
+    ) -> bool {
         let mut inner = self.inner.write();
         if let Some(c) = inner.connections.get_mut(connection_id) {
             c.actor_id = Some(actor_id.clone());
@@ -128,8 +128,12 @@ impl Subscriptions {
                 kind = ?actor_kind,
                 "actor connection bound as observer; inbox owner unchanged",
             );
-            return;
+            return false;
         }
+        let previously_owned = matches!(
+            inner.actor_conn.get(&actor_id),
+            Some(prev) if inner.connections.contains_key(prev)
+        );
         let take_inbox = match inner.actor_conn.get(&actor_id) {
             None => true,
             Some(prev) if prev == connection_id => true,
@@ -167,14 +171,22 @@ impl Subscriptions {
         if take_inbox {
             inner.actor_conn.insert(actor_id, connection_id.into());
         }
+        // "Came online" = took the inbox slot while no live connection held
+        // it before. Used for presence.changed broadcasts.
+        take_inbox && !previously_owned
     }
 
-    pub fn remove_connection(&self, connection_id: &str) {
+    /// Remove a connection; returns the actor id whose canonical inbox
+    /// binding was dropped (if any), so the caller can broadcast a
+    /// presence change.
+    pub fn remove_connection(&self, connection_id: &str) -> Option<String> {
         let mut inner = self.inner.write();
+        let mut went_offline = None;
         if let Some(c) = inner.connections.remove(connection_id) {
             if let Some(actor) = &c.actor_id {
                 if inner.actor_conn.get(actor).map(|s| s.as_str()) == Some(connection_id) {
                     inner.actor_conn.remove(actor);
+                    went_offline = Some(actor.clone());
                 }
             }
         }
@@ -185,6 +197,12 @@ impl Subscriptions {
                 }
             }
         }
+        went_offline
+    }
+
+    /// Stable actor kind learned at `bind_actor`, if any.
+    pub fn actor_kind(&self, actor_id: &str) -> Option<ActorKind> {
+        self.inner.read().actor_kind.get(actor_id).copied()
     }
 
     pub fn subscribe(&self, connection_id: &str, scope: ScopeRef) -> bool {

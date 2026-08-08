@@ -207,7 +207,7 @@ export interface RunGetResult {
   run: Run;
 }
 
-export type DeliveryState = "pending" | "delivered" | "failed";
+export type DeliveryState = "pending" | "delivered" | "failed" | "cancelled";
 
 export interface Delivery {
   sourceId: string;
@@ -220,6 +220,29 @@ export interface Delivery {
 export interface InboxListEntry {
   delivery: Delivery;
   message?: Message | null;
+}
+
+// ---- inbox.status / delivery.cancel / delivery.expedite (agent banner) ----
+
+export interface InboxStatusEntry {
+  sourceId: string;
+  updatedAt: string;
+}
+
+export interface InboxActorStatus {
+  actorId: string;
+  pending: number;
+  oldestPendingAt?: string | null;
+  entries?: InboxStatusEntry[];
+}
+
+export interface InboxStatusResult {
+  actors: InboxActorStatus[];
+}
+
+export interface PresenceChangedData {
+  actorId: string;
+  online: boolean;
 }
 
 export type TaskStatus =
@@ -345,6 +368,7 @@ export interface WakeSpec {
   replyReminder?: "every-turn" | "first-turn" | "off" | null;
   onHumanMessageWhileBusy?: "queue" | "cancel_and_requeue" | "inject" | null;
   contextTokenBudget?: number | null;
+  turnInputStyle?: "minimal" | "structured" | null;
 }
 
 export interface AgentInfo {

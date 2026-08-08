@@ -25,6 +25,7 @@ import { ErrorBanner, NoSpaceConnectionGuide } from "@/components/shared/PageCom
 import { ChatHeader } from "@/components/layout/ChatHeader";
 import { MessageFeed } from "@/components/chat/MessageFeed";
 import { Composer } from "@/components/chat/Composer";
+import { AgentActivityBanner } from "@/components/chat/AgentActivityBanner";
 import { RemoteFilePanel } from "@/components/chat/RemoteFilePanel";
 import { ThreadsView } from "@/components/views/ThreadsView";
 import { ChannelsView } from "@/components/views/ChannelsView";
@@ -77,6 +78,7 @@ export interface MainContentProps {
   // Direct view
   agentActors: Actor[];
   activeDirectActor: Actor | null;
+  activeDirectScope: ScopeRef | null;
   activeDirectTarget: string | null;
   directMessages: Message[];
   directDraft: string;
@@ -249,6 +251,13 @@ export function MainContent(props: MainContentProps) {
           busy={p.busy}
           anchorMessageId={p.messageAnchorId}
         />
+        <AgentActivityBanner
+          actors={p.actors}
+          agentActorIds={p.channelAgentActors.map((actor) => actor.id)}
+          runs={p.runs}
+          scope={p.activeScope}
+          enabled={p.connection === "open"}
+        />
         <Composer
           draft={p.draft}
           setDraft={p.setDraft}
@@ -365,6 +374,7 @@ export function MainContent(props: MainContentProps) {
           machines={p.machines}
           runs={p.runs}
           messages={p.directMessages}
+          directScope={p.activeDirectScope}
           anchorMessageId={p.messageAnchorId}
           selectedAgent={p.activeDirectActor}
           setDraft={p.setDirectDraft}

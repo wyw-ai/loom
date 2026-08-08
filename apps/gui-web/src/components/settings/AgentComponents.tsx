@@ -20,6 +20,7 @@ import { actorAvatarUrl, agentDisplayName, agentModelValue, agentSettingsDraft, 
 import { avatarLibraryUrls, reasoningEffortChoices } from "@/lib/constants";
 import { agentFormForMachine, capitalize, errorText, machineCanCreateAgent, machineCanRunCommands, resolveAgentProvider, statusDotClass } from "@/lib/format-utils";
 import { cn } from "@/lib/utils";
+import { applyWakePreset, wakePresetIdFor, WAKE_PRESETS, type WakePresetId } from "@/lib/wake-utils";
 import { ArrowLeft, Bot, Check, ChevronLeft, FileText, Folder, HardDrive, Loader2, Plus, RefreshCw, Settings, Trash2, Wrench, X } from "lucide-react";
 import type { MachineAgentProviderInfo, MachineDirListResult, MachineInfo, Run } from "@/ipc/types";
 import type { AgentDetailTab, AgentFormState, AgentMemberEntry, AgentSettingsDraft, AgentUpdatePatch } from "@/lib/types";
@@ -1146,72 +1147,120 @@ export function AgentMemberDetail({
             </div>
           </HostDetailSection>
           <HostDetailSection title="Wake Policy">
-            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
-              <label className="flex h-10 items-center gap-2 rounded-lg border border-[#dfe3ec] bg-white px-3 text-sm text-[#303849]">
-                <input
-                  type="checkbox"
-                  checked={draft.wake.coalesce !== false}
-                  onChange={(event) => updateWake({ coalesce: event.target.checked })}
+            <div className="space-y-3">
+              <div className="grid gap-3 md:grid-cols-2">
+                <StyledSelect
+                  value={wakePresetIdFor(draft.wake)}
+                  onChange={(event) => {
+                    const value = event.target.value;
+                    if (value === "custom") return;
+                    updateWake(
+                      applyWakePreset(draft.wake, value as WakePresetId),
+                    );
+                  }}
                   disabled={!canEdit}
-                />
-                Coalesce
-              </label>
-              <Input
-                type="number"
-                min={0}
-                max={10000}
-                value={draft.wake.debounceMs ?? 0}
-                onChange={(event) =>
-                  updateWake({ debounceMs: Math.max(0, Number(event.target.value) || 0) })
-                }
-                placeholder="Debounce ms"
-                className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
-                disabled={!canEdit}
-              />
-              <StyledSelect
-                value={draft.wake.replyReminder ?? "first-turn"}
-                onChange={(event) =>
-                  updateWake({
-                    replyReminder: event.target.value as NonNullable<
-                      AgentSettingsDraft["wake"]["replyReminder"]
-                    >,
-                  })
-                }
-                disabled={!canEdit}
-              >
-                <option value="first-turn">Reminder first turn</option>
-                <option value="every-turn">Reminder every turn</option>
-                <option value="off">Reminder off</option>
-              </StyledSelect>
-              <StyledSelect
-                value={draft.wake.onHumanMessageWhileBusy ?? "queue"}
-                onChange={(event) =>
-                  updateWake({
-                    onHumanMessageWhileBusy: event.target.value as NonNullable<
-                      AgentSettingsDraft["wake"]["onHumanMessageWhileBusy"]
-                    >,
-                  })
-                }
-                disabled={!canEdit}
-              >
-                <option value="queue">Busy: queue</option>
-                <option value="cancel_and_requeue">Busy: cancel + requeue</option>
-                <option value="inject">Busy: inject</option>
-              </StyledSelect>
-              <Input
-                type="number"
-                min={1}
-                max={8000}
-                value={draft.wake.contextTokenBudget ?? 900}
-                onChange={(event) =>
-                  updateWake({
-                    contextTokenBudget: Math.max(1, Number(event.target.value) || 900),
-                  })
-                }
-                placeholder="Context tokens"
-                className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
-                disabled={!canEdit}
-              />
+                >
+                  {WAKE_PRESETS.map((preset) => (
+                    <option key={preset.id} value={preset.id}>
+                      {preset.label}
+                    </option>
+                  ))}
+                  {wakePresetIdFor(draft.wake) === "custom" && (
+                    <option value="custom">Custom (via Advanced)</option>
+                  )}
+                </StyledSelect>
+                <p className="flex items-center text-xs text-[#667085]">
+                  {WAKE_PRESETS.find((p) => p.id === wakePresetIdFor(draft.wake))
+                    ?.description ??
+                    "Custom combination of the advanced wake fields below."}
+                </p>
+              </div>
+              <details className="rounded-lg border border-[#dfe3ec] bg-white px-3 py-2">
+                <summary className="cursor-pointer select-none text-xs font-semibold text-[#667085]">
+                  Advanced
+                </summary>
+                <div className="mt-3 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                  <label className="flex h-10 items-center gap-2 rounded-lg border border-[#dfe3ec] bg-white px-3 text-sm text-[#303849]">
+                    <input
+                      type="checkbox"
+                      checked={draft.wake.coalesce !== false}
+                      onChange={(event) => updateWake({ coalesce: event.target.checked })}
+                      disabled={!canEdit}
+                    />
+                    Coalesce
+                  </label>
+                  <Input
+                    type="number"
+                    min={0}
+                    max={10000}
+                    value={draft.wake.debounceMs ?? 0}
+                    onChange={(event) =>
+                      updateWake({ debounceMs: Math.max(0, Number(event.target.value) || 0) })
+                    }
+                    placeholder="Debounce ms"
+                    className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
+                    disabled={!canEdit}
+                  />
+                  <StyledSelect
+                    value={draft.wake.replyReminder ?? "first-turn"}
+                    onChange={(event) =>
+                      updateWake({
+                        replyReminder: event.target.value as NonNullable<
+                          AgentSettingsDraft["wake"]["replyReminder"]
+                        >,
+                      })
+                    }
+                    disabled={!canEdit}
+                  >
+                    <option value="first-turn">Reminder first turn</option>
+                    <option value="every-turn">Reminder every turn</option>
+                    <option value="off">Reminder off</option>
+                  </StyledSelect>
+                  <StyledSelect
+                    value={draft.wake.onHumanMessageWhileBusy ?? "queue"}
+                    onChange={(event) =>
+                      updateWake({
+                        onHumanMessageWhileBusy: event.target.value as NonNullable<
+                          AgentSettingsDraft["wake"]["onHumanMessageWhileBusy"]
+                        >,
+                      })
+                    }
+                    disabled={!canEdit}
+                  >
+                    <option value="queue">Busy: queue</option>
+                    <option value="cancel_and_requeue">Busy: cancel + requeue</option>
+                    <option value="inject">Busy: inject</option>
+                  </StyledSelect>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={8000}
+                    value={draft.wake.contextTokenBudget ?? 900}
+                    onChange={(event) =>
+                      updateWake({
+                        contextTokenBudget: Math.max(1, Number(event.target.value) || 900),
+                      })
+                    }
+                    placeholder="Context tokens"
+                    className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
+                    disabled={!canEdit}
+                  />
+                  <StyledSelect
+                    value={draft.wake.turnInputStyle ?? "minimal"}
+                    onChange={(event) =>
+                      updateWake({
+                        turnInputStyle: event.target.value as NonNullable<
+                          AgentSettingsDraft["wake"]["turnInputStyle"]
+                        >,
+                      })
+                    }
+                    disabled={!canEdit}
+                  >
+                    <option value="minimal">Turn input: minimal text</option>
+                    <option value="structured">Turn input: structured JSON</option>
+                  </StyledSelect>
+                </div>
+              </details>
             </div>
           </HostDetailSection>
           <HostDetailSection title="Environment Variables">

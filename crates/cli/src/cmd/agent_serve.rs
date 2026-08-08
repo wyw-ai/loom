@@ -31,12 +31,12 @@ use proto::methods::{
     InboxListResult, MessageListResult, MessageSendResult, OnHumanMessageWhileBusy,
     PromptTemplateSpec, ReplyReminderMode, RunAppendResult, RunCloseResult, RunOpenResult,
     RuntimeAwareness, TaskAssignmentContextResult, TaskAssignmentUpdateResult, ThreadListResult,
-    TriggerPrefixApplyOn,
+    TriggerPrefixApplyOn, TurnInputStyle,
 };
 use proto::types::trace::TraceKind;
 use proto::types::{
-    ActorKind, AudienceKind, DeliveryPolicy, Message, MessageIntent, MessageKind, Meta, Run,
-    RunStatus, ScopeKind, ScopeRef, TaskAssignmentStatus, Timestamp,
+    ActorKind, AudienceKind, Delivery, DeliveryPolicy, DeliveryState, Message, MessageIntent,
+    MessageKind, Meta, Run, RunStatus, ScopeKind, ScopeRef, TaskAssignmentStatus, Timestamp,
 };
 use proto::types::{Event, RefKind, RelationKind};
 use serde::{Deserialize, Serialize};
@@ -2856,6 +2856,41 @@ impl WorkerState {
         }
     }
 
+    /// Drop a queued (not yet dispatched) trigger after its delivery was
+    /// cancelled server-side. Returns true when a trigger was removed.
+    fn remove_pending_trigger(&self, source_id: &str) -> bool {
+        let mut pending = self
+            .pending_triggers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut removed = false;
+        pending.retain(|_, queue| {
+            let before = queue.len();
+            queue.retain(|t| t.id() != source_id);
+            removed = removed || queue.len() != before;
+            !queue.is_empty()
+        });
+        removed
+    }
+
+    /// Move a queued trigger to the front of its queue (delivery.expedite).
+    /// Returns true when the trigger was found and promoted.
+    fn promote_pending_trigger(&self, source_id: &str) -> bool {
+        let mut pending = self
+            .pending_triggers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for queue in pending.values_mut() {
+            if let Some(idx) = queue.iter().position(|t| t.id() == source_id) {
+                if let Some(trigger) = queue.remove(idx) {
+                    queue.push_front(trigger);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
     /// Atomically decide whether to dispatch `trigger` now or queue it. Returns
     /// `true` if the caller acquired the turn key and must dispatch; `false` if
     /// the conversation was already busy and the trigger was enqueued. The
@@ -3928,6 +3963,73 @@ async fn notification_loop(
             };
             if run.actor_id == actor_id && run_requests_no_reply(&run) {
                 let _ = state.mark_no_reply_requested(&run.id);
+            }
+            continue;
+        }
+        if kind == stream_kind::DELIVERY_UPDATED {
+            let Some(delivery_value) = params.get("data").and_then(|d| d.get("delivery")).cloned()
+            else {
+                continue;
+            };
+            let Ok(delivery) = serde_json::from_value::<Delivery>(delivery_value) else {
+                continue;
+            };
+            if delivery.actor_id != actor_id {
+                continue;
+            }
+            match delivery.state {
+                DeliveryState::Cancelled => {
+                    // A human withdrew this wake from the GUI before we
+                    // consumed it. Drop the queued trigger; an actively
+                    // running turn is run.cancel's job, not ours.
+                    if state.remove_pending_trigger(&delivery.source_id) {
+                        tracing::info!(
+                            actor = %actor_id,
+                            source = %delivery.source_id,
+                            "queued trigger dropped after delivery.cancel"
+                        );
+                    }
+                }
+                DeliveryState::Pending => {
+                    let expedited = delivery
+                        ._meta
+                        .as_ref()
+                        .and_then(|meta| meta.get("expedite"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if !expedited {
+                        continue;
+                    }
+                    if state.promote_pending_trigger(&delivery.source_id) {
+                        tracing::info!(
+                            actor = %actor_id,
+                            source = %delivery.source_id,
+                            "queued trigger promoted after delivery.expedite"
+                        );
+                    } else {
+                        // Not queued locally (missed notification or worker
+                        // restart): a drain picks the delivery up now.
+                        if let Err(e) = drain_pending_inbox(
+                            &client,
+                            &state,
+                            &adapter,
+                            &event_tx,
+                            &mut started,
+                            actor_id,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                actor = %actor_id,
+                                source = %delivery.source_id,
+                                %e,
+                                "expedite-triggered inbox drain failed"
+                            );
+                        }
+                        state.promote_pending_trigger(&delivery.source_id);
+                    }
+                }
+                _ => {}
             }
             continue;
         }
@@ -5973,16 +6075,25 @@ async fn render_trigger_prompt(
                 ack_source_ids: Vec::new(),
             }
         });
-    let latest_message = render_turn_input_contract_with_names(
-        &state.actor_id,
-        &state.spec.actor.display_name,
-        batch,
-        &actor_names,
-        reminder,
-        run_id,
-        first_turn,
-        &delivery_context.unread_gap,
-    );
+    let latest_message = match turn_input_style_for_spec(&state.spec) {
+        TurnInputStyle::Minimal => render_minimal_turn_input(
+            &state.actor_id,
+            batch,
+            &actor_names,
+            reminder,
+            &delivery_context.unread_gap,
+        ),
+        TurnInputStyle::Structured => render_turn_input_contract_with_names(
+            &state.actor_id,
+            &state.spec.actor.display_name,
+            batch,
+            &actor_names,
+            reminder,
+            run_id,
+            first_turn,
+            &delivery_context.unread_gap,
+        ),
+    };
     let assignment_context = assignment_context_for_prompt(client, primary)
         .await
         .unwrap_or_default();
@@ -6899,6 +7010,121 @@ a step for that requester/coordinator and they must continue after your reply, w
         "Use plain `message send --target \"$LOOM_REPLY_TARGET\"` only when your public reply \
 does not require any actor to act next.\n",
     );
+}
+
+fn turn_input_style_for_spec(spec: &AgentSpec) -> TurnInputStyle {
+    spec.wake
+        .as_ref()
+        .and_then(|wake| wake.turn_input_style)
+        .unwrap_or_default()
+}
+
+fn message_kind_label(kind: MessageKind) -> &'static str {
+    match kind {
+        MessageKind::Human => "Human",
+        MessageKind::Agent => "Agent",
+        MessageKind::System => "System",
+        MessageKind::Attention => "Attention",
+        MessageKind::TaskUpdate => "TaskUpdate",
+        MessageKind::Artifact => "Artifact",
+    }
+}
+
+/// Minimal plain-text turn input (`WakeSpec.turnInputStyle = minimal`,
+/// default). One line of metadata + capped body per delivered message, a
+/// one-line scope/queue summary, and a short rule footer — no JSON header,
+/// no fenced blocks. Full bodies stay one `loom message get <id>` away.
+fn render_minimal_turn_input(
+    local_actor_id: &str,
+    batch: &[AgentTrigger],
+    actor_names: &HashMap<String, String>,
+    reminder: ReminderRender,
+    unread_gap: &TurnUnreadGap,
+) -> String {
+    let Some(primary) = batch.last() else {
+        return String::new();
+    };
+    let mut out = String::new();
+    if batch.len() > 1 {
+        out.push_str("Pending message digest (oldest first):\n");
+    } else {
+        out.push_str("New message:\n");
+    }
+    for trigger in batch {
+        match trigger {
+            AgentTrigger::Message(message) => {
+                let display = actor_names
+                    .get(&message.author_actor_id)
+                    .map(String::as_str)
+                    .unwrap_or(message.author_actor_id.as_str());
+                let at = message
+                    .created_at
+                    .with_timezone(&Local)
+                    .format("%Y-%m-%d %H:%M:%S");
+                out.push_str(&format!(
+                    "[unread] {at} {display}({})[id={}][msgId={}]:\n",
+                    message_kind_label(message.kind),
+                    message.author_actor_id,
+                    message.id,
+                ));
+                let compact = compact_message_body(&message_body_for_prompt(message));
+                out.push_str(&compact.text);
+                if compact.truncated_from.is_some() {
+                    out.push_str(&format!(
+                        "（消息最多展示{CONTEXT_MESSAGE_BODY_MAX_CHARS}个字符，全文用 `loom --json message get {}` 查看）",
+                        message.id
+                    ));
+                }
+                out.push('\n');
+            }
+            AgentTrigger::Event(event) => {
+                let display = actor_names
+                    .get(&event.actor_id)
+                    .map(String::as_str)
+                    .unwrap_or(event.actor_id.as_str());
+                let at = event
+                    .occurred_at
+                    .with_timezone(&Local)
+                    .format("%Y-%m-%d %H:%M:%S");
+                let payload = serde_json::to_string(&event.payload).unwrap_or_default();
+                let (payload, truncated) = truncate_chars(&payload, CONTEXT_MESSAGE_BODY_MAX_CHARS);
+                out.push_str(&format!(
+                    "[event] {at} {display}[id={}][eventId={}] {}:\n{payload}",
+                    event.actor_id, event.id, event.kind,
+                ));
+                if truncated.is_some() {
+                    out.push_str("…");
+                }
+                out.push('\n');
+            }
+        }
+    }
+    let scope_label = primary
+        .reply_target()
+        .unwrap_or_else(|| primary.scope().id.clone());
+    out.push_str(&format!(
+        "Scope {scope_label}: {} message(s) delivered this turn, {} more pending",
+        batch.len(),
+        unread_gap.count,
+    ));
+    if let Some(hint) = unread_gap.hint.as_deref() {
+        out.push_str(&format!(" ({hint})"));
+    }
+    out.push_str(".\n");
+    match reminder {
+        ReminderRender::Full | ReminderRender::Pointer => {
+            out.push_str(
+                "Rules: handle all messages above in this one turn; reply with \
+                 `loom --json message send --target \"$LOOM_REPLY_TARGET\" --text \"...\"`; \
+                 if no visible reply is needed run `loom --json run ignore --reason \"...\"`. \
+                 Full operating rules: AGENTS.md#loom-operating-rules.\n",
+            );
+        }
+        ReminderRender::Skip => {}
+    }
+    push_private_reply_instruction(&mut out, local_actor_id, batch);
+    push_public_wake_back_instruction(&mut out, local_actor_id, batch);
+    out
 }
 
 fn render_turn_input_contract_with_names(
@@ -11709,6 +11935,88 @@ mod tests {
         assert!(context.contains("latest handoff result"));
         assert!(!context.contains("old context"));
         assert!(context.contains("History gap"));
+    }
+
+    #[test]
+    fn minimal_turn_input_lists_messages_with_caps_and_summary() {
+        let mut actor_names = HashMap::new();
+        actor_names.insert("actor_human_x".into(), "canfuu".into());
+        let mut first = sample_message(
+            "msg_min_1",
+            ScopeRef {
+                kind: ScopeKind::Channel,
+                id: "chan_dev".into(),
+            },
+            "#chan_dev",
+            None,
+            None,
+        );
+        first.author_actor_id = "actor_human_x".into();
+        first.body = "帮我把登录页的样式改成深色主题".into();
+        let mut second = first.clone();
+        second.id = "msg_min_2".into();
+        second.body = "好".repeat(600);
+        let gap = TurnUnreadGap {
+            count: 3,
+            included: 0,
+            hint: Some("loom --json inbox list --state pending --no-ack".into()),
+        };
+
+        let prompt = render_minimal_turn_input(
+            "actor_agent_dev",
+            &[
+                AgentTrigger::Message(first),
+                AgentTrigger::Message(second.clone()),
+            ],
+            &actor_names,
+            ReminderRender::Full,
+            &gap,
+        );
+
+        assert!(prompt.starts_with("Pending message digest"));
+        assert!(!prompt.contains("=== Loom turn input v1 ==="), "no JSON header in minimal style");
+        assert!(prompt.contains("canfuu(Human)[id=actor_human_x][msgId=msg_min_1]"));
+        assert!(prompt.contains("帮我把登录页的样式改成深色主题"));
+        // 600-char body is capped at the 500-char context limit with a
+        // pointer to the full-text command.
+        assert!(prompt.contains(&format!("loom --json message get {}", second.id)));
+        assert!(prompt.contains("2 message(s) delivered this turn, 3 more pending"));
+        assert!(prompt.contains("run ignore"));
+    }
+
+    #[test]
+    fn minimal_turn_input_single_message_uses_new_message_header() {
+        let mut message = sample_message(
+            "msg_min_single",
+            ScopeRef {
+                kind: ScopeKind::Channel,
+                id: "chan_dev".into(),
+            },
+            "#chan_dev",
+            None,
+            None,
+        );
+        message.body = "just one".into();
+        let prompt = render_minimal_turn_input(
+            "actor_agent_dev",
+            &[AgentTrigger::Message(message)],
+            &HashMap::new(),
+            ReminderRender::Skip,
+            &TurnUnreadGap::empty(),
+        );
+        assert!(prompt.starts_with("New message:"));
+        assert!(!prompt.contains("Rules:"), "reminder off leaves no rule footer");
+    }
+
+    #[test]
+    fn turn_input_style_defaults_to_minimal_and_reads_spec() {
+        let mut spec = sample_spec(None);
+        assert_eq!(turn_input_style_for_spec(&spec), TurnInputStyle::Minimal);
+        spec.wake = Some(proto::methods::WakeSpec {
+            turn_input_style: Some(TurnInputStyle::Structured),
+            ..Default::default()
+        });
+        assert_eq!(turn_input_style_for_spec(&spec), TurnInputStyle::Structured);
     }
 
     #[test]

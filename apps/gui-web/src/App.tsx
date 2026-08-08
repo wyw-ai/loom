@@ -12,7 +12,13 @@ import { defaultWakeSpec } from "@/lib/wake-utils";
 import { channelMentionAgentActors } from "@/lib/channel-utils";
 import { WorkspaceShell } from "@/containers/WorkspaceShell";
 import { OnboardingView } from "@/components/views/OnboardingView";
+import { WebConnectionView } from "@/components/views/WebConnectionView";
 import { ErrorBoundary } from "@/components/shared/ErrorBoundary";
+import {
+  configureWebConnection,
+  hasWebConnectionConfig,
+  isWebMode,
+} from "@/ipc/bridge";
 import * as D from "@/lib/derived";
 import { usePanelResize } from "@/hooks/usePanelResize";
 import { useStreamHandler } from "@/hooks/useStreamHandler";
@@ -371,6 +377,30 @@ export function App() {
     applyChannelDeleted,
   });
 
+  const saveWebConnection = useCallback(async (args: {
+    serverUrl: string;
+    actorId: string;
+    displayName: string;
+  }) => {
+    setBusy("web:connect");
+    setError(null);
+    try {
+      const next = configureWebConnection(args);
+      applyConfig(next);
+      const workspaceId = next.active ?? next.workspaces[0]?.id;
+      if (!workspaceId) throw new Error("Web workspace was not saved");
+      const connected = await connectWorkspace(workspaceId, { quiet: true });
+      if (connected) {
+        finishOnboarding();
+        pushNotice(`Connected to ${connected.name}`);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(null);
+    }
+  }, [applyConfig, connectWorkspace, finishOnboarding, pushNotice]);
+
   const chatEmpty =
     connection === "open"
       ? activeChannel
@@ -451,6 +481,18 @@ export function App() {
           Loading Loom
         </div>
       </div>
+    );
+  }
+
+  if (isWebMode() && !hasWebConnectionConfig()) {
+    return (
+      <ErrorBoundary>
+        <WebConnectionView
+          busy={busy}
+          error={error}
+          onConnect={saveWebConnection}
+        />
+      </ErrorBoundary>
     );
   }
 

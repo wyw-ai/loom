@@ -112,7 +112,7 @@ export function AgentActivityBanner({
 
   if (!open) {
     return (
-      <div className="border-t border-[#e2e6ef] bg-white px-5 py-1">
+      <div className="agent-activity-banner border-t border-[#e2e6ef] bg-white px-5 py-1">
         <button
           type="button"
           className="mx-auto flex h-8 w-full max-w-4xl items-center gap-2 rounded-lg border border-[#e2e6ef] bg-[#fbfcff] px-3 text-xs font-semibold text-[#485063] transition-colors hover:border-[#cfd6e4] hover:bg-[#f7f8fb]"
@@ -128,7 +128,7 @@ export function AgentActivityBanner({
   }
 
   return (
-    <div className="border-t border-[#e2e6ef] bg-white px-5 py-2">
+    <div className="agent-activity-banner border-t border-[#e2e6ef] bg-white px-5 py-2">
       <div className="mx-auto max-w-4xl rounded-xl border border-[#e2e6ef] bg-[#fbfcff] shadow-sm">
         <button
           type="button"
@@ -214,7 +214,7 @@ export function AgentActivityBanner({
                     agent.queue.map((item) => (
                       <div
                         key={item.sourceId}
-                        className="grid min-h-8 grid-cols-[4.5rem_minmax(6rem,8rem)_minmax(0,1fr)_auto] items-center gap-2 rounded-md px-2 py-1 text-xs text-[#485063] hover:bg-[#f7f8fb]"
+                        className="agent-queue-row grid min-h-8 grid-cols-[4.5rem_minmax(6rem,8rem)_minmax(0,1fr)_auto] items-center gap-2 rounded-md px-2 py-1 text-xs text-[#485063] hover:bg-[#f7f8fb]"
                       >
                         <span className="font-medium text-[#8a93a5]">
                           {formatTime(item.updatedAt) || "—"}

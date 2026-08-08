@@ -34,6 +34,7 @@ export function ChannelPanel({
   threadStatsById,
   tab,
   busy,
+  className,
   onClose,
   onSelectTab,
   onSelectThread,
@@ -55,6 +56,7 @@ export function ChannelPanel({
   threadStatsById: Record<string, ThreadActivityStats>;
   tab: ChannelPanelTab;
   busy: string | null;
+  className?: string;
   onClose: () => void;
   onSelectTab: (tab: ChannelPanelTab) => void;
   onSelectThread: (thread: Thread) => void;
@@ -78,7 +80,7 @@ export function ChannelPanel({
       threadStatsById={threadStatsById}
       tab={tab}
       busy={busy}
-      className="hidden min-h-0 min-w-0 flex-col bg-[#fbfbfd] xl:flex"
+      className={className ?? "hidden min-h-0 min-w-0 flex-col bg-[#fbfbfd] xl:flex"}
       onClose={onClose}
       onSelectTab={onSelectTab}
       onSelectThread={onSelectThread}
@@ -1002,4 +1004,3 @@ export function ChannelTaskCard({
     </div>
   );
 }
-

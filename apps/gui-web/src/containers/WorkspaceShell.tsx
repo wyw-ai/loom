@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { Menu, X } from "lucide-react";
 import type {
   Channel,
   ChannelMemberConfig,
@@ -33,6 +34,7 @@ import { SearchPanel } from "@/components/chat/SearchPanel";
 import { ChannelPanel } from "@/components/panels/ChannelPanels";
 import { MainContent } from "@/containers/MainContent";
 import { RemoteFilePanel } from "@/components/chat/RemoteFilePanel";
+import { useMediaQuery } from "@/hooks/useMediaQuery";
 
 export interface WorkspaceShellProps {
   // Shell state
@@ -162,6 +164,90 @@ export interface WorkspaceShellProps {
 export function WorkspaceShell(props: WorkspaceShellProps) {
   const p = props;
   const [threadFilePanel, setThreadFilePanel] = useState(false);
+  const isMobile = useMediaQuery("(max-width: 767px)");
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+
+  useEffect(() => {
+    if (!isMobile) setMobileSidebarOpen(false);
+  }, [isMobile]);
+
+  const closeMobileSidebar = () => {
+    if (isMobile) setMobileSidebarOpen(false);
+  };
+
+  const mobileTitle =
+    p.view === "chat"
+      ? p.activeChannel?.title ?? p.workspace?.name ?? "Loom"
+      : p.view === "direct"
+        ? "Direct Messages"
+        : p.view[0].toUpperCase() + p.view.slice(1);
+
+  const detailContent = p.showChatDetail ? (
+    p.searchPanelOpen ? (
+      <SearchPanel
+        actors={p.actors}
+        channels={p.visibleChannels}
+        activeChannel={p.activeChannel ?? null}
+        activeThread={p.activeThread}
+        connection={p.connection}
+        className="flex min-h-0 min-w-0 flex-col border-l border-[#e2e6ef] bg-white"
+        onClose={() => p.setSearchPanelOpen(false)}
+        onOpenContext={p.openMessageContext}
+      />
+    ) : p.activeThread ? (
+      <ThreadPanel
+        actors={p.actors}
+        channel={p.activeChannel ?? null}
+        channelMessages={p.messages}
+        currentActorId={p.workspace?.actorId ?? null}
+        disabled={p.connection !== "open" || !p.threadMessageTarget}
+        draft={p.threadDraft}
+        mentionAgents={p.channelAgentActors}
+        machines={p.machines}
+        runs={p.runs}
+        messages={p.threadMessages}
+        anchorMessageId={p.messageAnchorId}
+        setDraft={p.setThreadDraft}
+        task={p.activeThreadTask}
+        thread={p.activeThread}
+        busy={p.busy}
+        className="flex min-h-0 min-w-0 flex-col bg-white"
+        onClose={() => p.setActiveThreadId(null)}
+        onSend={p.sendThreadMessage}
+        onToggleReaction={p.toggleMessageReaction}
+        onOpenAgentSettings={p.openAgentSettings}
+        onOpenFolder={() => setThreadFilePanel(true)}
+        scopeId={p.activeThreadScope?.id}
+      />
+    ) : p.channelPanelTab && p.activeChannel ? (
+      <ChannelPanel
+        actors={p.actors}
+        memberCandidates={p.memberCandidates}
+        channel={p.activeChannel}
+        channelMessages={p.messages}
+        channelMemberConfigs={p.activeChannelMemberConfigs}
+        channelTasks={p.channelTasks}
+        channelThreads={p.channelThreads}
+        currentActorId={p.workspace?.actorId ?? null}
+        machines={p.machines}
+        runs={p.runs}
+        threadStatsById={p.threadStatsById}
+        tab={p.channelPanelTab}
+        busy={p.busy}
+        className="flex min-h-0 min-w-0 flex-col bg-[#fbfbfd]"
+        onClose={() => p.setChannelPanelTab(null)}
+        onSelectTab={p.setChannelPanelTab}
+        onSelectThread={(thread) => {
+          p.setActiveThreadId(thread.id);
+          p.setChannelPanelTab(null);
+        }}
+        onInviteMember={p.inviteMemberToChannel}
+        onRemoveMember={p.removeMemberFromChannel}
+        onSaveMemberWorkspace={p.saveMemberWorkspace}
+        onClearMemberWorkspace={p.clearMemberWorkspace}
+      />
+    ) : null
+  ) : null;
 
   return (
     <div
@@ -169,24 +255,65 @@ export function WorkspaceShell(props: WorkspaceShellProps) {
         "app-shell h-screen w-screen overflow-hidden bg-[#f5f6fa] text-foreground",
         p.showWorkspaceChrome && "app-shell-workspace",
         p.showChatDetail && "app-shell-detail",
+        mobileSidebarOpen && "mobile-sidebar-open",
       )}
       style={p.shellStyle}
     >
+      <div className="mobile-topbar">
+        <button
+          type="button"
+          className="mobile-menu-button"
+          aria-label={mobileSidebarOpen ? "Close navigation" : "Open navigation"}
+          aria-expanded={mobileSidebarOpen}
+          onClick={() => setMobileSidebarOpen((open) => !open)}
+        >
+          {mobileSidebarOpen ? <X size={20} /> : <Menu size={20} />}
+        </button>
+        <div className="min-w-0">
+          <div className="truncate text-sm font-bold text-[#111827]">{mobileTitle}</div>
+          <div className="truncate text-xs font-semibold text-[#667085]">
+            {p.connection === "open" ? "Connected" : p.connection}
+          </div>
+        </div>
+      </div>
+      {mobileSidebarOpen && (
+        <button
+          type="button"
+          className="mobile-sidebar-overlay"
+          aria-label="Close navigation"
+          onClick={() => setMobileSidebarOpen(false)}
+        />
+      )}
       <Rail
         account={p.account}
         busy={p.busy}
         connection={p.connection}
         workspace={p.workspace}
         workspaces={p.workspaces}
-        onSelectWorkspace={p.selectWorkspace}
-        onOpenHome={() => p.setView("chat")}
-        onOpenSpaces={() => p.setView("spaces")}
-        onOpenAccount={() => p.setView("account")}
+        onSelectWorkspace={(id) => {
+          void p.selectWorkspace(id);
+          closeMobileSidebar();
+        }}
+        onOpenHome={() => {
+          p.setView("chat");
+          closeMobileSidebar();
+        }}
+        onOpenSpaces={() => {
+          p.setView("spaces");
+          closeMobileSidebar();
+        }}
+        onOpenAccount={() => {
+          p.setView("account");
+          closeMobileSidebar();
+        }}
       />
       {p.showWorkspaceChrome && (
         <Sidebar
           view={p.view}
-          setView={p.setView}
+          setView={(view) => {
+            p.setView(view);
+            closeMobileSidebar();
+          }}
           busy={p.busy}
           channels={p.visibleChannels}
           channelGroups={p.channelGroups}
@@ -215,18 +342,21 @@ export function WorkspaceShell(props: WorkspaceShellProps) {
             p.setActiveChannelId(id);
             p.setActiveThreadId(null);
             p.setChannelPanelTab(null);
+            closeMobileSidebar();
           }}
           onSelectThread={(thread) => {
             p.setView("chat");
             p.setActiveChannelId(thread.channelId);
             p.setActiveThreadId(thread.id);
             p.setChannelPanelTab(null);
+            closeMobileSidebar();
           }}
           onSelectDirectAgent={(actorId) => {
             p.setView("direct");
             p.setActiveDirectActorId(actorId);
             p.setActiveThreadId(null);
             p.setChannelPanelTab(null);
+            closeMobileSidebar();
           }}
           onToggleChannelGroup={p.toggleChannelGroup}
         />
@@ -345,70 +475,10 @@ export function WorkspaceShell(props: WorkspaceShellProps) {
           onPointerDown={(event) => p.startPanelResize(event, "detail")}
         />
       )}
-      {p.showChatDetail && (
-        p.searchPanelOpen ? (
-          <SearchPanel
-            actors={p.actors}
-            channels={p.visibleChannels}
-            activeChannel={p.activeChannel ?? null}
-            activeThread={p.activeThread}
-            connection={p.connection}
-            className="fixed inset-y-0 right-0 z-40 flex w-[420px] max-w-[calc(100vw-2rem)] min-h-0 min-w-0 flex-col border-l border-[#e2e6ef] bg-white shadow-2xl xl:static xl:z-auto xl:w-auto xl:max-w-none xl:shadow-none"
-            onClose={() => p.setSearchPanelOpen(false)}
-            onOpenContext={p.openMessageContext}
-          />
-        ) : p.activeThread ? (
-          <ThreadPanel
-            actors={p.actors}
-            channel={p.activeChannel ?? null}
-            channelMessages={p.messages}
-            currentActorId={p.workspace?.actorId ?? null}
-            disabled={p.connection !== "open" || !p.threadMessageTarget}
-            draft={p.threadDraft}
-            mentionAgents={p.channelAgentActors}
-            machines={p.machines}
-            runs={p.runs}
-            messages={p.threadMessages}
-            anchorMessageId={p.messageAnchorId}
-            setDraft={p.setThreadDraft}
-            task={p.activeThreadTask}
-            thread={p.activeThread}
-            busy={p.busy}
-            className="flex min-h-0 min-w-0 flex-col bg-white"
-            onClose={() => p.setActiveThreadId(null)}
-            onSend={p.sendThreadMessage}
-            onToggleReaction={p.toggleMessageReaction}
-            onOpenAgentSettings={p.openAgentSettings}
-            onOpenFolder={() => setThreadFilePanel(true)}
-            scopeId={p.activeThreadScope?.id}
-          />
-        ) : p.channelPanelTab && p.activeChannel ? (
-          <ChannelPanel
-            actors={p.actors}
-            memberCandidates={p.memberCandidates}
-            channel={p.activeChannel}
-            channelMessages={p.messages}
-            channelMemberConfigs={p.activeChannelMemberConfigs}
-            channelTasks={p.channelTasks}
-            channelThreads={p.channelThreads}
-            currentActorId={p.workspace?.actorId ?? null}
-            machines={p.machines}
-            runs={p.runs}
-            threadStatsById={p.threadStatsById}
-            tab={p.channelPanelTab}
-            busy={p.busy}
-            onClose={() => p.setChannelPanelTab(null)}
-            onSelectTab={p.setChannelPanelTab}
-            onSelectThread={(thread) => {
-              p.setActiveThreadId(thread.id);
-              p.setChannelPanelTab(null);
-            }}
-            onInviteMember={p.inviteMemberToChannel}
-            onRemoveMember={p.removeMemberFromChannel}
-            onSaveMemberWorkspace={p.saveMemberWorkspace}
-            onClearMemberWorkspace={p.clearMemberWorkspace}
-          />
-        ) : null
+      {detailContent && (
+        <section className="detail-panel-shell">
+          {detailContent}
+        </section>
       )}
       {p.notice && (
         <div className="fixed bottom-4 left-1/2 z-50 -translate-x-1/2 rounded-md border border-border bg-popover px-4 py-2 text-sm shadow-soft">

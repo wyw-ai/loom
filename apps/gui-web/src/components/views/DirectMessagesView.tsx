@@ -64,7 +64,7 @@ export function DirectMessagesView({
     ? busy === `direct:message:send:${selectedAgent.id}`
     : false;
   return (
-    <section className="grid min-h-0 flex-1 grid-cols-[minmax(260px,340px)_minmax(0,1fr)] bg-white">
+    <section className="direct-messages-view grid min-h-0 flex-1 grid-cols-1 bg-white md:grid-cols-[minmax(260px,340px)_minmax(0,1fr)]">
       <aside className="min-h-0 border-r border-[#e2e6ef] bg-[#fbfbfd]">
         <div className="flex h-[96px] flex-col justify-center border-b border-[#e2e6ef] px-5">
           <h1 className="text-[22px] font-bold text-[#111827]">Direct Messages</h1>

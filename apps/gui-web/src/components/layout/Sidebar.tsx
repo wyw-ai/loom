@@ -14,10 +14,11 @@ import {
   Bell,
   Bot,
   Check,
-  Home,
   MessageCircle,
   MessageSquare,
   Play,
+  Search,
+  Server,
 } from "lucide-react";
 import type { Actor, Channel, MachineInfo, Run, Thread } from "@/ipc/types";
 import type {
@@ -38,6 +39,7 @@ import { Input } from "@/components/ui/input";
 import { ChannelDeleteConfirm } from "@/components/channel/ChannelDeleteConfirm";
 import { ActorAvatar } from "@/components/agent/ActorAvatar";
 import { getActorRunContext, runStatusAnimationName, runStatusDotClass, runStatusFullLabel, memberPresence } from "@/lib/agent-utils";
+import { useUIStore } from "@/store/uiStore";
 
 const sidebarMoreExpandedStorageKey = "loom.sidebar.moreExpanded";
 
@@ -137,13 +139,15 @@ export function Sidebar({
   const dragListenerCleanupRef = useRef<(() => void) | null>(null);
   const suppressChannelClickRef = useRef<string | null>(null);
   const sections = channelGroupSections(channelGroups, channels);
+  const settingsSection = useUIStore((state) => state.settingsSection);
+  const setSettingsSection = useUIStore((state) => state.setSettingsSection);
   const contextMenuChannel = channelContextMenu
     ? channels.find((channel) => channel.id === channelContextMenu.channelId) ?? null
     : null;
   const mainNavItems = [
-    { id: "chat" as const, label: "Home", icon: Home },
     { id: "direct" as const, label: "Direct Messages", icon: MessageCircle },
-    { id: "settings" as const, label: "Actors", icon: Bot },
+    { id: "settings" as const, label: "Actors", icon: Bot, section: "agents" as const },
+    { id: "settings" as const, label: "Managed Hosts", icon: Server, section: "hosts" as const },
   ];
   const moreNavItems = [
     { id: "threads" as const, label: "Threads", icon: MessageSquare },
@@ -456,16 +460,22 @@ export function Sidebar({
           {mainNavItems.map((item) => {
             const Icon = item.icon;
             const selected =
-              item.id === "chat"
-                ? view === "chat" && !activeThreadId && !activeChannelId
+              item.id === "settings"
+                ? view === "settings" &&
+                  (item.section === "hosts"
+                    ? settingsSection === "hosts"
+                    : settingsSection !== "hosts")
                 : view === item.id;
             return (
               <button
-                key={item.id}
+                key={item.label}
                 type="button"
                 className={cn("nav-row h-9 text-sm", selected && "nav-row-active")}
                 onClick={() => {
                   closeCreateMenu();
+                  if (item.id === "settings" && item.section) {
+                    setSettingsSection(item.section);
+                  }
                   setView(item.id);
                 }}
               >
@@ -536,16 +546,13 @@ export function Sidebar({
       )}
 
       <div className="flex min-h-0 flex-1 flex-col">
-        <div className="border-b border-[#edf0f5] p-3">
-          <div className="flex items-center justify-between px-1">
-            <span className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
-              Channels
-            </span>
+        <div className="border-b border-[#edf0f5] px-3 py-2">
+          <div className="flex items-center justify-end px-1">
             <div className="relative">
               <button
                 type="button"
                 className="composer-icon h-6 min-w-6"
-                title="Create channel or section"
+                title="Add or browse channels"
                 aria-haspopup="menu"
                 aria-expanded={createMenuOpen}
                 onClick={() => {
@@ -577,6 +584,22 @@ export function Sidebar({
                       >
                         <Folder size={15} />
                         New section
+                      </button>
+                      <button
+                        type="button"
+                        className="flex h-9 w-full items-center gap-2 rounded-md px-3 text-left font-semibold text-[#303849] hover:bg-[#f5f3ff] hover:text-[#503ed4]"
+                        onClick={() => {
+                          closeCreateMenu();
+                          closeDeleteChannelConfirm();
+                          closeRenameChannel();
+                          setView("channels");
+                        }}
+                      >
+                        <Search size={15} />
+                        Browse all channels
+                        <span className="count-badge ml-auto h-5 min-w-5 text-[10px]">
+                          {channels.length}
+                        </span>
                       </button>
                     </>
                   ) : (
@@ -625,25 +648,6 @@ export function Sidebar({
               )}
             </div>
           </div>
-          <button
-            type="button"
-            className={cn(
-              "nav-row mt-2 h-8 text-sm",
-              view === "channels" && "nav-row-active",
-            )}
-            onClick={() => {
-              closeCreateMenu();
-              closeDeleteChannelConfirm();
-              closeRenameChannel();
-              setView("channels");
-            }}
-          >
-            <Hash size={15} />
-            <span className="min-w-0 flex-1 truncate">All Channels</span>
-            <span className="count-badge h-5 min-w-5 text-[10px]">
-              {channels.length}
-            </span>
-          </button>
         </div>
         <div className="min-h-0 flex-1 overflow-y-auto p-3 soft-scrollbar">
           {sections.map((section) => (

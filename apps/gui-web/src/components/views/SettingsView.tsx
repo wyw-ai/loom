@@ -29,6 +29,8 @@ export function SettingsView({
   runs,
   targetAgentId,
   onConsumeTargetAgent,
+  activeSection,
+  onSectionChange,
   onCheckMachines,
   onCreateMachine,
   onRemoveMachine,
@@ -46,6 +48,11 @@ export function SettingsView({
   runs: Record<string, Run>;
   targetAgentId: string | null;
   onConsumeTargetAgent: () => void;
+  /** Controlled: which workspace section is shown. The sidebar exposes
+   * Actors (agents/humans/services) and Managed Hosts as separate nav
+   * entries over this same view, so section state lives in the UI store. */
+  activeSection: ActorWorkspaceSection;
+  onSectionChange: (section: ActorWorkspaceSection) => void;
   onCheckMachines: () => void;
   onCreateMachine: (args: {
     name: string;
@@ -62,7 +69,7 @@ export function SettingsView({
   onRemoveAgent: (machineId: string, actorId: string) => void;
   onOpenLocalPath: (path: string) => void;
 }) {
-  const [activeSection, setActiveSection] = useState<ActorWorkspaceSection>("hosts");
+  const setActiveSection = onSectionChange;
   const [selectedMachineId, setSelectedMachineId] = useState<string | null>(null);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(targetAgentId);
   const [selectedServiceId, setSelectedServiceId] = useState<string | null>(null);
@@ -91,7 +98,7 @@ export function SettingsView({
     count: number;
     icon: ComponentType<{ size?: string | number; className?: string }>;
   }> = [
-    { id: "hosts", label: "Registered Hosts", count: machines.length, icon: Server },
+    { id: "hosts", label: "Managed Hosts", count: machines.length, icon: Server },
     { id: "humans", label: "Humans", count: humanActors.length, icon: Users },
     { id: "agents", label: "Agents", count: memberEntries.length, icon: Bot },
     { id: "services", label: "Services", count: serviceEntries.length, icon: Split },
@@ -392,7 +399,7 @@ export function SettingsView({
                 <div className="space-y-2">
                   <div className="mb-2 flex items-center justify-between px-1">
                     <div className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
-                      Registered Hosts
+                      Managed Hosts
                     </div>
                     <div className="flex items-center gap-1.5">
                       <span className="count-badge">{machines.length}</span>
@@ -413,7 +420,7 @@ export function SettingsView({
                   </div>
                   {machines.length === 0 ? (
                     <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-white p-4 text-sm text-[#667085]">
-                      <div>No registered hosts.</div>
+                      <div>No managed hosts.</div>
                       <Button
                         size="sm"
                         className="mt-3 rounded-lg"

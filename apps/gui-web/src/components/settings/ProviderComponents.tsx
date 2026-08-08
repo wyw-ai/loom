@@ -166,7 +166,7 @@ export function ProviderAddDialog({
               onChange={(event) => setMachineId(event.target.value)}
             >
               {machines.length === 0 ? (
-                <option value="">No registered hosts</option>
+                <option value="">No managed hosts</option>
               ) : (
                 machines.map((machine) => (
                   <option key={machine.id} value={machine.id}>

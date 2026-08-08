@@ -39,6 +39,7 @@ import { AccountView } from "@/components/views/AccountView";
 import { SettingsView } from "@/components/views/SettingsView";
 import { CoachMarkTooltip } from "@/components/ui/CoachMark";
 import { useCoachMark } from "@/hooks/useCoachMark";
+import { useUIStore } from "@/store/uiStore";
 import { actorName } from "@/lib/format-utils";
 import { channelFromMessage, threadIdForMessage } from "@/lib/message-utils";
 import { directPeerForMessage } from "@/lib/channel-utils";
@@ -155,6 +156,8 @@ export function MainContent(props: MainContentProps) {
     channelId: string;
     target: string;
   } | null>(null);
+  const settingsSection = useUIStore((state) => state.settingsSection);
+  const setSettingsSection = useUIStore((state) => state.setSettingsSection);
   const actorsCoach = useCoachMark("actors", p.view === "settings");
   const channelCoach = useCoachMark(
     "channel",
@@ -524,6 +527,8 @@ export function MainContent(props: MainContentProps) {
         runs={p.runs}
         targetAgentId={p.settingsAgentId}
         onConsumeTargetAgent={p.consumeSettingsAgentTarget}
+        activeSection={settingsSection}
+        onSectionChange={setSettingsSection}
         onCheckMachines={p.checkMachines}
         onCreateMachine={p.createMachine}
         onRemoveMachine={p.removeMachine}

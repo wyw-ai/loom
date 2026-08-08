@@ -189,7 +189,7 @@ export function AgentRosterOverview({
             <div className="grid gap-2">
               {hostRows.length === 0 ? (
                 <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] p-4 text-sm text-[#667085]">
-                  No registered hosts.
+                  No managed hosts.
                 </div>
               ) : (
                 hostRows.map(({ machine, canCreate }) => {

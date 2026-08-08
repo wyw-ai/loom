@@ -919,7 +919,7 @@ export function OnboardingView({
                   <div className="mt-4 grid gap-2">
                     {agentProviderStatus === "loading" ? (
                       <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-white p-4 text-sm text-[#667085]">
-                        Scanning registered hosts…
+                        Scanning managed hosts…
                       </div>
                     ) : agentProviderChoices.length > 0 ? (
                       agentProviderChoices.map((choice) => {

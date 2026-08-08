@@ -294,10 +294,11 @@ export function WorkspaceShell(props: WorkspaceShellProps) {
           void p.selectWorkspace(id);
           closeMobileSidebar();
         }}
-        onOpenHome={() => {
-          p.setView("chat");
+        onOpenDirect={() => {
+          p.setView("direct");
           closeMobileSidebar();
         }}
+        directActive={p.view === "direct"}
         onOpenSpaces={() => {
           p.setView("spaces");
           closeMobileSidebar();

@@ -1,4 +1,4 @@
-import { Loader2, Plus, Users } from "lucide-react";
+import { Loader2, MessageCircle, Plus, Users } from "lucide-react";
 import type { HumanAccount, Workspace } from "@/ipc/types";
 import type { ConnectionState } from "@/lib/types";
 import { accountName, workspaceInitials } from "@/lib/format-utils";
@@ -12,9 +12,10 @@ export function Rail({
   workspace,
   workspaces,
   onSelectWorkspace,
-  onOpenHome,
+  onOpenDirect,
   onOpenSpaces,
   onOpenAccount,
+  directActive,
 }: {
   account: HumanAccount | null;
   busy: string | null;
@@ -22,19 +23,24 @@ export function Rail({
   workspace: Workspace | null;
   workspaces: Workspace[];
   onSelectWorkspace: (workspaceId: string) => void;
-  onOpenHome: () => void;
+  onOpenDirect: () => void;
   onOpenSpaces: () => void;
   onOpenAccount: () => void;
+  directActive: boolean;
 }) {
   return (
     <nav className="flex min-h-0 flex-col items-center border-r border-[#e2e6ef] bg-[#f7f8fb] px-2.5 py-4">
       <button
         type="button"
-        title="Home"
-        className="mb-4 flex h-11 w-11 items-center justify-center rounded-xl bg-gradient-to-br from-[#6f58f6] to-[#4b36d8] text-base font-bold text-white shadow-sm ring-1 ring-white/60"
-        onClick={onOpenHome}
+        title="Direct Messages"
+        aria-label="Direct Messages"
+        className={cn(
+          "mb-4 flex h-11 w-11 items-center justify-center rounded-xl bg-gradient-to-br from-[#6f58f6] to-[#4b36d8] text-white shadow-sm ring-1 ring-white/60 transition-transform",
+          directActive && "ring-2 ring-[#d9d4ff] scale-105",
+        )}
+        onClick={onOpenDirect}
       >
-        L
+        <MessageCircle size={20} />
       </button>
       <div className="flex flex-1 flex-col items-center gap-2">
         {workspaces.map((item) => {

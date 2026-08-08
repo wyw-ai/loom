@@ -151,7 +151,7 @@ export function ServiceRosterOverview({
         <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
           {machines.length === 0 ? (
             <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] p-4 text-sm text-[#667085]">
-              No registered hosts.
+              No managed hosts.
             </div>
           ) : (
             machines.map((machine) => (

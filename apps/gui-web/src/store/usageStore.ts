@@ -3,11 +3,13 @@ import type {
   Message,
   MessageTokenUsageMeta,
   PromptBreakdown,
+  Run,
   TokenUsage,
 } from "@/ipc/types";
 import {
   readMessagePromptBreakdown,
   readMessageTokenUsage,
+  readRunTokenUsage,
 } from "@/ipc/types";
 
 // ---------------------------------------------------------------------------
@@ -16,16 +18,24 @@ import {
 // PRD: art_18a2865ccbcd / ARCH design: art_f822814f9124 (D5 channel A).
 // Single-agent MVP per PRD D3: keyed by `actorId` (the agent's actor id).
 //
-// Each assistant `message.created` event carries `metadata.token_usage =
-// { increment, cumulative }` from BE `build_turn_meta`. We treat the value
-// from the newest message (by `createdAt`) as authoritative; older messages
-// arriving out of order are ignored.
+// Two sources feed the store:
+//   1. (preferred) `run.updated` / `run.list` — closed runs carry
+//      `metadata.token_usage = { increment, cumulative }` where `cumulative`
+//      is the SERVER-side durable per-(actor, scope) counter. This survives
+//      worker restarts and does not depend on the agent publishing a message.
+//   2. (legacy fallback) assistant `message.created` metadata written by BE
+//      `build_turn_meta` — worker-memory cumulative, kept for compatibility
+//      with older daemons/servers.
+// Run-sourced snapshots always win over message-sourced ones for the same
+// actor when at least as new, because their cumulative is authoritative.
 //
 // `promptBreakdown` is the BE `prompt_breakdown` sections (from the same
 // turn meta), used by U8 to derive per-segment token counts.
 // ---------------------------------------------------------------------------
 
 const MAX_ENTRIES = 32;
+
+export type UsageSource = "run" | "message";
 
 export interface AgentUsageSnapshot {
   increment: TokenUsage;
@@ -38,6 +48,8 @@ export interface AgentUsageSnapshot {
   scopeId: string;
   /** "channel" | "thread" — mirrors message.scope.kind. */
   scopeKind: string;
+  /** Which channel produced this snapshot (run metadata vs message meta). */
+  source: UsageSource;
 }
 
 /**
@@ -52,24 +64,36 @@ export interface ScopeUsageSummary {
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;
+  /** Portion of `totalTokens` that comes from estimated (non-provider)
+   * samples; > 0 means the summary should be rendered as approximate. */
+  estimatedTokens: number;
   byActor: Array<{
     actorId: string;
     totalTokens: number;
     inputTokens: number;
     outputTokens: number;
     updatedAt: string;
+    estimated: boolean;
   }>;
 }
 
 export interface UsageStore {
   byActor: Record<string, AgentUsageSnapshot>;
   applyMessage: (message: Message) => void;
+  applyRun: (run: Run) => void;
   reset: () => void;
 }
 
-function shouldReplace(prev: AgentUsageSnapshot | undefined, candidate: { updatedAt: string; messageId: string }): boolean {
+function shouldReplace(
+  prev: AgentUsageSnapshot | undefined,
+  candidate: { updatedAt: string; messageId: string; source: UsageSource },
+): boolean {
   if (!prev) return true;
+  // Run-sourced snapshots carry the server-durable cumulative; never let a
+  // legacy message-sourced snapshot overwrite one unless it is strictly newer
+  // AND no run snapshot has arrived for that same instant.
   if (candidate.updatedAt !== prev.updatedAt) return candidate.updatedAt > prev.updatedAt;
+  if (candidate.source !== prev.source) return candidate.source === "run";
   return candidate.messageId > prev.messageId;
 }
 
@@ -102,6 +126,7 @@ export const useUsageStore = create<UsageStore>((set, get) => ({
       messageId: message.id,
       scopeId: message.scope?.id ?? "",
       scopeKind: message.scope?.kind ?? "",
+      source: "message",
     };
     const prev = get().byActor[actorId];
     if (!shouldReplace(prev, candidate)) return;
@@ -110,11 +135,45 @@ export const useUsageStore = create<UsageStore>((set, get) => ({
     }));
   },
 
+  applyRun: (run: Run) => {
+    const usage = readRunTokenUsage(run.metadata);
+    if (!usage) return;
+    const actorId = run.actorId;
+    if (!actorId) return;
+    const candidate: AgentUsageSnapshot = {
+      increment: usage.increment,
+      cumulative: usage.cumulative,
+      promptBreakdown: null,
+      updatedAt: run.closedAt ?? run.openedAt,
+      messageId: run.id,
+      scopeId: run.scope?.id ?? "",
+      scopeKind: run.scope?.kind ?? "",
+      source: "run",
+    };
+    const prev = get().byActor[actorId];
+    if (!shouldReplace(prev, candidate)) return;
+    set((state) => ({
+      byActor: trimEntries({
+        ...state.byActor,
+        [actorId]: {
+          ...candidate,
+          // Keep the latest prompt breakdown from the message channel; the
+          // run channel doesn't carry one.
+          promptBreakdown: prev?.promptBreakdown ?? null,
+        },
+      }),
+    }));
+  },
+
   reset: () => set({ byActor: {} }),
 }));
 
 export function applyMessageToUsageStore(message: Message): void {
   useUsageStore.getState().applyMessage(message);
+}
+
+export function applyRunToUsageStore(run: Run): void {
+  useUsageStore.getState().applyRun(run);
 }
 
 export function useAgentUsage(actorId: string | null | undefined): AgentUsageSnapshot | null {
@@ -143,25 +202,29 @@ export function useScopeUsageSummary(scopeId: string | null | undefined): ScopeU
     let inputTokens = 0;
     let outputTokens = 0;
     let cacheReadTokens = 0;
+    let estimatedTokens = 0;
     for (const [actorId, snap] of Object.entries(state.byActor)) {
       if (snap.scopeId !== scopeId) continue;
       const tot = snap.cumulative.total_tokens ?? 0;
       if (tot <= 0) continue;
+      const estimated = snap.cumulative.estimated === true;
       totalTokens += tot;
       inputTokens += snap.cumulative.input_tokens ?? 0;
       outputTokens += snap.cumulative.output_tokens ?? 0;
       cacheReadTokens += snap.cumulative.cache_read_input_tokens ?? 0;
+      if (estimated) estimatedTokens += tot;
       byActor.push({
         actorId,
         totalTokens: tot,
         inputTokens: snap.cumulative.input_tokens ?? 0,
         outputTokens: snap.cumulative.output_tokens ?? 0,
         updatedAt: snap.updatedAt,
+        estimated,
       });
     }
     if (totalTokens <= 0) return null;
     byActor.sort((a, b) => b.totalTokens - a.totalTokens);
-    return { totalTokens, inputTokens, outputTokens, cacheReadTokens, byActor };
+    return { totalTokens, inputTokens, outputTokens, cacheReadTokens, estimatedTokens, byActor };
   });
 }
 

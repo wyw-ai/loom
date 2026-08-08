@@ -50,7 +50,7 @@ use tokio::sync::mpsc;
 use super::adapter::{Adapter, AdapterEvent, AdapterPrompt, AdapterStartInfo};
 use crate::acp::create_dir_all_unc;
 use crate::provider::ProviderRuntimeEvent;
-use crate::usage::{extract_token_usage_from_text, observe_usage_line};
+use crate::usage::{extract_token_usage_from_text_for_provider, observe_usage_line_for_provider};
 
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
@@ -139,6 +139,11 @@ pub struct CommandConfig {
     /// Optional per-turn subprocess-output idle timeout in milliseconds. `-1`
     /// is unlimited.
     pub idle_timeout_ms: Option<i64>,
+    /// Provider-catalog id (e.g. "claude", "codex") used to resolve
+    /// usage-manifest paths, field aliases, and accounting semantics when
+    /// parsing token usage from provider output. `None` falls back to the
+    /// manifest defaults.
+    pub usage_provider: Option<String>,
     /// Hash of provider command/session templates before per-turn runtime
     /// values are expanded. When the spec changes, saved sessions are
     /// invalidated.
@@ -222,6 +227,7 @@ impl CommandConfig {
             sessions_dir,
             timeout_ms: spec.timeout_ms,
             idle_timeout_ms: spec.idle_timeout_ms,
+            usage_provider: None,
             command_signature,
         }
     }
@@ -1237,8 +1243,13 @@ fn spawn_and_collect(
             }
         }
     }
-    let usage = extract_token_usage_from_text(&collected_stdout)
-        .or_else(|| extract_token_usage_from_text(&collected_stderr));
+    let usage = extract_token_usage_from_text_for_provider(
+        &collected_stdout,
+        cfg.usage_provider.as_deref(),
+    )
+    .or_else(|| {
+        extract_token_usage_from_text_for_provider(&collected_stderr, cfg.usage_provider.as_deref())
+    });
     release_run_slot(slot);
     let _ = sender.send(AdapterEvent::Finished {
         scope: Some(prompt.scope.clone()),
@@ -1289,7 +1300,11 @@ fn collect_stdout_line(
     let clean = strip_ansi(line);
     collected_stdout.push_str(&clean);
     let parsed_line = clean.trim_end_matches(&['\r', '\n'][..]);
-    if let Some(usage) = observe_usage_line(parsed_line, last_emitted_usage) {
+    if let Some(usage) = observe_usage_line_for_provider(
+        parsed_line,
+        cfg.usage_provider.as_deref(),
+        last_emitted_usage,
+    ) {
         let _ = sender.send(AdapterEvent::UsageUpdate {
             scope: Some(prompt.scope.clone()),
             usage,
@@ -3302,6 +3317,7 @@ mod tests {
             sessions_dir: std::env::temp_dir().join("loom-test-sessions"),
             timeout_ms: None,
             idle_timeout_ms: None,
+            usage_provider: None,
             command_signature: "sha256:test".into(),
         }
     }

@@ -1240,6 +1240,31 @@ fn parse_delivery_state_filter(raw: &str) -> Result<Option<DeliveryState>> {
     }
 }
 
+/// Fetch one message by id (via `message.context` with a zero window) and
+/// print it with the full body, spilling oversized bodies to a file like
+/// `read` does. This is the command that prompt truncation notes point to.
+pub async fn get(client: Arc<Client>, _actor_id: String, message_id: String) -> Result<()> {
+    let res: MessageContextResult = client
+        .call(
+            method::MESSAGE_CONTEXT,
+            json!({
+                "messageId": message_id,
+                "before": 0,
+                "after": 0,
+            }),
+        )
+        .await?;
+    let mut messages = vec![res.anchor];
+    spill_long_message_bodies(&mut messages)?;
+    let message = &messages[0];
+    if render::is_json() {
+        render::print_json(message);
+    } else {
+        render::render_message(message);
+    }
+    Ok(())
+}
+
 pub async fn search(
     client: Arc<Client>,
     _actor_id: String,

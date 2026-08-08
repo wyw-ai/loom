@@ -138,6 +138,11 @@ struct Inner {
     runs: HashMap<String, Run>,
     run_frames: HashMap<String, Vec<RunFrame>>,
     run_seq: HashMap<String, u64>,
+    /// Durable per-(actor, scope) cumulative token usage, folded from the
+    /// `token_usage.increment` values that closed runs carry in their
+    /// metadata. Rebuilt from RunUpsert records on replay, so it survives
+    /// both server and worker restarts.
+    run_usage_totals: HashMap<(String, String), proto::types::TokenUsageSummary>,
     agent_config_versions: HashMap<String, AgentConfigVersion>,
     agent_config_activations: HashMap<String, AgentConfigActivation>,
     coordination_sessions: HashMap<String, CoordinationSession>,
@@ -3032,7 +3037,12 @@ impl Store {
         Ok((run, frame))
     }
 
-    pub fn close_run(&self, run_id: &str, status: RunStatus) -> StoreResult<Run> {
+    pub fn close_run(
+        &self,
+        run_id: &str,
+        status: RunStatus,
+        usage: Option<proto::types::TokenUsageSummary>,
+    ) -> StoreResult<Run> {
         if !is_terminal_run_status(status) {
             return Err(StoreError::InvalidState(
                 "run.close requires completed, failed, or canceled".into(),
@@ -3046,10 +3056,45 @@ impl Store {
         }
         run.status = status;
         run.closed_at = Some(Utc::now());
+        if let Some(increment) = usage {
+            // Fold the per-turn increment into the durable per-(actor, scope)
+            // counter and stamp both onto the run so clients get increment +
+            // authoritative cumulative from the same broadcast.
+            let cumulative = {
+                let mut inner = self.inner.write();
+                let entry = inner
+                    .run_usage_totals
+                    .entry((run.actor_id.clone(), run.scope.id.clone()))
+                    .or_default();
+                entry.add(&increment);
+                entry.clone()
+            };
+            run.metadata.insert(
+                "token_usage".into(),
+                serde_json::json!({
+                    "increment": increment,
+                    "cumulative": cumulative,
+                }),
+            );
+        }
         self.journal.append(&Mutation::RunUpsert(run.clone()))?;
         self.inner.write().runs.insert(run.id.clone(), run.clone());
         self.emit(StoreEvent::RunUpdated(run.clone()));
         Ok(run)
+    }
+
+    /// Durable cumulative token usage for `(actor, scope)`, if any closed run
+    /// has reported usage there.
+    pub fn run_usage_total(
+        &self,
+        actor_id: &str,
+        scope_id: &str,
+    ) -> Option<proto::types::TokenUsageSummary> {
+        self.inner
+            .read()
+            .run_usage_totals
+            .get(&(actor_id.to_string(), scope_id.to_string()))
+            .cloned()
     }
 
     pub fn get_run(&self, run_id: &str) -> Option<Run> {
@@ -3694,6 +3739,13 @@ impl Store {
         idempotency_key: Option<String>,
         merge_mention_audience: bool,
     ) -> StoreResult<Message> {
+        if body.len() > MESSAGE_BODY_MAX_BYTES {
+            return Err(StoreError::InvalidState(format!(
+                "message body is {} bytes; the maximum is {} bytes — publish large content as an artifact and reference it instead",
+                body.len(),
+                MESSAGE_BODY_MAX_BYTES
+            )));
+        }
         let resolved = self.resolve_message_target_for_append(&target, &author_actor_id)?;
         self.check_scope_access(&resolved.scope, &author_actor_id)?;
         let idempotency_key = normalize_message_idempotency_key(idempotency_key)?;
@@ -5435,6 +5487,13 @@ fn apply(inner: &mut Inner, m: Mutation) {
             }
         }
         Mutation::RunUpsert(run) => {
+            if let Some(increment) = run_usage_increment_from_meta(&run.metadata) {
+                inner
+                    .run_usage_totals
+                    .entry((run.actor_id.clone(), run.scope.id.clone()))
+                    .or_default()
+                    .add(&increment);
+            }
             inner.runs.insert(run.id.clone(), run);
         }
         Mutation::RunFrameAppend(frame) => {
@@ -5902,6 +5961,22 @@ fn is_terminal_run_status(status: RunStatus) -> bool {
         status,
         RunStatus::Completed | RunStatus::Failed | RunStatus::Canceled
     )
+}
+
+/// Server-side hard cap on `message.send` body size. Oversized content should
+/// be published as an artifact and referenced from the message instead of
+/// inlining it, which keeps the journal, broadcast fanout, and agent turn
+/// inputs bounded.
+pub const MESSAGE_BODY_MAX_BYTES: usize = 64 * 1024;
+
+/// Extract the per-turn usage increment a closed run carries in
+/// `metadata.token_usage.increment` (written by `close_run`). Used on replay
+/// to rebuild the durable per-(actor, scope) cumulative counters.
+fn run_usage_increment_from_meta(
+    meta: &proto::types::Meta,
+) -> Option<proto::types::TokenUsageSummary> {
+    let value = meta.get("token_usage")?.get("increment")?;
+    serde_json::from_value(value.clone()).ok()
 }
 
 fn agent_config_activation_key(actor_id: &str, scope: Option<&ScopeRef>) -> String {
@@ -7519,7 +7594,7 @@ mod tests {
         assert_eq!(frame.seq, 1);
 
         let closed = store
-            .close_run(&run.id, RunStatus::Completed)
+            .close_run(&run.id, RunStatus::Completed, None)
             .expect("close run");
         assert_eq!(closed.status, RunStatus::Completed);
         assert!(closed.closed_at.is_some());
@@ -7530,6 +7605,106 @@ mod tests {
             replayed.get_run(&run.id).expect("replayed run").status,
             RunStatus::Completed
         );
+    }
+
+    #[test]
+    fn close_run_with_usage_accumulates_and_survives_replay() {
+        use proto::types::TokenUsageSummary;
+
+        let store = fresh_store();
+        store
+            .upsert_actor(test_actor("actor_agent_bot", ActorKind::Agent, "Bot"))
+            .unwrap();
+        let channel = store
+            .create_channel("usage".into(), Some("actor_agent_bot".into()))
+            .unwrap();
+        let config = store
+            .publish_agent_config_version(
+                "actor_agent_bot".into(),
+                Some("v1".into()),
+                String::new(),
+                "test-model".into(),
+                "test-adapter".into(),
+                serde_json::Value::Null,
+                Vec::new(),
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                "actor_agent_bot".into(),
+                Meta::default(),
+            )
+            .expect("publish config");
+        let scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: channel.id.clone(),
+        };
+        let usage = |input: u64, output: u64| TokenUsageSummary {
+            input_tokens: Some(input),
+            output_tokens: Some(output),
+            total_tokens: Some(input + output),
+            ..TokenUsageSummary::default()
+        };
+
+        let open = |reason: &str| {
+            store
+                .open_run(
+                    "actor_agent_bot".into(),
+                    scope.clone(),
+                    None,
+                    Some(reason.into()),
+                    config.id.clone(),
+                    Meta::default(),
+                )
+                .expect("open run")
+        };
+
+        let first = open("turn-1");
+        let first = store
+            .close_run(&first.id, RunStatus::Completed, Some(usage(100, 40)))
+            .expect("close first run");
+        let meta = first
+            .metadata
+            .get("token_usage")
+            .expect("first run has token_usage metadata");
+        assert_eq!(meta["increment"]["total_tokens"], 140);
+        assert_eq!(meta["cumulative"]["total_tokens"], 140);
+
+        let second = open("turn-2");
+        let second = store
+            .close_run(&second.id, RunStatus::Completed, Some(usage(50, 10)))
+            .expect("close second run");
+        let meta = second
+            .metadata
+            .get("token_usage")
+            .expect("second run has token_usage metadata");
+        assert_eq!(meta["increment"]["total_tokens"], 60);
+        assert_eq!(
+            meta["cumulative"]["total_tokens"], 200,
+            "cumulative must fold successive increments"
+        );
+
+        // Closing without usage leaves no token_usage metadata and does not
+        // disturb the running totals.
+        let third = open("turn-3");
+        let third = store
+            .close_run(&third.id, RunStatus::Failed, None)
+            .expect("close third run");
+        assert!(third.metadata.get("token_usage").is_none());
+
+        let total = store
+            .run_usage_total("actor_agent_bot", &channel.id)
+            .expect("usage total present");
+        assert_eq!(total.total_tokens, Some(200));
+
+        // Replay rebuilds the durable counters from run metadata alone.
+        let replayed = Store::open(Journal::open(store.journal.path().to_path_buf()).unwrap())
+            .expect("replay");
+        let total = replayed
+            .run_usage_total("actor_agent_bot", &channel.id)
+            .expect("usage total survives replay");
+        assert_eq!(total.total_tokens, Some(200));
+        assert_eq!(total.input_tokens, Some(150));
+        assert_eq!(total.output_tokens, Some(50));
     }
 
     #[test]
@@ -8253,7 +8428,7 @@ mod tests {
 
         // Status filter.
         store
-            .close_run(&run_public.id, RunStatus::Failed)
+            .close_run(&run_public.id, RunStatus::Failed, None)
             .expect("close run");
         let runs = store
             .list_runs(

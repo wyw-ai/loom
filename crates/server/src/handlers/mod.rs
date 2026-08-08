@@ -2073,7 +2073,7 @@ fn run_close(state: &AppState, connection_id: &str, params: Option<Value>) -> Ha
     }
     let run = state
         .store
-        .close_run(&p.run_id, p.status)
+        .close_run(&p.run_id, p.status, p.usage)
         .map_err(map_store_err)?;
     ok(RunCloseResult { run })
 }
@@ -2145,7 +2145,7 @@ fn run_cancel(state: &AppState, connection_id: &str, params: Option<Value>) -> H
         .map_err(map_store_err)?;
     let run = state
         .store
-        .close_run(&run.id, RunStatus::Canceled)
+        .close_run(&run.id, RunStatus::Canceled, None)
         .map_err(map_store_err)?;
     ok(RunCancelResult {
         run,

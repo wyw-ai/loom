@@ -543,6 +543,18 @@ export function readMessageTokenUsage(
   };
 }
 
+/**
+ * Read `{ increment, cumulative }` token usage from a Run's metadata.
+ * Written by the server's `run.close` handler (crates/server store
+ * `close_run`); `cumulative` is the durable per-(actor, scope) counter that
+ * survives worker restarts, making this the preferred usage source.
+ */
+export function readRunTokenUsage(
+  meta: Record<string, unknown> | undefined | null,
+): MessageTokenUsageMeta | null {
+  return readMessageTokenUsage(meta);
+}
+
 export function readMessagePromptBreakdown(
   meta: Record<string, unknown> | undefined | null,
 ): PromptBreakdown | null {

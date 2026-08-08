@@ -9,7 +9,7 @@ import type {
   ScopeRef,
   InboxListEntry,
 } from "@/ipc/types";
-import { applyMessageToUsageStore } from "@/store/usageStore";
+import { applyMessageToUsageStore, applyRunToUsageStore } from "@/store/usageStore";
 import {
   directChannelPeerId,
   isDirectChannel,
@@ -265,7 +265,10 @@ export function useStreamHandler(deps: StreamHandlerDeps) {
         }
         case "run.updated": {
           const run = update.data.run as Run | undefined;
-          if (run) d.setRuns((current) => ({ ...current, [run.id]: run }));
+          if (run) {
+            applyRunToUsageStore(run);
+            d.setRuns((current) => ({ ...current, [run.id]: run }));
+          }
           return;
         }
         case "task.changed": {

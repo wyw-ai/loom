@@ -2488,6 +2488,10 @@ struct WorkerState {
     /// Provider session usage accumulated per scope. ACP, command, and
     /// interactive transports all use scope as the session boundary here.
     usage_totals: Mutex<HashMap<String, TokenUsage>>,
+    /// Last raw usage snapshot reported by the provider per scope. Used to
+    /// recover per-turn increments from providers whose usage-manifest
+    /// semantics declare `report = "session_cumulative"`.
+    last_provider_usage: Mutex<HashMap<String, TokenUsage>>,
     /// Last rendered provider prompt per scope, used only for duplicate
     /// injection telemetry. The value is overwritten every turn.
     last_prompt_by_scope: Mutex<HashMap<String, String>>,
@@ -2706,6 +2710,7 @@ impl WorkerState {
             pending_triggers: Mutex::new(HashMap::new()),
             text_buffer: Mutex::new(HashMap::new()),
             usage_totals: Mutex::new(HashMap::new()),
+            last_provider_usage: Mutex::new(HashMap::new()),
             last_prompt_by_scope: Mutex::new(HashMap::new()),
             seeded: Mutex::new(HashSet::new()),
             scope_channel_cache: Mutex::new(HashMap::new()),
@@ -3096,6 +3101,35 @@ impl WorkerState {
     fn take_text(&self, turn_id: &str) -> Option<String> {
         let mut buf = self.text_buffer.lock().unwrap_or_else(|e| e.into_inner());
         buf.remove(turn_id).filter(|s| !s.is_empty())
+    }
+
+    /// Non-consuming view of the buffered assistant text for a turn. Used to
+    /// derive an estimated usage increment before the buffer is drained by
+    /// one of the `Finished` branches.
+    fn peek_text(&self, turn_id: &str) -> Option<String> {
+        let buf = self.text_buffer.lock().unwrap_or_else(|e| e.into_inner());
+        buf.get(turn_id).filter(|s| !s.is_empty()).cloned()
+    }
+
+    /// Convert the provider-reported usage for a finished turn into a
+    /// per-turn increment. For providers whose usage-manifest semantics
+    /// declare `report = "session_cumulative"`, consecutive snapshots per
+    /// scope are diffed; delta providers pass through unchanged.
+    fn turn_usage_increment(&self, scope_id: &str, reported: TokenUsage) -> TokenUsage {
+        let provider = usage_provider_hint(&self.spec.provider_ref.id);
+        let semantics = usage::usage_semantics(provider.as_deref());
+        if semantics.report != usage::UsageReportKind::SessionCumulative {
+            return reported;
+        }
+        let mut last = self
+            .last_provider_usage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = last.insert(scope_id.to_string(), reported.clone());
+        match previous {
+            Some(previous) => usage::diff_usage(&reported, &previous),
+            None => reported,
+        }
     }
 
     fn accumulate_usage(&self, scope_id: &str, increment: &TokenUsage) -> TokenUsage {
@@ -3589,6 +3623,18 @@ async fn publish_runtime_agent_config(
     Ok(activated.version.id)
 }
 
+/// Normalize the provider-catalog id from `AgentSpec.provider_ref` into the
+/// key space of the usage manifest (`[providers.<id>]`). Empty ids yield
+/// `None` so extraction falls back to the manifest defaults.
+fn usage_provider_hint(provider_ref_id: &str) -> Option<String> {
+    let id = provider_ref_id.trim().to_ascii_lowercase();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id)
+    }
+}
+
 fn build_adapter(
     spec: &AgentSpec,
     transport: &AgentTransport,
@@ -3689,7 +3735,7 @@ fn build_adapter(
             Ok(Arc::new(AcpAdapter::new(cfg)))
         }
         "command" => {
-            let cfg = CommandConfig::from_transport(
+            let mut cfg = CommandConfig::from_transport(
                 spec.actor.id.clone(),
                 transport.command.clone(),
                 transport.args.clone(),
@@ -3697,6 +3743,7 @@ fn build_adapter(
                 transport,
                 paths.sessions.clone(),
             );
+            cfg.usage_provider = usage_provider_hint(&spec.provider_ref.id);
             Ok(Arc::new(CommandAdapter::new(cfg)))
         }
         "interactive_command" => {
@@ -3706,7 +3753,7 @@ fn build_adapter(
                 .as_ref()
                 .and_then(|m| m.default.clone())
                 .or_else(|| transport.model.clone());
-            let cfg = InteractiveCommandConfig::new(
+            let mut cfg = InteractiveCommandConfig::new(
                 spec.actor.id.clone(),
                 transport.command.clone(),
                 &transport.args,
@@ -3718,6 +3765,7 @@ fn build_adapter(
                 paths.sessions.clone(),
                 paths.profile.clone(),
             );
+            cfg.usage_provider = usage_provider_hint(&spec.provider_ref.id);
             Ok(Arc::new(InteractiveCommandAdapter::new(cfg)))
         }
         other => Err(anyhow!(
@@ -5143,7 +5191,7 @@ async fn dispatch_trigger_batch(
                     None,
                 )
                 .await;
-                let _ = close_run(client, &active.run_id, RunStatus::Failed).await;
+                let _ = close_run(client, &active.run_id, RunStatus::Failed, None).await;
                 for source_id in &source_ids {
                     if let Err(ack_err) =
                         record_delivery_seen_by_id(client, &state.actor_id, source_id).await
@@ -6490,7 +6538,7 @@ fn format_recent_conversation_context(
             message.metadata.get("kind").and_then(Value::as_str) != Some("run.started_ack")
         })
         .filter_map(|message| {
-            let body = compact_message_body(&message.body);
+            let body = compact_message_body(&message.body).text;
             if body.is_empty() {
                 return None;
             }
@@ -6538,7 +6586,7 @@ fn format_hidden_visible_history(
         })
         .filter(|message| message_visible_to_actor_for_prompt(message, local_actor_id))
     {
-        let body = compact_message_body(&message_body_for_prompt(message));
+        let body = compact_message_body(&message_body_for_prompt(message)).text;
         if body.is_empty() {
             continue;
         }
@@ -6588,12 +6636,32 @@ fn render_hidden_history_lines(header: &str, newest_first: &[String]) -> String 
     out
 }
 
-fn compact_message_body(body: &str) -> String {
+struct CompactBody {
+    text: String,
+    /// Original char count when the body was truncated to
+    /// `CONTEXT_MESSAGE_BODY_MAX_CHARS`.
+    truncated_from: Option<usize>,
+}
+
+fn compact_message_body(body: &str) -> CompactBody {
     let compact = body.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.chars().count() <= 800 {
-        compact
+    let total = compact.chars().count();
+    if total <= CONTEXT_MESSAGE_BODY_MAX_CHARS {
+        CompactBody {
+            text: compact,
+            truncated_from: None,
+        }
     } else {
-        format!("{}...", compact.chars().take(800).collect::<String>())
+        CompactBody {
+            text: format!(
+                "{}...",
+                compact
+                    .chars()
+                    .take(CONTEXT_MESSAGE_BODY_MAX_CHARS)
+                    .collect::<String>()
+            ),
+            truncated_from: Some(total),
+        }
     }
 }
 
@@ -7152,19 +7220,74 @@ fn body_ref_for_trigger(trigger: &AgentTrigger) -> String {
     }
 }
 
+/// Hard per-block caps for prompt injection. Every fenced body a turn input
+/// can carry is bounded so a single oversized message / event payload /
+/// assignment contract can no longer blow up the prompt (analysis doc
+/// `gui-lightweight-and-runtime-visibility-analysis.md` §2). Truncated
+/// blocks end with a pointer to the CLI so the agent can fetch the full
+/// fact on demand.
+const TRIGGER_MESSAGE_BODY_MAX_CHARS: usize = 4_000;
+const CONTEXT_MESSAGE_BODY_MAX_CHARS: usize = 500;
+const EVENT_PAYLOAD_MAX_CHARS: usize = 2_000;
+const ASSIGNMENT_CONTEXT_MAX_CHARS: usize = 4_000;
+
+/// Truncate `text` to `max_chars` characters. Returns the (possibly
+/// truncated) text and the original char count when truncation happened.
+fn truncate_chars(text: &str, max_chars: usize) -> (String, Option<usize>) {
+    let total = text.chars().count();
+    if total <= max_chars {
+        return (text.to_string(), None);
+    }
+    (text.chars().take(max_chars).collect(), Some(total))
+}
+
+fn truncation_note(kind: &str, shown: usize, total: usize, fetch_hint: &str) -> String {
+    format!("({kind} truncated: showing {shown} of {total} chars; {fetch_hint})")
+}
+
 fn render_trigger_body_block(trigger: &AgentTrigger) -> String {
     match trigger {
-        AgentTrigger::Message(message) => fenced_block(
-            &format!("loom-message id={}", fence_info_id(&message.id)),
-            &message_body_for_prompt(message),
-        ),
+        AgentTrigger::Message(message) => {
+            let (body, truncated_from) = truncate_chars(
+                &message_body_for_prompt(message),
+                TRIGGER_MESSAGE_BODY_MAX_CHARS,
+            );
+            let mut out = fenced_block(
+                &format!("loom-message id={}", fence_info_id(&message.id)),
+                &body,
+            );
+            if let Some(total) = truncated_from {
+                out.push('\n');
+                out.push_str(&truncation_note(
+                    "message body",
+                    TRIGGER_MESSAGE_BODY_MAX_CHARS,
+                    total,
+                    &format!(
+                        "run `loom --json message get {}` for the full text",
+                        message.id
+                    ),
+                ));
+            }
+            out
+        }
         AgentTrigger::Event(event) => {
             let payload = serde_json::to_string_pretty(&event.payload)
                 .unwrap_or_else(|_| event.payload.to_string());
-            fenced_block(
+            let (payload, truncated_from) = truncate_chars(&payload, EVENT_PAYLOAD_MAX_CHARS);
+            let mut out = fenced_block(
                 &format!("loom-event id={}", fence_info_id(&event.id)),
                 &payload,
-            )
+            );
+            if let Some(total) = truncated_from {
+                out.push('\n');
+                out.push_str(&truncation_note(
+                    "event payload",
+                    EVENT_PAYLOAD_MAX_CHARS,
+                    total,
+                    "query the scope via the Loom CLI for the full payload",
+                ));
+            }
+            out
         }
     }
 }
@@ -7186,17 +7309,30 @@ fn render_context_message_block(
         out.push_str(&visibility);
         out.push('\n');
     }
-    let body = compact_message_body(&message_body_for_prompt(message));
+    let compact = compact_message_body(&message_body_for_prompt(message));
     out.push_str(&fenced_block(
         &format!("loom-message id={}", fence_info_id(&message.id)),
-        &body,
+        &compact.text,
     ));
+    if let Some(total) = compact.truncated_from {
+        out.push('\n');
+        out.push_str(&truncation_note(
+            "message body",
+            CONTEXT_MESSAGE_BODY_MAX_CHARS,
+            total,
+            &format!(
+                "run `loom --json message get {}` for the full text",
+                message.id
+            ),
+        ));
+    }
     out
 }
 
 fn render_context_event_block(event: &Event, actor_names: &HashMap<String, String>) -> String {
     let payload =
         serde_json::to_string_pretty(&event.payload).unwrap_or_else(|_| event.payload.to_string());
+    let (payload, truncated_from) = truncate_chars(&payload, EVENT_PAYLOAD_MAX_CHARS);
     let mut out = format!(
         "Event id: {}\nAt: {}\nFrom: {}\nType: {}\n",
         event.id,
@@ -7208,6 +7344,15 @@ fn render_context_event_block(event: &Event, actor_names: &HashMap<String, Strin
         &format!("loom-event id={}", fence_info_id(&event.id)),
         &payload,
     ));
+    if let Some(total) = truncated_from {
+        out.push('\n');
+        out.push_str(&truncation_note(
+            "event payload",
+            EVENT_PAYLOAD_MAX_CHARS,
+            total,
+            "query the scope via the Loom CLI for the full payload",
+        ));
+    }
     out
 }
 
@@ -7409,6 +7554,22 @@ async fn assignment_context_for_prompt(
         Ok(context) => {
             let body = serde_json::to_string_pretty(&context)
                 .unwrap_or_else(|_| "{\"error\":\"failed to render assignment context\"}".into());
+            let (body, truncated_from) = truncate_chars(&body, ASSIGNMENT_CONTEXT_MAX_CHARS);
+            let note = truncated_from
+                .map(|total| {
+                    format!(
+                        "\n{}",
+                        truncation_note(
+                            "assignment context",
+                            ASSIGNMENT_CONTEXT_MAX_CHARS,
+                            total,
+                            &format!(
+                                "run `loom --json task assignment context {assignment_id}` for the full contract"
+                            ),
+                        )
+                    )
+                })
+                .unwrap_or_default();
             Some(format!(
                 "=== Loom assignment context ===\n\
                  This JSON is the authoritative task input. Read it before acting; use preflight before external side effects.\n\
@@ -7417,7 +7578,7 @@ async fn assignment_context_for_prompt(
                  - Record durable evidence with `loom task fact append`; do not use plain messages as gate evidence.\n\
                  - Finish this assignment with `loom task assignment update <assignment_id> --status completed --result <summary> --result-artifact-id <art_id> ... --result-fact-id <fact_id> ...`.\n\
                  - Do not route to another actor directly to finish an assignment; the assignment update returns the task to the assigning actor.\n\
-                 ```json\n{body}\n```"
+                 ```json\n{body}\n```{note}"
             ))
         }
         Err(err) => Some(format!(
@@ -8364,6 +8525,19 @@ async fn translate_one(
                 );
                 return Ok(());
             };
+            // Resolve the per-turn usage increment once, up front: apply the
+            // session-cumulative diff for providers that report running
+            // totals, and fall back to an estimate from the buffered
+            // assistant text when the provider reported nothing. Every
+            // downstream consumer (message meta, failure notice, final trace
+            // frame, run.close) uses this same increment so the channels
+            // cannot drift apart.
+            let usage = usage.map(|u| state.turn_usage_increment(&active.scope.id, u));
+            let close_usage = usage.clone().or_else(|| {
+                state.peek_text(&active.id).map(|text| {
+                    usage::estimated_usage(active.prompt_stats.approx_token_count, &text)
+                })
+            });
             if active.cancel_requested || turn_no_reply_requested(&active) {
                 let _ = state.take_text(&active.id);
             } else if agent_text_auto_publish_enabled() {
@@ -8457,7 +8631,9 @@ async fn translate_one(
             } else {
                 RunStatus::Failed
             };
-            if let Err(e) = close_run(client, &active.run_id, run_status).await {
+            if let Err(e) =
+                close_run(client, &active.run_id, run_status, close_usage.as_ref()).await
+            {
                 tracing::warn!(
                     actor = %actor_id,
                     run = %active.run_id,
@@ -9395,12 +9571,19 @@ async fn flush_text(
     })
 }
 
-async fn close_run(client: &Arc<Client>, run_id: &str, status: RunStatus) -> Result<()> {
+async fn close_run(
+    client: &Arc<Client>,
+    run_id: &str,
+    status: RunStatus,
+    usage: Option<&TokenUsage>,
+) -> Result<()> {
+    let mut params = json!({ "runId": run_id, "status": status });
+    if let Some(usage) = usage {
+        // Additive field: servers that predate `run.close.usage` ignore it.
+        params["usage"] = serde_json::to_value(usage).unwrap_or(Value::Null);
+    }
     let _: RunCloseResult = client
-        .call(
-            method::RUN_CLOSE,
-            json!({ "runId": run_id, "status": status }),
-        )
+        .call(method::RUN_CLOSE, params)
         .await
         .with_context(|| format!("run.close run={run_id}"))?;
     Ok(())

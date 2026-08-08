@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import * as ipc from "@/ipc/bridge";
 import type { Run, RunStatus } from "@/ipc/types";
 import type { ConnectionState, View } from "@/lib/types";
+import { applyRunToUsageStore } from "@/store/usageStore";
 
 const ACTIVE_STATUSES: RunStatus[] = [
   "queued",
@@ -53,6 +54,7 @@ export function useRunsList({
       try {
         const result = await ipc.runList({ limit: RUN_LIST_LIMIT });
         if (requestId !== recentRequestRef.current) return;
+        for (const run of result.runs) applyRunToUsageStore(run);
         setRuns((current) => {
           const next: Record<string, Run> = {};
           // Keep the active snapshot recovered on connection even if it falls

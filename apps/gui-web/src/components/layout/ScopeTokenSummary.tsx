@@ -53,7 +53,10 @@ export function ScopeTokenSummary({
         <Coins size={14} className="text-[#503ed4]" />
         {/* Full label visible at xl+, icon-only below */}
         <span className="hidden xl:inline">
-          <span className="text-[#503ed4]">{formatCompact(summary.totalTokens)}</span>
+          <span className="text-[#503ed4]">
+            {summary.estimatedTokens > 0 ? "≈" : ""}
+            {formatCompact(summary.totalTokens)}
+          </span>
           <span className="ml-0.5 text-[#98a2b3]">tokens</span>
         </span>
         <ChevronDown
@@ -83,6 +86,7 @@ export function ScopeTokenSummary({
                   <div className="flex items-center justify-between">
                     <span className="truncate text-xs font-medium text-[#303849]">{name}</span>
                     <span className="ml-2 shrink-0 text-xs font-semibold text-[#503ed4]">
+                      {entry.estimated ? "≈" : ""}
                       {formatCompact(entry.totalTokens)}
                     </span>
                   </div>
@@ -103,9 +107,15 @@ export function ScopeTokenSummary({
               );
             })}
           </ul>
-          {summary.cacheReadTokens > 0 && (
+          {(summary.cacheReadTokens > 0 || summary.estimatedTokens > 0) && (
             <div className="mt-2 border-t border-[#eef0f5] pt-2 text-[10px] text-[#98a2b3]">
-              Cache read: {formatCompact(summary.cacheReadTokens)} tokens
+              {summary.cacheReadTokens > 0 && (
+                <span>Cache read: {formatCompact(summary.cacheReadTokens)} tokens</span>
+              )}
+              {summary.cacheReadTokens > 0 && summary.estimatedTokens > 0 && <span> · </span>}
+              {summary.estimatedTokens > 0 && (
+                <span>≈{formatCompact(summary.estimatedTokens)} estimated (provider reported no usage)</span>
+              )}
             </div>
           )}
         </div>

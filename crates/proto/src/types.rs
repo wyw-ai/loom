@@ -247,6 +247,63 @@ pub struct Run {
     pub metadata: Meta,
 }
 
+/// Per-turn token-usage summary reported by an agent worker when it closes a
+/// run. Field names intentionally mirror
+/// `agent-runtime::adapter::TokenUsage` (snake_case) so the worker can
+/// round-trip its adapter value through serde without a manual mapping.
+///
+/// Additive protocol surface: servers that predate this type ignore the
+/// extra `usage` field on `run.close`, and workers talking to such servers
+/// lose nothing but the durable copy.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TokenUsageSummary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_cost_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub estimated: bool,
+}
+
+impl TokenUsageSummary {
+    /// Field-wise saturating accumulation used by the server to maintain the
+    /// durable per-(actor, scope) cumulative counter.
+    pub fn add(&mut self, increment: &TokenUsageSummary) {
+        fn add_opt(left: &mut Option<u64>, right: Option<u64>) {
+            if let Some(right) = right {
+                *left = Some(left.unwrap_or(0).saturating_add(right));
+            }
+        }
+        add_opt(&mut self.input_tokens, increment.input_tokens);
+        add_opt(&mut self.output_tokens, increment.output_tokens);
+        add_opt(&mut self.total_tokens, increment.total_tokens);
+        add_opt(
+            &mut self.cache_creation_input_tokens,
+            increment.cache_creation_input_tokens,
+        );
+        add_opt(
+            &mut self.cache_read_input_tokens,
+            increment.cache_read_input_tokens,
+        );
+        add_opt(&mut self.reasoning_tokens, increment.reasoning_tokens);
+        if let Some(cost) = increment.total_cost_usd {
+            self.total_cost_usd = Some(self.total_cost_usd.unwrap_or(0.0) + cost);
+        }
+        self.estimated = self.estimated || increment.estimated;
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunFrame {

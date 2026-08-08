@@ -1280,6 +1280,12 @@ pub struct RunCloseParams {
     pub run_id: String,
     #[serde(default = "default_run_close_status")]
     pub status: RunStatus,
+    /// Optional per-turn token usage reported by the worker (additive field;
+    /// older servers ignore it, older workers never send it). The server
+    /// merges it into `run.metadata.token_usage` together with the durable
+    /// per-(actor, scope) cumulative counter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<crate::types::TokenUsageSummary>,
 }
 
 fn default_run_close_status() -> RunStatus {

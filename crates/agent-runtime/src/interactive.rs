@@ -24,13 +24,17 @@ use proto::methods::{
 use proto::types::{ScopeKind, ScopeRef};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use super::adapter::{Adapter, AdapterEvent, AdapterPrompt, AdapterStartInfo, TokenUsage};
 use crate::acp::create_dir_all_unc;
 use crate::usage::extract_token_usage_from_text_for_provider;
 use loom_platform::path::unc_prefix_path;
+
+const STARTUP_HANDSHAKE_ENV: &str = "LOOM_PROVIDER_STARTUP_HANDSHAKE";
+const STARTUP_ACK_FILE_ENV: &str = "LOOM_PROVIDER_STARTUP_ACK_FILE";
+const STARTUP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct InteractiveCommandConfig {
@@ -104,6 +108,33 @@ impl InteractiveCommandConfig {
 struct InFlight {
     pid: Option<u32>,
     cancel_requested: bool,
+    provider_started: bool,
+    start_sender: Option<oneshot::Sender<Result<u32, String>>>,
+}
+
+fn confirm_provider_start(slot: &Arc<Mutex<InFlight>>, pid: u32) {
+    let sender = {
+        let mut state = slot.lock();
+        state.provider_started = true;
+        state.start_sender.take()
+    };
+    if let Some(sender) = sender {
+        let _ = sender.send(Ok(pid));
+    }
+}
+
+fn fail_provider_start(slot: &Arc<Mutex<InFlight>>, message: String) -> bool {
+    let sender = {
+        let mut state = slot.lock();
+        if state.provider_started {
+            return false;
+        }
+        state.start_sender.take()
+    };
+    if let Some(sender) = sender {
+        let _ = sender.send(Err(message));
+    }
+    true
 }
 
 pub struct InteractiveCommandAdapter {
@@ -160,22 +191,18 @@ impl Adapter for InteractiveCommandAdapter {
 
     async fn send_prompt(&self, prompt: AdapterPrompt) -> Result<(), String> {
         if prompt.content.trim().is_empty() {
-            let _ = self.sender()?.send(AdapterEvent::Error {
-                scope: Some(prompt.scope.clone()),
-                message: "empty prompt".into(),
-            });
-            let _ = self.sender()?.send(AdapterEvent::Finished {
-                scope: Some(prompt.scope),
-                success: false,
-                summary: "empty prompt".into(),
-                usage: None,
-            });
-            return Ok(());
+            return Err("empty prompt".into());
         }
         let sender = self.sender()?;
         let cfg = self.cfg.clone();
         let slot = self.slot_for(&prompt.scope.id);
-        slot.lock().cancel_requested = false;
+        let (start_tx, start_rx) = oneshot::channel();
+        {
+            let mut state = slot.lock();
+            state.cancel_requested = false;
+            state.provider_started = false;
+            state.start_sender = Some(start_tx);
+        }
         // Detach the provider turn onto a blocking worker. send_prompt must
         // return promptly so the agent worker's notification loop stays
         // free to process turn/close, action responses, and directed messages to
@@ -188,7 +215,10 @@ impl Adapter for InteractiveCommandAdapter {
                 tracing::debug!(error = %e, "interactive run_prompt returned err (already reported via AdapterEvent)");
             }
         });
-        Ok(())
+        start_rx
+            .await
+            .map_err(|_| "provider startup worker stopped unexpectedly".to_string())?
+            .map(|_| ())
     }
 
     async fn respond_action(&self, _request_id: String, _option_id: String) -> Result<(), String> {
@@ -308,16 +338,18 @@ fn run_prompt(
             Ok(())
         }
         Err(e) => {
-            let _ = sender.send(AdapterEvent::Error {
-                scope: Some(prompt.scope.clone()),
-                message: e.clone(),
-            });
-            let _ = sender.send(AdapterEvent::Finished {
-                scope: Some(prompt.scope),
-                success: false,
-                summary: e.clone(),
-                usage: None,
-            });
+            if !fail_provider_start(&slot, e.clone()) {
+                let _ = sender.send(AdapterEvent::Error {
+                    scope: Some(prompt.scope.clone()),
+                    message: e.clone(),
+                });
+                let _ = sender.send(AdapterEvent::Finished {
+                    scope: Some(prompt.scope),
+                    success: false,
+                    summary: e.clone(),
+                    usage: None,
+                });
+            }
             Err(e)
         }
     }
@@ -370,7 +402,23 @@ fn run_prompt_inner(
     argv.extend(session_argv);
     append_provider_args(cfg, prompt, &mut argv)?;
 
-    let mut child = spawn_child(cfg, prompt, &argv)?;
+    let startup_handshake_required = cfg
+        .env
+        .get(STARTUP_HANDSHAKE_ENV)
+        .is_some_and(|value| value == "required");
+    let startup_ack_path = if startup_handshake_required {
+        let dir = cfg.sessions_dir.join(".startup");
+        create_dir_all_unc(&dir).map_err(|e| {
+            format!(
+                "failed to create provider startup handshake directory `{}`: {e}",
+                dir.display()
+            )
+        })?;
+        Some(dir.join(format!("{}.ack", Uuid::new_v4())))
+    } else {
+        None
+    };
+    let mut child = spawn_child(cfg, prompt, &argv, startup_ack_path.as_deref())?;
     {
         let mut s = slot.lock();
         s.pid = Some(child.id());
@@ -380,6 +428,51 @@ fn run_prompt_inner(
             let _ = apply_kill_policy(&cfg.spec.kill.on_cancel, pid);
         }
     }
+    if let Some(path) = startup_ack_path.as_ref() {
+        let deadline = Instant::now() + STARTUP_HANDSHAKE_TIMEOUT;
+        let mut startup_error = None;
+        loop {
+            if std::fs::read_to_string(path)
+                .ok()
+                .and_then(|value| value.trim().parse::<u32>().ok())
+                .is_some()
+            {
+                break;
+            }
+            if slot.lock().cancel_requested {
+                let _ = apply_kill_policy(&cfg.spec.kill.on_cancel, child.id());
+                startup_error = Some("provider cancelled before startup confirmation".into());
+                break;
+            }
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    startup_error = Some("provider exited before startup handshake".into());
+                    break;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = apply_kill_policy(&cfg.spec.kill.on_timeout, child.id());
+                    startup_error = Some(format!("failed to poll child during startup: {error}"));
+                    break;
+                }
+            }
+            if Instant::now() >= deadline {
+                let _ = apply_kill_policy(&cfg.spec.kill.on_timeout, child.id());
+                startup_error = Some(format!(
+                    "provider startup handshake timed out after {}ms",
+                    STARTUP_HANDSHAKE_TIMEOUT.as_millis()
+                ));
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = std::fs::remove_file(path);
+        if let Some(error) = startup_error {
+            let _ = child.wait();
+            return Err(error);
+        }
+    }
+    confirm_provider_start(slot, child.id());
 
     let stdout = child.stdout.take().ok_or("failed to open child stdout")?;
     let stderr = child.stderr.take().ok_or("failed to open child stderr")?;
@@ -574,6 +667,7 @@ fn spawn_child(
     cfg: &InteractiveCommandConfig,
     prompt: &AdapterPrompt,
     argv: &[String],
+    startup_ack_path: Option<&std::path::Path>,
 ) -> Result<Child, String> {
     // On Windows, prefix the cwd with UNC prefix to bypass MAX_PATH (260
     // char) limit.  Do NOT UNC-prefix the command path — `\\?\` bypasses
@@ -590,6 +684,10 @@ fn spawn_child(
         .stderr(Stdio::piped());
     for (k, v) in expanded_env(cfg, prompt) {
         cmd.env(k, v);
+    }
+    if let Some(path) = startup_ack_path {
+        let _ = std::fs::remove_file(path);
+        cmd.env(STARTUP_ACK_FILE_ENV, path);
     }
     // Windows CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB |
     // CREATE_NEW_PROCESS_GROUP and Unix process_group(0) are applied by
@@ -1214,6 +1312,34 @@ mod tests {
         assert!(!success);
         assert!(summary.contains("completion sentinel"));
         assert!(!session_path(&cfg, &scope(ScopeKind::Thread, "thr")).exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn required_startup_handshake_failure_cleans_ack_file() {
+        let root = std::env::temp_dir().join(format!("loom-it-{}", Uuid::new_v4()));
+        let mut cfg = cfg(root.clone());
+        cfg.command = "sh".into();
+        cfg.env
+            .insert(STARTUP_HANDSHAKE_ENV.into(), "required".into());
+        cfg.spec.session.new_args = vec!["-c".into(), "exit 9".into()];
+        cfg.spec.session.resume_args = cfg.spec.session.new_args.clone();
+        let adapter = InteractiveCommandAdapter::new(cfg.clone());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        adapter.start(tx).await.unwrap();
+
+        let error = adapter
+            .send_prompt(prompt(scope(ScopeKind::Thread, "thr"), "ignored"))
+            .await
+            .expect_err("provider exit before handshake must fail send_prompt");
+
+        assert!(error.contains("before startup handshake"), "{error}");
+        let startup_dir = cfg.sessions_dir.join(".startup");
+        let remaining = std::fs::read_dir(&startup_dir)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(remaining, 0, "startup ack files must be removed on failure");
         let _ = std::fs::remove_dir_all(root);
     }
 }

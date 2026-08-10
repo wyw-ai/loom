@@ -83,6 +83,12 @@ pub enum Signal {
 /// Returns the underlying OS error on failure. Does not wait for the
 /// target process to exit.
 pub fn signal_child(pid: u32, sig: Signal) -> std::io::Result<()> {
+    if pid == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "child pid must be greater than zero",
+        ));
+    }
     #[cfg(unix)]
     {
         return self::unix::signal_child(pid, sig);

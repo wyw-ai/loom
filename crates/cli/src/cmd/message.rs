@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 
 use crate::client::Client;
 use crate::config;
-use crate::render;
+use crate::{cmd::run, render};
 
 const LONG_MESSAGE_BODY_CHAR_LIMIT: usize = 6_000;
 const ENV_LONG_MESSAGE_DIR: &str = "LOOM_LONG_MESSAGE_DIR";
@@ -33,7 +33,9 @@ pub async fn send(
     idempotency_key: Option<String>,
     attachment_ids: Vec<String>,
     allow_escaped_newlines: bool,
+    allow_after_no_reply: bool,
 ) -> Result<()> {
+    run::ensure_visible_output_allowed(allow_after_no_reply)?;
     let private_to = normalize_actor_ids(private_to)?;
     if to.is_some() && !private_to.is_empty() {
         bail!("use either --to for global DM or --private-to for same-scope private delivery, not both");
@@ -152,7 +154,9 @@ pub async fn ask(
     idempotency_key: Option<String>,
     attachment_ids: Vec<String>,
     allow_escaped_newlines: bool,
+    allow_after_no_reply: bool,
 ) -> Result<()> {
+    run::ensure_visible_output_allowed(allow_after_no_reply)?;
     let target = resolve_send_target(client.as_ref(), target, thread, None, false).await?;
     let text_contains_escaped_newline = text
         .as_deref()

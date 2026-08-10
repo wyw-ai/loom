@@ -13,7 +13,9 @@ pub mod method {
     pub const SCOPE_SUBSCRIBE: &str = "scope/subscribe";
     pub const SCOPE_UNSUBSCRIBE: &str = "scope/unsubscribe";
     pub const CHANNEL_CREATE: &str = "channel/create";
+    pub const CHANNEL_ENSURE_PUBLIC: &str = "channel/ensure_public";
     pub const CHANNEL_LIST: &str = "channel/list";
+    pub const CHANNEL_LOOKUP: &str = "channel/lookup";
     pub const CHANNEL_UPDATE: &str = "channel/update";
     pub const CHANNEL_DELETE: &str = "channel/delete";
     pub const CHANNEL_INVITE: &str = "channel/invite";
@@ -23,10 +25,12 @@ pub mod method {
     pub const CHANNEL_MEMBER_CONFIG_LIST: &str = "channel/member_config.list";
     pub const CHANNEL_MEMBER_CONFIG_SET: &str = "channel/member_config.set";
     pub const CHANNEL_MEMBER_CONFIG_CLEAR: &str = "channel/member_config.clear";
+    pub const CHANNEL_MEMBER_RESOLVE: &str = "channel/member.resolve";
     pub const CHANNEL_SET_INSTRUCTION: &str = "channel/set_instruction";
     pub const CHANNEL_GET_INSTRUCTION: &str = "channel/get_instruction";
     pub const CHANNEL_CLEAR_INSTRUCTION: &str = "channel/clear_instruction";
     pub const THREAD_CREATE: &str = "thread/create";
+    pub const THREAD_GET: &str = "thread/get";
     pub const THREAD_LIST: &str = "thread/list";
     pub const THREAD_UPDATE: &str = "thread/update";
     pub const THREAD_ARCHIVE: &str = "thread/archive";
@@ -277,7 +281,32 @@ pub struct ChannelCreateResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelEnsurePublicParams {
+    pub title: String,
+    #[serde(default)]
+    pub topic: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelEnsurePublicResult {
+    pub channel: Channel,
+    pub created: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelListResult {
+    pub channels: Vec<Channel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelLookupParams {
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelLookupResult {
     pub channels: Vec<Channel>,
 }
 
@@ -351,7 +380,10 @@ pub struct ChannelMemberConfigListResult {
 pub struct ChannelMemberConfigSetParams {
     pub channel_id: String,
     pub actor_id: String,
-    pub workspace_dir: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mention_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -369,6 +401,27 @@ pub struct ChannelMemberConfigClearParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelMemberConfigClearResult {
     pub cleared: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelMemberResolveParams {
+    pub channel_id: String,
+    pub mention_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedChannelMember {
+    pub actor: Actor,
+    pub mention_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelMemberResolveResult {
+    pub members: Vec<ResolvedChannelMember>,
+    pub unresolved_mention_ids: Vec<String>,
 }
 
 // ---- channel/update / delete ----
@@ -461,6 +514,17 @@ pub struct ThreadCreateParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadCreateResult {
     pub thread: Thread,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadGetParams {
+    pub thread_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadGetResult {
+    pub thread: Option<Thread>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

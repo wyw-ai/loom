@@ -48,7 +48,7 @@ pub enum ActorKind {
     Service,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Actor {
     pub id: String,
@@ -120,6 +120,10 @@ pub struct ChannelMemberConfig {
     pub actor_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_dir: Option<String>,
+    /// External mention identifiers that route a platform-native mention to
+    /// this actor within the channel.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mention_ids: Vec<String>,
     pub updated_at: Timestamp,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
     pub _meta: Option<Meta>,

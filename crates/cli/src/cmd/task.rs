@@ -11,7 +11,7 @@ use proto::types::{
 use serde_json::{json, Value};
 
 use crate::client::Client;
-use crate::render;
+use crate::{cmd::run, render};
 
 pub async fn create(
     client: Arc<Client>,
@@ -332,8 +332,14 @@ pub async fn assignment_update(
             }),
         )
         .await?;
+    mark_terminal_assignment_handoff(&res);
     if render::is_json() {
         render::print_json(&res);
+    } else if is_terminal_assignment_status(res.assignment.status) {
+        println!(
+            "assignment {} ({:?}); task returned to {} automatically",
+            res.assignment.id, res.assignment.status, res.assignment.from_actor_id
+        );
     } else {
         println!(
             "assignment {} ({:?})",
@@ -341,6 +347,57 @@ pub async fn assignment_update(
         );
     }
     Ok(())
+}
+
+fn mark_terminal_assignment_handoff(result: &TaskAssignmentUpdateResult) {
+    if !is_terminal_assignment_status(result.assignment.status) {
+        return;
+    }
+    let active_assignment_id = std::env::var("LOOM_ASSIGNMENT_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if active_assignment_id.as_deref() != Some(result.assignment.id.as_str()) {
+        return;
+    }
+    let Some(run_id) = std::env::var("LOOM_RUN_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    let payload = json!({
+        "noReply": true,
+        "replyMode": "none",
+        "reason": "assignment_terminal_auto_return",
+        "assignmentId": result.assignment.id,
+        "assignmentStatus": result.assignment.status,
+        "taskId": result.task.id,
+        "returnedTo": result.assignment.from_actor_id,
+    });
+    match run::mark_local_no_reply(&run_id, &payload) {
+        Ok(true) => {}
+        Ok(false) => eprintln!(
+            "loom: assignment {} is terminal and returned to {} automatically; \
+             do not send another handoff message",
+            result.assignment.id, result.assignment.from_actor_id
+        ),
+        Err(err) => eprintln!(
+            "loom: warning: assignment {} returned automatically, but the local no-reply \
+             guard could not be recorded: {err}",
+            result.assignment.id
+        ),
+    }
+}
+
+fn is_terminal_assignment_status(status: TaskAssignmentStatus) -> bool {
+    matches!(
+        status,
+        TaskAssignmentStatus::Completed
+            | TaskAssignmentStatus::Failed
+            | TaskAssignmentStatus::Canceled
+    )
 }
 
 fn expand_cli_values(values: Vec<String>) -> Vec<String> {
@@ -1053,7 +1110,8 @@ fn normalize(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::expand_cli_values;
+    use super::{expand_cli_values, is_terminal_assignment_status};
+    use proto::types::TaskAssignmentStatus;
 
     #[test]
     fn expand_cli_values_splits_commas_trims_and_dedupes() {
@@ -1066,5 +1124,19 @@ mod tests {
             ]),
             vec!["art_1", "art_2", "art_3"]
         );
+    }
+
+    #[test]
+    fn terminal_assignment_statuses_return_control() {
+        assert!(is_terminal_assignment_status(
+            TaskAssignmentStatus::Completed
+        ));
+        assert!(is_terminal_assignment_status(TaskAssignmentStatus::Failed));
+        assert!(is_terminal_assignment_status(
+            TaskAssignmentStatus::Canceled
+        ));
+        assert!(!is_terminal_assignment_status(
+            TaskAssignmentStatus::Running
+        ));
     }
 }

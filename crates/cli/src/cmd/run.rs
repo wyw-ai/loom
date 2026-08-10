@@ -1,5 +1,6 @@
 use std::future::Future;
 use std::io::{self, BufRead, IsTerminal, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,7 +13,7 @@ use serde_json::{json, Value};
 use crate::client::Client;
 use crate::render;
 
-const LOOM_NO_REPLY_FILE_ENV: &str = "LOOM_NO_REPLY_FILE";
+pub(crate) const LOOM_NO_REPLY_FILE_ENV: &str = "LOOM_NO_REPLY_FILE";
 const WATCH_RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(1);
 const WATCH_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(5);
 
@@ -408,7 +409,7 @@ pub async fn ignore(
     Ok(())
 }
 
-fn mark_local_no_reply(run_id: &str, payload: &Value) -> std::io::Result<bool> {
+pub(crate) fn mark_local_no_reply(run_id: &str, payload: &Value) -> std::io::Result<bool> {
     let Some(path) = std::env::var_os(LOOM_NO_REPLY_FILE_ENV) else {
         return Ok(false);
     };
@@ -424,6 +425,28 @@ fn mark_local_no_reply(run_id: &str, payload: &Value) -> std::io::Result<bool> {
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
     std::fs::write(path, bytes)?;
     Ok(true)
+}
+
+pub(crate) fn ensure_visible_output_allowed(allow_after_no_reply: bool) -> Result<()> {
+    if allow_after_no_reply {
+        return Ok(());
+    }
+    let Some(path) = std::env::var_os(LOOM_NO_REPLY_FILE_ENV) else {
+        return Ok(());
+    };
+    ensure_visible_output_allowed_for_path(PathBuf::from(path).as_path())
+}
+
+fn ensure_visible_output_allowed_for_path(path: &std::path::Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "this agent run is already marked no-reply or has completed its assignment handoff; \
+         sending another message now can duplicate an outcome or wake. Send any visible result \
+         before the terminal assignment update, or pass --allow-after-no-reply when a deliberate \
+         post-handoff message is required"
+    );
 }
 
 pub async fn close(client: Arc<Client>, run_id: String, status: String) -> Result<()> {
@@ -532,5 +555,30 @@ mod tests {
                 "Cancel run `run_1`? [y/N] "
             );
         }
+    }
+
+    fn temp_marker(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "loom-{name}-{}-{}.json",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ))
+    }
+
+    #[test]
+    fn visible_output_guard_allows_missing_marker() {
+        let marker = temp_marker("missing-no-reply");
+        assert!(ensure_visible_output_allowed_for_path(&marker).is_ok());
+    }
+
+    #[test]
+    fn visible_output_guard_rejects_existing_marker() {
+        let marker = temp_marker("existing-no-reply");
+        std::fs::write(&marker, "{}").expect("write marker");
+
+        let err = ensure_visible_output_allowed_for_path(&marker).expect_err("guard should reject");
+
+        assert!(err.to_string().contains("--allow-after-no-reply"));
+        std::fs::remove_file(marker).ok();
     }
 }

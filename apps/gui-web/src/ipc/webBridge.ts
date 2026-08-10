@@ -1,8 +1,13 @@
-import type { DesktopConfig, HumanAccount, Workspace } from "./types";
+import type {
+  ConnectionEvent,
+  DesktopConfig,
+  HumanAccount,
+  Workspace,
+  WorkspaceConnectResult,
+} from "./types";
 
 type JsonValue = unknown;
 type Unlisten = () => void;
-type ConnectionEvent = { state: "open" } | { state: "closed"; reason?: string };
 type EventHandler<T> = (payload: T) => void;
 
 export interface WebConnectionInput {
@@ -31,6 +36,16 @@ interface RpcError {
   data?: unknown;
 }
 
+class RpcRequestError extends Error {
+  readonly code: number;
+
+  constructor(error: RpcError) {
+    super(`rpc failed: ${error.message} (code ${error.code})`);
+    this.name = "RpcRequestError";
+    this.code = error.code;
+  }
+}
+
 interface RpcResponse {
   id?: string | number | null;
   result?: JsonValue;
@@ -52,12 +67,15 @@ const connectionListeners = new Set<EventHandler<ConnectionEvent>>();
 
 let socket: WebSocket | null = null;
 let currentConfig: Required<Pick<StoredWebConfig, "serverUrl" | "actorId" | "displayName">> | null = null;
-let connectPromise: Promise<JsonValue> | null = null;
+let currentPassword: string | undefined;
+let connectPromise: Promise<{ open: JsonValue; connectionId: number }> | null = null;
 let reconnectTimer: number | null = null;
 let reconnectAttempt = 0;
 let wasOpened = false;
 let manuallyClosed = false;
 let nextRequestId = 1;
+let nextConnectionId = 1;
+let currentSocketConnectionId: number | null = null;
 
 const pending = new Map<string, PendingRequest>();
 
@@ -139,6 +157,7 @@ export function configureWebConnection(input: WebConnectionInput): DesktopConfig
 
 export function clearWebConnection(): DesktopConfig {
   disconnect();
+  currentPassword = undefined;
   if (canUseStorage()) window.localStorage.removeItem(storageKey);
   return webConfig();
 }
@@ -261,9 +280,15 @@ function scheduleReconnect(reason: string) {
   const delay = reconnectDelayMs(reconnectAttempt++);
   reconnectTimer = window.setTimeout(() => {
     reconnectTimer = null;
-    void openSocket(currentConfig!).catch((err) => {
-      emitConnection({ state: "closed", reason: err.message || reason });
-      scheduleReconnect(err.message || reason);
+    const connectionId = nextConnectionId++;
+    void openSocket(currentConfig!, connectionId, currentPassword).catch((err) => {
+      if (currentSocketConnectionId === connectionId) closeExistingSocket();
+      emitConnection({
+        state: "closed",
+        connectionId,
+        reason: err.message || reason,
+      });
+      if (!isServerAuthError(err)) scheduleReconnect(err.message || reason);
     });
   }, delay);
 }
@@ -303,11 +328,7 @@ function handleResponse(response: RpcResponse) {
   pending.delete(key);
   window.clearTimeout(item.timeout);
   if (response.error) {
-    item.reject(
-      new Error(
-        `rpc failed: ${response.error.message} (code ${response.error.code})`,
-      ),
-    );
+    item.reject(new RpcRequestError(response.error));
     return;
   }
   item.resolve(response.result ?? null);
@@ -347,9 +368,14 @@ function closeExistingSocket() {
     /* ignore close failures */
   }
   socket = null;
+  currentSocketConnectionId = null;
 }
 
-async function openSocket(config: Required<Pick<StoredWebConfig, "serverUrl" | "actorId" | "displayName">>) {
+async function openSocket(
+  config: Required<Pick<StoredWebConfig, "serverUrl" | "actorId" | "displayName">>,
+  connectionId: number,
+  password?: string,
+) {
   clearReconnectTimer();
   closeExistingSocket();
   rejectPending(new Error("WebSocket reconnecting"));
@@ -358,6 +384,7 @@ async function openSocket(config: Required<Pick<StoredWebConfig, "serverUrl" | "
 
   const ws = new WebSocket(config.serverUrl);
   socket = ws;
+  currentSocketConnectionId = connectionId;
 
   await new Promise<void>((resolve, reject) => {
     ws.onopen = () => resolve();
@@ -366,23 +393,36 @@ async function openSocket(config: Required<Pick<StoredWebConfig, "serverUrl" | "
 
   ws.onmessage = handleMessage;
   ws.onclose = (event) => {
-    if (socket === ws) socket = null;
+    if (socket !== ws) return;
+    socket = null;
+    currentSocketConnectionId = null;
     rejectPending(new Error("WebSocket closed"));
     if (manuallyClosed) return;
     const reason = event.reason || "connection lost";
-    emitConnection({ state: "closed", reason });
+    emitConnection({ state: "closed", connectionId, reason });
     scheduleReconnect(reason);
   };
   ws.onerror = null;
 
-  await sendRaw("initialize", {
+  const initialized = await sendRaw("initialize", {
     protocolVersion,
     clientInfo: {
       name: "loom-gui-web",
       title: "Loom Web",
-      version: "0.1.1",
+      version: "0.1.3",
     },
   });
+  if (serverRequiresPassword(initialized)) {
+    if (!password) throw new Error("LOOM_AUTH_REQUIRED: server password required");
+    try {
+      await sendRaw("auth/login", { password });
+    } catch (error) {
+      if (error instanceof RpcRequestError && error.code === -32011) {
+        throw new Error("LOOM_AUTH_INVALID: incorrect server password");
+      }
+      throw error;
+    }
+  }
   const open = await sendRaw("connection/open", {
     actorId: config.actorId,
     actorKind: "human",
@@ -391,14 +431,14 @@ async function openSocket(config: Required<Pick<StoredWebConfig, "serverUrl" | "
   });
   reconnectAttempt = 0;
   wasOpened = true;
-  emitConnection({ state: "open" });
-  return open;
+  if (socket !== ws || currentSocketConnectionId !== connectionId) {
+    throw new Error("WebSocket connection was superseded");
+  }
+  emitConnection({ state: "open", connectionId });
+  return { open, connectionId };
 }
 
-export async function connect(workspaceId: string): Promise<{
-  workspace: Workspace;
-  open: JsonValue;
-}> {
+export async function connect(workspaceId: string, password?: string): Promise<WorkspaceConnectResult> {
   const workspace = webWorkspace();
   if (!workspace || workspace.id !== workspaceId) {
     throw new Error(`unknown workspace id: ${workspaceId}`);
@@ -408,35 +448,70 @@ export async function connect(workspaceId: string): Promise<{
     actorId: workspace.actorId,
     displayName: workspace.displayName,
   };
+  if (currentConfig?.serverUrl && currentConfig.serverUrl !== config.serverUrl) {
+    currentPassword = undefined;
+  }
+  if (password) currentPassword = password;
   if (connectPromise) {
-    const open = await connectPromise;
-    return { workspace, open };
+    const result = await connectPromise;
+    return { workspace, ...result };
   }
   const sameConnection =
     currentConfig?.serverUrl === config.serverUrl &&
     currentConfig.actorId === config.actorId &&
     currentConfig.displayName === config.displayName;
-  if (websocketReady() && wasOpened && sameConnection) {
-    return { workspace, open: null };
+  if (
+    websocketReady() &&
+    wasOpened &&
+    sameConnection &&
+    currentSocketConnectionId !== null
+  ) {
+    return { workspace, open: null, connectionId: currentSocketConnectionId };
   }
-  connectPromise = openSocket(config)
+  const connectionId = nextConnectionId++;
+  connectPromise = openSocket(config, connectionId, password ?? currentPassword)
     .catch((err) => {
-      if (err instanceof Error) scheduleReconnect(err.message);
+      if (currentSocketConnectionId === connectionId) closeExistingSocket();
+      if (isServerAuthError(err)) {
+        currentPassword = undefined;
+      } else if (err instanceof Error) {
+        scheduleReconnect(err.message);
+      }
       throw err;
     })
     .finally(() => {
       connectPromise = null;
     });
-  const open = await connectPromise;
-  return { workspace, open };
+  const result = await connectPromise;
+  return { workspace, ...result };
+}
+
+function serverRequiresPassword(initialized: JsonValue): boolean {
+  if (!initialized || typeof initialized !== "object") return false;
+  const capabilities = (initialized as { serverCapabilities?: unknown }).serverCapabilities;
+  if (!capabilities || typeof capabilities !== "object") return false;
+  const auth = (capabilities as { auth?: unknown }).auth;
+  return Boolean(
+    auth
+      && typeof auth === "object"
+      && (auth as { required?: unknown }).required === true,
+  );
+}
+
+function isServerAuthError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes("LOOM_AUTH_REQUIRED") || message.includes("LOOM_AUTH_INVALID");
 }
 
 export function disconnect() {
+  const connectionId = currentSocketConnectionId;
   manuallyClosed = true;
   clearReconnectTimer();
   closeExistingSocket();
   rejectPending(new Error("WebSocket disconnected"));
-  if (wasOpened) emitConnection({ state: "closed", reason: "disconnected" });
+  if (wasOpened && connectionId !== null) {
+    emitConnection({ state: "closed", connectionId, reason: "disconnected" });
+  }
   wasOpened = false;
 }
 

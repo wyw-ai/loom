@@ -64,6 +64,7 @@
   .app-shell {
     display: grid;
     grid-template-columns: 72px minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
   }
 
   .app-shell-workspace {
@@ -836,6 +837,34 @@
     box-shadow: inset 0 0 0 1px #e3dfff;
   }
 
+  .composer-action-row {
+    position: absolute;
+    right: 8px;
+    bottom: 8px;
+    z-index: 10;
+    display: flex;
+    max-width: calc(100% - 16px);
+    flex-wrap: nowrap;
+    flex-shrink: 0;
+    align-items: center;
+    gap: 4px;
+    flex-direction: row;
+  }
+
+  .composer-action-attach,
+  .composer-action-send {
+    position: static;
+    flex-shrink: 0;
+  }
+
+  .composer-action-send {
+    flex: 0 0 36px;
+  }
+
+  .composer-textarea-with-actions {
+    padding-right: 96px !important;
+  }
+
   .composer-box {
     display: flex;
     min-height: 48px;
@@ -850,6 +879,57 @@
 
   .composer-box-compact {
     min-height: 44px;
+  }
+
+  /* Thread detail can be resized close to its minimum width. Every ancestor
+     in the composer width chain must therefore be allowed to shrink; previews
+     and banners scroll/wrap inside that width instead of widening the panel. */
+  .thread-composer {
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    overflow-x: clip;
+  }
+
+  .thread-composer-resizable,
+  .thread-composer-frame {
+    width: 100% !important;
+    min-width: 0;
+    max-width: 100%;
+    box-sizing: border-box;
+  }
+
+  .thread-composer .composer-attachment-bar {
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    overflow-x: auto;
+  }
+
+  .thread-composer-banner {
+    max-width: 100%;
+    overflow-wrap: anywhere;
+  }
+
+  .thread-composer-input-row {
+    display: block;
+    height: 100%;
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    overflow: visible;
+  }
+
+  .thread-composer-input {
+    position: relative;
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    overflow: visible;
+  }
+
+  .thread-composer-textarea {
+    min-width: 0;
   }
 
   .composer-box-manual textarea {
@@ -1289,16 +1369,6 @@
   }
 }
 
-/* ChatHeader agent activity status animations */
-@keyframes chat-header-pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.55; }
-}
-
-.chat-header-activity-running {
-  animation: chat-header-pulse 2s ease-in-out infinite;
-}
-
 /* Paste highlight animation for newly added attachment chips */
 @keyframes paste-highlight {
   0% {
@@ -1473,7 +1543,7 @@
   }
 
   .app-shell header button,
-  .agent-activity-banner button,
+  .actor-activity-banner button,
   .composer-box button,
   .toolbar-button,
   .nav-row,
@@ -1553,18 +1623,18 @@
     grid-row: 1 / span 2;
   }
 
-  .agent-activity-banner {
+  .actor-activity-banner {
     padding-right: 12px;
     padding-left: 12px;
   }
 
-  .agent-activity-banner .agent-queue-row {
+  .actor-activity-banner .agent-queue-row {
     grid-template-columns: minmax(0, 1fr);
     gap: 6px;
     align-items: start;
   }
 
-  .agent-activity-banner .agent-queue-row > span:last-child {
+  .actor-activity-banner .agent-queue-row > span:last-child {
     flex-wrap: wrap;
   }
 

@@ -8,6 +8,7 @@ import { HostMetric } from "@/components/settings/MachineComponents";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { useI18n } from "@/lib/i18n";
 import { ArrowLeft, FileText, Settings, Split } from "lucide-react";
 import type { MachineInfo } from "@/ipc/types";
 import type { ServiceDetailTab, ServiceMemberEntry } from "@/lib/types";
@@ -21,6 +22,7 @@ export function ServiceListItem({
   selected: boolean;
   onSelect: () => void;
 }) {
+  const { t } = useI18n();
   const service = entry.service;
 
   return (
@@ -45,7 +47,7 @@ export function ServiceListItem({
           <span className={cn("h-2 w-2 shrink-0 rounded-full", serviceStatusDotClass(service))} />
         </span>
         <span className="mt-0.5 block truncate text-xs text-[#667085]">
-          {service.kind} / {entry.machine.name}
+          {t(service.kind)} / {entry.machine.name}
         </span>
       </span>
     </button>
@@ -61,6 +63,7 @@ export function ServiceRosterOverview({
   machines: MachineInfo[];
   onSelectService: (entry: ServiceMemberEntry) => void;
 }) {
+  const { t } = useI18n();
   const schedulerCount = entries.filter((entry) => entry.service.kind === "scheduler").length;
   const autostartCount = entries.filter((entry) => entry.service.autostart !== false).length;
   const hostCount = new Set(entries.map((entry) => entry.machine.id)).size;
@@ -70,27 +73,27 @@ export function ServiceRosterOverview({
       <section className="border-b border-[#dfe3ec] px-6 py-6 lg:px-8">
         <div className="flex flex-wrap items-start justify-between gap-6">
           <div className="min-w-0">
-            <h2 className="text-xl font-bold text-[#111827]">Services</h2>
+            <h2 className="text-xl font-bold text-[#111827]">{t("Services")}</h2>
             <div className="mt-2 flex flex-wrap items-center gap-2 text-sm text-[#667085]">
-              <span>{entries.length} registered</span>
+              <span>{t("{{count}} registered", { count: entries.length })}</span>
               <span className="text-[#a0a6b3]">/</span>
-              <span>{schedulerCount} scheduler</span>
+              <span>{t("{{count}} scheduler", { count: schedulerCount })}</span>
               <span className="text-[#a0a6b3]">/</span>
-              <span>{hostCount} hosts</span>
+              <span>{t("{{count}} hosts", { count: hostCount })}</span>
             </div>
           </div>
           <div className="flex flex-wrap items-start gap-6">
-            <HostMetric label="Services" value={entries.length} />
-            <HostMetric label="Autostart" value={autostartCount} />
-            <HostMetric label="Hosts" value={hostCount} />
+            <HostMetric label={t("Services")} value={entries.length} />
+            <HostMetric label={t("Autostart")} value={autostartCount} />
+            <HostMetric label={t("Hosts")} value={hostCount} />
           </div>
         </div>
       </section>
 
-      <HostDetailSection title="Service Roster" count={entries.length}>
+      <HostDetailSection title={t("Service Roster")} count={entries.length}>
         {entries.length === 0 ? (
           <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] p-4 text-sm text-[#667085]">
-            No services registered.
+            {t("No services registered.")}
           </div>
         ) : (
           <div className="space-y-2">
@@ -111,9 +114,9 @@ export function ServiceRosterOverview({
                         <span className="truncate text-sm font-bold text-[#111827]">
                           {serviceDisplayName(entry.service)}
                         </span>
-                        <Badge variant="secondary">{entry.service.kind}</Badge>
+                        <Badge variant="secondary">{t(entry.service.kind)}</Badge>
                         <Badge variant={entry.service.autostart === false ? "warning" : "success"}>
-                          {entry.service.autostart === false ? "manual" : "autostart"}
+                          {t(entry.service.autostart === false ? "manual" : "autostart")}
                         </Badge>
                       </div>
                       <div className="mt-1 truncate font-mono text-xs text-[#667085]">
@@ -123,7 +126,7 @@ export function ServiceRosterOverview({
                   </div>
                   <div className="min-w-0">
                     <div className="text-[11px] font-semibold uppercase tracking-wide text-[#9aa1ae]">
-                      Host
+                      {t("Host")}
                     </div>
                     <div className="mt-1 truncate text-sm font-semibold text-[#303849]">
                       {entry.machine.name}
@@ -131,14 +134,14 @@ export function ServiceRosterOverview({
                   </div>
                   <div className="min-w-0">
                     <div className="text-[11px] font-semibold uppercase tracking-wide text-[#9aa1ae]">
-                      Lifecycle
+                      {t("Lifecycle")}
                     </div>
                     <div className="mt-1 truncate text-sm font-semibold text-[#303849]">
-                      {serviceLifecycleLabel(entry.service)}
+                      {t(serviceLifecycleLabel(entry.service))}
                     </div>
                   </div>
                   <div className="text-right text-xs font-semibold text-[#503ed4] lg:text-left">
-                    Inspect
+                    {t("Inspect")}
                   </div>
                 </div>
               </button>
@@ -147,11 +150,11 @@ export function ServiceRosterOverview({
         )}
       </HostDetailSection>
 
-      <HostDetailSection title="Host Coverage" count={machines.length}>
+      <HostDetailSection title={t("Host Coverage")} count={machines.length}>
         <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
           {machines.length === 0 ? (
             <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] p-4 text-sm text-[#667085]">
-              No managed hosts.
+              {t("No managed hosts.")}
             </div>
           ) : (
             machines.map((machine) => (
@@ -165,11 +168,14 @@ export function ServiceRosterOverview({
                       {machine.name}
                     </div>
                     <div className="mt-1 truncate text-xs text-[#667085]">
-                      {machine.providers.length} runtimes / {machine.agentCount} agents
+                      {t("{{runtimes}} runtimes / {{agents}} agents", {
+                        runtimes: machine.providers.length,
+                        agents: machine.agentCount,
+                      })}
                     </div>
                   </div>
                   <Badge variant={machine.serviceCount > 0 ? "success" : "outline"}>
-                    {machine.serviceCount} services
+                    {t("{{count}} services", { count: machine.serviceCount })}
                   </Badge>
                 </div>
               </div>
@@ -188,6 +194,7 @@ export function ServiceMemberDetail({
   entry: ServiceMemberEntry;
   onBack: () => void;
 }) {
+  const { t } = useI18n();
   const { machine, service } = entry;
   const [activeTab, setActiveTab] = useState<ServiceDetailTab>("overview");
   const serviceKey = `${machine.id}:${service.id}`;
@@ -196,9 +203,9 @@ export function ServiceMemberDetail({
     label: string;
     icon: ComponentType<{ size?: string | number; className?: string }>;
   }> = [
-    { id: "overview", label: "Overview", icon: Split },
-    { id: "spec", label: "Spec", icon: FileText },
-    { id: "config", label: "Config", icon: Settings },
+    { id: "overview", label: t("Overview"), icon: Split },
+    { id: "spec", label: t("Spec"), icon: FileText },
+    { id: "config", label: t("Config"), icon: Settings },
   ];
 
   useEffect(() => {
@@ -215,7 +222,7 @@ export function ServiceMemberDetail({
           className="mb-4 rounded-lg px-2 text-[#596174] hover:bg-[#f5f3ff] hover:text-[#503ed4]"
         >
           <ArrowLeft size={15} />
-          All Services
+          {t("All Services")}
         </Button>
         <div className="flex flex-wrap items-start justify-between gap-6">
           <div className="flex min-w-0 items-start gap-4">
@@ -228,15 +235,15 @@ export function ServiceMemberDetail({
               </h2>
               <div className="mt-1 flex flex-wrap items-center gap-2 text-sm text-[#667085]">
                 <span className={cn("h-2 w-2 rounded-full", serviceStatusDotClass(service))} />
-                <span>{service.autostart === false ? "Manual" : "Autostart"}</span>
+                <span>{t(service.autostart === false ? "Manual" : "Autostart")}</span>
                 <span className="text-[#a0a6b3]">/</span>
                 <span className="font-mono text-xs">{service.id}</span>
               </div>
               <div className="mt-3 flex flex-wrap gap-2">
-                <Badge variant="secondary">{service.kind}</Badge>
-                <Badge variant="outline">{serviceLifecycleLabel(service)}</Badge>
+                <Badge variant="secondary">{t(service.kind)}</Badge>
+                <Badge variant="outline">{t(serviceLifecycleLabel(service))}</Badge>
                 <Badge variant={service.autostart === false ? "warning" : "success"}>
-                  {service.autostart === false ? "manual" : "autostart"}
+                  {t(service.autostart === false ? "manual" : "autostart")}
                 </Badge>
                 <Badge variant="secondary">{machine.name}</Badge>
               </div>
@@ -244,9 +251,9 @@ export function ServiceMemberDetail({
           </div>
 
           <div className="flex flex-wrap items-start gap-6">
-            <HostMetric label="Jobs" value={serviceJobCount(service)} />
-            <HostMetric label="Config Keys" value={serviceConfigKeyCount(service)} />
-            <HostMetric label="Host Services" value={machine.serviceCount} />
+            <HostMetric label={t("Jobs")} value={serviceJobCount(service)} />
+            <HostMetric label={t("Config Keys")} value={serviceConfigKeyCount(service)} />
+            <HostMetric label={t("Host Services")} value={machine.serviceCount} />
           </div>
         </div>
       </section>
@@ -278,36 +285,36 @@ export function ServiceMemberDetail({
 
       {activeTab === "overview" && (
         <>
-          <HostDetailSection title="Runtime Summary">
+          <HostDetailSection title={t("Runtime Summary")}>
             <div className="divide-y divide-[#edf0f5]">
-              <HostInfoRow label="Display Name">
+              <HostInfoRow label={t("Display Name")}>
                 {serviceDisplayName(service)}
               </HostInfoRow>
-              <HostInfoRow label="Service ID" mono>
+              <HostInfoRow label={t("Service ID")} mono>
                 {service.id}
               </HostInfoRow>
-              <HostInfoRow label="Actor ID" mono>
-                {service.actor?.id || "Not set"}
+              <HostInfoRow label={t("Actor ID")} mono>
+                {service.actor?.id || t("Not set")}
               </HostInfoRow>
-              <HostInfoRow label="Kind">
-                {service.kind || "Not set"}
+              <HostInfoRow label={t("Kind")}>
+                {service.kind ? t(service.kind) : t("Not set")}
               </HostInfoRow>
-              <HostInfoRow label="Lifecycle">
-                {serviceLifecycleLabel(service)}
+              <HostInfoRow label={t("Lifecycle")}>
+                {t(serviceLifecycleLabel(service))}
               </HostInfoRow>
-              <HostInfoRow label="Autostart">
-                {service.autostart === false ? "Off" : "On"}
+              <HostInfoRow label={t("Autostart")}>
+                {t(service.autostart === false ? "Off" : "On")}
               </HostInfoRow>
-              <HostInfoRow label="Host">
+              <HostInfoRow label={t("Host")}>
                 {machine.name}
               </HostInfoRow>
             </div>
           </HostDetailSection>
 
-          <HostDetailSection title="Scheduler Jobs" count={serviceJobs(service).length}>
+          <HostDetailSection title={t("Scheduler Jobs")} count={serviceJobs(service).length}>
             {serviceJobs(service).length === 0 ? (
               <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] p-4 text-sm text-[#667085]">
-                No scheduler jobs declared in this service config.
+                {t("No scheduler jobs declared in this service config.")}
               </div>
             ) : (
               <div className="space-y-2">
@@ -322,36 +329,36 @@ export function ServiceMemberDetail({
                           {serviceJobId(job, index)}
                         </div>
                         <div className="mt-1 truncate font-mono text-xs text-[#667085]">
-                          {serviceJobCommand(job) || "No command source"}
+                          {serviceJobCommand(job) || t("No command source")}
                         </div>
                       </div>
                       <Badge variant="outline">
-                        {serviceJobSchedule(job) || "unscheduled"}
+                        {serviceJobSchedule(job) || t("unscheduled")}
                       </Badge>
                     </div>
                     <div className="mt-3 grid gap-2 text-xs text-[#667085] md:grid-cols-3">
                       <div>
                         <div className="font-semibold uppercase tracking-wide text-[#9aa1ae]">
-                          Target
+                          {t("Target")}
                         </div>
                         <div className="mt-1 truncate font-medium text-[#303849]">
-                          {serviceJobTarget(job) || "Not set"}
+                          {serviceJobTarget(job) || t("Not set")}
                         </div>
                       </div>
                       <div>
                         <div className="font-semibold uppercase tracking-wide text-[#9aa1ae]">
-                          Scope
+                          {t("Scope")}
                         </div>
                         <div className="mt-1 truncate font-medium text-[#303849]">
-                          {serviceJobScope(job) || "Not set"}
+                          {serviceJobScope(job) || t("Not set")}
                         </div>
                       </div>
                       <div>
                         <div className="font-semibold uppercase tracking-wide text-[#9aa1ae]">
-                          Dedupe
+                          {t("Dedupe")}
                         </div>
                         <div className="mt-1 truncate font-medium text-[#303849]">
-                          {serviceJobDedupe(job) || "Not set"}
+                          {serviceJobDedupe(job) || t("Not set")}
                         </div>
                       </div>
                     </div>
@@ -364,13 +371,13 @@ export function ServiceMemberDetail({
       )}
 
       {activeTab === "spec" && (
-        <HostDetailSection title="Service Spec">
+        <HostDetailSection title={t("Service Spec")}>
           <JsonInspector value={service} />
         </HostDetailSection>
       )}
 
       {activeTab === "config" && (
-        <HostDetailSection title="Config Payload">
+        <HostDetailSection title={t("Config Payload")}>
           <JsonInspector value={serviceConfigValue(service)} />
         </HostDetailSection>
       )}

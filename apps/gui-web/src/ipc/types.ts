@@ -19,6 +19,24 @@ export interface Channel {
   _meta?: Record<string, unknown>;
 }
 
+export interface ChannelLayoutSection {
+  id: string;
+  title: string;
+  channelIds: string[];
+  collapsed: boolean;
+}
+
+export interface ChannelLayout {
+  actorId: string;
+  sections: ChannelLayoutSection[];
+  revision: number;
+  updatedAt: string;
+}
+
+export interface ChannelLayoutResult {
+  layout: ChannelLayout;
+}
+
 export interface ChannelMemberConfig {
   channelId: string;
   actorId: string;
@@ -284,6 +302,17 @@ export interface Workspace {
   displayName: string;
 }
 
+export interface WorkspaceConnectResult {
+  workspace: Workspace;
+  open: unknown;
+  /** Monotonically increasing id assigned by the desktop connection manager. */
+  connectionId: number;
+}
+
+export type ConnectionEvent =
+  | { state: "open"; connectionId: number }
+  | { state: "closed"; connectionId: number; reason?: string };
+
 export interface HumanAccount {
   provider: string;
   staffId: string;
@@ -456,6 +485,7 @@ export interface MachineInfo {
   providers: MachineAgentProviderInfo[];
   agents: MachineAgentInfo[];
   services: MachineServiceInfo[];
+  serviceRuntimeStates: ServiceRuntimeState[];
   serveCommand: string;
   setupScript: string;
 }
@@ -468,6 +498,23 @@ export interface MachineServiceInfo {
   lifecycle?: string;
   autostart?: boolean;
   [key: string]: unknown;
+}
+
+export type ServiceRuntimePhase = "starting" | "running" | "failed";
+
+export interface ServiceRuntimeState {
+  runtimeId: string;
+  machineId: string;
+  serviceId: string;
+  actorId: string;
+  pluginKind: string;
+  lifecycle: "channel_singleton" | "thread_bound";
+  instanceId?: string | null;
+  scopes: ScopeRef[];
+  phase: ServiceRuntimePhase;
+  startedAt?: string | null;
+  updatedAt: string;
+  lastError?: string | null;
 }
 
 export interface MachineListResult {
@@ -505,7 +552,7 @@ export type TaskAssignmentType =
 
 export interface StreamUpdate {
   kind: string;
-  scope: ScopeRef;
+  scope?: ScopeRef | null;
   data: Record<string, unknown>;
 }
 

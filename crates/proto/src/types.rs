@@ -113,6 +113,33 @@ pub struct Channel {
     pub _meta: Option<Meta>,
 }
 
+/// One user-defined section in the per-actor channel navigation layout.
+/// Channel ids are ordered and globally unique across a normalized layout.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelLayoutSection {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub channel_ids: Vec<String>,
+    #[serde(default)]
+    pub collapsed: bool,
+}
+
+/// Server-backed channel navigation preferences for one actor. The server
+/// identity is deliberately part of the value, while the RPC never accepts an
+/// actor id from the caller; this prevents one actor from reading or replacing
+/// another actor's layout.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelLayout {
+    pub actor_id: String,
+    #[serde(default)]
+    pub sections: Vec<ChannelLayoutSection>,
+    pub revision: u64,
+    pub updated_at: Timestamp,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ChannelMemberConfig {

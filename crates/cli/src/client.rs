@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use loom_platform::ipc::{LocalSocketName, LocalStream};
-use proto::methods::method;
+use proto::methods::{method, AuthLoginResult, InitializeResult};
 use proto::{Notification, Request, Response, RpcEnvelope};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -278,17 +278,36 @@ impl Client {
         Ok(serde_json::from_value(result)?)
     }
 
-    pub async fn initialize(&self) -> Result<()> {
-        let _: Value = self
-            .call_raw(
+    pub async fn initialize(&self) -> Result<InitializeResult> {
+        let initialized: InitializeResult = self
+            .call(
                 method::INITIALIZE,
-                Some(json!({
+                json!({
                     "protocolVersion": proto::PROTOCOL_VERSION,
                     "clientInfo": { "name": "loom-cli", "title": "Loom CLI", "version": env!("CARGO_PKG_VERSION") },
-                })),
+                }),
             )
             .await?;
-        Ok(())
+        if initialized.password_auth_required() {
+            let password = configured_server_password()?.ok_or_else(|| {
+                anyhow!(
+                    "server requires a password; set LOOM_SERVER_PASSWORD or LOOM_SERVER_PASSWORD_FILE"
+                )
+            })?;
+            let result: AuthLoginResult = self
+                .call(method::AUTH_LOGIN, json!({ "password": password }))
+                .await?;
+            if !result.authenticated {
+                return Err(anyhow!("server password authentication failed"));
+            }
+        }
+        Ok(initialized)
+    }
+
+    pub async fn authenticate(&self, password: &str) -> Result<AuthLoginResult> {
+        self.call_raw(method::AUTH_LOGIN, Some(json!({ "password": password })))
+            .await
+            .and_then(|value| serde_json::from_value(value).map_err(Into::into))
     }
 
     pub async fn open_connection(
@@ -338,6 +357,37 @@ impl Client {
         )
         .await
     }
+}
+
+fn configured_server_password() -> Result<Option<String>> {
+    let inline = std::env::var("LOOM_SERVER_PASSWORD").ok();
+    let file = std::env::var_os("LOOM_SERVER_PASSWORD_FILE").map(PathBuf::from);
+    match (inline, file) {
+        (Some(_), Some(_)) => Err(anyhow!(
+            "set either LOOM_SERVER_PASSWORD or LOOM_SERVER_PASSWORD_FILE, not both"
+        )),
+        (Some(password), None) => validate_server_password(password).map(Some),
+        (None, Some(path)) => {
+            let content = std::fs::read_to_string(&path)
+                .with_context(|| format!("read server password file {}", path.display()))?;
+            validate_server_password(trim_password_file_line_endings(content)).map(Some)
+        }
+        (None, None) => Ok(None),
+    }
+}
+
+fn trim_password_file_line_endings(mut password: String) -> String {
+    while matches!(password.chars().last(), Some('\r' | '\n')) {
+        password.pop();
+    }
+    password
+}
+
+fn validate_server_password(password: String) -> Result<String> {
+    if password.is_empty() {
+        return Err(anyhow!("server password cannot be empty"));
+    }
+    Ok(password)
 }
 
 fn unix_url_path(url: &str) -> Option<&str> {

@@ -209,6 +209,12 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
   newline characters to `--text`; do not write escaped `\\n` unless the backslash\n\
   and letter `n` should be shown to readers. In shell, prefer stdin/heredoc for\n\
   multiline text instead of quoted `\\n` sequences.\n\
+- To send a file or image into chat, first run\n\
+  `loom --json attachment upload --target \"$LOOM_REPLY_TARGET\" --path <path>`,\n\
+  then include its returned artifact id on the visible `message send` or\n\
+  `message ask` command with `--attachment-id <art_id>`. Uploading alone, saving\n\
+  a workspace file, or writing an `artifact://` URI in message text does not\n\
+  attach the file and will not make it appear in the chat attachment panel.\n\
 - Use `$LOOM_REPLY_TARGET` as the default target for the current workflow. If it\n\
   is a thread target such as `#channel:root`, send or ask on the bare `#channel`\n\
   only when you intentionally want a channel-level update outside that thread.\n\

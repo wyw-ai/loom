@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type {
   Channel,
+  ChannelVisibility,
   MachineInfo,
   Message,
   Workspace,
@@ -25,7 +26,7 @@ import { ErrorBanner, NoSpaceConnectionGuide } from "@/components/shared/PageCom
 import { ChatHeader } from "@/components/layout/ChatHeader";
 import { MessageFeed } from "@/components/chat/MessageFeed";
 import { Composer } from "@/components/chat/Composer";
-import { AgentActivityBanner } from "@/components/chat/AgentActivityBanner";
+import { ActorActivityBanner } from "@/components/chat/ActorActivityBanner";
 import { RemoteFilePanel } from "@/components/chat/RemoteFilePanel";
 import { ThreadsView } from "@/components/views/ThreadsView";
 import { ChannelsView } from "@/components/views/ChannelsView";
@@ -36,6 +37,7 @@ import { RunsView } from "@/components/views/RunsView";
 import { RunDetailView } from "@/components/views/RunDetailView";
 import { SpacesView } from "@/components/views/SpacesView";
 import { AccountView } from "@/components/views/AccountView";
+import { SystemSettingsView } from "@/components/views/SystemSettingsView";
 import { SettingsView } from "@/components/views/SettingsView";
 import { CoachMarkTooltip } from "@/components/ui/CoachMark";
 import { useCoachMark } from "@/hooks/useCoachMark";
@@ -43,6 +45,7 @@ import { useUIStore } from "@/store/uiStore";
 import { actorName } from "@/lib/format-utils";
 import { channelFromMessage, threadIdForMessage } from "@/lib/message-utils";
 import { directPeerForMessage } from "@/lib/channel-utils";
+import { useI18n } from "@/lib/i18n";
 
 export interface MainContentProps {
   view: View;
@@ -134,6 +137,7 @@ export interface MainContentProps {
   createChannelWithTitle: (title: string) => Promise<void>;
   deleteChannel: (channel: Channel) => Promise<void>;
   renameChannel: (channel: Channel, title: string) => Promise<void>;
+  updateChannelVisibility: (channel: Channel, visibility: ChannelVisibility) => Promise<boolean>;
   addWorkspace: () => Promise<Workspace | null>;
   removeWorkspace: (id: string) => Promise<void>;
   selectWorkspace: (id: string) => Promise<Workspace | null>;
@@ -151,6 +155,7 @@ export interface MainContentProps {
 }
 
 export function MainContent(props: MainContentProps) {
+  const { t } = useI18n();
   const p = props;
   const [remoteFilePanel, setRemoteFilePanel] = useState<{
     channelId: string;
@@ -179,17 +184,14 @@ export function MainContent(props: MainContentProps) {
           }}
           searchOpen={p.searchPanelOpen}
           onToggleSearch={() => p.setSearchPanelOpen((open) => !open)}
-          onStopRun={(runId) => void p.cancelRun(runId)}
-          busy={p.busy}
-          runs={p.runs}
-          agentActors={p.agentActors}
-          runScope={p.activeThreadScope ?? p.activeScope}
           scopeId={p.activeScope?.id}
           actors={p.actors}
+          currentActorId={p.workspace?.actorId ?? null}
+          onUpdateVisibility={p.updateChannelVisibility}
           onOpenFolder={() => {
             const ch = p.activeChannel;
             if (!ch) {
-              p.setError("No active channel");
+              p.setError(t("No active channel"));
               return;
             }
             const localMachine = p.machines.find((m) => m.canOpenLocalPath);
@@ -213,11 +215,11 @@ export function MainContent(props: MainContentProps) {
         {channelCoach.visible && (
           <div className="border-b border-[#edf0f5] bg-white px-5 py-3">
             <CoachMarkTooltip
-              title="Channel tip"
+              title={t("Channel tip")}
               onDismiss={channelCoach.dismiss}
               className="mx-auto max-w-4xl"
             >
-              @ mention an agent in the composer to wake it for this channel.
+              {t("@ mention an agent in the composer to wake it for this channel.")}
             </CoachMarkTooltip>
           </div>
         )}
@@ -254,9 +256,10 @@ export function MainContent(props: MainContentProps) {
           busy={p.busy}
           anchorMessageId={p.messageAnchorId}
         />
-        <AgentActivityBanner
+        <ActorActivityBanner
           actors={p.actors}
-          agentActorIds={p.channelAgentActors.map((actor) => actor.id)}
+          actorIds={p.channelAgentActors.map((actor) => actor.id)}
+          machines={p.machines}
           runs={p.runs}
           scope={p.activeScope}
           enabled={p.connection === "open"}
@@ -495,10 +498,20 @@ export function MainContent(props: MainContentProps) {
         <ErrorBanner error={p.error} />
         <AccountView
           account={p.account}
+          workspace={p.workspace}
           busy={p.busy}
           onLogout={p.logout}
           onAvatarChange={p.updateAccountAvatar}
         />
+      </>
+    );
+  }
+
+  if (p.view === "system") {
+    return (
+      <>
+        <ErrorBanner error={p.error} />
+        <SystemSettingsView />
       </>
     );
   }
@@ -510,11 +523,11 @@ export function MainContent(props: MainContentProps) {
       {actorsCoach.visible && (
         <div className="border-b border-[#edf0f5] bg-white px-5 py-3">
           <CoachMarkTooltip
-            title="Actors"
+            title={t("Actors")}
             onDismiss={actorsCoach.dismiss}
             className="mx-auto max-w-5xl"
           >
-            Configure agent wake strategies and providers here.
+            {t("Configure agent wake strategies and providers here.")}
           </CoachMarkTooltip>
         </div>
       )}
@@ -543,10 +556,11 @@ export function MainContent(props: MainContentProps) {
 }
 
 function ChannelEmptyGuide() {
+  const { t } = useI18n();
   const steps = [
-    "① Type @ in the composer below and say hello to your agent.",
-    "② The agent wakes up and replies in this channel.",
-    "③ When needed, you will be able to stop or jump in from the banner above the composer.",
+    t("① Type @ in the composer below and say hello to your agent."),
+    t("② The agent wakes up and replies in this channel."),
+    t("③ When needed, you will be able to stop or jump in from the banner above the composer."),
   ];
   return (
     <div className="mt-5 grid gap-3 text-left">

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { Actor, InboxActorStatus, InboxListEntry, Run, ScopeRef } from "@/ipc/types";
+import type { Actor, InboxActorStatus, Run, ScopeRef } from "@/ipc/types";
 import * as ipc from "@/ipc/bridge";
-import { actorName, errorText } from "@/lib/format-utils";
+import { errorText } from "@/lib/format-utils";
 import { usePresenceStore } from "@/store/presenceStore";
 
 export type AgentActivityStatus = "running" | "queued" | "offline" | "unknown" | "idle";
@@ -9,9 +9,7 @@ export type AgentActivityStatus = "running" | "queued" | "offline" | "unknown" |
 export interface AgentQueueItem {
   sourceId: string;
   updatedAt: string;
-  authorActorId: string | null;
-  authorName: string;
-  preview: string;
+  sourceKind: string;
 }
 
 interface AgentQueueState {
@@ -72,41 +70,21 @@ function fallbackAgent(actorId: string): Actor {
   return { id: actorId, kind: "agent" };
 }
 
-function previewText(entry: InboxListEntry | undefined) {
-  const raw = entry?.message?.body ?? "";
-  const oneLine = raw.replace(/\s+/g, " ").trim();
-  if (!oneLine) return "No message preview";
-  return oneLine.length > 140 ? `${oneLine.slice(0, 139)}…` : oneLine;
+function sourceKindLabel(sourceId: string) {
+  if (sourceId.startsWith("msg_")) return "Message";
+  if (sourceId.startsWith("evt_")) return "Event";
+  return "Delivery";
 }
 
-function queueItemsFromResults(
-  actorId: string,
-  actors: Record<string, Actor>,
-  status: InboxActorStatus | undefined,
-  deliveries: InboxListEntry[],
-): AgentQueueItem[] {
-  const bySourceId = new Map(deliveries.map((entry) => [entry.delivery.sourceId, entry]));
-  const ordered = status?.entries?.length
-    ? status.entries.map((entry) => ({
-        sourceId: entry.sourceId,
-        updatedAt: entry.updatedAt,
-      }))
-    : deliveries.map((entry) => ({
-        sourceId: entry.delivery.sourceId,
-        updatedAt: entry.delivery.updatedAt,
-      }));
+function queueItemsFromStatus(status: InboxActorStatus | undefined): AgentQueueItem[] {
   const seen = new Set<string>();
-  return ordered.flatMap((entry) => {
+  return (status?.entries ?? []).flatMap((entry) => {
     if (seen.has(entry.sourceId)) return [];
     seen.add(entry.sourceId);
-    const deliveryEntry = bySourceId.get(entry.sourceId);
-    const authorActorId = deliveryEntry?.message?.authorActorId ?? null;
     return [{
       sourceId: entry.sourceId,
-      updatedAt: deliveryEntry?.delivery.updatedAt ?? entry.updatedAt,
-      authorActorId,
-      authorName: authorActorId ? actorName(actors, authorActorId) : actorId,
-      preview: previewText(deliveryEntry),
+      updatedAt: entry.updatedAt,
+      sourceKind: sourceKindLabel(entry.sourceId),
     }];
   });
 }
@@ -129,6 +107,7 @@ export function useAgentActivity({
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const statusRequestIdRef = useRef(0);
+  const queueRequestIdsRef = useRef<Record<string, number>>({});
 
   const baseAgentIds = useMemo(
     () => Array.from(new Set(agentActorIds)).sort(),
@@ -148,6 +127,9 @@ export function useAgentActivity({
   const relatedActorIds = useMemo(() => {
     const ids = new Set(baseAgentIds);
     for (const run of scopedRuns) {
+      // Thread activity is derived from live work in that exact thread. A
+      // completed historical run must not leave an offline agent row behind.
+      if (TERMINAL_RUN_STATUSES.has(run.status)) continue;
       const actor = actors[run.actorId];
       if (!actor || actor.kind === "agent") ids.add(run.actorId);
     }
@@ -213,6 +195,8 @@ export function useAgentActivity({
 
   const loadQueue = useCallback(async (actorId: string) => {
     if (!enabled) return;
+    const requestId = (queueRequestIdsRef.current[actorId] ?? 0) + 1;
+    queueRequestIdsRef.current[actorId] = requestId;
     setQueuesByActorId((current) => ({
       ...current,
       [actorId]: {
@@ -222,17 +206,23 @@ export function useAgentActivity({
       },
     }));
     try {
-      const [statusResult, listResult] = await Promise.all([
-        ipc.inboxStatus({ actorIds: [actorId], includeEntries: true, entryLimit: 50 }),
-        ipc.inboxList({ actorId, state: "pending", limit: 50 }),
-      ]);
+      // inbox.list is intentionally self-only because it includes message
+      // bodies. A human operator may inspect/manage an agent's queue through
+      // inbox.status, whose entries expose only delivery source ids and times.
+      const statusResult = await ipc.inboxStatus({
+        actorIds: [actorId],
+        includeEntries: true,
+        entryLimit: 50,
+      });
       const status = statusResult.actors.find((item) => item.actorId === actorId);
-      const items = queueItemsFromResults(actorId, actors, status, listResult.deliveries);
+      const items = queueItemsFromStatus(status);
+      if (queueRequestIdsRef.current[actorId] !== requestId) return;
       setQueuesByActorId((current) => ({
         ...current,
         [actorId]: { items, loading: false, error: null },
       }));
     } catch (err) {
+      if (queueRequestIdsRef.current[actorId] !== requestId) return;
       setQueuesByActorId((current) => ({
         ...current,
         [actorId]: {
@@ -242,7 +232,7 @@ export function useAgentActivity({
         },
       }));
     }
-  }, [actors, enabled]);
+  }, [enabled]);
 
   const refreshAfterDeliveryAction = useCallback(async (actorId: string) => {
     await refreshStatus();
@@ -310,13 +300,24 @@ export function useAgentActivity({
   }, [enabled, refreshStatus, relatedActorIds.length]);
 
   useEffect(() => {
-    if (!enabled || relatedActorIds.length === 0) return;
-    if (deliveryTick === 0 && presenceTick === 0) return;
+    if (!enabled || relatedActorIds.length === 0 || presenceTick === 0) return;
     const timer = window.setTimeout(() => {
       void refreshStatus();
     }, 1_000);
     return () => window.clearTimeout(timer);
-  }, [deliveryTick, enabled, presenceTick, refreshStatus, relatedActorIds.length]);
+  }, [enabled, presenceTick, refreshStatus, relatedActorIds.length]);
+
+  useEffect(() => {
+    if (!enabled || relatedActorIds.length === 0 || deliveryTick === 0) return;
+    const timer = window.setTimeout(() => {
+      const expandedActorIds = Array.from(expandedSetRef.current);
+      void Promise.all([
+        refreshStatus(),
+        ...expandedActorIds.map((actorId) => loadQueue(actorId)),
+      ]);
+    }, 1_000);
+    return () => window.clearTimeout(timer);
+  }, [deliveryTick, enabled, loadQueue, refreshStatus, relatedActorIds.length]);
 
   const agents = useMemo<AgentActivityAgent[]>(() =>
     relatedActorIds.map((actorId) => {
@@ -328,7 +329,7 @@ export function useAgentActivity({
       const online = onlineByActorId[actorId] === true;
       let status: AgentActivityStatus = "idle";
       if (activeRun) {
-        status = online ? "running" : "unknown";
+        status = presenceKnown && !online ? "unknown" : "running";
       } else if (presenceKnown && !online) {
         status = "offline";
       } else if (pending > 0) {
@@ -361,12 +362,22 @@ export function useAgentActivity({
   );
 
   const runningCount = agents.filter((agent) => agent.status === "running").length;
+  const activeAgents = agents.filter((agent) => agent.activeRun);
+  const primaryAgent = activeAgents.reduce<AgentActivityAgent | null>((best, agent) => {
+    if (!best) return agent;
+    const priority = ACTIVE_RUN_PRIORITY[agent.activeRun!.status] ?? 0;
+    const bestPriority = ACTIVE_RUN_PRIORITY[best.activeRun!.status] ?? 0;
+    if (priority !== bestPriority) return priority > bestPriority ? agent : best;
+    return agent.activeRun!.openedAt > best.activeRun!.openedAt ? agent : best;
+  }, null);
   const pendingTotal = agents.reduce((sum, agent) => sum + agent.pending, 0);
   const visibleAgents = agents.filter((agent) => agent.status !== "idle");
 
   return {
     agents,
     visibleAgents,
+    activeCount: activeAgents.length,
+    primaryAgent,
     runningCount,
     pendingTotal,
     hasActivity: visibleAgents.length > 0,

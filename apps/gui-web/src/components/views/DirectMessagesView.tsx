@@ -2,7 +2,7 @@ import {
   useState,
 } from "react";
 import { ActorAvatar } from "@/components/agent/ActorAvatar";
-import { AgentActivityBanner } from "@/components/chat/AgentActivityBanner";
+import { ActorActivityBanner } from "@/components/chat/ActorActivityBanner";
 import { Composer } from "@/components/chat/Composer";
 import { MessageFeed } from "@/components/chat/MessageFeed";
 import { EmptyState } from "@/components/shared/EmptyState";
@@ -11,6 +11,7 @@ import { displayName, shortActorAlias } from "@/lib/format-utils";
 import { cn } from "@/lib/utils";
 import { Bot, Hash, MessageCircle, Search } from "lucide-react";
 import type { Actor, Channel, MachineInfo, Message, Run, ScopeRef } from "@/ipc/types";
+import { useI18n } from "@/lib/i18n";
 
 export function DirectMessagesView({
   actors,
@@ -55,6 +56,7 @@ export function DirectMessagesView({
   onToggleReaction: (message: Message, emoji: string) => void;
   onOpenAgentSettings: (actorId: string) => void;
 }) {
+  const { t } = useI18n();
   const [query, setQuery] = useState("");
   const filteredAgents = agents.filter((agent) => {
     const text = `${displayName(agent)} ${agent.id}`.toLowerCase();
@@ -67,9 +69,9 @@ export function DirectMessagesView({
     <section className="direct-messages-view grid min-h-0 flex-1 grid-cols-1 bg-white md:grid-cols-[minmax(260px,340px)_minmax(0,1fr)]">
       <aside className="min-h-0 border-r border-[#e2e6ef] bg-[#fbfbfd]">
         <div className="flex h-[96px] flex-col justify-center border-b border-[#e2e6ef] px-5">
-          <h1 className="text-[22px] font-bold text-[#111827]">Direct Messages</h1>
+          <h1 className="text-[22px] font-bold text-[#111827]">{t("Direct Messages")}</h1>
           <div className="mt-1 text-sm font-medium text-[#667085]">
-            {agents.length} agents
+            {t("{{count}} agents", { count: agents.length })}
           </div>
         </div>
         <div className="p-4">
@@ -78,7 +80,7 @@ export function DirectMessagesView({
             <input
               value={query}
               onChange={(event) => setQuery(event.target.value)}
-              placeholder="Search agents"
+              placeholder={t("Search agents")}
               className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-[#8a93a5]"
             />
           </label>
@@ -110,7 +112,7 @@ export function DirectMessagesView({
               );
             })}
             {filteredAgents.length === 0 && (
-              <EmptyState icon={Bot} text="No agents." />
+              <EmptyState icon={Bot} text={t("No agents.")} />
             )}
           </div>
         </div>
@@ -118,7 +120,7 @@ export function DirectMessagesView({
       <div className="flex min-h-0 min-w-0 flex-col bg-white">
         {!selectedAgent ? (
           <div className="flex min-h-0 flex-1 items-center justify-center p-8">
-            <EmptyState icon={MessageCircle} text="Select an agent." />
+            <EmptyState icon={MessageCircle} text={t("Select an agent.")} />
           </div>
         ) : (
           <>
@@ -154,7 +156,7 @@ export function DirectMessagesView({
               tasksBySourceMessageId={{}}
               channelThreads={[]}
               threadStatsById={{}}
-              emptyText="No direct messages."
+              emptyText={t("No direct messages.")}
               onReply={() => {}}
               onStartThread={() => {}}
               onToggleReaction={onToggleReaction}
@@ -164,9 +166,10 @@ export function DirectMessagesView({
               busy={busy}
               anchorMessageId={anchorMessageId}
             />
-            <AgentActivityBanner
+            <ActorActivityBanner
               actors={actors}
-              agentActorIds={[selectedAgent.id]}
+              actorIds={[selectedAgent.id]}
+              machines={machines}
               runs={runs}
               scope={directScope}
               enabled={!disabled}
@@ -180,8 +183,8 @@ export function DirectMessagesView({
               onClearReply={() => {}}
               onSend={onSend}
               mentionAgents={[]}
-              placeholder={`Message ${displayName(selectedAgent)}`}
-              disabledPlaceholder="Connect and select an agent"
+              placeholder={t("Message {{name}}", { name: displayName(selectedAgent) })}
+              disabledPlaceholder={t("Connect and select an agent")}
               busy={selectedBusy}
             />
           </>

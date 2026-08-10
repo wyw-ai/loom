@@ -1,32 +1,23 @@
-import type { ComponentType } from "react";
-import { Check, FolderOpen, Hash, Search, Settings, Split, Users } from "lucide-react";
-import type { Actor, Channel, Run, ScopeRef } from "@/ipc/types";
+import { useCallback, useEffect, useState, type ComponentType } from "react";
+import {
+  Check,
+  FolderOpen,
+  Hash,
+  Search,
+  Settings,
+  Split,
+  Users,
+} from "lucide-react";
+import type { Actor, Channel, ChannelVisibility } from "@/ipc/types";
 import type { ChannelPanelTab } from "@/lib/types";
 import type { ConnectionState } from "@/lib/types";
-import { channelTopic } from "@/lib/channel-utils";
-import { getChannelAgentActivity } from "@/lib/agent-utils";
-import type { ChannelAgentActivity } from "@/lib/agent-utils";
-import { useMemo } from "react";
+import { channelTopic, isDirectChannel } from "@/lib/channel-utils";
 import { connectionLabel } from "@/lib/format-utils";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
-import { StopRunButton } from "@/components/shared/StopRunButton";
 import { ScopeTokenSummary } from "@/components/layout/ScopeTokenSummary";
-
-function formatActivityLabel(activity: ChannelAgentActivity): string {
-  const { primaryAgentName, primaryStatus, activeCount, hasFailed } = activity;
-  if (hasFailed && activeCount === 0) return `⚠ ${primaryAgentName} encountered an error`;
-  if (activeCount === 1) {
-    switch (primaryStatus) {
-      case "running": return `${primaryAgentName} is thinking…`;
-      case "waiting_tool": return `${primaryAgentName} is running a tool…`;
-      case "preparing_context": return `${primaryAgentName} is preparing context…`;
-      case "queued": return `${primaryAgentName} is queued…`;
-      default: return `${primaryAgentName} is working…`;
-    }
-  }
-  return `${primaryAgentName} and ${activeCount} agents working…`;
-}
+import { ChannelSettingsDialog } from "@/components/panels/ChannelSettingsDialog";
+import { useI18n } from "@/lib/i18n";
 
 export function ChatHeader({
   channel,
@@ -36,14 +27,11 @@ export function ChatHeader({
   onOpenPanel,
   searchOpen = false,
   onToggleSearch,
-  onStopRun,
-  busy = null,
-  runs,
-  agentActors,
-  runScope,
   scopeId,
   actors,
   onOpenFolder,
+  onUpdateVisibility,
+  currentActorId,
 }: {
   channel: Channel | null;
   target: string | null;
@@ -52,35 +40,31 @@ export function ChatHeader({
   onOpenPanel: (panel: ChannelPanelTab) => void;
   searchOpen?: boolean;
   onToggleSearch?: () => void;
-  onStopRun?: (runId: string) => void;
-  busy?: string | null;
-  runs: Record<string, Run>;
-  agentActors: Actor[];
-  runScope: ScopeRef | null;
   scopeId?: string | null;
   actors?: Record<string, Actor>;
   onOpenFolder?: () => void;
+  onUpdateVisibility?: (
+    channel: Channel,
+    visibility: ChannelVisibility,
+  ) => Promise<boolean>;
+  currentActorId?: string | null;
 }) {
+  const { t } = useI18n();
   const topic = channelTopic(channel);
-  const activity = useMemo(() => {
-    if (!runScope) return null;
-    const scopedRuns = Object.fromEntries(
-      Object.entries(runs).filter(([, run]) =>
-        run.scope.kind === runScope.kind && run.scope.id === runScope.id,
-      ),
-    );
-    return getChannelAgentActivity(scopedRuns, agentActors);
-  }, [agentActors, runScope, runs]);
-  const primaryRun = activity?.primaryRun ?? null;
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const closeSettings = useCallback(() => setSettingsOpen(false), []);
+
+  useEffect(() => {
+    setSettingsOpen(false);
+  }, [channel?.id]);
   const panelActions: Array<{
     id: ChannelPanelTab;
     title: string;
     icon: ComponentType<{ size?: string | number; className?: string }>;
   }> = [
-    { id: "threads", title: "Threads", icon: Split },
-    { id: "members", title: "Members", icon: Users },
-    { id: "tasks", title: "Tasks", icon: Check },
-    { id: "configure", title: "Configure", icon: Settings },
+    { id: "threads", title: t("Threads"), icon: Split },
+    { id: "members", title: t("Members"), icon: Users },
+    { id: "tasks", title: t("Tasks"), icon: Check },
   ];
   return (
     <header className="flex h-[86px] shrink-0 items-center gap-4 border-b border-[#e2e6ef] bg-white px-6">
@@ -90,35 +74,11 @@ export function ChatHeader({
             <Hash size={26} />
           </span>
           <h1 className="min-w-0 truncate text-[22px] font-bold leading-tight text-[#111827]">
-            {channel ? channel.title : "Space"}
+            {channel ? channel.title : t("Space")}
           </h1>
         </div>
         <div className="mt-1 flex min-w-0 items-center gap-2 pl-11 text-sm text-[#485063]">
-          {activity && !activity.isIdle ? (
-            <>
-              <span className={cn(
-                "truncate",
-                activity.hasFailed && activity.activeCount === 0 && "text-red-500",
-                activity.primaryStatus === "running" && "text-purple-500 chat-header-activity-running",
-                activity.primaryStatus === "waiting_tool" && "text-orange-500",
-              )}>
-                {formatActivityLabel(activity)}
-              </span>
-              {primaryRun && onStopRun && (
-                <StopRunButton
-                  key={primaryRun.id}
-                  compact
-                  label="Stop"
-                  title={`Stop ${activity.primaryAgentName}'s run`}
-                  busy={busy === `run:cancel:${primaryRun.id}`}
-                  disabled={connection !== "open"}
-                  onConfirm={() => onStopRun(primaryRun.id)}
-                />
-              )}
-            </>
-          ) : (
-            <span className="truncate">{topic || target || connectionLabel(connection)}</span>
-          )}
+          <span className="truncate">{topic || target || t(connectionLabel(connection))}</span>
         </div>
       </div>
       {/* L1/L2 scope token summary — silent-hidden when null */}
@@ -128,8 +88,8 @@ export function ChatHeader({
           <Button
             variant="outline"
             size="icon"
-            title="Search messages"
-            aria-label="Search messages"
+            title={t("Search messages")}
+            aria-label={t("Search messages")}
             aria-pressed={searchOpen}
             onClick={onToggleSearch}
             className={cn(
@@ -166,14 +126,42 @@ export function ChatHeader({
           <Button
             variant="outline"
             size="icon"
-            title="View channel attachments"
-            aria-label="View channel attachments"
+            title={t("View channel attachments")}
+            aria-label={t("View channel attachments")}
             disabled={!channel}
             onClick={onOpenFolder}
             className="relative h-9 w-9 shrink-0 rounded-lg"
           >
             <FolderOpen size={15} />
           </Button>
+        )}
+        {channel && !isDirectChannel(channel) && (
+          <>
+            <Button
+              variant="outline"
+              size="icon"
+              title={t("Channel settings")}
+              aria-label={t("Channel settings")}
+              aria-haspopup="dialog"
+              aria-expanded={settingsOpen}
+              onClick={() => setSettingsOpen(true)}
+              className={cn(
+                "relative h-9 w-9 shrink-0 rounded-lg",
+                settingsOpen && "border-[#bdb7ff] bg-[#f1efff] text-[#5843d7]",
+              )}
+            >
+              <Settings size={15} />
+            </Button>
+            {settingsOpen && (
+              <ChannelSettingsDialog
+                channel={channel}
+                connectionOpen={connection === "open"}
+                currentActorId={currentActorId}
+                onClose={closeSettings}
+                onUpdateVisibility={onUpdateVisibility}
+              />
+            )}
+          </>
         )}
       </div>
     </header>

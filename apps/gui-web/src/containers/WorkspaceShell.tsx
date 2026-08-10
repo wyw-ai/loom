@@ -3,6 +3,7 @@ import { Menu, X } from "lucide-react";
 import type {
   Channel,
   ChannelMemberConfig,
+  ChannelVisibility,
   MachineInfo,
   Message,
   MessageContextResult,
@@ -26,6 +27,7 @@ import type {
   AgentUpdatePatch,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { useI18n } from "@/lib/i18n";
 import { Rail } from "@/components/layout/Rail";
 import { ResizeHandle } from "@/components/layout/ResizeHandle";
 import { Sidebar } from "@/components/layout/Sidebar";
@@ -79,6 +81,7 @@ export interface WorkspaceShellProps {
   moveChannelToGroup: (channelId: string, groupId: string) => void;
   deleteChannel: (channel: Channel) => Promise<void>;
   renameChannel: (channel: Channel, title: string) => Promise<void>;
+  updateChannelVisibility: (channel: Channel, visibility: ChannelVisibility) => Promise<boolean>;
   removeChannelGroup: (groupId: string) => void;
   renameChannelGroup: (groupId: string, title: string) => void;
   toggleChannelGroup: (groupId: string) => void;
@@ -162,6 +165,7 @@ export interface WorkspaceShellProps {
 }
 
 export function WorkspaceShell(props: WorkspaceShellProps) {
+  const { t } = useI18n();
   const p = props;
   const [threadFilePanel, setThreadFilePanel] = useState(false);
   const isMobile = useMediaQuery("(max-width: 767px)");
@@ -179,8 +183,12 @@ export function WorkspaceShell(props: WorkspaceShellProps) {
     p.view === "chat"
       ? p.activeChannel?.title ?? p.workspace?.name ?? "Loom"
       : p.view === "direct"
-        ? "Direct Messages"
-        : p.view[0].toUpperCase() + p.view.slice(1);
+        ? t("Direct Messages")
+        : p.view === "account"
+          ? t("Personal Profile")
+          : p.view === "system"
+            ? t("System Settings")
+            : t(p.view[0].toUpperCase() + p.view.slice(1));
 
   const detailContent = p.showChatDetail ? (
     p.searchPanelOpen ? (
@@ -263,7 +271,7 @@ export function WorkspaceShell(props: WorkspaceShellProps) {
         <button
           type="button"
           className="mobile-menu-button"
-          aria-label={mobileSidebarOpen ? "Close navigation" : "Open navigation"}
+          aria-label={mobileSidebarOpen ? t("Close navigation") : t("Open navigation")}
           aria-expanded={mobileSidebarOpen}
           onClick={() => setMobileSidebarOpen((open) => !open)}
         >
@@ -272,7 +280,7 @@ export function WorkspaceShell(props: WorkspaceShellProps) {
         <div className="min-w-0">
           <div className="truncate text-sm font-bold text-[#111827]">{mobileTitle}</div>
           <div className="truncate text-xs font-semibold text-[#667085]">
-            {p.connection === "open" ? "Connected" : p.connection}
+            {p.connection === "open" ? t("Connected") : t(p.connection)}
           </div>
         </div>
       </div>
@@ -280,7 +288,7 @@ export function WorkspaceShell(props: WorkspaceShellProps) {
         <button
           type="button"
           className="mobile-sidebar-overlay"
-          aria-label="Close navigation"
+          aria-label={t("Close navigation")}
           onClick={() => setMobileSidebarOpen(false)}
         />
       )}
@@ -294,17 +302,19 @@ export function WorkspaceShell(props: WorkspaceShellProps) {
           void p.selectWorkspace(id);
           closeMobileSidebar();
         }}
-        onOpenDirect={() => {
-          p.setView("direct");
-          closeMobileSidebar();
-        }}
-        directActive={p.view === "direct"}
+        spacesActive={p.view === "spaces"}
+        accountActive={p.view === "account"}
+        systemSettingsActive={p.view === "system"}
         onOpenSpaces={() => {
           p.setView("spaces");
           closeMobileSidebar();
         }}
         onOpenAccount={() => {
           p.setView("account");
+          closeMobileSidebar();
+        }}
+        onOpenSystemSettings={() => {
+          p.setView("system");
           closeMobileSidebar();
         }}
       />
@@ -319,15 +329,15 @@ export function WorkspaceShell(props: WorkspaceShellProps) {
           channels={p.visibleChannels}
           channelGroups={p.channelGroups}
           connection={p.connection}
+          account={p.account}
+          workspace={p.workspace}
           hasWorkspace={Boolean(p.workspace)}
+          workspaceId={p.workspace?.id ?? null}
           workspaceName={p.workspace?.name ?? null}
+          workspaceServerUrl={p.workspace?.serverUrl ?? null}
           activeChannelId={p.activeChannelId}
-          activeDirectActorId={p.activeDirectActorId}
           activeThreadId={p.activeThreadId}
           inboxCount={p.inbox.length}
-          directAgents={p.agentActors}
-          runs={p.runs}
-          machines={p.machines}
           threadsByChannel={p.threadsByChannel}
           onAddChannel={(title) => {
             void p.createChannelWithTitle(title);
@@ -338,6 +348,10 @@ export function WorkspaceShell(props: WorkspaceShellProps) {
           onRenameChannel={p.renameChannel}
           onRemoveChannelGroup={p.removeChannelGroup}
           onRenameChannelGroup={p.renameChannelGroup}
+          onLeaveServer={() => {
+            if (!p.workspace) return;
+            void p.removeWorkspace(p.workspace.id);
+          }}
           onSelectChannel={(id) => {
             p.setView("chat");
             p.setActiveChannelId(id);
@@ -349,13 +363,6 @@ export function WorkspaceShell(props: WorkspaceShellProps) {
             p.setView("chat");
             p.setActiveChannelId(thread.channelId);
             p.setActiveThreadId(thread.id);
-            p.setChannelPanelTab(null);
-            closeMobileSidebar();
-          }}
-          onSelectDirectAgent={(actorId) => {
-            p.setView("direct");
-            p.setActiveDirectActorId(actorId);
-            p.setActiveThreadId(null);
             p.setChannelPanelTab(null);
             closeMobileSidebar();
           }}
@@ -451,6 +458,7 @@ export function WorkspaceShell(props: WorkspaceShellProps) {
           createChannelWithTitle={p.createChannelWithTitle}
           deleteChannel={p.deleteChannel}
           renameChannel={p.renameChannel}
+          updateChannelVisibility={p.updateChannelVisibility}
           addWorkspace={p.addWorkspace}
           removeWorkspace={p.removeWorkspace}
           selectWorkspace={p.selectWorkspace}

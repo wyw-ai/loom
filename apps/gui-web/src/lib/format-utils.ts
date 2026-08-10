@@ -135,7 +135,11 @@ export function formatShortDateTime(value: string) {
 // ---------------------------------------------------------------------------
 
 export function reconnectDelayMs(attempt: number) {
-  return Math.min(15_000, 500 * 2 ** Math.max(0, attempt - 1));
+  // The first retry should be effectively immediate so a brief proxy/NAT
+  // reset does not leave the composer disabled for a visible interval. Only
+  // repeated failures enter exponential backoff.
+  if (attempt <= 1) return 0;
+  return Math.min(15_000, 500 * 2 ** Math.max(0, attempt - 2));
 }
 
 // ---------------------------------------------------------------------------

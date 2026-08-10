@@ -4,6 +4,7 @@ import { Loader2, Wifi } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { normalizeServerUrl, serverUrlPreviewPlaceholder } from "@/lib/server-url";
+import { useI18n } from "@/lib/i18n";
 
 const actorIdPattern = /^[A-Za-z0-9_.:-]{1,64}$/;
 
@@ -20,6 +21,7 @@ export function WebConnectionView({
     displayName: string;
   }) => Promise<void>;
 }) {
+  const { t } = useI18n();
   const [serverUrl, setServerUrl] = useState("127.0.0.1:7878");
   const [actorId, setActorId] = useState("actor_human_web_user");
   const [displayName, setDisplayName] = useState("Web User");
@@ -27,9 +29,9 @@ export function WebConnectionView({
     try {
       return { value: normalizeServerUrl(serverUrl), valid: true };
     } catch {
-      return { value: "Invalid server URL", valid: false };
+      return { value: t("Invalid server URL"), valid: false };
     }
-  }, [serverUrl]);
+  }, [serverUrl, t]);
   const actorValid = actorIdPattern.test(actorId.trim());
   const connecting = busy === "web:connect";
 
@@ -55,9 +57,9 @@ export function WebConnectionView({
               <Wifi size={20} />
             </span>
             <div>
-              <h1 className="text-xl font-bold">Connect Loom Web</h1>
+              <h1 className="text-xl font-bold">{t("Connect Loom Web")}</h1>
               <p className="mt-1 text-sm text-[#667085]">
-                Browser mode connects directly to a Loom server.
+                {t("Browser mode connects directly to a Loom server.")}
               </p>
             </div>
           </div>
@@ -70,7 +72,7 @@ export function WebConnectionView({
           ) : null}
           <label className="block">
             <span className="text-xs font-bold uppercase tracking-wide text-[#596174]">
-              Server URL
+              {t("Server URL")}
             </span>
             <Input
               className="mt-2 h-11"
@@ -85,7 +87,7 @@ export function WebConnectionView({
           </label>
           <label className="block">
             <span className="text-xs font-bold uppercase tracking-wide text-[#596174]">
-              Actor ID
+              {t("Actor ID")}
             </span>
             <Input
               className="mt-2 h-11 font-mono"
@@ -94,13 +96,13 @@ export function WebConnectionView({
             />
             {!actorValid ? (
               <span className="mt-1 block text-xs font-medium text-red-600">
-                Use letters, numbers, _, -, ., or :, up to 64 characters.
+                {t("Use letters, numbers, _, -, ., or :, up to 64 characters.")}
               </span>
             ) : null}
           </label>
           <label className="block">
             <span className="text-xs font-bold uppercase tracking-wide text-[#596174]">
-              Nickname
+              {t("Nickname")}
             </span>
             <Input
               className="mt-2 h-11"
@@ -114,7 +116,7 @@ export function WebConnectionView({
             disabled={!preview.valid || !actorValid || connecting}
           >
             {connecting ? <Loader2 className="animate-spin" size={16} /> : <Wifi size={16} />}
-            Save and connect
+            {t("Save and connect")}
           </Button>
         </div>
       </form>

@@ -31,7 +31,7 @@ use proto::methods::{
     InboxListResult, MessageListResult, MessageSendResult, OnHumanMessageWhileBusy,
     PromptTemplateSpec, ReplyReminderMode, RunAppendResult, RunCloseResult, RunOpenResult,
     RuntimeAwareness, TaskAssignmentContextResult, TaskAssignmentUpdateResult, ThreadGetResult,
-    ThreadListResult, TriggerPrefixApplyOn, TurnInputStyle,
+    TriggerPrefixApplyOn, TurnInputStyle,
 };
 use proto::types::trace::TraceKind;
 use proto::types::{
@@ -43,7 +43,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::error::TryRecvError;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{interval, interval_at, sleep, Duration, Instant, MissedTickBehavior};
 
 use agent_runtime::acp::{create_dir_all_unc, normalize_path_separators, AcpAdapter, AcpConfig};
@@ -509,6 +509,9 @@ pub struct MachineHostSpec {
     pub actor_id: String,
     pub display_name: String,
     pub metadata: Arc<Mutex<Value>>,
+    /// Revision signal for inventory changes. The daemon updates `metadata`
+    /// before advancing this receiver, so the host can publish immediately.
+    pub metadata_changed: watch::Receiver<u64>,
     pub command_tx: Option<mpsc::UnboundedSender<MachineCommandTask>>,
 }
 
@@ -553,6 +556,7 @@ async fn run_machine_host_once(host: &MachineHostSpec, server_url: &str) -> Resu
     );
 
     let mut notifications = client.notifications.lock().await;
+    let mut metadata_changed = host.metadata_changed.clone();
     let mut in_progress = HashSet::new();
     drain_machine_commands(&client, host, &mut in_progress).await?;
     let mut command_poll = interval_at(
@@ -564,6 +568,12 @@ async fn run_machine_host_once(host: &MachineHostSpec, server_url: &str) -> Resu
         tokio::select! {
             _ = command_poll.tick() => {
                 drain_machine_commands(&client, host, &mut in_progress).await?;
+            }
+            changed = metadata_changed.changed() => {
+                if changed.is_err() {
+                    return Err(anyhow!("machine inventory publisher closed"));
+                }
+                upsert_machine_actor(&client, host).await?;
             }
             maybe_notification = notifications.recv() => {
                 let Some(notification) = maybe_notification else {
@@ -3058,6 +3068,71 @@ impl WorkerState {
         batch
     }
 
+    /// Release every in-memory reservation for a dispatch that failed before
+    /// the provider accepted its prompt. The durable inbox rows deliberately
+    /// remain Pending; forgetting their local de-dup markers lets a later
+    /// inbox reconciliation retry them instead of treating them as handled.
+    fn abandon_unexecuted_dispatch(
+        &self,
+        turn_key: &str,
+        scope_id: &str,
+        source_ids: &[String],
+        restore_first_turn: bool,
+    ) -> Vec<String> {
+        let mut retry_source_ids = source_ids.to_vec();
+        let active = self
+            .active_turns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(scope_id);
+        if let Some(active) = active {
+            if active.turn_key == turn_key {
+                retry_source_ids.extend(turn_source_ids(&active).into_iter().map(str::to_owned));
+                let _ = self.take_text(&active.id);
+            } else {
+                // This should be unreachable while `turn_key` is reserved,
+                // but do not tear down an unrelated live turn if state was
+                // replaced concurrently.
+                self.active_turns
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(scope_id.to_string(), active);
+            }
+        }
+
+        let mut busy = self
+            .busy_turn_keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut pending = self
+            .pending_triggers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(queued) = pending.remove(turn_key) {
+            retry_source_ids.extend(queued.into_iter().map(|trigger| trigger.id().to_string()));
+        }
+        drop(pending);
+
+        let mut unique = HashSet::new();
+        retry_source_ids.retain(|source_id| unique.insert(source_id.clone()));
+        let mut seen = self.seen_sources.lock().unwrap_or_else(|e| e.into_inner());
+        for source_id in &retry_source_ids {
+            seen.remove(source_id);
+        }
+        drop(seen);
+        if restore_first_turn {
+            self.seeded
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(scope_id);
+        }
+        // Release the busy gate last so a new notification cannot begin a
+        // retry between restoring first-turn/de-dup state and this cleanup.
+        busy.remove(turn_key);
+        drop(busy);
+        retry_source_ids
+    }
+
     fn drop_pending_sources(&self, source_ids: &[String]) {
         if source_ids.is_empty() {
             return;
@@ -5335,18 +5410,43 @@ async fn dispatch_trigger_batch(
         if batch.len() > 1 {
             run_metadata["coalescedSourceIds"] = json!(source_ids);
         }
-        let run_res: RunOpenResult = client
+        let run_res: RunOpenResult = match client
             .call(
                 method::RUN_OPEN,
                 json!({
                     "actorId": state.actor_id,
                     "scope": primary.scope(),
+                    "deliveryId": primary.id(),
                     "startReason": primary.id(),
                     "agentConfigVersionId": state.agent_config_version_id.clone(),
                     "metadata": run_metadata,
                 }),
             )
-            .await?;
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                let retry_ids = state.abandon_unexecuted_dispatch(
+                    &turn_key,
+                    &primary.scope().id,
+                    &source_ids,
+                    false,
+                );
+                tracing::warn!(
+                    actor = %state.actor_id,
+                    scope = %primary.scope().id,
+                    retry_sources = retry_ids.len(),
+                    %err,
+                    "run.open failed before provider execution; released slot and kept deliveries pending"
+                );
+                return Err(err).with_context(|| {
+                    format!(
+                        "run.open before provider execution for scope {}",
+                        primary.scope().id
+                    )
+                });
+            }
+        };
         let first_turn = state.take_seed_slot(&primary.scope().id);
         let turn_input =
             render_trigger_prompt(client, state, &batch, first_turn, &run_res.run.id).await;
@@ -5385,7 +5485,7 @@ async fn dispatch_trigger_batch(
         };
         state.set_turn(active.clone());
 
-        let adapter_prompt = build_adapter_prompt(
+        let adapter_prompt = match build_adapter_prompt(
             client,
             state,
             primary.scope(),
@@ -5393,7 +5493,57 @@ async fn dispatch_trigger_batch(
             Some(&active),
             Some(&primary),
         )
-        .await?;
+        .await
+        {
+            Ok(prompt) => prompt,
+            Err(err) => {
+                // No provider work ran, so terminate the bookkeeping run but
+                // deliberately send no ack ids. Canceled runs do not infer a
+                // legacy trigger ack on the server; the durable deliveries
+                // remain Pending and can be retried after local reconciliation.
+                if let Err(close_err) =
+                    close_run(client, &active.run_id, RunStatus::Canceled, None, &[]).await
+                {
+                    tracing::warn!(
+                        actor = %state.actor_id,
+                        run = %active.run_id,
+                        scope = %active.scope.id,
+                        %close_err,
+                        "failed to close pre-provider run; releasing local slot anyway"
+                    );
+                }
+                let retry_ids = state.abandon_unexecuted_dispatch(
+                    &turn_key,
+                    &active.scope.id,
+                    &source_ids,
+                    first_turn,
+                );
+                tracing::warn!(
+                    actor = %state.actor_id,
+                    run = %active.run_id,
+                    scope = %active.scope.id,
+                    retry_sources = retry_ids.len(),
+                    %err,
+                    "prompt preparation failed before provider execution; deliveries remain pending"
+                );
+                publish_runtime_warning_once(
+                    client,
+                    state,
+                    &active,
+                    &state.actor_id,
+                    "prompt.prepare",
+                    "failed to prepare the provider prompt; pending work will be retried",
+                    &err,
+                )
+                .await;
+                return Err(err).with_context(|| {
+                    format!(
+                        "prepare provider prompt for run={} scope={}",
+                        active.run_id, active.scope.id
+                    )
+                });
+            }
+        };
 
         match adapter.send_prompt(adapter_prompt).await {
             Ok(()) => {
@@ -5440,7 +5590,7 @@ async fn dispatch_trigger_batch(
                     None,
                 )
                 .await;
-                let _ = close_run(client, &active.run_id, RunStatus::Failed, None).await;
+                let _ = close_run(client, &active.run_id, RunStatus::Failed, None, &[]).await;
                 tracing::warn!(
                     actor = %state.actor_id,
                     sources = ?source_ids,
@@ -6992,6 +7142,7 @@ const RESPONSE_DELIVERY_POINTER: &str =
 with Loom CLI before ending. Use `$LOOM_REPLY_TARGET` by default for the current workflow; \
 use bare `#channel` only for intentional channel-level updates outside the active thread. \
 For multiline messages, omit `--text` and pipe stdin/heredoc; quoted `\\n` is stored literally. \
+To send a file or image, run `loom --json attachment upload --target \"$LOOM_REPLY_TARGET\" --path <path>`, then include the returned artifact id on the visible reply with `--attachment-id <art_id>`; upload alone and artifact URI text are not chat attachments. \
 In coordinated workflows, wake the requester/coordinator with your result unless you own or were delegated the next handoff. \
 Short requested answers like joining, choosing, voting, approving, or completing a step are actionable; wake the collector instead of notify-only. \
 When you own the handoff, or no coordinator exists and another actor or group must continue, use `message ask` \
@@ -8922,7 +9073,20 @@ async fn translate_one_with_gate(
                 if let Some(text) = state.take_text(&active.id) {
                     if let Some(text) = visible_agent_text_for_turn(&active, &text) {
                         let meta = build_turn_meta(state, &active, usage.as_ref(), &text);
-                        flush_text(client, actor_id, &active, text, Some(meta)).await?;
+                        if let Err(err) =
+                            flush_text(client, actor_id, &active, text, Some(meta)).await
+                        {
+                            publish_runtime_warning_once(
+                                client,
+                                state,
+                                &active,
+                                actor_id,
+                                "final-output",
+                                "failed to publish final agent output; run finalization will continue",
+                                &err,
+                            )
+                            .await;
+                        }
                     }
                 }
             } else {
@@ -8969,7 +9133,7 @@ async fn translate_one_with_gate(
             }
             if !effective_success {
                 if let Some(text) = failed_turn_text(&effective_summary) {
-                    append_trace_or_report(
+                    let _ = append_trace_or_report(
                         client,
                         state,
                         &active,
@@ -8978,7 +9142,7 @@ async fn translate_one_with_gate(
                         TraceKind::Error,
                         json!({ "message": text }),
                     )
-                    .await?;
+                    .await;
                 }
             }
             // U4 finalization: emit a terminal `agent.usage` trace frame so
@@ -8987,7 +9151,7 @@ async fn translate_one_with_gate(
             // mirroring the dual-write into the message metadata. Skip when
             // the adapter did not report any usage for this turn.
             if let Some(final_usage) = usage.as_ref() {
-                append_trace_or_report(
+                let _ = append_trace_or_report(
                     client,
                     state,
                     &active,
@@ -9000,7 +9164,7 @@ async fn translate_one_with_gate(
                         "isFinal": true,
                     }),
                 )
-                .await?;
+                .await;
             }
             let run_status = if active.cancel_requested {
                 RunStatus::Canceled
@@ -9009,29 +9173,53 @@ async fn translate_one_with_gate(
             } else {
                 RunStatus::Failed
             };
-            if let Err(e) =
-                close_run(client, &active.run_id, run_status, close_usage.as_ref()).await
+            let ack_source_ids = if active.ack_on_finish {
+                turn_source_ids(&active)
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            let atomically_acked = match close_run(
+                client,
+                &active.run_id,
+                run_status,
+                close_usage.as_ref(),
+                &ack_source_ids,
+            )
+            .await
             {
-                tracing::warn!(
-                    actor = %actor_id,
-                    run = %active.run_id,
-                    scope = %active.scope.id,
-                    %e,
-                    "run.close RPC failed; clearing slot anyway so the queue can drain"
-                );
-                publish_runtime_warning_once(
-                    client,
-                    state,
-                    &active,
-                    actor_id,
-                    "run.close",
-                    "failed to close run; queue will continue",
-                    &e,
-                )
-                .await;
-            }
+                Ok(acked) => acked,
+                Err(e) => {
+                    tracing::warn!(
+                        actor = %actor_id,
+                        run = %active.run_id,
+                        scope = %active.scope.id,
+                        %e,
+                        "run.close RPC failed; clearing slot anyway so the queue can drain"
+                    );
+                    publish_runtime_warning_once(
+                        client,
+                        state,
+                        &active,
+                        actor_id,
+                        "run.close",
+                        "failed to close run; queue will continue",
+                        &e,
+                    )
+                    .await;
+                    HashSet::new()
+                }
+            };
             if active.ack_on_finish {
-                for source_id in turn_source_ids(&active) {
+                for source_id in &ack_source_ids {
+                    // New servers finalize run + deliveries atomically. Empty
+                    // results identify an older server, where the legacy
+                    // individual acks remain the compatibility fallback.
+                    if atomically_acked.contains(source_id) {
+                        continue;
+                    }
                     if let Err(e) = record_delivery_seen_by_id(client, actor_id, source_id).await {
                         tracing::warn!(
                             actor = %actor_id,
@@ -9948,17 +10136,21 @@ async fn close_run(
     run_id: &str,
     status: RunStatus,
     usage: Option<&TokenUsage>,
-) -> Result<()> {
+    ack_source_ids: &[String],
+) -> Result<HashSet<String>> {
     let mut params = json!({ "runId": run_id, "status": status });
     if let Some(usage) = usage {
         // Additive field: servers that predate `run.close.usage` ignore it.
         params["usage"] = serde_json::to_value(usage).unwrap_or(Value::Null);
     }
-    let _: RunCloseResult = client
+    if !ack_source_ids.is_empty() {
+        params["ackSourceIds"] = json!(ack_source_ids);
+    }
+    let result: RunCloseResult = client
         .call(method::RUN_CLOSE, params)
         .await
         .with_context(|| format!("run.close run={run_id}"))?;
-    Ok(())
+    Ok(result.acked_source_ids.into_iter().collect())
 }
 
 #[cfg(test)]
@@ -12205,7 +12397,10 @@ mod tests {
         );
 
         assert!(prompt.starts_with("Pending message digest"));
-        assert!(!prompt.contains("=== Loom turn input v1 ==="), "no JSON header in minimal style");
+        assert!(
+            !prompt.contains("=== Loom turn input v1 ==="),
+            "no JSON header in minimal style"
+        );
         assert!(prompt.contains("canfuu(Human)[id=actor_human_x][msgId=msg_min_1]"));
         assert!(prompt.contains("帮我把登录页的样式改成深色主题"));
         // 600-char body is capped at the 500-char context limit with a
@@ -12236,7 +12431,10 @@ mod tests {
             &TurnUnreadGap::empty(),
         );
         assert!(prompt.starts_with("New message:"));
-        assert!(!prompt.contains("Rules:"), "reminder off leaves no rule footer");
+        assert!(
+            !prompt.contains("Rules:"),
+            "reminder off leaves no rule footer"
+        );
     }
 
     #[test]
@@ -13718,6 +13916,100 @@ mod tests {
         assert!(state.current_turn(&active_scope.id).is_none());
         assert!(state.clear_turn(&active_scope.id).is_none());
         assert!(state.has_pending_source(&queued_thread.id));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn abandoning_unexecuted_dispatch_releases_slot_and_retry_markers() {
+        let root = temp_path("pre-provider-abort");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        let state = WorkerState::new(
+            "actor_demo".into(),
+            sample_spec(None),
+            paths.profile.clone(),
+            paths,
+            "ws://127.0.0.1:0".into(),
+        );
+        let scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: "chan_retry".into(),
+        };
+        let turn_key = "scope:channel:chan_retry";
+        let current = AgentTrigger::Message(sample_message(
+            "msg_current",
+            scope.clone(),
+            "#chan_retry",
+            None,
+            None,
+        ));
+        let queued = AgentTrigger::Message(sample_message(
+            "msg_queued",
+            scope.clone(),
+            "#chan_retry",
+            None,
+            None,
+        ));
+        for source_id in ["msg_current", "msg_context", "msg_queued"] {
+            assert!(state.remember_source(source_id));
+        }
+        assert!(state.begin_or_enqueue(turn_key, current.clone()));
+        state.set_turn(ActiveTurn {
+            id: "run_pre_provider".into(),
+            run_id: "run_pre_provider".into(),
+            turn_key: turn_key.into(),
+            scope: scope.clone(),
+            opened_at: Utc::now(),
+            trigger_source_id: "msg_current".into(),
+            trigger_source_ids: vec!["msg_current".into(), "msg_context".into()],
+            trigger_batch: vec![current.clone()],
+            ack_on_finish: true,
+            trigger_is_message: true,
+            assignment_id: None,
+            reply_target: Some("#chan_retry".into()),
+            prompt_stats: empty_prompt_stats(),
+            prompt_breakdown: empty_prompt_breakdown(),
+            trigger_actor: "actor_human".into(),
+            trigger_private_to: Vec::new(),
+            no_reply_file: None,
+            no_reply_requested: false,
+            cancel_requested: false,
+            provider_started: false,
+        });
+        assert!(!state.begin_or_enqueue(turn_key, queued.clone()));
+        assert!(state.take_seed_slot(&scope.id));
+        state.push_text("run_pre_provider", "must be discarded");
+
+        let retry_ids = state.abandon_unexecuted_dispatch(
+            turn_key,
+            &scope.id,
+            &["msg_current".into(), "msg_context".into()],
+            true,
+        );
+
+        assert_eq!(
+            retry_ids.into_iter().collect::<HashSet<_>>(),
+            ["msg_current", "msg_context", "msg_queued"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        );
+        assert!(state.current_turn(&scope.id).is_none());
+        assert!(!state.has_pending_source("msg_queued"));
+        assert!(state.peek_text("run_pre_provider").is_none());
+        assert!(
+            state.take_seed_slot(&scope.id),
+            "failed prompt preparation must restore first-turn bootstrap"
+        );
+        for source_id in ["msg_current", "msg_context", "msg_queued"] {
+            assert!(
+                state.remember_source(source_id),
+                "{source_id} must be eligible for durable-inbox retry"
+            );
+        }
+        assert!(
+            state.begin_or_enqueue(turn_key, current),
+            "busy reservation must be released after pre-provider failure"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 

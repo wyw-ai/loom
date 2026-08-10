@@ -2,6 +2,7 @@ import type { ChannelGroup, ChannelGroupSection, ThreadWithChannel } from "@/lib
 import type {
   Actor,
   Channel,
+  ChannelLayout,
   Message,
   ScopeRef,
   Task,
@@ -16,6 +17,14 @@ import { ungroupedChannelGroupId } from "@/lib/constants";
 
 export function channelGroupStorageKey(workspace: Workspace | null) {
   return `loom:channel-groups:v1:${workspace?.id ?? "global"}`;
+}
+
+export function channelGroupMigrationStorageKey(key: string) {
+  return `${key}:server-layout-migrated:v1`;
+}
+
+export function channelGroupDirtyStorageKey(key: string) {
+  return `${key}:server-layout-dirty:v1`;
 }
 
 export function loadChannelGroups(key: string): ChannelGroup[] {
@@ -35,6 +44,41 @@ export function saveChannelGroups(key: string, groups: ChannelGroup[]) {
   } catch {
     /* local-only preference; ignore quota or privacy-mode failures */
   }
+}
+
+function readStorageFlag(key: string) {
+  if (typeof window === "undefined") return false;
+  try {
+    return window.localStorage.getItem(key) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function writeStorageFlag(key: string, value: boolean) {
+  if (typeof window === "undefined") return;
+  try {
+    if (value) window.localStorage.setItem(key, "1");
+    else window.localStorage.removeItem(key);
+  } catch {
+    /* local-only sync metadata; ignore quota or privacy-mode failures */
+  }
+}
+
+export function hasMigratedChannelGroups(key: string) {
+  return readStorageFlag(channelGroupMigrationStorageKey(key));
+}
+
+export function markChannelGroupsMigrated(key: string) {
+  writeStorageFlag(channelGroupMigrationStorageKey(key), true);
+}
+
+export function hasDirtyChannelGroups(key: string) {
+  return readStorageFlag(channelGroupDirtyStorageKey(key));
+}
+
+export function markChannelGroupsDirty(key: string, dirty: boolean) {
+  writeStorageFlag(channelGroupDirtyStorageKey(key), dirty);
 }
 
 export function normalizeChannelGroups(value: unknown): ChannelGroup[] {
@@ -72,6 +116,21 @@ export function normalizeChannelGroups(value: unknown): ChannelGroup[] {
       },
     ];
   });
+}
+
+export function normalizeChannelLayout(value: unknown): ChannelLayout | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as Partial<ChannelLayout>;
+  if (!Array.isArray(candidate.sections)) return null;
+  if (typeof candidate.actorId !== "string" || !candidate.actorId.trim()) return null;
+  const revision = Number(candidate.revision);
+  if (!Number.isSafeInteger(revision) || revision < 0) return null;
+  return {
+    actorId: candidate.actorId,
+    sections: normalizeChannelGroups(candidate.sections),
+    revision,
+    updatedAt: typeof candidate.updatedAt === "string" ? candidate.updatedAt : "",
+  };
 }
 
 export function channelGroupSections(
@@ -132,7 +191,17 @@ export function flattenThreads(
 // ---------------------------------------------------------------------------
 
 export function sortChannels(items: Channel[]) {
-  return [...items].sort((a, b) => a.title.localeCompare(b.title));
+  const sortKey = (value: string) =>
+    value.trim().normalize("NFKC").toLowerCase();
+  return [...items].sort((left, right) => {
+    const leftTitle = sortKey(left.title);
+    const rightTitle = sortKey(right.title);
+    if (leftTitle < rightTitle) return -1;
+    if (leftTitle > rightTitle) return 1;
+    if (left.id < right.id) return -1;
+    if (left.id > right.id) return 1;
+    return 0;
+  });
 }
 
 // ---------------------------------------------------------------------------

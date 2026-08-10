@@ -14,7 +14,11 @@ import type {
   Artifact,
   ArtifactReadResult,
   Channel,
+  ChannelLayoutResult,
+  ChannelLayoutSection,
   ChannelMemberConfig,
+  ChannelVisibility,
+  ConnectionEvent,
   DesktopConfig,
   DeliveryPolicy,
   DeliveryState,
@@ -41,7 +45,7 @@ import type {
   TaskAssignmentType,
   Thread,
   WakeSpec,
-  Workspace,
+  WorkspaceConnectResult,
 } from "./types";
 
 export type LoginProvider = "google" | "github";
@@ -86,6 +90,8 @@ const commandToRpcMethod: Record<string, string> = {
   channel_list: "channel/list",
   channel_create: "channel/create",
   channel_update: "channel/update",
+  channel_layout_get: "channel.layout.get",
+  channel_layout_set: "channel.layout.set",
   channel_delete: "channel/delete",
   channel_invite: "channel/invite",
   channel_member_config_list: "channel/member_config.list",
@@ -181,6 +187,9 @@ async function webInvoke<T>(
     case "connect":
       return webBridge.connect(
         String((args?.args as { workspaceId?: unknown } | undefined)?.workspaceId ?? ""),
+        typeof (args?.args as { password?: unknown } | undefined)?.password === "string"
+          ? String((args?.args as { password?: unknown }).password)
+          : undefined,
       ) as T;
     case "disconnect":
       webBridge.disconnect();
@@ -305,11 +314,8 @@ export async function avatarCachedUrl(url: string): Promise<string> {
   return invoke("avatar_cached_url", { args: { url } });
 }
 
-export async function connect(workspaceId: string): Promise<{
-  workspace: Workspace;
-  open: unknown;
-}> {
-  return invoke("connect", { args: { workspaceId } });
+export async function connect(workspaceId: string, password?: string): Promise<WorkspaceConnectResult> {
+  return invoke("connect", { args: { workspaceId, ...(password ? { password } : {}) } });
 }
 
 export async function disconnect(): Promise<void> {
@@ -330,10 +336,27 @@ export async function channelCreate(params: {
 
 export async function channelUpdate(params: {
   channelId: string;
-  title: string;
+  title?: string;
   topic?: string;
+  visibility?: ChannelVisibility;
 }): Promise<{ channel: Channel }> {
   return invoke("channel_update", { params });
+}
+
+export async function channelLayoutGet(): Promise<ChannelLayoutResult> {
+  return invoke("channel_layout_get", { params: {} });
+}
+
+export async function channelLayoutSet(params: {
+  sections: ChannelLayoutSection[];
+  merge?: boolean;
+}): Promise<ChannelLayoutResult> {
+  return invoke("channel_layout_set", {
+    params: {
+      sections: params.sections,
+      ...(params.merge === undefined ? {} : { merge: params.merge }),
+    },
+  });
 }
 
 export async function channelDelete(params: {
@@ -1026,9 +1049,9 @@ export function onStream(cb: (u: StreamUpdate) => void): Promise<UnlistenFn> {
 }
 
 export function onConnection(
-  cb: (u: { state: "open" } | { state: "closed"; reason?: string }) => void,
+  cb: (u: ConnectionEvent) => void,
 ): Promise<UnlistenFn> {
-  return listen<{ state: "open" | "closed"; reason?: string }>(
+  return listen<ConnectionEvent>(
     "loom://connection",
     (e) => cb(e.payload),
   );

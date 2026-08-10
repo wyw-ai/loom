@@ -8,13 +8,17 @@ import { PageHeader } from "@/components/shared/PageComponents";
 import { ProviderAddDialog } from "@/components/settings/ProviderComponents";
 import { HostListItem, RegisteredHostsEmpty, HostRegisterDialog, MachineCard } from "@/components/settings/MachineComponents";
 import { MemberListItem, AgentRosterOverview, AgentCreateDialog, AgentMemberDetail } from "@/components/settings/AgentComponents";
-import { ServiceListItem, ServiceMemberDetail, ServiceRosterOverview } from "@/components/settings/ServiceComponents";
+import {
+  ServiceListItem,
+  ServiceMemberDetail,
+  ServiceRosterOverview,
+} from "@/components/settings/ServiceComponents";
 import { HumanListItem, HumanRosterOverview } from "@/components/settings/HumanComponents";
-
 import { Button } from "@/components/ui/button";
 import { agentMemberEntries, serviceMemberEntries } from "@/lib/agent-utils";
 import { agentFormForMachine, displayName, findAgentMemberEntry, machineCanCreateAgent } from "@/lib/format-utils";
 import { cn } from "@/lib/utils";
+import { useI18n } from "@/lib/i18n";
 import { Bot, ChevronDown, ListChecks, Loader2, Plus, RefreshCw, Server, Split, Users } from "lucide-react";
 import type { Actor, MachineInfo, Run } from "@/ipc/types";
 import type { ActorWorkspaceSection, AgentFormState, AgentMemberEntry, AgentUpdatePatch, ServiceMemberEntry } from "@/lib/types";
@@ -69,6 +73,7 @@ export function SettingsView({
   onRemoveAgent: (machineId: string, actorId: string) => void;
   onOpenLocalPath: (path: string) => void;
 }) {
+  const { t } = useI18n();
   const setActiveSection = onSectionChange;
   const [selectedMachineId, setSelectedMachineId] = useState<string | null>(null);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(targetAgentId);
@@ -92,16 +97,30 @@ export function SettingsView({
     (count, machine) => count + machine.providers.length,
     0,
   );
+  const pageTitle = activeSection === "hosts" ? t("Managed Hosts") : t("Actors");
+  const pageDetail =
+    activeSection === "hosts"
+      ? t("{{machines}} registered / {{providers}} runtimes / {{online}}/{{agents}} agents online", {
+          machines: machines.length,
+          providers: providerCount,
+          online: onlineAgents,
+          agents: memberEntries.length,
+        })
+      : t("{{humans}} humans / {{online}}/{{agents}} agents online / {{services}} services", {
+          humans: humanActors.length,
+          online: onlineAgents,
+          agents: memberEntries.length,
+          services: serviceEntries.length,
+        });
   const workspaceSections: Array<{
     id: ActorWorkspaceSection;
     label: string;
     count: number;
     icon: ComponentType<{ size?: string | number; className?: string }>;
   }> = [
-    { id: "hosts", label: "Managed Hosts", count: machines.length, icon: Server },
-    { id: "humans", label: "Humans", count: humanActors.length, icon: Users },
-    { id: "agents", label: "Agents", count: memberEntries.length, icon: Bot },
-    { id: "services", label: "Services", count: serviceEntries.length, icon: Split },
+    { id: "humans", label: t("Humans"), count: humanActors.length, icon: Users },
+    { id: "agents", label: t("Agents"), count: memberEntries.length, icon: Bot },
+    { id: "services", label: t("Services"), count: serviceEntries.length, icon: Split },
   ];
   const selectedMemberEntry =
     selectedAgentId === null
@@ -343,70 +362,71 @@ export function SettingsView({
 
   return (
     <section className="flex min-h-0 flex-1 flex-col">
-      <PageHeader
-        title="Actors"
-        detail={`${humanActors.length} humans / ${onlineAgents}/${memberEntries.length} agents online / ${machines.length} hosts / ${providerCount} providers / ${serviceEntries.length} services`}
-      />
+      <PageHeader title={pageTitle} detail={pageDetail} />
       <div className="min-h-0 flex-1 overflow-hidden bg-white">
         <div className="grid h-full min-h-0 grid-cols-1 lg:grid-cols-[minmax(208px,224px)_minmax(0,1fr)]">
-          <aside className="flex min-h-0 flex-col border-r border-[#e2e6ef] bg-[#fbfbfd]">
-            <div className="border-b border-[#edf0f5] p-4">
-              <div className="flex items-center justify-between gap-2">
-                <div className="min-w-0 text-sm font-bold text-[#111827]">
-                  Actor Manage
+          <aside
+            aria-label={activeSection === "hosts" ? t("Managed hosts list") : t("Actor manage")}
+            className="flex min-h-0 flex-col border-r border-[#e2e6ef] bg-[#fbfbfd]"
+          >
+            {activeSection !== "hosts" && (
+              <div className="border-b border-[#edf0f5] p-4">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="min-w-0 text-sm font-bold text-[#111827]">
+                    {t("Actor Manage")}
+                  </div>
                 </div>
-                <Button
-                  variant="outline"
-                  size="icon"
-                  title="Refresh hosts"
-                  onClick={onCheckMachines}
-                  disabled={busy === "machine:check"}
-                  className="h-8 w-8 rounded-lg border-[#dfe3ec] bg-white"
-                >
-                  {busy === "machine:check" ? (
-                    <Loader2 className="animate-spin" size={15} />
-                  ) : (
-                    <RefreshCw size={15} />
-                  )}
-                </Button>
+                <div className="mt-3 space-y-1">
+                  {workspaceSections.map((section) => {
+                    const Icon = section.icon;
+                    const selected = activeSection === section.id;
+                    return (
+                      <button
+                        key={section.id}
+                        type="button"
+                        className={cn(
+                          "flex h-9 w-full items-center gap-2 rounded-lg border px-2.5 text-left text-sm font-semibold transition-colors",
+                          selected
+                            ? "border-[#bdb7ff] bg-white text-[#503ed4] shadow-sm"
+                            : "border-transparent text-[#596174] hover:border-[#dfe3ec] hover:bg-white",
+                        )}
+                        onClick={() => selectSection(section.id)}
+                      >
+                        <Icon size={15} className="shrink-0" />
+                        <span className="min-w-0 flex-1 truncate">{section.label}</span>
+                        <span className="count-badge">{section.count}</span>
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
-              <div className="mt-3 space-y-1">
-                {workspaceSections.map((section) => {
-                  const Icon = section.icon;
-                  const selected = activeSection === section.id;
-                  return (
-                    <button
-                      key={section.id}
-                      type="button"
-                      className={cn(
-                        "flex h-9 w-full items-center gap-2 rounded-lg border px-2.5 text-left text-sm font-semibold transition-colors",
-                        selected
-                          ? "border-[#bdb7ff] bg-white text-[#503ed4] shadow-sm"
-                          : "border-transparent text-[#596174] hover:border-[#dfe3ec] hover:bg-white",
-                      )}
-                      onClick={() => selectSection(section.id)}
-                    >
-                      <Icon size={15} className="shrink-0" />
-                      <span className="min-w-0 flex-1 truncate">{section.label}</span>
-                      <span className="count-badge">{section.count}</span>
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
+            )}
             <div className="min-h-0 flex-1 overflow-y-auto p-3 soft-scrollbar">
               {activeSection === "hosts" && (
                 <div className="space-y-2">
                   <div className="mb-2 flex items-center justify-between px-1">
                     <div className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
-                      Managed Hosts
+                      {t("Managed Hosts")}
                     </div>
                     <div className="flex items-center gap-1.5">
                       <span className="count-badge">{machines.length}</span>
                       <button
                         type="button"
+                        className="composer-icon h-7 min-w-7 rounded-lg border border-[#dfe3ec] bg-white text-[#596174]"
+                        title={t("Refresh hosts")}
+                        onClick={onCheckMachines}
+                        disabled={busy === "machine:check"}
+                      >
+                        {busy === "machine:check" ? (
+                          <Loader2 className="animate-spin" size={13} />
+                        ) : (
+                          <RefreshCw size={13} />
+                        )}
+                      </button>
+                      <button
+                        type="button"
                         className="composer-icon h-7 min-w-7 rounded-lg border border-[#dfe3ec] bg-white text-[#503ed4]"
-                        title="Register host"
+                        title={t("Register host")}
                         onClick={openRegisterHostDialog}
                         disabled={busy === "machine:create"}
                       >
@@ -420,20 +440,7 @@ export function SettingsView({
                   </div>
                   {machines.length === 0 ? (
                     <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-white p-4 text-sm text-[#667085]">
-                      <div>No managed hosts.</div>
-                      <Button
-                        size="sm"
-                        className="mt-3 rounded-lg"
-                        onClick={openRegisterHostDialog}
-                        disabled={busy === "machine:create"}
-                      >
-                        {busy === "machine:create" ? (
-                          <Loader2 className="animate-spin" size={14} />
-                        ) : (
-                          <Plus size={14} />
-                        )}
-                        Register Host
-                      </Button>
+                      {t("No managed hosts.")}
                     </div>
                   ) : (
                     machines.map((machine) => (
@@ -451,13 +458,13 @@ export function SettingsView({
                 <div>
                   <div className="mb-2 flex items-center justify-between px-1">
                     <div className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
-                      Humans
+                      {t("Humans")}
                     </div>
                     <span className="count-badge">{humanActors.length}</span>
                   </div>
                   {humanActors.length === 0 ? (
                     <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-white p-3 text-xs text-[#667085]">
-                      No humans registered.
+                      {t("No humans registered.")}
                     </div>
                   ) : (
                     <div className="space-y-1.5">
@@ -472,14 +479,14 @@ export function SettingsView({
                 <div>
                 <div className="mb-2 flex items-center justify-between px-1">
                   <div className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
-                    Agents
+                    {t("Agents")}
                   </div>
                   <div ref={memberCreateMenuRef} className="relative flex items-center gap-1.5">
                     <span className="count-badge">{memberEntries.length}</span>
                     <button
                       type="button"
                       className="composer-icon h-7 min-w-9 gap-0.5 rounded-lg border border-[#dfe3ec] bg-white text-[#503ed4]"
-                      title="Add actor"
+                      title={t("Add actor")}
                       aria-expanded={memberCreateMenuOpen}
                       onClick={() => setMemberCreateMenuOpen((open) => !open)}
                     >
@@ -494,7 +501,7 @@ export function SettingsView({
                         onClick={() => openCreateAgentDialog()}
                       >
                         <Bot size={15} className="text-[#503ed4]" />
-                        Agent
+                        {t("Agent")}
                         </button>
                         <button
                           type="button"
@@ -504,10 +511,10 @@ export function SettingsView({
                           <Server size={15} className="mt-0.5 text-[#667085]" />
                           <span className="min-w-0">
                             <span className="block text-sm font-semibold text-[#303849]">
-                              Service
+                              {t("Service")}
                             </span>
                             <span className="block text-xs font-medium text-[#667085]">
-                              Coming Soon
+                              {t("Coming Soon")}
                             </span>
                           </span>
                         </button>
@@ -531,16 +538,16 @@ export function SettingsView({
                     </span>
                     <span className="min-w-0 flex-1">
                       <span className="block truncate text-sm font-bold text-[#111827]">
-                        All Agents
+                        {t("All Agents")}
                       </span>
                       <span className="mt-0.5 block truncate text-xs text-[#667085]">
-                        {memberEntries.length} registered
+                        {t("{{count}} registered", { count: memberEntries.length })}
                       </span>
                     </span>
                   </button>
                   {memberEntries.length === 0 ? (
                     <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-white p-3 text-xs text-[#667085]">
-                      <div>No agents registered.</div>
+                      <div>{t("No agents registered.")}</div>
                       <Button
                         size="sm"
                         className="mt-3 rounded-lg"
@@ -548,7 +555,7 @@ export function SettingsView({
                         disabled={!canCreateAgentFromAnyHost}
                       >
                         <Plus size={14} />
-                        Create Agent
+                        {t("Create Agent")}
                       </Button>
                     </div>
                   ) : (
@@ -569,13 +576,13 @@ export function SettingsView({
                 <div>
                 <div className="mb-2 flex items-center justify-between px-1">
                   <div className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
-                    Services
+                    {t("Services")}
                   </div>
                   <span className="count-badge">{serviceEntries.length}</span>
                 </div>
                 {serviceEntries.length === 0 ? (
                   <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-white p-3 text-xs text-[#667085]">
-                    No services registered.
+                    {t("No services registered.")}
                   </div>
                 ) : (
                   <div className="space-y-1.5">
@@ -594,7 +601,11 @@ export function SettingsView({
             </div>
           </aside>
 
-          <div className="min-h-0 overflow-y-auto bg-white soft-scrollbar">
+          <div
+            role="region"
+            aria-label={activeSection === "hosts" ? t("Managed host details") : t("Actor details")}
+            className="min-h-0 overflow-y-auto bg-white soft-scrollbar"
+          >
             {detailContent}
           </div>
         </div>

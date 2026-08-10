@@ -18,17 +18,19 @@ use agent_runtime::provider::{
 use anyhow::{anyhow, Context, Result};
 use proto::methods::{
     AgentBundleSkillSpec, AgentBundleSpec, AgentModelSpec, AgentPromptAssemblySpec,
-    AgentProviderRef, AgentSpec, ProviderManifest, RuntimeAwareness, ServiceSpec, WakeSpec,
+    AgentProviderRef, AgentSpec, ProviderManifest, RuntimeAwareness, ServiceRuntimeState,
+    ServiceSpec, WakeSpec,
 };
 use proto::types::{Actor, ActorKind};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{sleep, Duration};
 
 use crate::cmd::agent_serve::{self, MachineCommandTask, MachineHostSpec};
 use crate::cmd::service;
 use crate::daemon_ipc;
+use crate::service::ServiceRuntimeRegistry;
 use crate::{config, render};
 
 const CONFIG_RELOAD_INTERVAL: Duration = Duration::from_secs(3);
@@ -95,6 +97,8 @@ pub async fn run(
         initial_specs.retain(|spec| allow.contains(spec.actor.id.as_str()));
     }
     let mut inventory_revision = 1u64;
+    let service_runtime_registry = ServiceRuntimeRegistry::default();
+    let initial_service_runtime_states = service_runtime_registry.snapshot();
     let initial_service_specs = load_config_service_specs().unwrap_or_else(|err| {
         eprintln!("loom-daemon: warning: failed to load ServiceSpecs for inventory: {err:#}");
         Vec::new()
@@ -107,6 +111,7 @@ pub async fn run(
         &providers,
         &initial_specs,
         &annotated_initial_service_specs,
+        &initial_service_runtime_states,
     );
     let machine_inventory = Arc::new(Mutex::new(machine_inventory_meta(
         &machine,
@@ -114,8 +119,10 @@ pub async fn run(
         &providers,
         &initial_specs,
         &annotated_initial_service_specs,
+        &initial_service_runtime_states,
         inventory_revision,
     )));
+    let (inventory_changed_tx, inventory_changed_rx) = watch::channel(inventory_revision);
     let (machine_host, mut machine_command_rx) = if no_machine_actor {
         tracing::info!("loom-daemon: machine actor disabled by --no-machine-actor");
         (None, None)
@@ -126,6 +133,7 @@ pub async fn run(
             actor_id: machine_connection_actor_id(&machine),
             display_name: machine.name.clone(),
             metadata: machine_inventory.clone(),
+            metadata_changed: inventory_changed_rx,
             command_tx: Some(machine_command_tx),
         };
         (Some(machine_host), Some(machine_command_rx))
@@ -148,7 +156,13 @@ pub async fn run(
     if no_services {
         tracing::info!("loom-daemon: service host disabled by --no-services");
     } else {
-        spawn_service_host(services_dir, server_url.clone(), allow_services);
+        spawn_service_host(
+            services_dir,
+            server_url.clone(),
+            allow_services,
+            machine.id.clone(),
+            service_runtime_registry.clone(),
+        );
     }
 
     let machine_host_handle =
@@ -181,6 +195,8 @@ pub async fn run(
                 &data_root,
                 &server_url,
                 &machine_inventory,
+                &service_runtime_registry,
+                &inventory_changed_tx,
                 &mut inventory_revision,
                 &mut inventory_fingerprint,
                 &mut running_agents,
@@ -250,6 +266,8 @@ pub async fn run(
                             &data_root,
                             &server_url,
                             &machine_inventory,
+                            &service_runtime_registry,
+                            &inventory_changed_tx,
                             &mut inventory_revision,
                             &mut inventory_fingerprint,
                             &mut running_agents,
@@ -363,6 +381,8 @@ fn refresh_machine_runtime(
     data_root: &PathBuf,
     server_url: &str,
     machine_inventory: &Arc<Mutex<Value>>,
+    service_runtime_registry: &ServiceRuntimeRegistry,
+    inventory_changed: &watch::Sender<u64>,
     inventory_revision: &mut u64,
     inventory_fingerprint: &mut String,
     running_agents: &mut HashMap<String, RunningAgent>,
@@ -375,16 +395,20 @@ fn refresh_machine_runtime(
         warned_missing,
     )?;
     *selected_machine = snapshot.machine.clone();
+    let service_runtime_states = service_runtime_registry.snapshot();
     let next_fingerprint = machine_inventory_fingerprint(
         &snapshot.machine,
         data_root,
         &snapshot.providers,
         &snapshot.specs,
         &snapshot.service_specs,
+        &service_runtime_states,
     );
+    let mut did_change = false;
     if next_fingerprint != *inventory_fingerprint {
         *inventory_revision = inventory_revision.saturating_add(1);
         *inventory_fingerprint = next_fingerprint;
+        did_change = true;
     }
     *machine_inventory.lock().unwrap() = machine_inventory_meta(
         &snapshot.machine,
@@ -392,8 +416,16 @@ fn refresh_machine_runtime(
         &snapshot.providers,
         &snapshot.specs,
         &snapshot.service_specs,
+        &service_runtime_states,
         *inventory_revision,
     );
+    // Wake the machine host after the metadata write so it cannot publish the
+    // preceding snapshot. Runtime transitions are therefore visible after at
+    // most the daemon's three-second inventory poll rather than the 15-second
+    // heartbeat interval.
+    if did_change {
+        let _ = inventory_changed.send(*inventory_revision);
+    }
     reconcile_agents(running_agents, snapshot.specs, server_url, data_root);
     Ok(())
 }
@@ -1102,9 +1134,19 @@ fn spawn_service_host(
     services_dir: Option<PathBuf>,
     server_url: String,
     allow_services: Vec<String>,
+    machine_id: String,
+    runtime_registry: ServiceRuntimeRegistry,
 ) {
     tokio::spawn(async move {
-        if let Err(e) = service::serve(services_dir, server_url, allow_services).await {
+        if let Err(e) = service::serve_with_runtime_reporting(
+            services_dir,
+            server_url,
+            allow_services,
+            machine_id,
+            runtime_registry,
+        )
+        .await
+        {
             tracing::error!("loom-daemon: service host exited with error: {e:#}");
         }
     });
@@ -2400,6 +2442,7 @@ fn machine_inventory_meta(
     providers: &[DetectedAgentProvider],
     specs: &[AgentSpec],
     service_specs: &[ServiceSpec],
+    service_runtime_states: &[ServiceRuntimeState],
     revision: u64,
 ) -> serde_json::Value {
     json!({
@@ -2437,6 +2480,7 @@ fn machine_inventory_meta(
         "providers": providers,
         "agentSpecs": specs,
         "serviceSpecs": service_specs,
+        "serviceRuntimeStates": service_runtime_states,
     })
 }
 
@@ -2446,6 +2490,7 @@ fn machine_inventory_fingerprint(
     providers: &[DetectedAgentProvider],
     specs: &[AgentSpec],
     service_specs: &[ServiceSpec],
+    service_runtime_states: &[ServiceRuntimeState],
 ) -> String {
     serde_json::to_string(&json!({
         "machineId": &machine.id,
@@ -2458,6 +2503,7 @@ fn machine_inventory_fingerprint(
         "providers": providers,
         "agentSpecs": specs,
         "serviceSpecs": service_specs,
+        "serviceRuntimeStates": service_runtime_states,
     }))
     .unwrap_or_default()
 }
@@ -3299,6 +3345,40 @@ mod tests {
             prompt_template: None,
         };
         annotate_machine_agent_specs(std::slice::from_mut(&mut spec), &machine);
+        let runtime_state = ServiceRuntimeState {
+            runtime_id: "machine_local:daily".into(),
+            machine_id: "machine_local".into(),
+            service_id: "daily".into(),
+            actor_id: "actor_service_daily".into(),
+            plugin_kind: "scheduler".into(),
+            lifecycle: proto::methods::ServiceLifecycle::ChannelSingleton,
+            instance_id: None,
+            scopes: vec![proto::types::ScopeRef {
+                kind: proto::types::ScopeKind::Channel,
+                id: "chan_ops".into(),
+            }],
+            phase: proto::methods::ServiceRuntimePhase::Running,
+            started_at: Some("2026-08-09T10:00:00Z".into()),
+            updated_at: "2026-08-09T10:00:01Z".into(),
+            last_error: None,
+        };
+        let fingerprint_without_runtime = machine_inventory_fingerprint(
+            &machine,
+            &PathBuf::from("/tmp/loom-data"),
+            &[],
+            std::slice::from_ref(&spec),
+            &[],
+            &[],
+        );
+        let fingerprint_with_runtime = machine_inventory_fingerprint(
+            &machine,
+            &PathBuf::from("/tmp/loom-data"),
+            &[],
+            std::slice::from_ref(&spec),
+            &[],
+            std::slice::from_ref(&runtime_state),
+        );
+        assert_ne!(fingerprint_without_runtime, fingerprint_with_runtime);
 
         let meta = machine_inventory_meta(
             &machine,
@@ -3306,6 +3386,7 @@ mod tests {
             &[],
             &[spec],
             &[],
+            &[runtime_state],
             7,
         );
 
@@ -3321,6 +3402,13 @@ mod tests {
                 .and_then(Value::as_array)
                 .map(Vec::len),
             Some(1)
+        );
+        assert_eq!(
+            meta.get("serviceRuntimeStates")
+                .and_then(Value::as_array)
+                .and_then(|states| states.first())
+                .and_then(|state| state.get("phase")),
+            Some(&json!("running"))
         );
     }
 

@@ -44,6 +44,14 @@ pub enum Mutation {
         closed_at: Timestamp,
     },
     RunUpsert(Run),
+    /// Atomically records a terminal run together with every actor-inbox row
+    /// consumed by that turn. Keeping this as one mutation closes the crash
+    /// window between `run.close` and separate `delivery.ack` records.
+    RunFinish {
+        run: Run,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        deliveries: Vec<Delivery>,
+    },
     RunFrameAppend(RunFrame),
     AgentConfigVersionPublish(AgentConfigVersion),
     AgentConfigActivationUpsert(AgentConfigActivation),
@@ -58,6 +66,7 @@ pub enum Mutation {
         channel_id: String,
         actor_id: String,
     },
+    ChannelLayoutUpsert(ChannelLayout),
     DeliveryUpsert(Delivery),
     MachineCommandUpsert(MachineCommand),
     ReminderUpsert(Reminder),
@@ -146,6 +155,7 @@ const LEGACY_VARIANTS: &[&str] = &[
     "turn_open",
     "turn_close",
     "run_upsert",
+    "run_finish",
     "run_frame_append",
     "agent_config_version_publish",
     "agent_config_activation_upsert",
@@ -159,6 +169,7 @@ const LEGACY_VARIANTS: &[&str] = &[
     "artifact_create",
     "channel_grant",
     "channel_revoke",
+    "channel_layout_upsert",
     "thread_archive",
 ];
 

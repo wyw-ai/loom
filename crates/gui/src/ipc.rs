@@ -17,7 +17,9 @@ use std::sync::Arc;
 
 use agent_runtime::discovery::{detect_agent_cli_providers, DetectedAgentProvider};
 use proto::methods::method;
-use proto::methods::{AgentInfo, AgentListResult, AgentModelChoice, AgentSpec, ServiceSpec};
+use proto::methods::{
+    AgentInfo, AgentListResult, AgentModelChoice, AgentSpec, ServiceRuntimeState, ServiceSpec,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, State};
@@ -33,7 +35,8 @@ use crate::{account, avatar};
 // ---- workspace management -------------------------------------------------
 
 #[tauri::command]
-pub async fn workspaces_list() -> Result<DesktopConfig, String> {
+pub async fn workspaces_list(state: State<'_, AppState>) -> Result<DesktopConfig, String> {
+    let _config_guard = state.config_gate.lock().await;
     config::load_or_init().map_err(|e| e.to_string())
 }
 
@@ -43,13 +46,21 @@ pub struct SaveWorkspacesArgs {
 }
 
 #[tauri::command]
-pub async fn workspaces_save(args: SaveWorkspacesArgs) -> Result<DesktopConfig, String> {
+pub async fn workspaces_save(
+    state: State<'_, AppState>,
+    args: SaveWorkspacesArgs,
+) -> Result<DesktopConfig, String> {
+    let _connection_guard = state.connection_gate.lock().await;
+    let _config_guard = state.config_gate.lock().await;
     config::save(&args.config).map_err(|e| e.to_string())?;
-    config::load_or_init().map_err(|e| e.to_string())
+    let cfg = config::load_or_init().map_err(|e| e.to_string())?;
+    state.invalidate().await;
+    Ok(cfg)
 }
 
 #[tauri::command]
-pub async fn account_get() -> Result<Option<HumanAccount>, String> {
+pub async fn account_get(state: State<'_, AppState>) -> Result<Option<HumanAccount>, String> {
+    let _config_guard = state.config_gate.lock().await;
     Ok(config::load_or_init().map_err(stringify)?.account)
 }
 
@@ -142,12 +153,14 @@ pub async fn account_login(
             tracing::warn!(%err, "avatar prefetch failed");
         }
     });
+    let _connection_guard = state.connection_gate.lock().await;
+    let _config_guard = state.config_gate.lock().await;
     let mut cfg = config::load_or_init().map_err(stringify)?;
     cfg.account = Some(account.clone());
     apply_account_identity(&mut cfg);
     config::save(&cfg).map_err(stringify)?;
     let cfg = config::load_or_init().map_err(stringify)?;
-    state.set(None).await;
+    state.invalidate().await;
     Ok(AccountLoginResult {
         account: cfg.account.clone().unwrap_or(account),
         config: cfg,
@@ -175,12 +188,14 @@ pub async fn account_set_local(
         actor_id,
         avatar_url: String::new(),
     });
+    let _connection_guard = state.connection_gate.lock().await;
+    let _config_guard = state.config_gate.lock().await;
     let mut cfg = config::load_or_init().map_err(stringify)?;
     cfg.account = Some(account.clone());
     apply_account_identity(&mut cfg);
     config::save(&cfg).map_err(stringify)?;
     let cfg = config::load_or_init().map_err(stringify)?;
-    state.set(None).await;
+    state.invalidate().await;
     Ok(AccountLoginResult {
         account: cfg.account.clone().unwrap_or(account),
         config: cfg,
@@ -189,10 +204,12 @@ pub async fn account_set_local(
 
 #[tauri::command]
 pub async fn account_logout(state: State<'_, AppState>) -> Result<DesktopConfig, String> {
+    let _connection_guard = state.connection_gate.lock().await;
+    let _config_guard = state.config_gate.lock().await;
     let mut cfg = config::load_or_init().map_err(stringify)?;
     cfg.account = None;
     config::save(&cfg).map_err(stringify)?;
-    state.set(None).await;
+    state.invalidate().await;
     Ok(cfg)
 }
 
@@ -280,42 +297,61 @@ pub struct AccountUpdateAvatarArgs {
 
 #[tauri::command]
 pub async fn account_update_avatar(
+    app: AppHandle,
     state: State<'_, AppState>,
     args: AccountUpdateAvatarArgs,
 ) -> Result<DesktopConfig, String> {
+    let _connection_guard = state.connection_gate.lock().await;
+    let connected_client = state.try_client().await;
     let avatar_url = args.avatar_url.trim().to_string();
-    let mut cfg = config::load_or_init().map_err(stringify)?;
-    let active_workspace = cfg
-        .active
-        .as_deref()
-        .and_then(|id| cfg.workspaces.iter().find(|workspace| workspace.id == id))
-        .or_else(|| cfg.workspaces.first())
-        .cloned();
-    if cfg.account.is_none() {
-        let workspace = active_workspace
-            .as_ref()
-            .ok_or_else(|| "create a workspace before setting an account avatar".to_string())?;
-        let staff_id = workspace
-            .actor_id
-            .strip_prefix("actor_human_local_")
-            .unwrap_or(workspace.actor_id.as_str())
-            .to_string();
-        cfg.account = Some(HumanAccount {
-            provider: "local".into(),
-            staff_id,
-            nickname: workspace.display_name.clone(),
-            real_name: String::new(),
-            email: String::new(),
-            actor_id: workspace.actor_id.clone(),
-            avatar_url: avatar_url.clone(),
-        });
-    } else if let Some(account) = cfg.account.as_mut() {
-        account.avatar_url = avatar_url.clone();
-    }
-    apply_account_identity(&mut cfg);
-    config::save(&cfg).map_err(stringify)?;
-    let cfg = config::load_or_init().map_err(stringify)?;
-    if let (Some(client), Some(account)) = (state.try_client().await, cfg.account.as_ref()) {
+    let (cfg, identity_changed) = {
+        let _config_guard = state.config_gate.lock().await;
+        let mut cfg = config::load_or_init().map_err(stringify)?;
+        let previous_identity = active_connection_snapshot(&cfg);
+        let active_workspace = cfg
+            .active
+            .as_deref()
+            .and_then(|id| cfg.workspaces.iter().find(|workspace| workspace.id == id))
+            .or_else(|| cfg.workspaces.first())
+            .cloned();
+        if cfg.account.is_none() {
+            let workspace = active_workspace
+                .as_ref()
+                .ok_or_else(|| "create a workspace before setting an account avatar".to_string())?;
+            let staff_id = workspace
+                .actor_id
+                .strip_prefix("actor_human_local_")
+                .unwrap_or(workspace.actor_id.as_str())
+                .to_string();
+            cfg.account = Some(HumanAccount {
+                provider: "local".into(),
+                staff_id,
+                nickname: workspace.display_name.clone(),
+                real_name: String::new(),
+                email: String::new(),
+                actor_id: workspace.actor_id.clone(),
+                avatar_url: avatar_url.clone(),
+            });
+        } else if let Some(account) = cfg.account.as_mut() {
+            account.avatar_url = avatar_url.clone();
+        }
+        apply_account_identity(&mut cfg);
+        let identity_changed = active_connection_snapshot(&cfg) != previous_identity;
+        config::save(&cfg).map_err(stringify)?;
+        (config::load_or_init().map_err(stringify)?, identity_changed)
+    };
+    if identity_changed {
+        let connection_id = state.invalidate().await;
+        if connected_client.is_some() {
+            let _ = app.emit(
+                "loom://connection",
+                forward::ConnectionEvent::Closed {
+                    connection_id,
+                    reason: Some("account identity changed".into()),
+                },
+            );
+        }
+    } else if let (Some(client), Some(account)) = (connected_client, cfg.account.as_ref()) {
         upsert_human_actor(&client, account)
             .await
             .map_err(deep_stringify)?;
@@ -352,7 +388,11 @@ fn default_activate() -> bool {
 }
 
 #[tauri::command]
-pub async fn workspace_add(args: WorkspaceAddArgs) -> Result<DesktopConfig, String> {
+pub async fn workspace_add(
+    state: State<'_, AppState>,
+    args: WorkspaceAddArgs,
+) -> Result<DesktopConfig, String> {
+    let _config_guard = state.config_gate.lock().await;
     let mut cfg = config::load_or_init().map_err(|e| e.to_string())?;
     let normalized_server_url =
         config::normalize_workspace_server_url(&args.server_url).map_err(stringify)?;
@@ -416,7 +456,11 @@ pub struct WorkspaceIdArgs {
 }
 
 #[tauri::command]
-pub async fn workspace_remove(args: WorkspaceIdArgs) -> Result<DesktopConfig, String> {
+pub async fn workspace_remove(
+    state: State<'_, AppState>,
+    args: WorkspaceIdArgs,
+) -> Result<DesktopConfig, String> {
+    let _config_guard = state.config_gate.lock().await;
     let mut cfg = config::load_or_init().map_err(|e| e.to_string())?;
     cfg.workspaces.retain(|w| w.id != args.id);
     if cfg.active.as_deref() == Some(args.id.as_str()) {
@@ -427,7 +471,11 @@ pub async fn workspace_remove(args: WorkspaceIdArgs) -> Result<DesktopConfig, St
 }
 
 #[tauri::command]
-pub async fn set_active_workspace(args: WorkspaceIdArgs) -> Result<DesktopConfig, String> {
+pub async fn set_active_workspace(
+    state: State<'_, AppState>,
+    args: WorkspaceIdArgs,
+) -> Result<DesktopConfig, String> {
+    let _config_guard = state.config_gate.lock().await;
     let mut cfg = config::load_or_init().map_err(|e| e.to_string())?;
     if !cfg.workspaces.iter().any(|w| w.id == args.id) {
         return Err(format!("unknown workspace id: {}", args.id));
@@ -443,6 +491,59 @@ pub async fn set_active_workspace(args: WorkspaceIdArgs) -> Result<DesktopConfig
 #[serde(rename_all = "camelCase")]
 pub struct ConnectArgs {
     pub workspace_id: String,
+    #[serde(default)]
+    pub password: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ConnectionSnapshot {
+    workspace_id: String,
+    server_url: String,
+    actor_id: String,
+    display_name: String,
+}
+
+impl ConnectionSnapshot {
+    fn from_workspace(workspace: &Workspace) -> Self {
+        Self {
+            workspace_id: workspace.id.clone(),
+            server_url: workspace.server_url.clone(),
+            actor_id: workspace.actor_id.clone(),
+            display_name: workspace.display_name.clone(),
+        }
+    }
+}
+
+fn active_connection_snapshot(cfg: &DesktopConfig) -> Option<ConnectionSnapshot> {
+    cfg.active
+        .as_deref()
+        .and_then(|id| cfg.workspaces.iter().find(|workspace| workspace.id == id))
+        .or_else(|| cfg.workspaces.first())
+        .map(ConnectionSnapshot::from_workspace)
+}
+
+fn validated_connection_workspace(
+    cfg: &DesktopConfig,
+    expected: &ConnectionSnapshot,
+) -> Result<Workspace, String> {
+    let workspace = cfg
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == expected.workspace_id)
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "workspace `{}` was removed while connecting",
+                expected.workspace_id
+            )
+        })?;
+    if ConnectionSnapshot::from_workspace(&workspace) != *expected {
+        return Err(format!(
+            "workspace `{}` changed while connecting; retry with the latest profile",
+            expected.workspace_id
+        ));
+    }
+    Ok(workspace)
 }
 
 #[tauri::command]
@@ -451,52 +552,105 @@ pub async fn connect(
     state: State<'_, AppState>,
     args: ConnectArgs,
 ) -> Result<Value, String> {
-    let mut cfg = config::load_or_init().map_err(|e| e.to_string())?;
-    if apply_account_identity(&mut cfg) {
-        config::save(&cfg).map_err(stringify)?;
-    }
-    let ws = cfg
-        .workspaces
-        .iter()
-        .find(|w| w.id == args.workspace_id)
-        .cloned()
-        .ok_or_else(|| format!("unknown workspace id: {}", args.workspace_id))?;
+    let _connection_guard = state.connection_gate.lock().await;
+    let (ws, snapshot) = {
+        let _config_guard = state.config_gate.lock().await;
+        let mut cfg = config::load_or_init().map_err(|e| e.to_string())?;
+        if apply_account_identity(&mut cfg) {
+            config::save(&cfg).map_err(stringify)?;
+        }
+        let workspace = cfg
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == args.workspace_id)
+            .cloned()
+            .ok_or_else(|| format!("unknown workspace id: {}", args.workspace_id))?;
+        let snapshot = ConnectionSnapshot::from_workspace(&workspace);
+        (workspace, snapshot)
+    };
 
-    // Drop any prior client first — only one WS at a time for v0. Letting the
-    // old Arc fall off scope ends its writer/reader tasks cleanly.
-    state.set(None).await;
+    // Reserve the candidate's generation before touching the network. Old
+    // forwarders immediately become stale and cannot publish notifications
+    // into the next workspace while the handshake is in flight.
+    let generation = state.begin_transition().await;
 
     let client = Client::connect(&ws.server_url)
         .await
         .map_err(deep_stringify)?;
-    client
+    let initialized = client
         .initialize("loom-gui", env!("CARGO_PKG_VERSION"))
         .await
         .map_err(deep_stringify)?;
+    if initialized.password_auth_required() {
+        let password = args
+            .password
+            .as_deref()
+            .filter(|password| !password.is_empty())
+            .ok_or_else(|| "LOOM_AUTH_REQUIRED: server password required".to_string())?;
+        if let Err(error) = client.authenticate(password).await {
+            let detail = deep_stringify(error);
+            if detail.contains(&format!("code {}", proto::ErrorCode::APP_AUTH_FAILED)) {
+                return Err("LOOM_AUTH_INVALID: incorrect server password".into());
+            }
+            return Err(detail);
+        }
+    }
     let open = client
         .open_connection(&ws.actor_id, Some(&ws.display_name))
         .await
         .map_err(deep_stringify)?;
-    upsert_workspace_actor(&client, cfg.account.as_ref(), &ws)
+
+    // Account metadata (notably the avatar) may have changed without changing
+    // the connection identity. Read it fresh before the actor upsert, and
+    // reject a changed or removed workspace rather than publishing a client
+    // for a stale profile.
+    let (current_ws, current_account) = {
+        let _config_guard = state.config_gate.lock().await;
+        let cfg = config::load_or_init().map_err(stringify)?;
+        let workspace = validated_connection_workspace(&cfg, &snapshot)?;
+        (workspace, cfg.account)
+    };
+    upsert_workspace_actor(&client, current_account.as_ref(), &current_ws)
         .await
         .map_err(deep_stringify)?;
 
-    forward::spawn(app.clone(), Arc::clone(&state.inner), Arc::clone(&client));
-    state.set(Some(client)).await;
-    let _ = app.emit("loom://connection", forward::ConnectionEvent::Open);
+    // Re-read and narrowly update only `active`; never write the stale config
+    // snapshot from before the network handshake. The config lock also makes
+    // the final validation + persistence atomic with workspace/account edits.
+    let published_ws = {
+        let _config_guard = state.config_gate.lock().await;
+        let mut cfg = config::load_or_init().map_err(stringify)?;
+        let workspace = validated_connection_workspace(&cfg, &snapshot)?;
+        cfg.active = Some(workspace.id.clone());
+        config::save(&cfg).map_err(stringify)?;
+        if !state.publish(generation, Arc::clone(&client)).await {
+            return Err("connection attempt was superseded before publication".into());
+        }
+        workspace
+    };
 
-    // Persist the chosen workspace as active and refresh the daemon's
-    // server profile. Daemon runtime config is maintained by daemon startup,
-    // not by GUI host discovery.
-    cfg.active = Some(ws.id.clone());
-    config::save(&cfg).map_err(stringify)?;
+    // Open is synchronously enqueued before the forwarder can observe a
+    // buffered transport close. Event order for this generation is therefore
+    // always Open -> Closed, never Closed -> Open.
+    let _ = app.emit(
+        "loom://connection",
+        forward::ConnectionEvent::Open {
+            connection_id: generation,
+        },
+    );
+    forward::spawn(app.clone(), Arc::clone(&state.inner), client, generation);
 
-    Ok(json!({ "workspace": ws, "open": open }))
+    Ok(json!({
+        "workspace": published_ws,
+        "open": open,
+        "connectionId": generation,
+    }))
 }
 
 #[tauri::command]
 pub async fn disconnect(state: State<'_, AppState>) -> Result<(), String> {
-    state.set(None).await;
+    let _connection_guard = state.connection_gate.lock().await;
+    state.invalidate().await;
     Ok(())
 }
 
@@ -604,6 +758,32 @@ pub async fn channel_update(state: State<'_, AppState>, params: Value) -> Result
         .client()
         .await?
         .call_raw(method::CHANNEL_UPDATE, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn channel_layout_get(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::CHANNEL_LAYOUT_GET, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn channel_layout_set(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::CHANNEL_LAYOUT_SET, Some(params))
         .await
         .map_err(stringify)
 }
@@ -1102,10 +1282,7 @@ pub async fn delivery_cancel(state: State<'_, AppState>, params: Value) -> Resul
 }
 
 #[tauri::command]
-pub async fn delivery_expedite(
-    state: State<'_, AppState>,
-    params: Value,
-) -> Result<Value, String> {
+pub async fn delivery_expedite(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
     state
         .client()
         .await?
@@ -2815,6 +2992,7 @@ pub struct MachineInfo {
     pub providers: Vec<MachineAgentProviderInfo>,
     pub agents: Vec<MachineAgentInfo>,
     pub services: Vec<ServiceSpec>,
+    pub service_runtime_states: Vec<ServiceRuntimeState>,
     pub serve_command: String,
     pub setup_script: String,
 }
@@ -3342,18 +3520,49 @@ fn merge_local_service_specs(result: &mut MachineListResult) {
 
 fn load_local_service_specs() -> Vec<ServiceSpec> {
     let dir = cli_config_dir().join("services");
+    load_service_specs_from_dir(&dir)
+}
+
+fn load_service_specs_from_dir(dir: &Path) -> Vec<ServiceSpec> {
     let mut out = Vec::new();
-    let Ok(entries) = fs::read_dir(&dir) else {
+    let Ok(entries) = fs::read_dir(dir) else {
         return out;
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            push_service_spec(&path.join("service.json"), &mut out);
-        } else if path.extension().and_then(|value| value.to_str()) == Some("json") {
-            push_service_spec(&path, &mut out);
+
+    let mut paths = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    paths.sort();
+    let mut seen_ids = HashSet::new();
+
+    // Prefer the canonical nested layout. If both files exist, spec.json is
+    // authoritative even when malformed; silently reviving a stale legacy
+    // service.json would make the GUI disagree with the daemon.
+    for path in paths.iter().filter(|path| path.is_dir()) {
+        let canonical = path.join("spec.json");
+        let legacy = path.join("service.json");
+        let selected = if canonical.exists() {
+            Some(canonical)
+        } else if legacy.exists() {
+            Some(legacy)
+        } else {
+            None
+        };
+        if let Some(selected) = selected {
+            push_service_spec(&selected, &mut out, &mut seen_ids);
         }
     }
+
+    // Keep the original flat `<services>/<id>.json` layout. Nested specs are
+    // loaded first so a duplicate service id cannot override the canonical
+    // directory-based definition.
+    for path in paths.iter().filter(|path| !path.is_dir()) {
+        if path.extension().and_then(|value| value.to_str()) == Some("json") {
+            push_service_spec(path, &mut out, &mut seen_ids);
+        }
+    }
+
     out
 }
 
@@ -3366,7 +3575,7 @@ fn cli_config_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".loom"))
 }
 
-fn push_service_spec(path: &Path, out: &mut Vec<ServiceSpec>) {
+fn push_service_spec(path: &Path, out: &mut Vec<ServiceSpec>, seen_ids: &mut HashSet<String>) {
     let Ok(text) = fs::read_to_string(path) else {
         return;
     };
@@ -3374,7 +3583,7 @@ fn push_service_spec(path: &Path, out: &mut Vec<ServiceSpec>) {
         return;
     };
     spec.normalize();
-    if spec.validate().is_ok() {
+    if spec.validate().is_ok() && seen_ids.insert(spec.id.clone()) {
         out.push(spec);
     }
 }
@@ -3409,6 +3618,8 @@ struct RemoteMachineMeta {
     agent_specs: Vec<AgentSpec>,
     #[serde(default, rename = "serviceSpecs")]
     service_specs: Vec<ServiceSpec>,
+    #[serde(default, rename = "serviceRuntimeStates")]
+    service_runtime_states: Vec<ServiceRuntimeState>,
     capabilities: Vec<String>,
     revision: u64,
     observed_at: String,
@@ -3637,6 +3848,7 @@ fn server_machine_info_from_actor(
         })
         .collect();
     let services = meta.service_specs.clone();
+    let service_runtime_states = meta.service_runtime_states.clone();
     let setup_status = if providers.is_empty() {
         "noCli"
     } else if agents.is_empty() {
@@ -3684,6 +3896,7 @@ fn server_machine_info_from_actor(
         providers,
         agents,
         services,
+        service_runtime_states,
         serve_command,
         setup_script,
     })
@@ -3734,10 +3947,13 @@ async fn cleanup_legacy_remote_machine_inventory(client: &Arc<Client>, actor: &V
 
 async fn temporary_machine_check_client(cfg: &DesktopConfig) -> Option<Arc<Client>> {
     let client = Client::connect(active_server_url(cfg)).await.ok()?;
-    client
+    let initialized = client
         .initialize("loom-gui-machine-check", env!("CARGO_PKG_VERSION"))
         .await
         .ok()?;
+    if initialized.password_auth_required() {
+        return None;
+    }
     Some(client)
 }
 
@@ -3807,6 +4023,7 @@ fn pending_machine_registration(
         providers: Vec::new(),
         agents: Vec::new(),
         services: Vec::new(),
+        service_runtime_states: Vec::new(),
         serve_command,
         setup_script,
     })
@@ -3954,6 +4171,7 @@ fn pending_machine_info_from_registration(
         providers: Vec::new(),
         agents: Vec::new(),
         services: Vec::new(),
+        service_runtime_states: Vec::new(),
         serve_command,
         setup_script,
     }
@@ -4722,6 +4940,8 @@ pub async fn thread_skill_remove(args: ThreadSkillRemoveArgs) -> Result<SkillReg
 mod tests {
     use super::*;
 
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn test_account() -> HumanAccount {
         config::normalize_human_account(HumanAccount {
             provider: "github".into(),
@@ -4732,6 +4952,156 @@ mod tests {
             actor_id: String::new(),
             avatar_url: String::new(),
         })
+    }
+
+    fn test_connection_config() -> DesktopConfig {
+        DesktopConfig {
+            active: Some("workspace-a".into()),
+            account: None,
+            workspaces: vec![Workspace {
+                id: "workspace-a".into(),
+                name: "A".into(),
+                server_url: "ws://127.0.0.1:7878/rpc".into(),
+                actor_id: "actor_human_local_test".into(),
+                display_name: "Tester".into(),
+            }],
+        }
+    }
+
+    fn service_specs_test_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "loom-gui-service-specs-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after unix epoch")
+                .as_nanos(),
+        ));
+        fs::create_dir_all(&dir).expect("create service specs test dir");
+        dir
+    }
+
+    fn write_service_spec_fixture(path: &Path, id: &str, display_name: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create service spec parent");
+        }
+        fs::write(
+            path,
+            serde_json::to_vec_pretty(&json!({
+                "id": id,
+                "kind": "scheduler",
+                "actor": {
+                    "id": format!("actor_service_{id}"),
+                    "kind": "service",
+                    "displayName": display_name,
+                },
+                "config": {},
+            }))
+            .expect("serialize service spec fixture"),
+        )
+        .expect("write service spec fixture");
+    }
+
+    #[test]
+    fn local_service_spec_scan_supports_canonical_legacy_and_flat_layouts() {
+        let dir = service_specs_test_dir("layouts");
+        write_service_spec_fixture(
+            &dir.join("canonical-service").join("spec.json"),
+            "canonical-service",
+            "Canonical Service",
+        );
+        write_service_spec_fixture(
+            &dir.join("legacy-service").join("service.json"),
+            "legacy-service",
+            "Legacy Service",
+        );
+        write_service_spec_fixture(
+            &dir.join("flat-service.json"),
+            "flat-service",
+            "Flat Service",
+        );
+
+        let mut ids = load_service_specs_from_dir(&dir)
+            .into_iter()
+            .map(|spec| spec.id)
+            .collect::<Vec<_>>();
+        ids.sort();
+
+        assert_eq!(
+            ids,
+            vec![
+                "canonical-service".to_string(),
+                "flat-service".to_string(),
+                "legacy-service".to_string(),
+            ]
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn local_service_spec_scan_prefers_canonical_and_deduplicates_service_ids() {
+        let dir = service_specs_test_dir("precedence");
+        let nested = dir.join("daily-digest");
+        write_service_spec_fixture(
+            &nested.join("spec.json"),
+            "daily-digest",
+            "Canonical Daily Digest",
+        );
+        write_service_spec_fixture(
+            &nested.join("service.json"),
+            "daily-digest",
+            "Legacy Daily Digest",
+        );
+        write_service_spec_fixture(
+            &dir.join("daily-digest.json"),
+            "daily-digest",
+            "Flat Daily Digest",
+        );
+
+        let specs = load_service_specs_from_dir(&dir);
+
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].id, "daily-digest");
+        assert_eq!(specs[0].actor.display_name, "Canonical Daily Digest");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn connection_snapshot_rejects_removed_or_identity_changed_workspace() {
+        let cfg = test_connection_config();
+        let expected = ConnectionSnapshot::from_workspace(&cfg.workspaces[0]);
+
+        let mut changed = cfg.clone();
+        changed.workspaces[0].actor_id = "actor_human_local_other".into();
+        assert!(validated_connection_workspace(&changed, &expected)
+            .expect_err("changed identity must be rejected")
+            .contains("changed while connecting"));
+
+        let mut removed = cfg;
+        removed.workspaces.clear();
+        assert!(validated_connection_workspace(&removed, &expected)
+            .expect_err("removed workspace must be rejected")
+            .contains("removed while connecting"));
+    }
+
+    #[test]
+    fn connection_snapshot_allows_unrelated_profile_changes() {
+        let cfg = test_connection_config();
+        let expected = ConnectionSnapshot::from_workspace(&cfg.workspaces[0]);
+        let mut latest = cfg;
+        latest.workspaces[0].name = "Renamed".into();
+        latest.workspaces.push(Workspace {
+            id: "workspace-b".into(),
+            name: "B".into(),
+            server_url: "ws://example.test/rpc".into(),
+            actor_id: "actor_human_local_test".into(),
+            display_name: "Tester".into(),
+        });
+
+        let workspace = validated_connection_workspace(&latest, &expected)
+            .expect("unrelated edits must survive a connect publication");
+        assert_eq!(workspace.name, "Renamed");
+        assert_eq!(latest.workspaces.len(), 2);
     }
 
     #[test]
@@ -5117,6 +5487,22 @@ mod tests {
                         "model": "claude-sonnet-4.6"
                     },
                     "autostart": true
+                }],
+                "serviceRuntimeStates": [{
+                    "runtimeId": "machine_remote:daily:thread_ops",
+                    "machineId": "machine_remote",
+                    "serviceId": "daily",
+                    "actorId": "actor_service_daily",
+                    "pluginKind": "scheduler",
+                    "lifecycle": "thread_bound",
+                    "instanceId": "thread_ops",
+                    "scopes": [
+                        { "kind": "thread", "id": "thread_ops" },
+                        { "kind": "channel", "id": "chan_ops" }
+                    ],
+                    "phase": "running",
+                    "startedAt": "2026-08-09T10:00:00Z",
+                    "updatedAt": "2026-08-09T10:00:01Z"
                 }]
             }
         });
@@ -5145,6 +5531,12 @@ mod tests {
         assert_eq!(machine.providers[0].id, "claude");
         assert_eq!(machine.providers[0].actor_count, 1);
         assert_eq!(machine.agents[0].info.spec.actor.id, "actor_remote_agent");
+        assert_eq!(machine.service_runtime_states.len(), 1);
+        assert_eq!(
+            machine.service_runtime_states[0].phase,
+            proto::methods::ServiceRuntimePhase::Running
+        );
+        assert_eq!(machine.service_runtime_states[0].scopes.len(), 2);
         assert_eq!(
             machine.agents[0].profile_path,
             format!(
@@ -5348,6 +5740,7 @@ mod tests {
             providers: Vec::new(),
             agents: Vec::new(),
             services: Vec::new(),
+            service_runtime_states: Vec::new(),
             serve_command: String::new(),
             setup_script: String::new(),
         };
@@ -5405,6 +5798,7 @@ mod tests {
 
     #[test]
     fn agent_data_root_honors_env_override() {
+        let _env_guard = ENV_LOCK.lock().expect("environment test lock");
         // Env override takes precedence over the default data_dir path.
         // SAFETY: env var mutation is process-local; this test owns
         // LOOM_AGENT_DATA_ROOT for its duration and restores it after.
@@ -5422,6 +5816,7 @@ mod tests {
 
     #[test]
     fn agent_data_root_env_override_ignores_empty_value() {
+        let _env_guard = ENV_LOCK.lock().expect("environment test lock");
         // An empty LOOM_AGENT_DATA_ROOT must not short-circuit; the resolver
         // must fall through to the data_dir default. This mirrors the CLI's
         // default_data_root() semantics.

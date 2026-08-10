@@ -165,7 +165,6 @@ export function ChannelDetailPanel({
     { id: "threads", label: "Threads", count: channelThreads.length },
     { id: "members", label: "Members", count: members.length },
     { id: "tasks", label: "Tasks", count: channelTasks.length },
-    { id: "configure", label: "Configure", count: 0 },
   ];
   return (
     <aside className={cn("min-h-0 min-w-0 flex-col bg-[#fbfbfd]", className ?? "flex")}>
@@ -200,7 +199,7 @@ export function ChannelDetailPanel({
         </div>
       </div>
 
-      <div className="grid h-12 shrink-0 grid-cols-4 border-b border-[#edf0f5] bg-white px-5">
+      <div className="grid h-12 shrink-0 grid-cols-3 border-b border-[#edf0f5] bg-white px-5">
         {tabs.map((item) => (
           <button
             key={item.id}

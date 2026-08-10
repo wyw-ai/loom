@@ -1266,9 +1266,7 @@ enum MessageCmd {
     },
     /// Fetch a single message by id with its full body. Bodies larger than
     /// the inline limit are saved to a file and referenced in the output.
-    Get {
-        message_id: String,
-    },
+    Get { message_id: String },
     /// Search visible message text.
     Search {
         #[arg(long)]

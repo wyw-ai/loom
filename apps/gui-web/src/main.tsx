@@ -4,13 +4,16 @@ import ReactDOM from "react-dom/client";
 import "./design/globals.css";
 import { App } from "./App";
 import { AgentIdentityBadgeWorkbench } from "@/components/agent/AgentIdentityBadge";
+import { I18nProvider } from "@/lib/i18n";
 
 const preview = new URLSearchParams(window.location.search).get("preview");
 const Root = preview === "agent-badge" ? AgentIdentityBadgeWorkbench : App;
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    <Root />
+    <I18nProvider>
+      <Root />
+    </I18nProvider>
   </React.StrictMode>,
 );
 

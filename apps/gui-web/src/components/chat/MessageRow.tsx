@@ -14,6 +14,7 @@ import { PollCard } from "@/components/chat/PollCard";
 import { ReactionPicker } from "@/components/chat/ReactionPicker";
 import { ThreadSummaryRow } from "@/components/chat/ThreadSummaryRow";
 import { WorkflowEventRow, WorkflowResultRow } from "@/components/chat/WorkflowRows";
+import { useI18n } from "@/lib/i18n";
 
 const MessageMarkdown = lazy(() =>
   import("@/components/chat/MessageMarkdown").then((m) => ({ default: m.MessageMarkdown })),
@@ -62,6 +63,7 @@ export const MessageRow = memo(function MessageRow({
   currentActorId: string | null;
   busy: string | null;
 }) {
+  const { t } = useI18n();
   const actionRequest = messageKind(message) === "action.request";
   const bodyPoll = actionRequest ? null : bodyPollFromMessage(message);
   const choices = actionChoices(message);
@@ -110,7 +112,7 @@ export const MessageRow = memo(function MessageRow({
             {sourceTask && <TaskStateBadge task={sourceTask} />}
             {message.parentMessageId && (
               <span className="font-mono text-xs text-muted-foreground">
-                reply {shortId(message.parentMessageId)}
+                {t("reply {{id}}", { id: shortId(message.parentMessageId) })}
               </span>
             )}
           </div>
@@ -185,7 +187,7 @@ export const MessageRow = memo(function MessageRow({
             {canReply && (
               <Button variant="ghost" size="sm" onClick={() => onReply(message)}>
                 <Reply size={14} />
-                Reply
+                {t("Reply")}
               </Button>
             )}
             {reactions.length === 0 && (
@@ -203,7 +205,7 @@ export const MessageRow = memo(function MessageRow({
                 disabled={busy === `thread:create:${message.id}`}
               >
                 <Split size={14} />
-                Thread
+                {t("Thread")}
               </Button>
             )}
             <span className="self-center font-mono text-[11px] text-muted-foreground">

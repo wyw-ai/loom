@@ -1,4 +1,4 @@
-import { useCallback } from "react";
+import { useCallback, useRef } from "react";
 import type { MachineInfo, Workspace, DesktopConfig } from "@/ipc/types";
 import type { AgentFormState, WorkspaceFormState, ConnectionState } from "@/lib/types";
 import * as ipc from "@/ipc/bridge";
@@ -15,6 +15,14 @@ import { sortTasks } from "@/lib/format-utils";
 import { localServerCommand } from "@/lib/constants";
 import { defaultWorkspaceForm } from "@/lib/server-url";
 import type { View } from "@/lib/types";
+import { serverAuthErrorKind } from "@/lib/server-auth";
+import {
+  adoptConnectionResult,
+  beginConnectionAttempt,
+  createConnectionGenerationState,
+  finishConnectionAttemptFailure,
+  isCurrentConnectionAttempt,
+} from "@/hooks/connectionGeneration";
 
 export interface WorkspaceConnectionDeps {
   config: DesktopConfig;
@@ -44,10 +52,18 @@ export interface WorkspaceConnectionDeps {
   reconnectTimerRef: React.MutableRefObject<number | null>;
   reconnectAttemptRef: React.MutableRefObject<number>;
   actorIdRef: React.MutableRefObject<string | null>;
+  serverPasswordsRef: React.MutableRefObject<Map<string, string>>;
+  requestServerPassword: (prompt: {
+    serverName: string;
+    serverUrl: string;
+    invalid: boolean;
+  }) => Promise<string | null>;
 }
 
 export function useWorkspaceConnection(deps: WorkspaceConnectionDeps) {
   const d = deps;
+  const connectionGenerationRef = useRef(createConnectionGenerationState());
+  const busyConnectionAttemptRef = useRef<number | null>(null);
 
   const applyConfig = useCallback((next: DesktopConfig) => {
     d.setConfig(next);
@@ -200,16 +216,79 @@ export function useWorkspaceConnection(deps: WorkspaceConnectionDeps) {
       if (d.workspaceRef.current?.id === workspaceId && d.connection === "open") {
         return d.workspaceRef.current;
       }
+      const attempt = beginConnectionAttempt(connectionGenerationRef.current);
+      if (busyConnectionAttemptRef.current !== null) {
+        busyConnectionAttemptRef.current = null;
+        d.setBusy(null);
+      }
       if (!automatic) {
         d.autoReconnectRef.current = true;
         d.reconnectAttemptRef.current = 0;
       }
       clearReconnectTimer();
-      if (!automatic && !quiet) d.setBusy(`connect:${workspaceId}`);
+      if (!automatic && !quiet) {
+        busyConnectionAttemptRef.current = attempt;
+        d.setBusy(`connect:${workspaceId}`);
+      }
       d.setConnection("connecting");
       d.setError(reconnecting ? "Connection lost. Reconnecting..." : null);
       try {
-        const result = await ipc.connect(workspaceId);
+        let selectedWorkspace = d.config.workspaces.find((item) => item.id === workspaceId);
+        // A newly saved web/native profile can be connected before React has
+        // committed the config state update. Read the authoritative config in
+        // that narrow case so password discovery can still open its prompt.
+        if (!selectedWorkspace) {
+          const latest = await ipc.workspacesList();
+          selectedWorkspace = latest.workspaces.find((item) => item.id === workspaceId);
+        }
+        let password = selectedWorkspace
+          ? d.serverPasswordsRef.current.get(selectedWorkspace.serverUrl)
+          : undefined;
+        let result: Awaited<ReturnType<typeof ipc.connect>>;
+        while (true) {
+          try {
+            result = await ipc.connect(workspaceId, password);
+            if (selectedWorkspace && password) {
+              d.serverPasswordsRef.current.set(selectedWorkspace.serverUrl, password);
+            }
+            break;
+          } catch (error) {
+            const authError = serverAuthErrorKind(error);
+            if (!authError || !selectedWorkspace) throw error;
+            d.serverPasswordsRef.current.delete(selectedWorkspace.serverUrl);
+            password = await d.requestServerPassword({
+              serverName: selectedWorkspace.name,
+              serverUrl: selectedWorkspace.serverUrl,
+              invalid: authError === "invalid",
+            }) ?? undefined;
+            if (!password) {
+              d.autoReconnectRef.current = false;
+              d.setConnection("closed");
+              d.setError(null);
+              return null;
+            }
+          }
+        }
+        const generation = adoptConnectionResult(
+          connectionGenerationRef.current,
+          attempt,
+          result.connectionId,
+        );
+        if (!generation.current) return null;
+        if (generation.closed) {
+          d.setConnection("closed");
+          if (reconnecting) {
+            d.setError("Connection lost. Reconnecting...");
+          } else {
+            d.autoReconnectRef.current = false;
+            d.setError(
+              automatic || quiet
+                ? null
+                : generation.closedReason ?? "Connection closed before it was ready",
+            );
+          }
+          return null;
+        }
         d.workspaceRef.current = result.workspace;
         d.hasOpenedConnectionRef.current = true;
         d.autoReconnectRef.current = true;
@@ -227,6 +306,9 @@ export function useWorkspaceConnection(deps: WorkspaceConnectionDeps) {
         }
         return result.workspace;
       } catch (err) {
+        if (!finishConnectionAttemptFailure(connectionGenerationRef.current, attempt)) {
+          return null;
+        }
         d.setConnection("error");
         if (reconnecting) {
           d.setError("Connection lost. Reconnecting...");
@@ -236,7 +318,13 @@ export function useWorkspaceConnection(deps: WorkspaceConnectionDeps) {
         }
         return null;
       } finally {
-        if (!automatic && !quiet) d.setBusy(null);
+        if (
+          busyConnectionAttemptRef.current === attempt &&
+          isCurrentConnectionAttempt(connectionGenerationRef.current, attempt)
+        ) {
+          busyConnectionAttemptRef.current = null;
+          d.setBusy(null);
+        }
       }
     },
     [clearReconnectTimer, d.connection, loadWorkspaceData, pushNotice],
@@ -254,5 +342,6 @@ export function useWorkspaceConnection(deps: WorkspaceConnectionDeps) {
     loadConfig,
     loadWorkspaceData,
     connectWorkspace,
+    connectionGenerationRef,
   };
 }

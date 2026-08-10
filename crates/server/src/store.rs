@@ -44,6 +44,14 @@ pub enum StoreEvent {
     DeliveryUpdated(Delivery),
     MachineCommandUpdated(MachineCommand),
     ChannelUpdated(Channel),
+    /// A visibility transition needs global discovery fanout rather than the
+    /// normal scope-only `ChannelUpdated` route.  The previous value lets the
+    /// websocket layer distinguish newly-public discovery from removal of
+    /// implicit public access without exposing private channel data.
+    ChannelVisibilityChanged {
+        channel: Channel,
+        previous_visibility: ChannelVisibility,
+    },
     ChannelDeleted {
         channel_id: String,
         visibility: ChannelVisibility,
@@ -86,6 +94,9 @@ impl StoreEvent {
                 kind: ScopeKind::Channel,
                 id: c.id.clone(),
             }),
+            // Routed specially by ws::fanout: visibility transitions must
+            // reach clients that are not subscribed to the channel scope.
+            StoreEvent::ChannelVisibilityChanged { .. } => None,
             StoreEvent::ChannelDeleted { .. } => None,
             StoreEvent::TaskAssignmentChanged { task, .. } => Some(ScopeRef {
                 kind: ScopeKind::Channel,
@@ -111,6 +122,9 @@ struct Inner {
     channels: HashMap<String, Channel>,
     channels_by_title: HashMap<String, HashSet<String>>,
     channel_member_configs: HashMap<(String, String), ChannelMemberConfig>,
+    /// Per-actor navigation preferences. A Store belongs to exactly one
+    /// server, so the actor key also provides the required server isolation.
+    channel_layouts: HashMap<String, ChannelLayout>,
     actor_groups: HashMap<String, ActorGroup>,
     actor_presences: HashMap<(String, String), ActorPresence>,
     threads: HashMap<String, Thread>,
@@ -253,7 +267,9 @@ impl Store {
             structure_lock: Mutex::new(()),
             broadcaster: tx,
         });
-        let stats = store.replay()?;
+        let mut stats = store.replay()?;
+        let repaired_finishes = store.reconcile_terminal_run_delivery_acks()?;
+        stats.tail_records = stats.tail_records.saturating_add(repaired_finishes);
         store.compact_journal_if_needed(&stats);
         Ok(store)
     }
@@ -271,6 +287,60 @@ impl Store {
             self.apply_replay(m);
         })?;
         Ok(stats)
+    }
+
+    /// Upgrade repair for journals written by workers that closed a run and
+    /// acknowledged its trigger in two RPCs. If the close made it to disk but
+    /// the ack did not, the terminal run is durable proof that a completed or
+    /// failed turn already consumed the delivery. Canceled runs are excluded:
+    /// cancel-and-requeue intentionally leaves those sources pending.
+    ///
+    /// Legacy workers did not persist the ids of extra pending-context rows
+    /// folded into a prompt, so those cannot be reconstructed safely. We only
+    /// repair ids explicitly tied to the run and never guess by scope: a
+    /// same-scope sweep could consume newer work the provider never saw.
+    fn reconcile_terminal_run_delivery_acks(&self) -> StoreResult<usize> {
+        let stranded = {
+            let inner = self.inner.read();
+            inner
+                .runs
+                .values()
+                .filter(|run| matches!(run.status, RunStatus::Completed | RunStatus::Failed))
+                .filter(|run| {
+                    run_ack_source_ids(run, &[], true)
+                        .into_iter()
+                        .any(|source_id| {
+                            inner
+                                .deliveries
+                                .get(&(source_id, run.actor_id.clone()))
+                                .is_some_and(|delivery| delivery.state == DeliveryState::Pending)
+                        })
+                })
+                .map(|run| (run.id.clone(), run.status))
+                .collect::<Vec<_>>()
+        };
+        let mut repaired_finishes = 0usize;
+        let mut repaired_deliveries = 0usize;
+        for (run_id, status) in stranded {
+            let (_, acknowledged) =
+                self.close_run_with_delivery_acks(&run_id, status, None, &[])?;
+            let repaired = acknowledged
+                .iter()
+                .filter(|delivery| delivery.state == DeliveryState::Delivered)
+                .count();
+            if repaired > 0 {
+                repaired_finishes += 1;
+                repaired_deliveries += repaired;
+            }
+        }
+        if repaired_deliveries > 0 {
+            tracing::warn!(
+                repaired_deliveries,
+                repaired_finishes,
+                "reconciled terminal runs with stranded pending inbox deliveries"
+            );
+        }
+        Ok(repaired_finishes)
     }
 
     /// Startup compaction: when the journal tail replayed after the last
@@ -319,6 +389,13 @@ impl Store {
                 .values()
                 .cloned()
                 .map(Mutation::ChannelMemberConfigUpsert),
+        );
+        out.extend(
+            inner
+                .channel_layouts
+                .values()
+                .cloned()
+                .map(Mutation::ChannelLayoutUpsert),
         );
         out.extend(
             inner
@@ -584,10 +661,27 @@ impl Store {
         topic: String,
         creator_actor_id: Option<String>,
     ) -> StoreResult<Channel> {
-        let (visibility, members) = match creator_actor_id {
-            Some(id) => (ChannelVisibility::Private, vec![id]),
-            None => (ChannelVisibility::Public, Vec::new()),
+        let visibility = if creator_actor_id.is_some() {
+            ChannelVisibility::Private
+        } else {
+            ChannelVisibility::Public
         };
+        self.create_channel_with_visibility(title, topic, creator_actor_id, visibility)
+    }
+
+    /// Create a channel with an explicit visibility while retaining the
+    /// creator as its first explicit member.  This is used by modern RPC
+    /// callers that deliberately create a public channel: public access stays
+    /// implicit for everyone else, but the creator identity is not discarded,
+    /// so the channel can still be administered later.
+    pub fn create_channel_with_visibility(
+        &self,
+        title: String,
+        topic: String,
+        creator_actor_id: Option<String>,
+        visibility: ChannelVisibility,
+    ) -> StoreResult<Channel> {
+        let members = creator_actor_id.into_iter().collect();
         let channel = Channel {
             id: format!("chan_{}", short_id()),
             title,
@@ -780,6 +874,58 @@ impl Store {
 
     pub fn get_channel(&self, id: &str) -> Option<Channel> {
         self.inner.read().channels.get(id).cloned()
+    }
+
+    pub fn get_channel_layout(&self, actor_id: &str) -> ChannelLayout {
+        self.inner
+            .read()
+            .channel_layouts
+            .get(actor_id)
+            .cloned()
+            .unwrap_or_else(|| ChannelLayout {
+                actor_id: actor_id.to_string(),
+                sections: Vec::new(),
+                revision: 0,
+                // A stable sentinel keeps repeated reads of a never-written
+                // layout deterministic while preserving the required field.
+                updated_at: chrono::DateTime::<Utc>::from_timestamp(0, 0)
+                    .expect("unix epoch is a valid UTC timestamp"),
+            })
+    }
+
+    /// Persist a complete, already-normalized layout and allocate its next
+    /// revision atomically. Validation/merge semantics live in the RPC layer,
+    /// while this store primitive guarantees monotonic revisions across
+    /// concurrent GUI/mobile writes and journal replay.
+    pub fn set_channel_layout(
+        &self,
+        actor_id: &str,
+        sections: Vec<ChannelLayoutSection>,
+    ) -> StoreResult<ChannelLayout> {
+        let _guard = self.structure_lock.lock();
+        let revision = self
+            .inner
+            .read()
+            .channel_layouts
+            .get(actor_id)
+            .map(|layout| layout.revision)
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| {
+                StoreError::InvalidState(format!(
+                    "channel layout revision exhausted for actor {actor_id}"
+                ))
+            })?;
+        let layout = ChannelLayout {
+            actor_id: actor_id.to_string(),
+            sections,
+            revision,
+            updated_at: Utc::now(),
+        };
+        let mutation = Mutation::ChannelLayoutUpsert(layout.clone());
+        self.journal.append(&mutation)?;
+        apply(&mut self.inner.write(), mutation);
+        Ok(layout)
     }
 
     pub fn get_channel_member_config(
@@ -1201,11 +1347,23 @@ impl Store {
             visibility,
         })?;
         let mut inner = self.inner.write();
+        let previous_visibility = inner
+            .channels
+            .get(id)
+            .map(|channel| channel.visibility)
+            .ok_or_else(|| StoreError::NotFound(format!("channel {id}")))?;
         let updated = inner
             .update_channel(id, title, topic, visibility)
             .ok_or_else(|| StoreError::NotFound(format!("channel {id}")))?;
         drop(inner);
-        self.emit(StoreEvent::ChannelUpdated(updated.clone()));
+        if updated.visibility != previous_visibility {
+            self.emit(StoreEvent::ChannelVisibilityChanged {
+                channel: updated.clone(),
+                previous_visibility,
+            });
+        } else {
+            self.emit(StoreEvent::ChannelUpdated(updated.clone()));
+        }
         Ok(updated)
     }
 
@@ -3528,44 +3686,137 @@ impl Store {
         status: RunStatus,
         usage: Option<proto::types::TokenUsageSummary>,
     ) -> StoreResult<Run> {
+        self.close_run_with_delivery_acks(run_id, status, usage, &[])
+            .map(|(run, _)| run)
+    }
+
+    /// Close a run and durably consume every inbox source handled by it in a
+    /// single journal mutation. The old worker flow called `run.close` and
+    /// then `delivery.ack` one source at a time; a disconnect between those
+    /// calls left a terminal run beside pending deliveries, so daemon startup
+    /// replayed mentions the agent had already answered.
+    pub fn close_run_with_delivery_acks(
+        &self,
+        run_id: &str,
+        status: RunStatus,
+        usage: Option<proto::types::TokenUsageSummary>,
+        ack_source_ids: &[String],
+    ) -> StoreResult<(Run, Vec<Delivery>)> {
         if !is_terminal_run_status(status) {
             return Err(StoreError::InvalidState(
                 "run.close requires completed, failed, or canceled".into(),
             ));
         }
+        let _guard = self.structure_lock.lock();
         let mut run = self
             .get_run(run_id)
             .ok_or_else(|| StoreError::NotFound(format!("run {run_id}")))?;
-        if is_terminal_run_status(run.status) {
-            return Ok(run);
+        let was_terminal = is_terminal_run_status(run.status);
+        let now = Utc::now();
+        if !was_terminal {
+            run.status = status;
+            run.closed_at = Some(now);
         }
-        run.status = status;
-        run.closed_at = Some(Utc::now());
-        if let Some(increment) = usage {
-            // Fold the per-turn increment into the durable per-(actor, scope)
-            // counter and stamp both onto the run so clients get increment +
-            // authoritative cumulative from the same broadcast.
-            let cumulative = {
-                let mut inner = self.inner.write();
-                let entry = inner
-                    .run_usage_totals
-                    .entry((run.actor_id.clone(), run.scope.id.clone()))
-                    .or_default();
-                entry.add(&increment);
-                entry.clone()
-            };
-            run.metadata.insert(
-                "token_usage".into(),
-                serde_json::json!({
-                    "increment": increment,
-                    "cumulative": cumulative,
-                }),
-            );
+        if !was_terminal {
+            if let Some(increment) = usage {
+                // Fold the per-turn increment into the durable per-(actor, scope)
+                // counter and stamp both onto the run so clients get increment +
+                // authoritative cumulative from the same broadcast. Do not mutate
+                // the counter yet: applying the atomic RunFinish mutation is the
+                // single live/replay path that commits it.
+                let cumulative = {
+                    let inner = self.inner.read();
+                    let mut total = inner
+                        .run_usage_totals
+                        .get(&(run.actor_id.clone(), run.scope.id.clone()))
+                        .cloned()
+                        .unwrap_or_default();
+                    total.add(&increment);
+                    total
+                };
+                run.metadata.insert(
+                    "token_usage".into(),
+                    serde_json::json!({
+                        "increment": increment,
+                        "cumulative": cumulative,
+                    }),
+                );
+            }
         }
-        self.journal.append(&Mutation::RunUpsert(run.clone()))?;
-        self.inner.write().runs.insert(run.id.clone(), run.clone());
-        self.emit(StoreEvent::RunUpdated(run.clone()));
-        Ok(run)
+
+        let infer_legacy_sources = matches!(run.status, RunStatus::Completed | RunStatus::Failed);
+        let source_ids = run_ack_source_ids(&run, ack_source_ids, infer_legacy_sources);
+        let mut acknowledged = Vec::new();
+        let mut delivery_updates = Vec::new();
+        {
+            let inner = self.inner.read();
+            for source_id in &source_ids {
+                let key = (source_id.clone(), run.actor_id.clone());
+                let Some(existing) = inner.deliveries.get(&key) else {
+                    continue;
+                };
+                match existing.state {
+                    DeliveryState::Pending => {
+                        let mut delivered = existing.clone();
+                        delivered.state = DeliveryState::Delivered;
+                        delivered.updated_at = run.closed_at.unwrap_or(now);
+                        acknowledged.push(delivered.clone());
+                        delivery_updates.push(delivered);
+                    }
+                    DeliveryState::Delivered => acknowledged.push(existing.clone()),
+                    DeliveryState::Failed | DeliveryState::Cancelled => {}
+                }
+            }
+        }
+        let acknowledged_ids = acknowledged
+            .iter()
+            .map(|delivery| delivery.source_id.clone())
+            .collect::<Vec<_>>();
+        let previous_ack_ids = run
+            .metadata
+            .get("ackSourceIds")
+            .and_then(serde_json::Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let persisted_ack_ids = unique_nonempty(
+            previous_ack_ids
+                .iter()
+                .cloned()
+                .chain(acknowledged_ids)
+                .collect(),
+        );
+        let ack_metadata_changed = persisted_ack_ids != previous_ack_ids;
+        if !persisted_ack_ids.is_empty() {
+            run.metadata
+                .insert("ackSourceIds".into(), serde_json::json!(persisted_ack_ids));
+        }
+
+        let run_changed = !was_terminal || ack_metadata_changed;
+        if !run_changed && delivery_updates.is_empty() {
+            return Ok((run, acknowledged));
+        }
+        let mutation = Mutation::RunFinish {
+            run: run.clone(),
+            deliveries: delivery_updates.clone(),
+        };
+        self.journal.append(&mutation)?;
+        {
+            let mut inner = self.inner.write();
+            apply(&mut inner, mutation);
+        }
+        if run_changed {
+            self.emit(StoreEvent::RunUpdated(run.clone()));
+        }
+        for delivery in delivery_updates {
+            self.emit(StoreEvent::DeliveryUpdated(delivery));
+        }
+        Ok((run, acknowledged))
     }
 
     /// Durable cumulative token usage for `(actor, scope)`, if any closed run
@@ -4274,6 +4525,7 @@ impl Store {
                 )));
             }
         }
+        validate_explicit_mention_spans(&body, &explicit_mentions)?;
         self.validate_message_mentions(&resolved.scope, &explicit_mentions)?;
         self.validate_message_audience(&resolved.scope, &explicit_audience)?;
         if let Some(parent_id) = parent_message_id.as_deref() {
@@ -5506,20 +5758,25 @@ impl Store {
     }
 
     pub fn ack_delivery(&self, actor_id: &str, source_id: &str) -> StoreResult<Delivery> {
+        let _guard = self.structure_lock.lock();
         let now = Utc::now();
-        let mut inner = self.inner.write();
         let key = (source_id.to_string(), actor_id.to_string());
-        let Some(delivery) = inner.deliveries.get_mut(&key) else {
+        let Some(mut delivery) = self.inner.read().deliveries.get(&key).cloned() else {
             return Err(StoreError::NotFound(format!(
                 "delivery source={source_id} actor={actor_id}"
             )));
         };
+        // Delivery states are monotonic. A duplicate ack is idempotent, and a
+        // late worker completion must never revive a delivery that a human
+        // cancelled (or that already failed) into Delivered.
+        if delivery.state != DeliveryState::Pending {
+            return Ok(delivery);
+        }
         delivery.state = DeliveryState::Delivered;
         delivery.updated_at = now;
-        let delivery = delivery.clone();
-        drop(inner);
         self.journal
             .append(&Mutation::DeliveryUpsert(delivery.clone()))?;
+        self.inner.write().insert_delivery(delivery.clone());
         self.emit(StoreEvent::DeliveryUpdated(delivery.clone()));
         Ok(delivery)
     }
@@ -5579,33 +5836,35 @@ impl Store {
         actor_id: &str,
         source_ids: Option<&[String]>,
     ) -> StoreResult<Vec<Delivery>> {
+        let _guard = self.structure_lock.lock();
         let now = Utc::now();
+        let candidates: Vec<String> = match source_ids {
+            Some(ids) => ids.to_vec(),
+            None => self
+                .inner
+                .read()
+                .deliveries_by_actor
+                .get(actor_id)
+                .map(|set| set.iter().cloned().collect())
+                .unwrap_or_default(),
+        };
         let mut cancelled = Vec::new();
-        {
-            let mut inner = self.inner.write();
-            let candidates: Vec<String> = match source_ids {
-                Some(ids) => ids.to_vec(),
-                None => inner
-                    .deliveries_by_actor
-                    .get(actor_id)
-                    .map(|set| set.iter().cloned().collect())
-                    .unwrap_or_default(),
+        for source_id in candidates {
+            let key = (source_id, actor_id.to_string());
+            let Some(mut delivery) = self.inner.read().deliveries.get(&key).cloned() else {
+                continue;
             };
-            for source_id in candidates {
-                let key = (source_id.clone(), actor_id.to_string());
-                if let Some(delivery) = inner.deliveries.get_mut(&key) {
-                    if delivery.state != DeliveryState::Pending {
-                        continue;
-                    }
-                    delivery.state = DeliveryState::Cancelled;
-                    delivery.updated_at = now;
-                    cancelled.push(delivery.clone());
-                }
+            if delivery.state != DeliveryState::Pending {
+                continue;
             }
-        }
-        for delivery in &cancelled {
+            delivery.state = DeliveryState::Cancelled;
+            delivery.updated_at = now;
             self.journal
                 .append(&Mutation::DeliveryUpsert(delivery.clone()))?;
+            self.inner.write().insert_delivery(delivery.clone());
+            cancelled.push(delivery);
+        }
+        for delivery in &cancelled {
             self.emit(StoreEvent::DeliveryUpdated(delivery.clone()));
         }
         Ok(cancelled)
@@ -5615,10 +5874,10 @@ impl Store {
     /// of its queue. The state stays `pending`; only `_meta.expedite` is set
     /// and the row is re-broadcast.
     pub fn expedite_delivery(&self, actor_id: &str, source_id: &str) -> StoreResult<Delivery> {
+        let _guard = self.structure_lock.lock();
         let now = Utc::now();
-        let mut inner = self.inner.write();
         let key = (source_id.to_string(), actor_id.to_string());
-        let Some(delivery) = inner.deliveries.get_mut(&key) else {
+        let Some(mut delivery) = self.inner.read().deliveries.get(&key).cloned() else {
             return Err(StoreError::NotFound(format!(
                 "delivery source={source_id} actor={actor_id}"
             )));
@@ -5631,10 +5890,9 @@ impl Store {
         delivery.updated_at = now;
         let meta = delivery._meta.get_or_insert_with(Default::default);
         meta.insert("expedite".into(), serde_json::json!(true));
-        let delivery = delivery.clone();
-        drop(inner);
         self.journal
             .append(&Mutation::DeliveryUpsert(delivery.clone()))?;
+        self.inner.write().insert_delivery(delivery.clone());
         self.emit(StoreEvent::DeliveryUpdated(delivery.clone()));
         Ok(delivery)
     }
@@ -6090,6 +6348,7 @@ fn apply(inner: &mut Inner, m: Mutation) {
         }
         Mutation::ActorDelete { actor_id } => {
             inner.actors.remove(&actor_id);
+            inner.channel_layouts.remove(&actor_id);
             for channel in inner.channels.values_mut() {
                 channel.members.retain(|member| member != &actor_id);
             }
@@ -6128,6 +6387,11 @@ fn apply(inner: &mut Inner, m: Mutation) {
             actor_id,
         } => {
             inner.channel_member_configs.remove(&(channel_id, actor_id));
+        }
+        Mutation::ChannelLayoutUpsert(layout) => {
+            inner
+                .channel_layouts
+                .insert(layout.actor_id.clone(), layout);
         }
         Mutation::ActorGroupUpsert(group) => {
             inner.actor_groups.insert(group.id.clone(), group);
@@ -6197,6 +6461,42 @@ fn apply(inner: &mut Inner, m: Mutation) {
                     .add(&increment);
             }
             inner.runs.insert(run.id.clone(), run);
+        }
+        Mutation::RunFinish { run, deliveries } => {
+            // A terminal retry may carry late ack ids after the original
+            // close. Account usage only on the first mutation that gives this
+            // run its per-turn increment; delivery application is naturally
+            // idempotent by (source, actor) key.
+            let usage_already_accounted = inner.runs.get(&run.id).is_some_and(|previous| {
+                run_usage_increment_from_meta(&previous.metadata).is_some()
+            });
+            if !usage_already_accounted {
+                if let Some(increment) = run_usage_increment_from_meta(&run.metadata) {
+                    inner
+                        .run_usage_totals
+                        .entry((run.actor_id.clone(), run.scope.id.clone()))
+                        .or_default()
+                        .add(&increment);
+                }
+            }
+            inner.runs.insert(run.id.clone(), run);
+            for delivery in deliveries {
+                // `RunFinish` is allowed to consume only a pending row. This
+                // guard is deliberately repeated in the replay path: an old
+                // or concurrently produced stale finish record must never
+                // revive an already Cancelled/Failed delivery. New live
+                // mutators share `structure_lock`, while this makes journal
+                // replay converge to the same monotonic state.
+                let key = (delivery.source_id.clone(), delivery.actor_id.clone());
+                let can_apply = delivery.state != DeliveryState::Delivered
+                    || inner
+                        .deliveries
+                        .get(&key)
+                        .is_none_or(|current| current.state == DeliveryState::Pending);
+                if can_apply {
+                    inner.insert_delivery(delivery);
+                }
+            }
         }
         Mutation::RunFrameAppend(frame) => {
             let entry = inner.run_seq.entry(frame.run_id.clone()).or_insert(0);
@@ -6496,17 +6796,54 @@ fn is_mention_body_char(ch: char) -> bool {
         ))
 }
 
-fn merge_mentions(into: &mut Vec<MessageMention>, incoming: Vec<MessageMention>) {
-    for mention in incoming {
-        if !into.iter().any(|existing| {
-            existing.kind == mention.kind
-                && existing.actor_or_group_id == mention.actor_or_group_id
-                && existing.byte_start == mention.byte_start
-                && existing.byte_end == mention.byte_end
-        }) {
-            into.push(mention);
+fn validate_explicit_mention_spans(body: &str, mentions: &[MessageMention]) -> StoreResult<()> {
+    for mention in mentions {
+        if mention.byte_start >= mention.byte_end || mention.byte_end > body.len() {
+            return Err(StoreError::InvalidState(format!(
+                "mention span {}..{} is outside message body ({} bytes)",
+                mention.byte_start,
+                mention.byte_end,
+                body.len()
+            )));
+        }
+        if !body.is_char_boundary(mention.byte_start) || !body.is_char_boundary(mention.byte_end) {
+            return Err(StoreError::InvalidState(format!(
+                "mention span {}..{} is not on UTF-8 character boundaries",
+                mention.byte_start, mention.byte_end
+            )));
         }
     }
+    for (index, mention) in mentions.iter().enumerate() {
+        if mentions[index + 1..]
+            .iter()
+            .any(|other| mention.byte_start < other.byte_end && other.byte_start < mention.byte_end)
+        {
+            return Err(StoreError::InvalidState(format!(
+                "explicit mention spans overlap at {}..{}",
+                mention.byte_start, mention.byte_end
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Structured mentions come from the editor's selected actor/group and are
+/// authoritative for their source span. The server parser is only a fallback
+/// for plain-text clients; keeping its different actor for the same `@name`
+/// would widen the audience when two actors share a display alias.
+fn merge_mentions(parsed: &mut Vec<MessageMention>, explicit: Vec<MessageMention>) {
+    parsed.retain(|candidate| {
+        !explicit.iter().any(|authoritative| {
+            candidate.byte_start < authoritative.byte_end
+                && authoritative.byte_start < candidate.byte_end
+        })
+    });
+    parsed.extend(explicit);
+    parsed.sort_by(|left, right| {
+        left.byte_start
+            .cmp(&right.byte_start)
+            .then_with(|| left.byte_end.cmp(&right.byte_end))
+    });
 }
 
 fn merge_audience_from_mentions(audience: &mut Vec<AudienceRef>, mentions: &[MessageMention]) {
@@ -6705,6 +7042,55 @@ fn is_terminal_run_status(status: RunStatus) -> bool {
         status,
         RunStatus::Completed | RunStatus::Failed | RunStatus::Canceled
     )
+}
+
+/// Resolve every delivery source a terminal run is allowed to consume.
+/// Explicit close-time ids are authoritative (and are required for canceled
+/// runs); completed/failed runs additionally understand metadata written by
+/// older workers so an upgraded server can close their historical ack gap.
+fn run_ack_source_ids(
+    run: &Run,
+    explicit_source_ids: &[String],
+    infer_legacy_sources: bool,
+) -> Vec<String> {
+    let mut ids = explicit_source_ids.to_vec();
+    if let Some(values) = run
+        .metadata
+        .get("ackSourceIds")
+        .and_then(serde_json::Value::as_array)
+    {
+        ids.extend(
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned),
+        );
+    }
+    if infer_legacy_sources {
+        if let Some(delivery_id) = run.delivery_id.as_deref() {
+            ids.push(delivery_id.to_string());
+        }
+        if let Some(source_id) = run
+            .metadata
+            .get("triggerSourceId")
+            .and_then(serde_json::Value::as_str)
+        {
+            ids.push(source_id.to_string());
+        }
+        if let Some(values) = run
+            .metadata
+            .get("coalescedSourceIds")
+            .and_then(serde_json::Value::as_array)
+        {
+            ids.extend(
+                values
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned),
+            );
+        }
+    }
+    unique_nonempty(ids)
 }
 
 /// Server-side hard cap on `message.send` body size. Oversized content should
@@ -7393,6 +7779,17 @@ mod tests {
             .create_channel("snap".into(), Some("actor_h".into()))
             .unwrap();
         store.grant_channel(&channel.id, "actor_a").unwrap();
+        let channel_layout = store
+            .set_channel_layout(
+                "actor_h",
+                vec![ChannelLayoutSection {
+                    id: "local-work".into(),
+                    title: "Work".into(),
+                    channel_ids: vec![channel.id.clone()],
+                    collapsed: true,
+                }],
+            )
+            .expect("set channel layout");
         let root = send_test_message(&store, "actor_h", &format!("#{}", channel.id), "root msg");
         store
             .append_message(
@@ -7434,6 +7831,51 @@ mod tests {
         let recipients = reopened.delivery_recipients_for_source(&deliveries[0].source_id);
         assert_eq!(recipients, vec!["actor_a".to_string()]);
         assert!(reopened.get_channel(&channel.id).is_some());
+        assert_eq!(reopened.get_channel_layout("actor_h"), channel_layout);
+    }
+
+    #[test]
+    fn channel_layout_revision_and_json_journal_replay_are_monotonic() {
+        let store = fresh_store();
+        let empty = store.get_channel_layout("actor_alice");
+        assert_eq!(empty.actor_id, "actor_alice");
+        assert_eq!(empty.revision, 0);
+        assert!(empty.sections.is_empty());
+
+        let first = store
+            .set_channel_layout(
+                "actor_alice",
+                vec![ChannelLayoutSection {
+                    id: "one".into(),
+                    title: "One".into(),
+                    channel_ids: vec!["chan_a".into()],
+                    collapsed: false,
+                }],
+            )
+            .expect("first layout");
+        let second = store
+            .set_channel_layout(
+                "actor_alice",
+                vec![ChannelLayoutSection {
+                    id: "two".into(),
+                    title: "Two".into(),
+                    channel_ids: vec!["chan_b".into()],
+                    collapsed: true,
+                }],
+            )
+            .expect("second layout");
+        assert_eq!(first.revision, 1);
+        assert_eq!(second.revision, 2);
+        assert!(second.updated_at >= first.updated_at);
+
+        let journal =
+            Journal::open(store.journal.path().to_path_buf()).expect("open replay journal");
+        let replayed = Store::open(journal).expect("replay store");
+        assert_eq!(replayed.get_channel_layout("actor_alice"), second);
+        let third = replayed
+            .set_channel_layout("actor_alice", Vec::new())
+            .expect("revision continues after replay");
+        assert_eq!(third.revision, 3);
     }
 
     #[test]
@@ -7659,15 +8101,20 @@ mod tests {
         let channel = store
             .create_channel("private".into(), Some("actor_agent_qa".into()))
             .expect("create channel");
+        store
+            .set_channel_layout("actor_agent_qa", Vec::new())
+            .expect("set layout");
 
         assert!(store.delete_actor("actor_agent_qa").expect("delete actor"));
         assert!(store.get_actor("actor_agent_qa").is_none());
         assert!(!store.is_channel_member(&channel.id, "actor_agent_qa"));
+        assert_eq!(store.get_channel_layout("actor_agent_qa").revision, 0);
 
         let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
         let replayed = Store::open(journal).unwrap();
         assert!(replayed.get_actor("actor_agent_qa").is_none());
         assert!(!replayed.is_channel_member(&channel.id, "actor_agent_qa"));
+        assert_eq!(replayed.get_channel_layout("actor_agent_qa").revision, 0);
     }
 
     #[test]
@@ -8106,6 +8553,107 @@ mod tests {
         );
         assert_eq!(deliveries.len(), 1);
         assert_eq!(deliveries[0].source_id, message.id);
+    }
+
+    #[test]
+    fn explicit_mention_span_overrides_ambiguous_server_alias() {
+        let store = fresh_store();
+        store
+            .upsert_actor(test_actor("actor_alice", ActorKind::Human, "Alice"))
+            .unwrap();
+        for actor_id in ["actor_agent_twin_a", "actor_agent_twin_b"] {
+            store
+                .upsert_actor(test_actor(actor_id, ActorKind::Agent, "Twin"))
+                .unwrap();
+        }
+        let channel = store
+            .create_channel("structured mentions".into(), Some("actor_alice".into()))
+            .unwrap();
+        for actor_id in ["actor_agent_twin_a", "actor_agent_twin_b"] {
+            store.grant_channel(&channel.id, actor_id).unwrap();
+        }
+
+        // HashMap iteration makes the plain-text alias intentionally
+        // ambiguous. Select the other actor explicitly so this test proves
+        // the parser candidate at the exact same span is replaced, not
+        // merely deduplicated by actor id.
+        let parser_choice = store.resolve_actor_alias("Twin").expect("parser choice");
+        let explicit_actor = if parser_choice == "actor_agent_twin_a" {
+            "actor_agent_twin_b"
+        } else {
+            "actor_agent_twin_a"
+        };
+        let body = "你好，@Twin 请处理".to_string();
+        let byte_start = body.find("@Twin").expect("mention start");
+        let byte_end = byte_start + "@Twin".len();
+        let message = store
+            .append_message(
+                "actor_alice".into(),
+                format!("#{}", channel.id),
+                MessageKind::Human,
+                body,
+                vec![MessageMention {
+                    actor_or_group_id: explicit_actor.into(),
+                    kind: MessageMentionKind::Actor,
+                    source: "mobile_composer".into(),
+                    byte_start,
+                    byte_end,
+                    display: "@Twin".into(),
+                }],
+                Vec::new(),
+                MessageIntent::RequestAction,
+                DeliveryPolicy::WakeAgent,
+                None,
+                None,
+                Vec::new(),
+                Meta::default(),
+                None,
+            )
+            .expect("append structured mention");
+
+        assert_eq!(message.mentions.len(), 1);
+        assert_eq!(message.mentions[0].actor_or_group_id, explicit_actor);
+        assert_eq!(message.mentions[0].source, "mobile_composer");
+        assert_eq!(
+            &message.body[message.mentions[0].byte_start..message.mentions[0].byte_end],
+            "@Twin"
+        );
+        assert_eq!(
+            store
+                .list_deliveries(explicit_actor, Some(DeliveryState::Pending), 10, None)
+                .len(),
+            1,
+        );
+        assert!(store
+            .list_deliveries(&parser_choice, Some(DeliveryState::Pending), 10, None)
+            .is_empty());
+    }
+
+    #[test]
+    fn explicit_mention_spans_require_valid_utf8_bounds() {
+        let body = "你 @Twin";
+        let mention = |byte_start, byte_end| MessageMention {
+            actor_or_group_id: "actor_agent_twin".into(),
+            kind: MessageMentionKind::Actor,
+            source: "mobile_composer".into(),
+            byte_start,
+            byte_end,
+            display: "@Twin".into(),
+        };
+
+        let split_codepoint = validate_explicit_mention_spans(body, &[mention(1, body.len())])
+            .expect_err("span inside a Chinese codepoint must be rejected");
+        assert!(matches!(
+            split_codepoint,
+            StoreError::InvalidState(message) if message.contains("UTF-8 character boundaries")
+        ));
+
+        let outside = validate_explicit_mention_spans(body, &[mention(4, body.len() + 1)])
+            .expect_err("out-of-bounds span must be rejected");
+        assert!(matches!(
+            outside,
+            StoreError::InvalidState(message) if message.contains("outside message body")
+        ));
     }
 
     #[test]
@@ -8643,6 +9191,308 @@ mod tests {
     }
 
     #[test]
+    fn closing_run_consumes_its_trigger_delivery_across_restart() {
+        let store = fresh_store();
+        store
+            .upsert_actor(test_actor("actor_human", ActorKind::Human, "Human"))
+            .unwrap();
+        store
+            .upsert_actor(test_actor("actor_agent_bot", ActorKind::Agent, "Bot"))
+            .unwrap();
+        let channel = store
+            .create_channel("run delivery ack".into(), Some("actor_human".into()))
+            .unwrap();
+        store.grant_channel(&channel.id, "actor_agent_bot").unwrap();
+        let message = send_test_message(
+            &store,
+            "actor_human",
+            &format!("#{}", channel.id),
+            "@Bot handle this once",
+        );
+        assert_eq!(
+            store
+                .list_deliveries("actor_agent_bot", Some(DeliveryState::Pending), 10, None,)
+                .len(),
+            1,
+        );
+
+        let config = store
+            .publish_agent_config_version(
+                "actor_agent_bot".into(),
+                Some("v1".into()),
+                String::new(),
+                "test-model".into(),
+                "test-adapter".into(),
+                serde_json::Value::Null,
+                Vec::new(),
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                "actor_agent_bot".into(),
+                Meta::default(),
+            )
+            .expect("publish config");
+        let run = store
+            .open_run(
+                "actor_agent_bot".into(),
+                message.scope.clone(),
+                None,
+                Some(message.id.clone()),
+                config.id,
+                serde_json::from_value(serde_json::json!({
+                    "triggerSourceId": message.id,
+                }))
+                .expect("run metadata"),
+            )
+            .expect("open run");
+
+        store
+            .close_run(&run.id, RunStatus::Completed, None)
+            .expect("close run");
+        assert!(
+            store
+                .list_deliveries("actor_agent_bot", Some(DeliveryState::Pending), 10, None,)
+                .is_empty(),
+            "a terminal run must not leave its trigger pending for daemon restart",
+        );
+
+        let replayed = Store::open(Journal::open(store.journal.path().to_path_buf()).unwrap())
+            .expect("replay");
+        assert!(
+            replayed
+                .list_deliveries("actor_agent_bot", Some(DeliveryState::Pending), 10, None,)
+                .is_empty(),
+            "the consumed trigger must stay delivered after server restart",
+        );
+    }
+
+    #[test]
+    fn startup_repairs_legacy_terminal_ack_gap_but_preserves_canceled_requeue() {
+        let store = fresh_store();
+        store
+            .upsert_actor(test_actor("actor_human", ActorKind::Human, "Human"))
+            .unwrap();
+        store
+            .upsert_actor(test_actor("actor_agent_bot", ActorKind::Agent, "Bot"))
+            .unwrap();
+        let channel = store
+            .create_channel("legacy run ack".into(), Some("actor_human".into()))
+            .unwrap();
+        store.grant_channel(&channel.id, "actor_agent_bot").unwrap();
+        let completed_message = send_test_message(
+            &store,
+            "actor_human",
+            &format!("#{}", channel.id),
+            "@Bot completed before disconnect",
+        );
+        let canceled_message = send_test_message(
+            &store,
+            "actor_human",
+            &format!("#{}", channel.id),
+            "@Bot canceled and requeued",
+        );
+        let config = store
+            .publish_agent_config_version(
+                "actor_agent_bot".into(),
+                Some("v1".into()),
+                String::new(),
+                "test-model".into(),
+                "test-adapter".into(),
+                serde_json::Value::Null,
+                Vec::new(),
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                "actor_agent_bot".into(),
+                Meta::default(),
+            )
+            .expect("publish config");
+        let open = |message: &Message| {
+            store
+                .open_run(
+                    "actor_agent_bot".into(),
+                    message.scope.clone(),
+                    None,
+                    Some(message.id.clone()),
+                    config.id.clone(),
+                    serde_json::from_value(serde_json::json!({
+                        "triggerSourceId": message.id,
+                    }))
+                    .expect("run metadata"),
+                )
+                .expect("open run")
+        };
+        let mut completed = open(&completed_message);
+        completed.status = RunStatus::Completed;
+        completed.closed_at = Some(Utc::now());
+        let mut canceled = open(&canceled_message);
+        canceled.status = RunStatus::Canceled;
+        canceled.closed_at = Some(Utc::now());
+
+        // Reproduce the legacy two-RPC crash window exactly: terminal run
+        // records made it to disk, but no DeliveryUpsert followed them.
+        for run in [completed, canceled] {
+            let mutation = Mutation::RunUpsert(run);
+            store
+                .journal
+                .append(&mutation)
+                .expect("append legacy close");
+            apply(&mut store.inner.write(), mutation);
+        }
+        assert_eq!(
+            store
+                .list_deliveries("actor_agent_bot", Some(DeliveryState::Pending), 10, None,)
+                .len(),
+            2,
+        );
+
+        let reopened = Store::open(Journal::open(store.journal.path().to_path_buf()).unwrap())
+            .expect("reopen and repair");
+        let pending =
+            reopened.list_deliveries("actor_agent_bot", Some(DeliveryState::Pending), 10, None);
+        assert_eq!(
+            pending
+                .iter()
+                .map(|delivery| delivery.source_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![canceled_message.id.as_str()],
+            "completed work is repaired, while cancel-and-requeue remains pending",
+        );
+    }
+
+    #[test]
+    fn terminal_close_retry_adds_late_acks_without_reviving_cancelled_delivery() {
+        let store = fresh_store();
+        store
+            .upsert_actor(test_actor("actor_human", ActorKind::Human, "Human"))
+            .unwrap();
+        store
+            .upsert_actor(test_actor("actor_agent_bot", ActorKind::Agent, "Bot"))
+            .unwrap();
+        let channel = store
+            .create_channel("late acks".into(), Some("actor_human".into()))
+            .unwrap();
+        store.grant_channel(&channel.id, "actor_agent_bot").unwrap();
+        let pending_message = send_test_message(
+            &store,
+            "actor_human",
+            &format!("#{}", channel.id),
+            "@Bot pending retry",
+        );
+        let withdrawn_message = send_test_message(
+            &store,
+            "actor_human",
+            &format!("#{}", channel.id),
+            "@Bot withdrawn wake",
+        );
+        store
+            .cancel_pending_deliveries(
+                "actor_agent_bot",
+                Some(std::slice::from_ref(&withdrawn_message.id)),
+            )
+            .expect("cancel delivery");
+        let config = store
+            .publish_agent_config_version(
+                "actor_agent_bot".into(),
+                Some("v1".into()),
+                String::new(),
+                "test-model".into(),
+                "test-adapter".into(),
+                serde_json::Value::Null,
+                Vec::new(),
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                "actor_agent_bot".into(),
+                Meta::default(),
+            )
+            .expect("publish config");
+        let run = store
+            .open_run(
+                "actor_agent_bot".into(),
+                pending_message.scope.clone(),
+                None,
+                Some("cancel-and-requeue".into()),
+                config.id,
+                Meta::default(),
+            )
+            .expect("open run");
+        store
+            .close_run(&run.id, RunStatus::Canceled, None)
+            .expect("legacy canceled close leaves pending");
+
+        let requested = vec![pending_message.id.clone(), withdrawn_message.id.clone()];
+        let (_, acknowledged) = store
+            .close_run_with_delivery_acks(&run.id, RunStatus::Canceled, None, &requested)
+            .expect("terminal retry with late acks");
+        assert_eq!(
+            acknowledged
+                .iter()
+                .map(|delivery| delivery.source_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![pending_message.id.as_str()],
+        );
+        assert_eq!(
+            store
+                .ack_delivery("actor_agent_bot", &withdrawn_message.id)
+                .expect("late legacy ack remains idempotent")
+                .state,
+            DeliveryState::Cancelled,
+        );
+        assert_eq!(
+            store
+                .list_deliveries("actor_agent_bot", Some(DeliveryState::Cancelled), 10, None,)
+                .into_iter()
+                .map(|delivery| delivery.source_id)
+                .collect::<Vec<_>>(),
+            vec![withdrawn_message.id.clone()],
+            "a withdrawn wake must stay cancelled rather than becoming delivered",
+        );
+
+        // Deterministically reproduce the worst concurrent ordering on disk:
+        // cancellation is already durable, then a stale close snapshot tries
+        // to apply Delivered for the same row. Both the live apply path and a
+        // fresh replay must keep the absorbing Cancelled state.
+        let mut stale_delivery = store
+            .inner
+            .read()
+            .deliveries
+            .get(&(withdrawn_message.id.clone(), "actor_agent_bot".to_string()))
+            .cloned()
+            .expect("cancelled delivery exists");
+        stale_delivery.state = DeliveryState::Delivered;
+        stale_delivery.updated_at = Utc::now();
+        let stale_finish = Mutation::RunFinish {
+            run: store.get_run(&run.id).expect("terminal run exists"),
+            deliveries: vec![stale_delivery],
+        };
+        store
+            .journal
+            .append(&stale_finish)
+            .expect("append stale finish after cancellation");
+        apply(&mut store.inner.write(), stale_finish);
+        assert_eq!(
+            store
+                .ack_delivery("actor_agent_bot", &withdrawn_message.id)
+                .expect("live state remains terminal")
+                .state,
+            DeliveryState::Cancelled,
+        );
+
+        let replayed = Store::open(Journal::open(store.journal.path().to_path_buf()).unwrap())
+            .expect("replay cancellation followed by stale finish");
+        assert_eq!(
+            replayed
+                .list_deliveries("actor_agent_bot", Some(DeliveryState::Cancelled), 10, None,)
+                .into_iter()
+                .map(|delivery| delivery.source_id)
+                .collect::<Vec<_>>(),
+            vec![withdrawn_message.id],
+            "journal replay must not revive a cancelled delivery",
+        );
+    }
+
+    #[test]
     fn close_run_with_usage_accumulates_and_survives_replay() {
         use proto::types::TokenUsageSummary;
 
@@ -8703,6 +9553,21 @@ mod tests {
             .expect("first run has token_usage metadata");
         assert_eq!(meta["increment"]["total_tokens"], 140);
         assert_eq!(meta["cumulative"]["total_tokens"], 140);
+        store
+            .close_run_with_delivery_acks(
+                &first.id,
+                RunStatus::Completed,
+                Some(usage(999, 999)),
+                &[],
+            )
+            .expect("terminal retry is idempotent");
+        assert_eq!(
+            store
+                .run_usage_total("actor_agent_bot", &channel.id)
+                .and_then(|total| total.total_tokens),
+            Some(140),
+            "a terminal run retry must not account usage twice",
+        );
 
         let second = open("turn-2");
         let second = store

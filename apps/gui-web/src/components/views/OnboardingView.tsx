@@ -34,6 +34,7 @@ import {
 } from "@/lib/server-url";
 import { cn } from "@/lib/utils";
 import { defaultWakeSpec } from "@/lib/wake-utils";
+import { useI18n } from "@/lib/i18n";
 import type { AgentFormState, ConnectionState, WorkspaceFormState } from "@/lib/types";
 
 type OnboardingStep = "prep" | "identity" | "server" | "host" | "agent";
@@ -89,6 +90,7 @@ export function OnboardingView({
   onCreateAgent: (form?: AgentFormState) => Promise<boolean> | boolean;
   onFinish: () => void;
 }) {
+  const { t } = useI18n();
   const [step, setStep] = useState<OnboardingStep>(
     account ? (connection === "open" ? "host" : "server") : "prep",
   );
@@ -229,9 +231,9 @@ export function OnboardingView({
         valid: true,
       };
     } catch {
-      return { text: "Invalid server target", valid: false };
+      return { text: t("Invalid server target"), valid: false };
     }
-  }, [hasServerTarget, workspaceForm]);
+  }, [hasServerTarget, t, workspaceForm]);
   const pendingHost = machines.find((machine) => machine.source === "local_registration") ?? null;
   const liveHost =
     machines.find(
@@ -301,7 +303,9 @@ export function OnboardingView({
   }
 
   async function removeSavedServer(item: Workspace) {
-    const ok = window.confirm(`Remove ${item.name || "this server"} from Loom?`);
+    const ok = window.confirm(
+      t("Remove {{server}} from Loom?", { server: item.name || t("this server") }),
+    );
     if (!ok) return;
     await onRemoveWorkspace(item.id);
     if (item.id === workspace?.id) {
@@ -346,7 +350,7 @@ export function OnboardingView({
           </div>
           <div className="min-w-0">
             <div className="text-sm font-bold text-[#111827]">Loom</div>
-            <div className="text-xs font-semibold text-[#667085]">First run setup</div>
+            <div className="text-xs font-semibold text-[#667085]">{t("First run setup")}</div>
           </div>
         </div>
 
@@ -355,16 +359,16 @@ export function OnboardingView({
             active={step === "prep"}
             complete={prepComplete}
             icon={Check}
-            title="Before you start"
-            detail="How Loom is wired"
+            title={t("Before you start")}
+            detail={t("How Loom is wired")}
             onSelect={() => setStep("prep")}
           />
           <StepRow
             active={step === "identity"}
             complete={Boolean(account)}
             icon={UserRound}
-            title="Your identity"
-            detail={account ? accountName(account) : "User ID and nickname"}
+            title={t("Your identity")}
+            detail={account ? accountName(account) : t("User ID and nickname")}
             onSelect={() => setStep("identity")}
           />
           <StepRow
@@ -372,8 +376,8 @@ export function OnboardingView({
             complete={connection === "open"}
             disabled={!canVisitServer}
             icon={Server}
-            title="Server"
-            detail={workspace ? workspace.name : "Choose a shared space"}
+            title={t("Server")}
+            detail={workspace ? workspace.name : t("Choose a shared space")}
             onSelect={() => {
               if (canVisitServer) setStep("server");
             }}
@@ -383,13 +387,18 @@ export function OnboardingView({
             complete={Boolean(liveHost)}
             disabled={!canVisitHost}
             icon={MonitorCog}
-            title="Host"
+            title={t("Host")}
             detail={
               liveHost
                 ? liveHost.name
                 : hasLocalProvider
-                  ? `${providers.length} runtime${providers.length === 1 ? "" : "s"} detected`
-                  : "Recommended"
+                  ? t(
+                      providers.length === 1
+                        ? "{{count}} runtime detected"
+                        : "{{count}} runtimes detected",
+                      { count: providers.length },
+                    )
+                  : t("Recommended")
             }
             onSelect={() => {
               if (canVisitHost) setStep("host");
@@ -400,13 +409,18 @@ export function OnboardingView({
             complete={agentCount > 0}
             disabled={!canVisitAgent}
             icon={Bot}
-            title="Agent"
+            title={t("Agent")}
             detail={
               agentCount > 0
-                ? `${agentCount} configured`
+                ? t("{{count}} configured", { count: agentCount })
                 : agentProviderChoices.length > 0
-                  ? `${agentProviderChoices.length} runtime${agentProviderChoices.length === 1 ? "" : "s"} ready`
-                  : "Create or skip"
+                  ? t(
+                      agentProviderChoices.length === 1
+                        ? "{{count}} runtime ready"
+                        : "{{count}} runtimes ready",
+                      { count: agentProviderChoices.length },
+                    )
+                  : t("Create or skip")
             }
             onSelect={() => {
               if (canVisitAgent) setStep("agent");
@@ -415,10 +429,10 @@ export function OnboardingView({
         </div>
 
         <div className="mt-auto border-t border-[#e2e6ef] pt-4">
-          <div className="text-xs font-semibold text-[#667085]">Current status</div>
+          <div className="text-xs font-semibold text-[#667085]">{t("Current status")}</div>
           <div className="mt-2 space-y-2 text-sm">
-            <StatusLine label="Account" value={account ? accountName(account) : "Not set"} />
-            <StatusLine label="Connection" value={connectionLabelEn(connection)} />
+            <StatusLine label={t("Account")} value={account ? accountName(account) : t("Not set")} />
+            <StatusLine label={t("Connection")} value={t(connectionLabelEn(connection))} />
           </div>
         </div>
       </aside>
@@ -436,32 +450,32 @@ export function OnboardingView({
           ) : step === "identity" ? (
             <section className="flex flex-1 flex-col justify-center">
               <div className="max-w-2xl">
-                <StepEyebrow icon={UserRound}>Step 1</StepEyebrow>
+                <StepEyebrow icon={UserRound}>{t("Step 1")}</StepEyebrow>
                 <h1 className="mt-4 text-3xl font-bold tracking-normal text-[#111827]">
-                  Set your Loom identity
+                  {t("Set your Loom identity")}
                 </h1>
                 <p className="mt-3 max-w-xl text-sm leading-6 text-[#667085]">
-                  This identity is reused across every server. User ID, nickname, and Actor ID can be left blank to use the suggested values.
+                  {t("This identity is reused across every server. User ID, nickname, and Actor ID can be left blank to use the suggested values.")}
                 </p>
 
                 <form className="mt-7 overflow-hidden rounded-lg border border-[#dfe3ec] bg-white" onSubmit={submitIdentity}>
                   <div className="border-b border-[#e6e9f0] bg-[#fbfbfd] px-5 py-4">
                     <div className="flex flex-wrap items-center justify-between gap-3">
                       <div>
-                        <div className="text-sm font-bold text-[#111827]">Custom Identity</div>
+                        <div className="text-sm font-bold text-[#111827]">{t("Custom Identity")}</div>
                         <div className="mt-1 text-sm leading-5 text-[#667085]">
-                          No account registration required. Loom stores this locally to identify your messages and ownership.
+                          {t("No account registration required. Loom stores this locally to identify your messages and ownership.")}
                         </div>
                       </div>
-                      <Badge variant="success">Current method</Badge>
+                      <Badge variant="success">{t("Current method")}</Badge>
                     </div>
                   </div>
 
                   <div className="p-5">
                     <div className="grid gap-4">
                       <FormField
-                        label="User ID"
-                        hint="Used to generate the default Actor ID. Letters, numbers, underscores, and hyphens are supported."
+                        label={t("User ID")}
+                        hint={t("Used to generate the default Actor ID. Letters, numbers, underscores, and hyphens are supported.")}
                       >
                         <Input
                           value={userId}
@@ -471,7 +485,7 @@ export function OnboardingView({
                           autoFocus
                         />
                       </FormField>
-                      <FormField label="Nickname" hint="Shown in chat and lists when available.">
+                      <FormField label={t("Nickname")} hint={t("Shown in chat and lists when available.")}>
                         <Input
                           value={nickname}
                           onChange={(event) => setNickname(event.target.value)}
@@ -480,8 +494,8 @@ export function OnboardingView({
                         />
                       </FormField>
                       <FormField
-                        label="Actor ID"
-                        hint="Change this only when you need a stable custom identity. The default is fine for most users."
+                        label={t("Actor ID")}
+                        hint={t("Change this only when you need a stable custom identity. The default is fine for most users.")}
                       >
                         <Input
                           value={actorId}
@@ -501,12 +515,12 @@ export function OnboardingView({
                       )}
                     >
                       {userId.trim() && !userIdValid
-                        ? "User ID can only use letters, numbers, underscores, and hyphens."
+                        ? t("User ID can only use letters, numbers, underscores, and hyphens.")
                         : actorId.trim() && !actorIdValid
-                          ? "Actor ID can use letters, numbers, underscores, hyphens, dots, and colons, up to 64 characters."
+                          ? t("Actor ID can use letters, numbers, underscores, hyphens, dots, and colons, up to 64 characters.")
                           : (
                             <>
-                              <span className="font-semibold">Will use</span>
+                              <span className="font-semibold">{t("Will use")}</span>
                               <code className="ml-2 font-mono">{effectiveActorId}</code>
                             </>
                           )}
@@ -519,7 +533,7 @@ export function OnboardingView({
                         ) : (
                           <ArrowRight size={16} />
                         )}
-                        Continue
+                        {t("Continue")}
                       </Button>
                       <Button
                         type="button"
@@ -528,7 +542,7 @@ export function OnboardingView({
                         onClick={() => setStep("prep")}
                       >
                         <ArrowLeft size={15} />
-                        Back to overview
+                        {t("Back to overview")}
                       </Button>
                     </div>
                   </div>
@@ -538,12 +552,12 @@ export function OnboardingView({
                   <div className="mt-5 overflow-hidden rounded-lg border border-[#dfe3ec] bg-[#fbfbfd]">
                     <DisabledProviderRow
                       icon={Github}
-                      title="GitHub sign-in"
-                      detail="Not supported yet. The entry stays here; use Custom Identity in this build."
+                      title={t("GitHub sign-in")}
+                      detail={t("Not supported yet. The entry stays here; use Custom Identity in this build.")}
                     />
                     <DisabledProviderRow
-                      title="Google sign-in"
-                      detail="Not supported yet. This row will become available after integration."
+                      title={t("Google sign-in")}
+                      detail={t("Not supported yet. This row will become available after integration.")}
                     />
                   </div>
                 ) : null}
@@ -558,20 +572,20 @@ export function OnboardingView({
                 onClick={() => setStep("identity")}
               >
                 <ArrowLeft size={15} />
-                Back to identity
+                {t("Back to identity")}
               </Button>
-              <StepEyebrow icon={Server}>Step 2</StepEyebrow>
+              <StepEyebrow icon={Server}>{t("Step 2")}</StepEyebrow>
               <h1 className="mt-4 text-3xl font-bold tracking-normal text-[#111827]">
-                Choose a server
+                {t("Choose a server")}
               </h1>
               <p className="mt-3 max-w-xl text-sm leading-6 text-[#667085]">
-                A server is Loom's shared space. Connect an existing address or add a reachable server. This will not create a new user identity.
+                {t("A server is Loom's shared space. Connect an existing address or add a reachable server. This will not create a new user identity.")}
               </p>
 
               {workspaces.length > 0 ? (
                 <div className="mt-7">
                   <div className="mb-2 text-xs font-semibold tracking-wide text-[#596174]">
-                    Saved Servers
+                    {t("Saved Servers")}
                   </div>
                   <div className="overflow-hidden rounded-lg border border-[#dfe3ec] bg-white">
                     {workspaces.map((item, index) => {
@@ -618,12 +632,12 @@ export function OnboardingView({
                             </span>
                           </button>
                           {selected && connection === "open" ? (
-                            <Badge variant="success">Connected</Badge>
+                            <Badge variant="success">{t("Connected")}</Badge>
                           ) : null}
                           <button
                             type="button"
-                            title="Remove server"
-                            aria-label="Remove server"
+                            title={t("Remove server")}
+                            aria-label={t("Remove server")}
                             className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-[#667085] transition-colors hover:bg-white hover:text-[#b42318]"
                             onClick={() => {
                               void removeSavedServer(item);
@@ -641,19 +655,19 @@ export function OnboardingView({
 
               <form className="mt-7 rounded-lg border border-[#dfe3ec] bg-[#fbfbfd] p-4" onSubmit={submitServer}>
                 <div className="mb-3">
-                  <div className="text-sm font-bold text-[#111827]">Add a server</div>
+                  <div className="text-sm font-bold text-[#111827]">{t("Add a server")}</div>
                   <div className="mt-1 text-sm text-[#667085]">
-                    Enter a host and port. Loom will turn it into a WebSocket RPC address.
+                    {t("Enter a host and port. Loom will turn it into a WebSocket RPC address.")}
                   </div>
                 </div>
                 <div className="grid gap-3 lg:grid-cols-[180px_minmax(0,1fr)_auto]">
                   <Input
                     value={workspaceForm.name}
-                    aria-label="Server name"
+                    aria-label={t("Server name")}
                     onChange={(event) =>
                       setWorkspaceForm({ ...workspaceForm, name: event.target.value })
                     }
-                    placeholder="Local"
+                    placeholder={t("Local")}
                   />
                   <Input
                     value={
@@ -661,7 +675,7 @@ export function OnboardingView({
                         ? workspaceForm.serverUrl
                         : workspaceForm.host
                     }
-                    aria-label={workspaceForm.advanced ? "Server URL" : "Server host"}
+                    aria-label={workspaceForm.advanced ? t("Server URL") : t("Server host")}
                     onChange={(event) =>
                       setWorkspaceForm(
                         workspaceForm.advanced
@@ -688,7 +702,7 @@ export function OnboardingView({
                     ) : (
                       <Power size={15} />
                     )}
-                    Connect
+                    {t("Connect")}
                   </Button>
                 </div>
                 <div
@@ -712,7 +726,7 @@ export function OnboardingView({
                       })
                     }
                   >
-                    {workspaceForm.advanced ? "Host mode" : "Full URL"}
+                    {workspaceForm.advanced ? t("Host mode") : t("Full URL")}
                   </button>
                 </div>
               </form>
@@ -726,16 +740,16 @@ export function OnboardingView({
                 onClick={() => setStep("server")}
               >
                 <ArrowLeft size={15} />
-                Back to Server
+                {t("Back to Server")}
               </Button>
               <div className="flex flex-wrap items-start justify-between gap-4">
                 <div>
-                  <StepEyebrow icon={MonitorCog}>Step 3</StepEyebrow>
+                  <StepEyebrow icon={MonitorCog}>{t("Step 3")}</StepEyebrow>
                   <h1 className="mt-4 text-3xl font-bold tracking-normal text-[#111827]">
-                    Start your local Host
+                    {t("Start your local Host")}
                   </h1>
                   <p className="mt-3 max-w-xl text-sm leading-6 text-[#667085]">
-                    Recommended for this setup: start a Host on this computer so Loom can create and run local agents. You can skip this if agents run on another machine.
+                    {t("Recommended for this setup: start a Host on this computer so Loom can create and run local agents. You can skip this if agents run on another machine.")}
                   </p>
                 </div>
                 <Button variant="outline" onClick={onCheckMachines} disabled={busy === "machine:check"}>
@@ -744,7 +758,7 @@ export function OnboardingView({
                   ) : (
                     <RefreshCw size={15} />
                   )}
-                  Refresh
+                  {t("Refresh")}
                 </Button>
               </div>
 
@@ -754,31 +768,31 @@ export function OnboardingView({
                     <div className="min-w-0">
                       <div className="text-sm font-bold text-[#111827]">
                         {localProviderStatus === "loading"
-                          ? "Checking local runtimes"
+                          ? t("Checking local runtimes")
                           : hasLocalProvider
-                            ? "Runtimes detected"
-                            : "No local runtimes detected"}
+                            ? t("Runtimes detected")
+                            : t("No local runtimes detected")}
                       </div>
                       <div className="mt-1 text-sm text-[#667085]">
                         {liveHost
-                          ? `${liveHost.name} is online.`
+                          ? t("{{name}} is online.", { name: liveHost.name })
                           : pendingHost
-                            ? `${pendingHost.name} is prepared.`
+                            ? t("{{name}} is prepared.", { name: pendingHost.name })
                             : hasLocalProvider
-                              ? "Loom can start a local Host for this server."
-                            : "You can continue and add an agent later."}
+                              ? t("Loom can start a local Host for this server.")
+                            : t("You can continue and add an agent later.")}
                       </div>
                     </div>
                     {liveHost ? (
-                      <Badge variant="success">Online</Badge>
+                      <Badge variant="success">{t("Online")}</Badge>
                     ) : pendingHost ? (
-                      <Badge variant="warning">Prepared</Badge>
+                      <Badge variant="warning">{t("Prepared")}</Badge>
                     ) : null}
                   </div>
 
                   <div className="mt-4 flex flex-wrap gap-2">
                     {localProviderStatus === "loading" ? (
-                      <Badge variant="secondary">Scanning PATH</Badge>
+                      <Badge variant="secondary">{t("Scanning PATH")}</Badge>
                     ) : providers.length > 0 ? (
                       providers.map((provider) => (
                         <Badge key={provider.id} variant="outline">
@@ -786,7 +800,7 @@ export function OnboardingView({
                         </Badge>
                       ))
                     ) : (
-                      <Badge variant="secondary">No CLI found</Badge>
+                      <Badge variant="secondary">{t("No CLI found")}</Badge>
                     )}
                   </div>
 
@@ -809,17 +823,17 @@ export function OnboardingView({
                       ) : (
                         <Power size={15} />
                       )}
-                      {liveHost ? "Continue to agent" : "Start Local Host"}
+                      {liveHost ? t("Continue to agent") : t("Start Local Host")}
                     </Button>
                     <Button variant="outline" onClick={() => setStep("agent")} className="rounded-lg">
-                      Skip host
+                      {t("Skip host")}
                     </Button>
                   </div>
                 </div>
 
                 <div className="rounded-lg border border-[#dfe3ec] bg-white p-4">
                   <div className="text-xs font-semibold text-[#667085]">
-                    Connected Server
+                    {t("Connected Server")}
                   </div>
                   <div className="mt-3 flex items-center gap-3">
                     <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-[#dfe3ec] bg-[#fbfbfd] text-sm font-bold text-[#303849]">
@@ -827,7 +841,7 @@ export function OnboardingView({
                     </span>
                     <div className="min-w-0">
                       <div className="truncate text-sm font-bold text-[#111827]">
-                        {workspace?.name ?? "Server"}
+                        {workspace?.name ?? t("Server")}
                       </div>
                       <div className="truncate font-mono text-xs text-[#667085]">
                         {workspace?.serverUrl ?? ""}
@@ -846,16 +860,16 @@ export function OnboardingView({
                 onClick={() => setStep("host")}
               >
                 <ArrowLeft size={15} />
-                Back to Host
+                {t("Back to Host")}
               </Button>
               <div className="flex flex-wrap items-start justify-between gap-4">
                 <div>
-                  <StepEyebrow icon={Bot}>Step 4</StepEyebrow>
+                  <StepEyebrow icon={Bot}>{t("Step 4")}</StepEyebrow>
                   <h1 className="mt-4 text-3xl font-bold tracking-normal text-[#111827]">
-                    Create your first agent
+                    {t("Create your first agent")}
                   </h1>
                   <p className="mt-3 max-w-xl text-sm leading-6 text-[#667085]">
-                    Pick a detected runtime and Loom will create a default Assistant with the recommended queued wake policy. You can skip this and configure agents later.
+                    {t("Pick a detected runtime and Loom will create a default Assistant with the recommended queued wake policy. You can skip this and configure agents later.")}
                   </p>
                 </div>
                 <Button
@@ -880,7 +894,7 @@ export function OnboardingView({
                   ) : (
                     <RefreshCw size={15} />
                   )}
-                  Refresh
+                  {t("Refresh")}
                 </Button>
               </div>
 
@@ -890,36 +904,36 @@ export function OnboardingView({
                     <div>
                       <div className="text-sm font-bold text-[#111827]">
                         {agentProviderStatus === "loading"
-                          ? "Checking host runtimes"
+                          ? t("Checking host runtimes")
                           : agentProviderChoices.length > 0
-                            ? "Runtime ready"
-                            : "No runtime ready"}
+                            ? t("Runtime ready")
+                            : t("No runtime ready")}
                       </div>
                       <div className="mt-1 text-sm text-[#667085]">
                         {agentProviderChoices.length > 0
-                          ? "Choose a provider for the default Assistant."
-                          : "Start a local Host with a detected runtime, or skip and add agents later."}
+                          ? t("Choose a provider for the default Assistant.")
+                          : t("Start a local Host with a detected runtime, or skip and add agents later.")}
                       </div>
                     </div>
                     <Badge
                       variant={agentProviderChoices.length > 0 ? "success" : "secondary"}
                     >
                       {agentProviderChoices.length > 0
-                        ? `${agentProviderChoices.length} ready`
-                        : "Optional"}
+                        ? t("{{count}} ready", { count: agentProviderChoices.length })
+                        : t("Optional")}
                     </Badge>
                   </div>
 
                   {agentProviderStatus === "error" && (
                     <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-medium text-amber-700">
-                      Could not refresh host runtimes. Showing the last known host list.
+                      {t("Could not refresh host runtimes. Showing the last known host list.")}
                     </div>
                   )}
 
                   <div className="mt-4 grid gap-2">
                     {agentProviderStatus === "loading" ? (
                       <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-white p-4 text-sm text-[#667085]">
-                        Scanning managed hosts…
+                        {t("Scanning managed hosts…")}
                       </div>
                     ) : agentProviderChoices.length > 0 ? (
                       agentProviderChoices.map((choice) => {
@@ -956,7 +970,7 @@ export function OnboardingView({
                       })
                     ) : (
                       <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-white p-4 text-sm text-[#667085]">
-                        No provider is available on an online Host yet.
+                        {t("No provider is available on an online Host yet.")}
                       </div>
                     )}
                   </div>
@@ -978,30 +992,35 @@ export function OnboardingView({
                       ) : (
                         <Bot size={15} />
                       )}
-                      Create Assistant
+                      {t("Create Assistant")}
                     </Button>
                     <Button variant="outline" onClick={onFinish} className="rounded-lg">
-                      Skip
+                      {t("Skip")}
                     </Button>
                   </div>
                 </div>
 
                 <div className="rounded-lg border border-[#dfe3ec] bg-white p-4">
                   <div className="text-xs font-semibold text-[#667085]">
-                    Default agent
+                    {t("Default agent")}
                   </div>
                   <div className="mt-3 rounded-lg border border-[#edf0f5] bg-[#fbfbfd] p-3">
                     <div className="flex items-center gap-2 text-sm font-bold text-[#111827]">
                       <Bot size={16} className="text-[#503ed4]" />
-                      Assistant
+                      {t("Assistant")}
                     </div>
                     <div className="mt-2 text-sm leading-6 text-[#667085]">
-                      Queues human messages while busy, coalesces bursts, and autostarts with the selected provider.
+                      {t("Queues human messages while busy, coalesces bursts, and autostarts with the selected provider.")}
                     </div>
                   </div>
                   {agentCount > 0 && (
                     <div className="mt-4 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs font-medium text-emerald-700">
-                      {agentCount} agent{agentCount === 1 ? "" : "s"} already configured. You can still create Assistant or skip.
+                      {t(
+                        agentCount === 1
+                          ? "{{count}} agent already configured. You can still create Assistant or skip."
+                          : "{{count}} agents already configured. You can still create Assistant or skip.",
+                        { count: agentCount },
+                      )}
                     </div>
                   )}
                 </div>
@@ -1015,47 +1034,48 @@ export function OnboardingView({
 }
 
 function PrepStep({ onContinue }: { onContinue: () => void }) {
+  const { t } = useI18n();
   return (
     <section className="flex flex-1 flex-col justify-center">
       <div className="max-w-3xl">
-        <StepEyebrow icon={Check}>Before you start</StepEyebrow>
+        <StepEyebrow icon={Check}>{t("Before you start")}</StepEyebrow>
         <h1 className="mt-4 text-3xl font-bold tracking-normal text-[#111827]">
-          A quick map before setup
+          {t("A quick map before setup")}
         </h1>
         <p className="mt-3 max-w-2xl text-sm leading-6 text-[#667085]">
-          First run has four jobs: identify yourself, connect to a server, decide whether this computer should run agents as a Host, and create an Assistant.
+          {t("First run has four jobs: identify yourself, connect to a server, decide whether this computer should run agents as a Host, and create an Assistant.")}
         </p>
 
         <div className="mt-8 overflow-hidden rounded-lg border border-[#dfe3ec] bg-white">
           <ConceptRow
             icon={UserRound}
-            title="Identity"
-            body="Your User ID and nickname identify you. Connecting a new server does not create another user."
-            detail="Leave fields blank to use the defaults"
+            title={t("Identity")}
+            body={t("Your User ID and nickname identify you. Connecting a new server does not create another user.")}
+            detail={t("Leave fields blank to use the defaults")}
           />
           <ConceptRow
             icon={Server}
-            title="Server"
-            body="The server is the shared space for channels, messages, tasks, and registered Hosts. Connect an existing address, or start a server on one machine first."
+            title={t("Server")}
+            body={t("The server is the shared space for channels, messages, tasks, and registered Hosts. Connect an existing address, or start a server on one machine first.")}
             detail={localServerCommand}
           />
           <ConceptRow
             icon={MonitorCog}
-            title="Host"
-            body="A Host is a computer that runs agents. If this machine runs agents, start the local Host after connecting. If agents live on another machine, connect that machine to the same server and run its generated Host command there."
-            detail="Run locally, or run the Host command on the agent machine"
+            title={t("Host")}
+            body={t("A Host is a computer that runs agents. If this machine runs agents, start the local Host after connecting. If agents live on another machine, connect that machine to the same server and run its generated Host command there.")}
+            detail={t("Run locally, or run the Host command on the agent machine")}
           />
           <ConceptRow
             icon={Bot}
-            title="Agent"
-            body="An agent is the assistant you @ mention in a channel. Loom can create a default Assistant after it detects a runtime provider."
-            detail="@Assistant wakes it in channel messages"
+            title={t("Agent")}
+            body={t("An agent is the assistant you @ mention in a channel. Loom can create a default Assistant after it detects a runtime provider.")}
+            detail={t("@Assistant wakes it in channel messages")}
           />
         </div>
 
         <div className="mt-6 flex flex-wrap gap-3">
           <Button onClick={onContinue} className="h-11 rounded-lg">
-            Start setup
+            {t("Start setup")}
             <ArrowRight size={16} />
           </Button>
         </div>
@@ -1165,6 +1185,7 @@ function DisabledProviderRow({
   icon?: LucideIcon;
   title: string;
 }) {
+  const { t } = useI18n();
   return (
     <div className="flex items-center gap-3 border-t border-[#e6e9f0] px-4 py-3 first:border-t-0">
       <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-[#dfe3ec] bg-white text-[#667085]">
@@ -1174,7 +1195,7 @@ function DisabledProviderRow({
         <div className="text-sm font-bold text-[#111827]">{title}</div>
         <div className="mt-0.5 truncate text-xs text-[#667085]">{detail}</div>
       </div>
-      <Badge variant="secondary">Not supported</Badge>
+      <Badge variant="secondary">{t("Not supported")}</Badge>
     </div>
   );
 }

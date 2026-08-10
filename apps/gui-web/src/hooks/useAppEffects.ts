@@ -1,19 +1,14 @@
 import { useEffect } from "react";
 import type { Actor, ScopeRef } from "@/ipc/types";
-import type { ChannelGroup, PanelSizes } from "@/lib/types";
+import type { PanelSizes } from "@/lib/types";
 import {
   initialViewportWidth,
   savePanelSizes,
 } from "@/lib/format-utils";
-import {
-  loadChannelGroups,
-} from "@/lib/channel-utils";
 
 export interface AppEffectsDeps {
   panelSizes: PanelSizes;
   setViewportWidth: (width: number) => void;
-  channelGroupsKey: string;
-  setChannelGroups: (groups: ChannelGroup[] | ((prev: ChannelGroup[]) => ChannelGroup[])) => void;
   workspaceId: string | undefined;
   setActiveDirectActorId: (id: string | null | ((prev: string | null) => string | null)) => void;
   setDirectMessages: (messages: never[]) => void;
@@ -38,10 +33,6 @@ export function useAppEffects(deps: AppEffectsDeps) {
     window.addEventListener("resize", updateViewport);
     return () => window.removeEventListener("resize", updateViewport);
   }, []);
-
-  useEffect(() => {
-    d.setChannelGroups(loadChannelGroups(d.channelGroupsKey));
-  }, [d.channelGroupsKey]);
 
   useEffect(() => {
     d.setActiveDirectActorId(null);

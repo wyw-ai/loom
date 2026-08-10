@@ -10,6 +10,7 @@ import {
 import { MessageRow } from "@/components/chat/MessageRow";
 import { FeedScrollManager } from "@/components/chat/FeedScrollManager";
 import { cn } from "@/lib/utils";
+import { useI18n } from "@/lib/i18n";
 
 /** Per-message error boundary: catches single-message render crashes and logs the message id. */
 class MessageItemErrorBoundary extends Component<
@@ -90,6 +91,7 @@ export function MessageFeed({
   busy: string | null;
   anchorMessageId?: string | null;
 }) {
+  const { t } = useI18n();
   const workflowSourceIds = useMemo(
     () => new Set(messages.filter(isWorkflowMessage).map((m) => m.id)),
     [messages],
@@ -128,7 +130,7 @@ export function MessageFeed({
         return (
           <div className={`date-divider ${index === 0 ? "date-divider-first" : ""}`}>
             <span />
-            <div>{item.label}</div>
+            <div>{t(item.label)}</div>
             <span />
           </div>
         );
@@ -190,6 +192,7 @@ export function MessageFeed({
       allowThreads,
       currentActorId,
       busy,
+      t,
       threadStatsById,
       anchorMessageId,
     ],

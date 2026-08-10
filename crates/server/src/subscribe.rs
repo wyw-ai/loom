@@ -246,6 +246,19 @@ impl Subscriptions {
             .and_then(|c| c.actor_id.clone())
     }
 
+    /// Snapshot every live connection and its bound actor identity.  Global
+    /// channel visibility transitions need per-connection routing: explicit
+    /// members receive the updated private channel, while everyone else gets
+    /// only a removal notification (and therefore no private metadata).
+    pub(crate) fn connection_actors(&self) -> Vec<(String, Option<String>)> {
+        self.inner
+            .read()
+            .connections
+            .values()
+            .map(|connection| (connection.id.clone(), connection.actor_id.clone()))
+            .collect()
+    }
+
     /// True when `connection_id` is a stale/duplicate agent worker connection
     /// (an agent/service connection that is no longer its actor's canonical
     /// inbox owner). Scope-wake fan-out must skip such connections so only one
@@ -324,10 +337,15 @@ impl Subscriptions {
         }
     }
 
-    /// Send a JSON-RPC notification to every connected client, regardless
-    /// of scope subscriptions. Used for global announcements like
-    /// `channel.created` for public channels.
-    pub fn broadcast_to_all(&self, method: &str, payload: Value) {
+    /// Send a JSON-RPC notification to every authenticated client, regardless
+    /// of scope subscriptions. When server authentication is disabled, every
+    /// connection remains eligible for backwards-compatible discovery events.
+    pub fn broadcast_to_authenticated(
+        &self,
+        auth: &crate::auth::ServerAuth,
+        method: &str,
+        payload: Value,
+    ) {
         let frame = match serde_json::to_string(&proto::Notification::new(method, Some(payload))) {
             Ok(s) => s,
             Err(e) => {
@@ -337,7 +355,9 @@ impl Subscriptions {
         };
         let inner = self.inner.read();
         for c in inner.connections.values() {
-            let _ = c.tx.send(frame.clone());
+            if auth.is_authenticated(&c.id) {
+                let _ = c.tx.send(frame.clone());
+            }
         }
     }
 
@@ -444,6 +464,30 @@ impl Subscriptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protected_global_broadcast_reaches_only_authenticated_connections() {
+        let subs = Subscriptions::new();
+        let (allowed_tx, mut allowed_rx) = mpsc::unbounded_channel();
+        let (blocked_tx, mut blocked_rx) = mpsc::unbounded_channel();
+        subs.add_connection(Connection {
+            id: "conn_allowed".into(),
+            actor_id: None,
+            tx: allowed_tx,
+        });
+        subs.add_connection(Connection {
+            id: "conn_blocked".into(),
+            actor_id: None,
+            tx: blocked_tx,
+        });
+        let auth = crate::auth::ServerAuth::with_password("secret").expect("password auth");
+        assert!(auth.authenticate("conn_allowed", "secret"));
+
+        subs.broadcast_to_authenticated(&auth, "stream/update", serde_json::json!({ "ok": true }));
+
+        assert!(allowed_rx.try_recv().is_ok());
+        assert!(blocked_rx.try_recv().is_err());
+    }
 
     fn make_conn(id: &str) -> Connection {
         let (tx, _rx) = mpsc::unbounded_channel();

@@ -9,11 +9,16 @@ import {
 import { detailPanelBreakpoint, machineStatusPollIntervalMs } from "@/lib/constants";
 import type { AgentFormState } from "@/lib/types";
 import { defaultWakeSpec } from "@/lib/wake-utils";
+import { useI18n } from "@/lib/i18n";
 import { channelMentionAgentActors } from "@/lib/channel-utils";
 import { WorkspaceShell } from "@/containers/WorkspaceShell";
 import { OnboardingView } from "@/components/views/OnboardingView";
 import { WebConnectionView } from "@/components/views/WebConnectionView";
 import { ErrorBoundary } from "@/components/shared/ErrorBoundary";
+import {
+  ServerPasswordDialog,
+  type ServerPasswordPrompt,
+} from "@/components/shared/ServerPasswordDialog";
 import {
   configureWebConnection,
   hasWebConnectionConfig,
@@ -33,6 +38,7 @@ import { useAppEffects } from "@/hooks/useAppEffects";
 
 
 export function App() {
+  const { t } = useI18n();
   const {
     config, setConfig, workspace, setWorkspace, connection, setConnection,
     error, setError, notice, setNotice, busy, setBusy, workspaceForm, setWorkspaceForm,
@@ -69,6 +75,7 @@ export function App() {
     Record<string, Record<string, ChannelMemberConfig>>
   >({});
   const [messageAnchorId, setMessageAnchorId] = useState<string | null>(null);
+  const [serverPasswordPrompt, setServerPasswordPrompt] = useState<ServerPasswordPrompt | null>(null);
 
   const activeScopeRef = useRef<ScopeRef | null>(null);
   const activeThreadScopeRef = useRef<ScopeRef | null>(null);
@@ -81,6 +88,30 @@ export function App() {
   const hasOpenedConnectionRef = useRef(false);
   const reconnectTimerRef = useRef<number | null>(null);
   const reconnectAttemptRef = useRef(0);
+  const serverPasswordsRef = useRef(new Map<string, string>());
+  const serverPasswordResolverRef = useRef<((password: string | null) => void) | null>(null);
+
+  const requestServerPassword = useCallback((prompt: ServerPasswordPrompt) => {
+    serverPasswordResolverRef.current?.(null);
+    return new Promise<string | null>((resolve) => {
+      serverPasswordResolverRef.current = resolve;
+      setServerPasswordPrompt(prompt);
+    });
+  }, []);
+  const submitServerPassword = useCallback((password: string) => {
+    const resolve = serverPasswordResolverRef.current;
+    serverPasswordResolverRef.current = null;
+    setServerPasswordPrompt(null);
+    resolve?.(password);
+  }, []);
+  const cancelServerPassword = useCallback(() => {
+    const resolve = serverPasswordResolverRef.current;
+    serverPasswordResolverRef.current = null;
+    setServerPasswordPrompt(null);
+    resolve?.(null);
+  }, []);
+
+  useEffect(() => () => serverPasswordResolverRef.current?.(null), []);
 
   const account = config.account ?? null;
   const workspaces = config.workspaces ?? [];
@@ -134,6 +165,7 @@ export function App() {
     loadConfig,
     loadWorkspaceData,
     connectWorkspace,
+    connectionGenerationRef,
   } = useWorkspaceConnection({
     config,
     setConfig,
@@ -162,10 +194,13 @@ export function App() {
     reconnectTimerRef,
     reconnectAttemptRef,
     actorIdRef,
+    serverPasswordsRef,
+    requestServerPassword,
   });
 
   const {
-    updateChannelGroups,
+    removeChannelFromGroupsLocally,
+    applyRemoteChannelLayout,
     addChannelGroup,
     renameChannelGroup,
     removeChannelGroup,
@@ -175,6 +210,8 @@ export function App() {
     channelGroups,
     setChannelGroups,
     channelGroupsKey,
+    connection,
+    workspaceId: workspace?.id,
   });
 
   const { handleStream, applyChannelDeleted } = useStreamHandler({
@@ -201,7 +238,8 @@ export function App() {
     setReplyTo,
     setActiveChannelId,
     setActiveThreadId,
-    updateChannelGroups,
+    removeChannelFromGroupsLocally,
+    applyRemoteChannelLayout,
     refreshInbox,
   });
 
@@ -221,6 +259,7 @@ export function App() {
     reconnectTimerRef,
     reconnectAttemptRef,
     clearReconnectTimer,
+    connectionGenerationRef,
   });
 
   useEffect(() => {
@@ -296,6 +335,7 @@ export function App() {
     openLocalPath,
     createChannelWithTitle,
     renameChannel,
+    updateChannelVisibility,
     deleteChannel,
     sendMessage,
     sendThreadMessage,
@@ -429,14 +469,7 @@ export function App() {
   const selectedRun = selectedRunId ? runs[selectedRunId] ?? null : null;
 
   const showWorkspaceChrome =
-    view === "chat" ||
-    view === "threads" ||
-    view === "channels" ||
-    view === "direct" ||
-    view === "inbox" ||
-    view === "tasks" ||
-    view === "runs" ||
-    view === "settings";
+    view !== "spaces" && view !== "account" && view !== "system";
   const showChatDetail =
     view === "chat" &&
     (Boolean(activeThread) || (Boolean(channelPanelTab) && Boolean(activeChannel)) || searchPanelOpen);
@@ -460,8 +493,6 @@ export function App() {
   useAppEffects({
     panelSizes,
     setViewportWidth,
-    channelGroupsKey,
-    setChannelGroups,
     workspaceId: workspace?.id,
     setActiveDirectActorId,
     setDirectMessages,
@@ -478,7 +509,7 @@ export function App() {
       <div className="flex h-screen w-screen items-center justify-center bg-[#f5f6fa] text-[#303849]">
         <div className="flex items-center gap-3 rounded-xl border border-[#dfe3ec] bg-white px-4 py-3 text-sm font-semibold shadow-sm">
           <Loader2 className="animate-spin text-[#5843d7]" size={18} />
-          Loading Loom
+          {t("Loading Loom")}
         </div>
       </div>
     );
@@ -498,8 +529,9 @@ export function App() {
 
   if (onboardingActive) {
     return (
-      <ErrorBoundary>
-        <OnboardingView
+      <>
+        <ErrorBoundary>
+          <OnboardingView
         account={account}
         busy={busy}
         connection={connection}
@@ -517,8 +549,14 @@ export function App() {
         onStartLocalHost={startLocalHost}
         onCreateAgent={createAgent}
         onFinish={finishOnboarding}
-      />
-      </ErrorBoundary>
+          />
+        </ErrorBoundary>
+        <ServerPasswordDialog
+          prompt={serverPasswordPrompt}
+          onCancel={cancelServerPassword}
+          onSubmit={submitServerPassword}
+        />
+      </>
     );
   }
 
@@ -531,7 +569,7 @@ export function App() {
     searchPanelOpen, setSearchPanelOpen, machines, threadsByChannel,
     runsLoading, runsError, refreshRuns,
     createChannelWithTitle, addChannelGroup, moveChannelToGroup, deleteChannel,
-    renameChannel, removeChannelGroup, renameChannelGroup, toggleChannelGroup,
+    renameChannel, updateChannelVisibility, removeChannelGroup, renameChannelGroup, toggleChannelGroup,
     setActiveChannelId, setActiveThreadId, setActiveDirectActorId, setChannelPanelTab,
     resizePanelByKeyboard, startPanelResize, error, target, channelPanelTab,
     activeThread, activeThreadTask, activeScope, activeThreadScope, messages,
@@ -551,8 +589,15 @@ export function App() {
   };
 
   return (
-    <ErrorBoundary>
-      <WorkspaceShell {...shellProps} />
-    </ErrorBoundary>
+    <>
+      <ErrorBoundary>
+        <WorkspaceShell {...shellProps} />
+      </ErrorBoundary>
+      <ServerPasswordDialog
+        prompt={serverPasswordPrompt}
+        onCancel={cancelServerPassword}
+        onSubmit={submitServerPassword}
+      />
+    </>
   );
 }

@@ -8,20 +8,22 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { defaultProviderManifestText } from "@/lib/constants";
 import { errorText, machineCanRunCommands } from "@/lib/format-utils";
+import { useI18n } from "@/lib/i18n";
 import type { ProviderAvailabilityGroup } from "@/lib/types";
 import type { MachineInfo } from "@/ipc/types";
 import * as ipc from "@/ipc/bridge";
 import { Bot, Check, Loader2, X } from "lucide-react";
 
 export function ProviderAvailabilityRow({ group }: { group: ProviderAvailabilityGroup }) {
+  const { t } = useI18n();
   const iconKey = agentProviderIconKey(group.id, group.name);
   const hostNames = group.hosts.map(({ machine }) => machine.name);
   const modelLabel =
     group.defaultModels.length === 0
-      ? "default model"
+      ? t("default model")
       : group.defaultModels.length === 1
         ? group.defaultModels[0]
-        : `${group.defaultModels.length} model defaults`;
+        : t("{{count}} model defaults", { count: group.defaultModels.length });
 
   return (
     <div className="grid min-h-[58px] grid-cols-[minmax(0,1fr)_auto] items-center gap-3 rounded-lg border border-[#edf0f5] bg-white px-3 py-2.5">
@@ -47,9 +49,9 @@ export function ProviderAvailabilityRow({ group }: { group: ProviderAvailability
         </div>
       </div>
       <div className="flex shrink-0 items-center gap-1.5">
-        <Badge variant="outline">{group.hosts.length} hosts</Badge>
+        <Badge variant="outline">{t("{{count}} hosts", { count: group.hosts.length })}</Badge>
         {group.actorCount > 0 && (
-          <Badge variant="secondary">{group.actorCount} agents</Badge>
+          <Badge variant="secondary">{t("{{count}} agents", { count: group.actorCount })}</Badge>
         )}
       </div>
     </div>
@@ -67,6 +69,7 @@ export function ProviderAddDialog({
   onCheckMachines: () => void;
   onClose: () => void;
 }) {
+  const { t } = useI18n();
   const writableMachines = machines.filter(
     (machine) =>
       machineCanRunCommands(machine) &&
@@ -104,7 +107,7 @@ export function ProviderAddDialog({
     try {
       const parsed = JSON.parse(manifestText) as unknown;
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-        throw new Error("manifest must be a JSON object");
+        throw new Error(t("Manifest must be a JSON object."));
       }
       await ipc.providerAdd({
         machineId: selectedMachine.id,
@@ -143,16 +146,16 @@ export function ProviderAddDialog({
               <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-[#f1efff] text-[#503ed4]">
                 <Bot size={15} />
               </span>
-              Add Provider
+              {t("Add Provider")}
             </div>
             <div className="mt-2 text-sm text-[#667085]">
-              {selectedMachine?.name ?? "No host selected"}
+              {selectedMachine?.name ?? t("No host selected")}
             </div>
           </div>
           <button
             type="button"
             className="composer-icon h-8 min-w-8"
-            title="Close"
+            title={t("Close")}
             onClick={onClose}
           >
             <X size={15} />
@@ -166,7 +169,7 @@ export function ProviderAddDialog({
               onChange={(event) => setMachineId(event.target.value)}
             >
               {machines.length === 0 ? (
-                <option value="">No managed hosts</option>
+                <option value="">{t("No managed hosts")}</option>
               ) : (
                 machines.map((machine) => (
                   <option key={machine.id} value={machine.id}>
@@ -181,7 +184,7 @@ export function ProviderAddDialog({
                 checked={replace}
                 onChange={(event) => setReplace(event.target.checked)}
               />
-              Replace
+              {t("Replace")}
             </label>
           </div>
           <Textarea
@@ -191,8 +194,7 @@ export function ProviderAddDialog({
             spellCheck={false}
           />
           <div className="mt-2 text-xs font-medium text-[#667085]">
-            Set timeoutMs or idleTimeoutMs to -1 for unlimited, or use a positive
-            millisecond value to enable that limit.
+            {t("Set timeoutMs or idleTimeoutMs to -1 for unlimited, or use a positive millisecond value to enable that limit.")}
           </div>
           {error && (
             <div className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm font-medium text-red-700">
@@ -202,15 +204,15 @@ export function ProviderAddDialog({
           {selectedMachine && !canSubmit && (
             <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm font-medium text-amber-800">
               {selectedMachine.connectionStatus === "online"
-                ? "This host cannot write provider manifests."
-                : "Start the host daemon before adding a provider."}
+                ? t("This host cannot write provider manifests.")
+                : t("Start the host daemon before adding a provider.")}
             </div>
           )}
         </div>
 
         <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[#edf0f5] px-5 py-4">
           <div className="text-xs font-medium text-[#667085]">
-            {selectedMachine?.configDir || "No config directory"}
+            {selectedMachine?.configDir || t("No config directory")}
           </div>
           <Button
             type="submit"
@@ -218,7 +220,7 @@ export function ProviderAddDialog({
             className="rounded-lg"
           >
             {saving ? <Loader2 className="animate-spin" size={15} /> : <Check size={15} />}
-            Add Provider
+            {t("Add Provider")}
           </Button>
         </div>
       </form>

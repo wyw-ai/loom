@@ -11,9 +11,7 @@ mod ipc;
 mod state;
 mod ws;
 
-use std::sync::Arc;
 use tauri::Manager;
-use tokio::sync::Mutex;
 
 use crate::state::AppState;
 
@@ -29,9 +27,7 @@ fn main() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
-        .manage(AppState {
-            inner: Arc::new(Mutex::new(None)),
-        })
+        .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             ipc::workspaces_list,
             ipc::workspaces_save,
@@ -51,6 +47,8 @@ fn main() {
             ipc::channel_list,
             ipc::channel_create,
             ipc::channel_update,
+            ipc::channel_layout_get,
+            ipc::channel_layout_set,
             ipc::channel_delete,
             ipc::channel_invite,
             ipc::channel_member_config_list,

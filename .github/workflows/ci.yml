@@ -29,6 +29,7 @@ jobs:
     env:
       LOOM_GUIDE_DIR: ${{ github.workspace }}/crates/cli/fixtures/ci-runtime-content/loom-guide
       LOOM_SKILLS_DIR: ${{ github.workspace }}/crates/cli/fixtures/ci-runtime-content/loom-skills
+      LOOM_ACTOR_CIRCUIT_DIR: ${{ github.workspace }}/crates/cli/fixtures/ci-runtime-content/actor-circuit
     steps:
       - name: Checkout
         uses: actions/checkout@v6.0.3
@@ -38,6 +39,7 @@ jobs:
         run: |
           test -f crates/cli/fixtures/ci-runtime-content/loom-guide/guides/runtime-awareness.md
           test -f crates/cli/fixtures/ci-runtime-content/loom-skills/skills/loom/SKILL.md
+          test -f crates/cli/fixtures/ci-runtime-content/actor-circuit/skills/actor-circuit/SKILL.md
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -112,6 +114,9 @@ jobs:
 
       - name: Check release metadata script syntax
         run: node --check scripts/write-release-downloads.mjs
+
+      - name: Test release packaging scripts
+        run: bash scripts/tests/release-scripts.test.sh
 
       - name: Build Pages portal
         run: bash pages/build.sh

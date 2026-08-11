@@ -93,7 +93,7 @@ loom.exe is a command-line tool; run it in a terminal:
 
 Common subcommands: channel, thread, message, task, chat, agent, run
 
-Project: joi-apps-temp-fork
+Source:  https://github.com/wyw-ai/loom
         ";
         let body: Vec<u16> = OsStr::new(body)
             .encode_wide()

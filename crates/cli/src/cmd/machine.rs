@@ -486,7 +486,7 @@ mod tests {
 
     #[test]
     fn agent_update_command_uses_update_operation_and_omits_unspecified_fields() {
-        let source_root = std::env::current_dir().expect("current directory");
+        let source_root = std::fs::canonicalize(".").expect("canonical current directory");
         let command = agent_update_command(
             "actor_impl".into(),
             Some("Implementation Agent".into()),

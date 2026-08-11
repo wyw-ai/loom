@@ -9,6 +9,7 @@ import {
 } from "@/lib/message-utils";
 import { MessageRow } from "@/components/chat/MessageRow";
 import { FeedScrollManager } from "@/components/chat/FeedScrollManager";
+import { cn } from "@/lib/utils";
 
 /** Per-message error boundary: catches single-message render crashes and logs the message id. */
 class MessageItemErrorBoundary extends Component<
@@ -66,6 +67,7 @@ export function MessageFeed({
   onOpenAgentSettings,
   currentActorId,
   busy,
+  anchorMessageId,
 }: {
   actors: Record<string, Actor>;
   allowReply?: boolean;
@@ -86,6 +88,7 @@ export function MessageFeed({
   onOpenAgentSettings: (actorId: string) => void;
   currentActorId: string | null;
   busy: string | null;
+  anchorMessageId?: string | null;
 }) {
   const workflowSourceIds = useMemo(
     () => new Set(messages.filter(isWorkflowMessage).map((m) => m.id)),
@@ -136,29 +139,38 @@ export function MessageFeed({
         message.scope.kind === "channel"
           ? tasksBySourceMessageId[message.id] ?? null
           : null;
+      const isAnchor = message.id === anchorMessageId;
       return (
-        <MessageItemErrorBoundary messageId={message.id}>
-          <MessageRow
-            actor={actors[message.authorActorId]}
-            actors={actors}
-            machines={machines}
-            runs={runs}
-            message={message}
-            workflowSourceIds={workflowSourceIds}
-            onReply={onReply}
-            onStartThread={onStartThread}
-            onToggleReaction={onToggleReaction}
-            onAnswerAction={onAnswerAction}
-            onOpenAgentSettings={onOpenAgentSettings}
-            canReply={allowReply}
-            canStartThread={allowThreads && canUseAsThreadRoot(message)}
-            threadSummary={threadSummary}
-            threadStats={threadSummary ? threadStatsById[threadSummary.id] : undefined}
-            sourceTask={sourceTask}
-            currentActorId={currentActorId}
-            busy={busy}
-          />
-        </MessageItemErrorBoundary>
+        <div
+          data-search-anchor={isAnchor ? "true" : undefined}
+          className={cn(
+            isAnchor &&
+              "relative z-[1] rounded-lg bg-amber-50/70 ring-2 ring-inset ring-amber-300",
+          )}
+        >
+          <MessageItemErrorBoundary messageId={message.id}>
+            <MessageRow
+              actor={actors[message.authorActorId]}
+              actors={actors}
+              machines={machines}
+              runs={runs}
+              message={message}
+              workflowSourceIds={workflowSourceIds}
+              onReply={onReply}
+              onStartThread={onStartThread}
+              onToggleReaction={onToggleReaction}
+              onAnswerAction={onAnswerAction}
+              onOpenAgentSettings={onOpenAgentSettings}
+              canReply={allowReply}
+              canStartThread={allowThreads && canUseAsThreadRoot(message)}
+              threadSummary={threadSummary}
+              threadStats={threadSummary ? threadStatsById[threadSummary.id] : undefined}
+              sourceTask={sourceTask}
+              currentActorId={currentActorId}
+              busy={busy}
+            />
+          </MessageItemErrorBoundary>
+        </div>
       );
     },
     [
@@ -179,6 +191,7 @@ export function MessageFeed({
       currentActorId,
       busy,
       threadStatsById,
+      anchorMessageId,
     ],
   );
 
@@ -198,6 +211,7 @@ export function MessageFeed({
       feedKey={feedKey}
       feedItems={feedItems}
       renderItem={renderItem}
+      anchorMessageId={anchorMessageId}
     />
   );
 }

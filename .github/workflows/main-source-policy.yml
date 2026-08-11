@@ -1,0 +1,65 @@
+name: Main source policy
+
+on:
+  pull_request_target:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited
+      - ready_for_review
+
+permissions:
+  contents: read
+  statuses: write
+
+jobs:
+  source-policy:
+    name: Evaluate main source policy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate pull request source branch
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          status_url="repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}"
+          post_status() {
+            gh api --silent --method POST "$status_url" \
+              --raw-field state="$1" \
+              --raw-field context="policy/main-source" \
+              --raw-field description="$2" \
+              --raw-field target_url="$RUN_URL"
+          }
+
+          post_status pending "Validating pull request source branch"
+
+          if [[ "$HEAD_REPO" != "$GITHUB_REPOSITORY" ]]; then
+            echo "::error::Pull requests into main must come from a branch in $GITHUB_REPOSITORY; got '$HEAD_REPO'."
+            post_status failure "Source branch must be in the base repository"
+            exit 1
+          fi
+
+          if [[ "$HEAD_REF" =~ ^preview-[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Allowed release preview branch: $HEAD_REF"
+            post_status success "Source branch matches the main merge policy"
+            exit 0
+          fi
+
+          if [[ "$HEAD_REF" =~ ^hotfix/.+ ]]; then
+            echo "Allowed hotfix branch: $HEAD_REF"
+            post_status success "Source branch matches the main merge policy"
+            exit 0
+          fi
+
+          echo "::error::Pull requests into main must come from preview-X.Y.Z or hotfix/*; got '$HEAD_REF'."
+          post_status failure "Source must be preview-X.Y.Z or hotfix/*"
+          exit 1

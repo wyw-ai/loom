@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent-runtime"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2542,7 +2542,7 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "loom-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agent-runtime",
  "anyhow",
@@ -2578,7 +2578,7 @@ dependencies = [
 
 [[package]]
 name = "loom-gui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agent-runtime",
  "anyhow",
@@ -2606,7 +2606,7 @@ dependencies = [
 
 [[package]]
 name = "loom-platform"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dirs 5.0.1",
  "dunce",
@@ -2620,7 +2620,7 @@ dependencies = [
 
 [[package]]
 name = "loom-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agent-runtime",
  "anyhow",
@@ -2647,7 +2647,7 @@ dependencies = [
 
 [[package]]
 name = "loom-shell"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "loom-platform",
  "native-windows-derive",
@@ -3567,7 +3567,7 @@ dependencies = [
 
 [[package]]
 name = "proto"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "serde",

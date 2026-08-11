@@ -768,6 +768,26 @@ pub async fn message_list(state: State<'_, AppState>, params: Value) -> Result<V
 }
 
 #[tauri::command]
+pub async fn message_search(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::MESSAGE_SEARCH, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn message_context(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::MESSAGE_CONTEXT, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
 pub async fn message_send(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
     let cfg = config::load_or_init().map_err(stringify)?;
     let client = state.client().await?;
@@ -1377,7 +1397,10 @@ pub fn cleanup_downloads() {
 }
 
 /// Remove a single file if its mtime is older than `cutoff`.
-fn remove_if_older_than(path: &std::path::Path, cutoff: std::time::SystemTime) -> std::io::Result<()> {
+fn remove_if_older_than(
+    path: &std::path::Path,
+    cutoff: std::time::SystemTime,
+) -> std::io::Result<()> {
     let metadata = std::fs::metadata(path)?;
     if let Ok(mtime) = metadata.modified() {
         if mtime < cutoff {
@@ -1863,8 +1886,8 @@ fn read_local_file_bytes_at_root(
 ) -> Result<Value, String> {
     let canonical_root = std::fs::canonicalize(cache_root)
         .map_err(|e| format!("Cache directory does not exist: {e}"))?;
-    let canonical_target = std::fs::canonicalize(path)
-        .map_err(|e| format!("Failed to resolve path: {e}"))?;
+    let canonical_target =
+        std::fs::canonicalize(path).map_err(|e| format!("Failed to resolve path: {e}"))?;
     if !canonical_target.starts_with(&canonical_root) {
         return Err("Path is outside the attachment cache directory".to_string());
     }
@@ -1894,10 +1917,7 @@ fn read_local_file_bytes_at_root(
     // FE would request the next chunk only to get 0 bytes). By checking
     // the real file length we know definitively whether more data
     // remains beyond the current read window.
-    let file_len = file
-        .metadata()
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
     let bytes_after = file_len.saturating_sub(offset + read as u64);
     let truncated = bytes_after > 0;
     let next_offset = if truncated {
@@ -1984,7 +2004,9 @@ struct CacheBreakdownResult {
 /// Returns `(images, other, cached_ids)` where `cached_ids` is the list
 /// of artifactIds (= subdirectory names) present on disk. ARCH TODO#2:
 /// the FE uses this set to reconcile localStorage orphan mappings.
-fn cache_breakdown_at_root(cache_root: &Path) -> (CacheCategoryStats, CacheCategoryStats, Vec<String>) {
+fn cache_breakdown_at_root(
+    cache_root: &Path,
+) -> (CacheCategoryStats, CacheCategoryStats, Vec<String>) {
     let mut images = CacheCategoryStats::default();
     let mut other = CacheCategoryStats::default();
     let mut cached_ids = Vec::new();
@@ -2038,7 +2060,12 @@ pub fn get_attachment_cache_breakdown() -> Result<Value, String> {
         size: images.size + other.size,
         count: images.count + other.count,
     };
-    let result = CacheBreakdownResult { images, other, total, cached_ids };
+    let result = CacheBreakdownResult {
+        images,
+        other,
+        total,
+        cached_ids,
+    };
     serde_json::to_value(result).map_err(|e| format!("Failed to serialize breakdown: {e}"))
 }
 
@@ -2065,10 +2092,7 @@ struct ClearAttachmentCacheByTypeResult {
 
 /// Core clear-by-type logic parameterized by cache root, so it can be
 /// unit tested with an isolated temp dir.
-fn clear_cache_by_type_at_root(
-    cache_root: &Path,
-    category: &str,
-) -> (u64, Vec<String>) {
+fn clear_cache_by_type_at_root(cache_root: &Path, category: &str) -> (u64, Vec<String>) {
     let mut freed_bytes = 0u64;
     let mut cleared_ids = Vec::new();
 
@@ -2157,6 +2181,26 @@ pub async fn run_cancel(state: State<'_, AppState>, params: Value) -> Result<Val
         .client()
         .await?
         .call_raw(method::RUN_CANCEL, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn run_list(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::RUN_LIST, Some(params))
+        .await
+        .map_err(stringify)
+}
+
+#[tauri::command]
+pub async fn run_get(state: State<'_, AppState>, params: Value) -> Result<Value, String> {
+    state
+        .client()
+        .await?
+        .call_raw(method::RUN_GET, Some(params))
         .await
         .map_err(stringify)
 }
@@ -2398,9 +2442,8 @@ async fn sync_agent_actor_on_server(client: &Arc<Client>, updated: &proto::types
             .get("actors")
             .and_then(Value::as_array)
             .and_then(|rows| {
-                rows.iter().find(|row| {
-                    row.get("id").and_then(Value::as_str) == Some(actor.id.as_str())
-                })
+                rows.iter()
+                    .find(|row| row.get("id").and_then(Value::as_str) == Some(actor.id.as_str()))
             })
             .and_then(|row| row.get("_meta"))
             .and_then(Value::as_object)
@@ -2851,8 +2894,7 @@ pub async fn save_file_dialog(args: SaveFileDialogArgs) -> Result<Option<String>
         Some(handle) => {
             let path = handle.path();
             let path_str = path.to_string_lossy().to_string();
-            std::fs::write(path, &args.bytes)
-                .map_err(|e| format!("Failed to write file: {e}"))?;
+            std::fs::write(path, &args.bytes).map_err(|e| format!("Failed to write file: {e}"))?;
             Ok(Some(path_str))
         }
         None => Ok(None),
@@ -4650,7 +4692,7 @@ mod tests {
     fn test_account() -> HumanAccount {
         config::normalize_human_account(HumanAccount {
             provider: "github".into(),
-            staff_id: "88084".into(),
+            staff_id: "test".into(),
             nickname: "octocat".into(),
             real_name: "Octo Cat".into(),
             email: String::new(),
@@ -4705,7 +4747,7 @@ mod tests {
     fn local_account_defaults_are_generic_and_actor_id_safe() {
         assert_eq!(local_user_id_from_display_name("Jane Doe"), "jane_doe");
         assert_eq!(local_user_id_from_display_name("!!!"), "local_user");
-        assert_eq!(local_user_id_from_display_name("残风 MacBook"), "macbook");
+        assert_eq!(local_user_id_from_display_name("测试 MacBook"), "macbook");
 
         let long_user_id = local_user_id_from_display_name(&"A".repeat(80));
         let actor_id = default_actor_id_for_local_user(&long_user_id);
@@ -4733,11 +4775,11 @@ mod tests {
             Some(Path::new("/tmp/loom config")),
             custom_url,
             "machine_test",
-            "CanfengMac",
+            "TesterMac",
         );
 
         assert!(serve_command.contains(&format!(
-            "--server {custom_url} --machine-id machine_test --machine-name CanfengMac"
+            "--server {custom_url} --machine-id machine_test --machine-name TesterMac"
         )));
         assert!(serve_command.starts_with("LOOM_CONFIG_DIR="));
         assert!(serve_command.contains("LOOM_AGENT_DATA_ROOT="));
@@ -4745,7 +4787,7 @@ mod tests {
         assert!(setup_script.contains("export LOOM_CONFIG_DIR="));
         assert!(setup_script.contains("LOOM_DAEMON_BIN"));
         assert!(setup_script.contains(&format!(
-            "exec \"$LOOM_DAEMON_BIN\" --server {custom_url} --machine-id machine_test --machine-name CanfengMac"
+            "exec \"$LOOM_DAEMON_BIN\" --server {custom_url} --machine-id machine_test --machine-name TesterMac"
         )));
         assert!(!setup_script.contains(" daemon --machine-id "));
     }
@@ -4924,8 +4966,8 @@ mod tests {
                 id: "default".into(),
                 name: "Local".into(),
                 server_url: "ws://127.0.0.1:7878/rpc".into(),
-                actor_id: "actor_human_88084".into(),
-                display_name: "actor_human_88084".into(),
+                actor_id: "actor_human_test".into(),
+                display_name: "actor_human_test".into(),
             }],
         };
         let value = json!({
@@ -4942,11 +4984,11 @@ mod tests {
                         "revision": 7,
                         "observedAt": "2026-05-13T10:50:00Z",
                         "workspaceId": "server_workspace",
-                        "ownerActorId": "actor_human_88084",
+                        "ownerActorId": "actor_human_test",
                         "name": "Remote Box",
                         "kind": "remote",
-                        "dataRoot": "/home/canfeng/.agentx/machine_remote",
-                        "configDir": "/home/canfeng/.loom-apps",
+                        "dataRoot": "/home/tester/.loom/machine_remote",
+                        "configDir": "/home/tester/.loom-apps",
                         "capabilities": ["inventory.read", "connection.status", "machine.command"],
                         "providers": [{
                             "id": "codex",
@@ -5018,8 +5060,8 @@ mod tests {
                 "ownerActorId": account.actor_id,
                 "name": "Remote Box",
                 "kind": "remote",
-                "dataRoot": "/home/canfeng/.agentx/machine_remote",
-                "configDir": "/home/canfeng/.loom-apps",
+                "dataRoot": "/home/tester/.loom/machine_remote",
+                "configDir": "/home/tester/.loom-apps",
                 "capabilities": ["inventory.read", "connection.status", "machine.command"],
                 "providers": [{
                     "id": "claude",
@@ -5073,7 +5115,7 @@ mod tests {
         assert_eq!(
             machine.agents[0].profile_path,
             format!(
-                "/home/canfeng/.agentx/machine_remote{}agents{}actor_remote_agent{}profile",
+                "/home/tester/.loom/machine_remote{}agents{}actor_remote_agent{}profile",
                 std::path::MAIN_SEPARATOR,
                 std::path::MAIN_SEPARATOR,
                 std::path::MAIN_SEPARATOR
@@ -5110,8 +5152,8 @@ mod tests {
                 "ownerActorId": account.actor_id,
                 "name": "Remote Box",
                 "kind": "remote",
-                "dataRoot": "/home/canfeng/.agentx/machine_remote",
-                "configDir": "/home/canfeng/.loom-apps",
+                "dataRoot": "/home/tester/.loom/machine_remote",
+                "configDir": "/home/tester/.loom-apps",
                 "capabilities": ["inventory.read", "connection.status", "machine.command"],
                 "providers": [],
                 "agentSpecs": []
@@ -5155,7 +5197,7 @@ mod tests {
                 "ownerActorId": "actor_human_other",
                 "name": "Other Box",
                 "kind": "remote",
-                "dataRoot": "/home/other/.agentx/machine_other",
+                "dataRoot": "/home/other/.loom/machine_other",
                 "configDir": "/home/other/.loom-apps",
                 "capabilities": ["inventory.read", "connection.status", "machine.command"],
                 "providers": [],
@@ -5200,8 +5242,8 @@ mod tests {
                 "ownerActorId": account.actor_id,
                 "name": "Remote Box",
                 "kind": "remote",
-                "dataRoot": "/home/canfeng/.agentx/machine_remote",
-                "configDir": "/home/canfeng/.loom-apps",
+                "dataRoot": "/home/tester/.loom/machine_remote",
+                "configDir": "/home/tester/.loom-apps",
                 "capabilities": ["inventory.read", "connection.status", "machine.command"],
                 "providers": [{
                     "id": "claude",
@@ -5317,8 +5359,8 @@ mod tests {
                 "ownerActorId": account.actor_id,
                 "name": "Old Local Machine",
                 "kind": "local",
-                "dataRoot": "/Users/boyd/.agentx/machines/ws_abbb0e0b/actor_human_local_ws_abbb0e0b/local",
-                "configDir": "/Users/boyd/.loom-apps",
+                "dataRoot": "/Users/alice/.loom/machines/ws_abbb0e0b/actor_human_local_ws_abbb0e0b/local",
+                "configDir": "/Users/alice/.loom-apps",
                 "capabilities": ["inventory.read", "connection.status", "machine.command", "agent.create"],
                 "providers": [],
                 "agents": []
@@ -5358,7 +5400,11 @@ mod tests {
         // but it must NOT be the empty PathBuf and must end with the
         // default `loom` suffix (callers append `agents/<actor_id>`).
         assert_ne!(root, PathBuf::from(""));
-        assert!(root.ends_with("loom"), "expected <data_dir>/loom, got {}", root.display());
+        assert!(
+            root.ends_with("loom"),
+            "expected <data_dir>/loom, got {}",
+            root.display()
+        );
         match saved {
             Some(v) => std::env::set_var(key, v),
             None => std::env::remove_var(key),
@@ -5390,8 +5436,7 @@ mod tests {
 
         // Scenario 3: a different RPC error code (e.g. -32602 invalid params)
         // must NOT be classified as not-found.
-        let invalid_params_msg =
-            "rpc `artifact_get` failed: invalid params (code -32602)";
+        let invalid_params_msg = "rpc `artifact_get` failed: invalid params (code -32602)";
         assert!(
             !invalid_params_msg.contains("(code -32000)"),
             "non-APP_NOT_FOUND error must not be classified as not-found"
@@ -5522,7 +5567,10 @@ mod tests {
         cleanup_dir_older_than(&dir, cutoff).expect("cleanup");
 
         assert!(!dir.join("old.txt").exists(), "old.txt should be deleted");
-        assert!(!dir.join("very_old.txt").exists(), "very_old.txt should be deleted");
+        assert!(
+            !dir.join("very_old.txt").exists(),
+            "very_old.txt should be deleted"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5538,8 +5586,14 @@ mod tests {
             .unwrap();
         cleanup_dir_older_than(&dir, cutoff).expect("cleanup");
 
-        assert!(dir.join("fresh.txt").exists(), "fresh.txt should be preserved");
-        assert!(dir.join("recent.txt").exists(), "recent.txt should be preserved");
+        assert!(
+            dir.join("fresh.txt").exists(),
+            "fresh.txt should be preserved"
+        );
+        assert!(
+            dir.join("recent.txt").exists(),
+            "recent.txt should be preserved"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5578,7 +5632,11 @@ mod tests {
         let missing = std::env::temp_dir()
             .join("loom-cache-missing")
             .join(uuid::Uuid::new_v4().to_string());
-        assert_eq!(dir_size_bytes(&missing), 0, "missing dir should report 0 bytes");
+        assert_eq!(
+            dir_size_bytes(&missing),
+            0,
+            "missing dir should report 0 bytes"
+        );
     }
 
     // ---------- Cache: write_cache_meta ----------
@@ -5597,9 +5655,10 @@ mod tests {
         };
         write_cache_meta(&dir, &meta).expect("write meta");
 
-        let loaded: CachedArtifactMeta =
-            serde_json::from_str(&std::fs::read_to_string(dir.join(".meta.json")).expect("read meta"))
-                .expect("parse meta");
+        let loaded: CachedArtifactMeta = serde_json::from_str(
+            &std::fs::read_to_string(dir.join(".meta.json")).expect("read meta"),
+        )
+        .expect("parse meta");
         assert_eq!(loaded.name, "photo.png");
         assert_eq!(loaded.media_type, "image/png");
         assert_eq!(loaded.size, 4096);
@@ -5741,8 +5800,15 @@ mod tests {
         let resp = json!({ "images": images, "other": other, "total": total });
         let total_obj = resp.get("total").expect("total key");
         // total must be an object with size+count, NOT a bare number.
-        assert!(total_obj.is_object(), "total must be an object, got: {total_obj}");
-        assert_eq!(total_obj["count"].as_u64(), Some(2), "total.count = 2 artifacts");
+        assert!(
+            total_obj.is_object(),
+            "total must be an object, got: {total_obj}"
+        );
+        assert_eq!(
+            total_obj["count"].as_u64(),
+            Some(2),
+            "total.count = 2 artifacts"
+        );
         assert!(
             total_obj["size"].as_u64().unwrap() >= 300,
             "total.size >= sum of blob bytes"
@@ -5769,10 +5835,23 @@ mod tests {
         let (_images, _other, cached_ids) = cache_breakdown_at_root(&root);
 
         // All three artifactIds (= directory names) must be collected.
-        assert_eq!(cached_ids.len(), 3, "cached_ids must contain all 3 artifact dirs");
-        assert!(cached_ids.contains(&"art-a".to_string()), "cached_ids contains art-a");
-        assert!(cached_ids.contains(&"art-b".to_string()), "cached_ids contains art-b");
-        assert!(cached_ids.contains(&"art-c".to_string()), "cached_ids contains art-c");
+        assert_eq!(
+            cached_ids.len(),
+            3,
+            "cached_ids must contain all 3 artifact dirs"
+        );
+        assert!(
+            cached_ids.contains(&"art-a".to_string()),
+            "cached_ids contains art-a"
+        );
+        assert!(
+            cached_ids.contains(&"art-b".to_string()),
+            "cached_ids contains art-b"
+        );
+        assert!(
+            cached_ids.contains(&"art-c".to_string()),
+            "cached_ids contains art-c"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -5788,7 +5867,10 @@ mod tests {
 
         let (_images, _other, cached_ids) = cache_breakdown_at_root(&root);
 
-        assert!(cached_ids.is_empty(), "empty cache root -> empty cached_ids");
+        assert!(
+            cached_ids.is_empty(),
+            "empty cache root -> empty cached_ids"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -5822,7 +5904,10 @@ mod tests {
             category: "videos".to_string(),
         };
         let err = clear_attachment_cache_by_type(args).unwrap_err();
-        assert!(err.contains("Invalid category"), "expected invalid category error, got: {err}");
+        assert!(
+            err.contains("Invalid category"),
+            "expected invalid category error, got: {err}"
+        );
     }
 
     #[test]
@@ -5839,7 +5924,10 @@ mod tests {
         cache_make_artifact_dir(&root, "art-2", "application/pdf", &[0u8; 200]);
 
         let (freed, cleared) = clear_attachment_cache_at_root(&root);
-        assert!(freed >= 300, "freed bytes should cover both blobs, got {freed}");
+        assert!(
+            freed >= 300,
+            "freed bytes should cover both blobs, got {freed}"
+        );
         assert_eq!(cleared.len(), 2, "cleared both artifact ids");
         assert!(
             cleared.iter().any(|id| id == "art-1"),

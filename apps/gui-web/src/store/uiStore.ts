@@ -8,6 +8,8 @@ export interface UIStore {
   view: View;
   settingsAgentId: string | null;
   channelPanelTab: ChannelPanelTab | null;
+  searchPanelOpen: boolean;
+  selectedRunId: string | null;
   panelSizes: PanelSizes;
   viewportWidth: number;
   resizingPanel: PanelResizeKind | null;
@@ -17,6 +19,8 @@ export interface UIStore {
   setView: (view: View | ((prev: View) => View)) => void;
   setSettingsAgentId: (id: string | null | ((prev: string | null) => string | null)) => void;
   setChannelPanelTab: (tab: ChannelPanelTab | null | ((prev: ChannelPanelTab | null) => ChannelPanelTab | null)) => void;
+  setSearchPanelOpen: (open: boolean | ((prev: boolean) => boolean)) => void;
+  setSelectedRunId: (id: string | null | ((prev: string | null) => string | null)) => void;
   setPanelSizes: (sizes: PanelSizes | ((prev: PanelSizes) => PanelSizes)) => void;
   setViewportWidth: (width: number | ((prev: number) => number)) => void;
   setResizingPanel: (kind: PanelResizeKind | null | ((prev: PanelResizeKind | null) => PanelResizeKind | null)) => void;
@@ -27,6 +31,8 @@ export const useUIStore = create<UIStore>((set) => ({
   view: "chat",
   settingsAgentId: null,
   channelPanelTab: null,
+  searchPanelOpen: false,
+  selectedRunId: null,
   panelSizes: loadPanelSizes(),
   viewportWidth: initialViewportWidth(),
   resizingPanel: null,
@@ -35,6 +41,8 @@ export const useUIStore = create<UIStore>((set) => ({
   setView: (view) => set((state) => ({ view: typeof view === 'function' ? view(state.view) : view })),
   setSettingsAgentId: (settingsAgentId) => set((state) => ({ settingsAgentId: typeof settingsAgentId === 'function' ? settingsAgentId(state.settingsAgentId) : settingsAgentId })),
   setChannelPanelTab: (channelPanelTab) => set((state) => ({ channelPanelTab: typeof channelPanelTab === 'function' ? channelPanelTab(state.channelPanelTab) : channelPanelTab })),
+  setSearchPanelOpen: (searchPanelOpen) => set((state) => ({ searchPanelOpen: typeof searchPanelOpen === 'function' ? searchPanelOpen(state.searchPanelOpen) : searchPanelOpen })),
+  setSelectedRunId: (selectedRunId) => set((state) => ({ selectedRunId: typeof selectedRunId === 'function' ? selectedRunId(state.selectedRunId) : selectedRunId })),
   setPanelSizes: (panelSizes) => set((state) => ({ panelSizes: typeof panelSizes === 'function' ? panelSizes(state.panelSizes) : panelSizes })),
   setViewportWidth: (viewportWidth) => set((state) => ({ viewportWidth: typeof viewportWidth === 'function' ? viewportWidth(state.viewportWidth) : viewportWidth })),
   setResizingPanel: (resizingPanel) => set((state) => ({ resizingPanel: typeof resizingPanel === 'function' ? resizingPanel(state.resizingPanel) : resizingPanel })),

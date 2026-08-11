@@ -18,6 +18,7 @@ CROSS          ?= cross
 LIPO           ?= lipo
 DIST_DIR       ?= dist
 PACKAGE_OUT_DIR ?= $(DIST_DIR)/packages
+CARGO_TARGET_DIR ?= target
 WINSW_VERSION  ?= $(shell cat .winsw-version 2>/dev/null || echo v2.12.0)
 WINSW_URL      := https://github.com/winsw/winsw/releases/download/$(WINSW_VERSION)/WinSW-x64.exe
 WINSW_CACHE    := .cache/WinSW-x64.exe
@@ -88,6 +89,7 @@ help:
 	@echo "  CARGO=$(CARGO)  CROSS=$(CROSS)  LIPO=$(LIPO)"
 	@echo "  DIST_DIR=$(DIST_DIR)"
 	@echo "  PACKAGE_OUT_DIR=$(PACKAGE_OUT_DIR)"
+	@echo "  CARGO_TARGET_DIR=$(CARGO_TARGET_DIR)   (override to isolate Cargo build artifacts)"
 	@echo "  LINUX_BUILDER=$(LINUX_BUILDER)   (set to '$(CROSS)' to use cross-rs containers)"
 
 # ---- Native --------------------------------------------------------------
@@ -114,18 +116,18 @@ define define-target
 .PHONY: $(1)-debug $(1)-release
 
 $(1)-debug:
-	$(3) build --target $(2) $(PKG_FLAGS)
+	$(3) build --target $(2) $(PKG_FLAGS) --target-dir $(CARGO_TARGET_DIR)
 	@mkdir -p $(DIST_DIR)/debug/$(2)
-	cp target/$(2)/debug/loom        $(DIST_DIR)/debug/$(2)/loom
-	cp target/$(2)/debug/loom-daemon $(DIST_DIR)/debug/$(2)/loom-daemon
-	cp target/$(2)/debug/loom-server $(DIST_DIR)/debug/$(2)/loom-server
+	cp $(CARGO_TARGET_DIR)/$(2)/debug/loom        $(DIST_DIR)/debug/$(2)/loom
+	cp $(CARGO_TARGET_DIR)/$(2)/debug/loom-daemon $(DIST_DIR)/debug/$(2)/loom-daemon
+	cp $(CARGO_TARGET_DIR)/$(2)/debug/loom-server $(DIST_DIR)/debug/$(2)/loom-server
 
 $(1)-release:
-	$(3) build --release --target $(2) $(PKG_FLAGS)
+	$(3) build --release --target $(2) $(PKG_FLAGS) --target-dir $(CARGO_TARGET_DIR)
 	@mkdir -p $(DIST_DIR)/release/$(2)
-	cp target/$(2)/release/loom        $(DIST_DIR)/release/$(2)/loom
-	cp target/$(2)/release/loom-daemon $(DIST_DIR)/release/$(2)/loom-daemon
-	cp target/$(2)/release/loom-server $(DIST_DIR)/release/$(2)/loom-server
+	cp $(CARGO_TARGET_DIR)/$(2)/release/loom        $(DIST_DIR)/release/$(2)/loom
+	cp $(CARGO_TARGET_DIR)/$(2)/release/loom-daemon $(DIST_DIR)/release/$(2)/loom-daemon
+	cp $(CARGO_TARGET_DIR)/$(2)/release/loom-server $(DIST_DIR)/release/$(2)/loom-server
 
 endef
 

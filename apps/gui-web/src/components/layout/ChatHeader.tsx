@@ -1,6 +1,6 @@
 import type { ComponentType } from "react";
-import { Check, FolderOpen, Hash, Settings, Split, Users } from "lucide-react";
-import type { Actor, Channel, Run } from "@/ipc/types";
+import { Check, FolderOpen, Hash, Search, Settings, Split, Users } from "lucide-react";
+import type { Actor, Channel, Run, ScopeRef } from "@/ipc/types";
 import type { ChannelPanelTab } from "@/lib/types";
 import type { ConnectionState } from "@/lib/types";
 import { channelTopic } from "@/lib/channel-utils";
@@ -10,6 +10,7 @@ import { useMemo } from "react";
 import { connectionLabel } from "@/lib/format-utils";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { StopRunButton } from "@/components/shared/StopRunButton";
 import { ScopeTokenSummary } from "@/components/layout/ScopeTokenSummary";
 
 function formatActivityLabel(activity: ChannelAgentActivity): string {
@@ -33,8 +34,13 @@ export function ChatHeader({
   connection,
   activePanel,
   onOpenPanel,
+  searchOpen = false,
+  onToggleSearch,
+  onStopRun,
+  busy = null,
   runs,
   agentActors,
+  runScope,
   scopeId,
   actors,
   onOpenFolder,
@@ -44,17 +50,28 @@ export function ChatHeader({
   connection: ConnectionState;
   activePanel: ChannelPanelTab | null;
   onOpenPanel: (panel: ChannelPanelTab) => void;
+  searchOpen?: boolean;
+  onToggleSearch?: () => void;
+  onStopRun?: (runId: string) => void;
+  busy?: string | null;
   runs: Record<string, Run>;
   agentActors: Actor[];
+  runScope: ScopeRef | null;
   scopeId?: string | null;
   actors?: Record<string, Actor>;
   onOpenFolder?: () => void;
 }) {
   const topic = channelTopic(channel);
-  const activity = useMemo(
-    () => getChannelAgentActivity(runs, agentActors),
-    [runs, agentActors],
-  );
+  const activity = useMemo(() => {
+    if (!runScope) return null;
+    const scopedRuns = Object.fromEntries(
+      Object.entries(runs).filter(([, run]) =>
+        run.scope.kind === runScope.kind && run.scope.id === runScope.id,
+      ),
+    );
+    return getChannelAgentActivity(scopedRuns, agentActors);
+  }, [agentActors, runScope, runs]);
+  const primaryRun = activity?.primaryRun ?? null;
   const panelActions: Array<{
     id: ChannelPanelTab;
     title: string;
@@ -76,23 +93,53 @@ export function ChatHeader({
             {channel ? channel.title : "Space"}
           </h1>
         </div>
-        <div className="mt-1 truncate pl-11 text-sm text-[#485063]">
+        <div className="mt-1 flex min-w-0 items-center gap-2 pl-11 text-sm text-[#485063]">
           {activity && !activity.isIdle ? (
-            <span className={cn(
-              activity.hasFailed && activity.activeCount === 0 && "text-red-500",
-              activity.primaryStatus === "running" && "text-purple-500 chat-header-activity-running",
-              activity.primaryStatus === "waiting_tool" && "text-orange-500",
-            )}>
-              {formatActivityLabel(activity)}
-            </span>
+            <>
+              <span className={cn(
+                "truncate",
+                activity.hasFailed && activity.activeCount === 0 && "text-red-500",
+                activity.primaryStatus === "running" && "text-purple-500 chat-header-activity-running",
+                activity.primaryStatus === "waiting_tool" && "text-orange-500",
+              )}>
+                {formatActivityLabel(activity)}
+              </span>
+              {primaryRun && onStopRun && (
+                <StopRunButton
+                  key={primaryRun.id}
+                  compact
+                  label="Stop"
+                  title={`Stop ${activity.primaryAgentName}'s run`}
+                  busy={busy === `run:cancel:${primaryRun.id}`}
+                  disabled={connection !== "open"}
+                  onConfirm={() => onStopRun(primaryRun.id)}
+                />
+              )}
+            </>
           ) : (
-            topic || target || connectionLabel(connection)
+            <span className="truncate">{topic || target || connectionLabel(connection)}</span>
           )}
         </div>
       </div>
       {/* L1/L2 scope token summary — silent-hidden when null */}
       <ScopeTokenSummary scopeId={scopeId} actors={actors ?? {}} />
       <div className="flex shrink-0 items-center gap-1.5">
+        {onToggleSearch && (
+          <Button
+            variant="outline"
+            size="icon"
+            title="Search messages"
+            aria-label="Search messages"
+            aria-pressed={searchOpen}
+            onClick={onToggleSearch}
+            className={cn(
+              "relative h-9 w-9 shrink-0 rounded-lg",
+              searchOpen && "border-[#bdb7ff] bg-[#f1efff] text-[#5843d7]",
+            )}
+          >
+            <Search size={15} />
+          </Button>
+        )}
         {panelActions.map((item) => {
           const Icon = item.icon;
           const selected = activePanel === item.id;

@@ -173,8 +173,11 @@ bundle 相关变量为：`{agent.bundle_root}`、`{agent.bundle}`。它们表示
 ### 3.1 数据结构
 
 ```text
-~/.agentx/sessions/<actor_id>/<scope_id>.json
+<agent 数据根>/sessions/<actor_id>/<scope_id>.json
 ```
+
+agent 数据根默认为平台数据目录下的 `loom/agents`（Linux 为
+`~/.local/share/loom/agents`），可用 `LOOM_AGENT_DATA_ROOT` 覆盖。
 
 每个文件：
 
@@ -279,15 +282,15 @@ spec 里配置，由 runtime 固定设为当前 channel 下该 actor 的 workspa
 | `{actor.id}` | 当前 actor id |
 | `{scope.id}` | 当前 scope id（trigger message 的 scope） |
 | `{scope.kind}` | `"thread"` 或 `"channel"` |
-| `{agent.workspace}` | `~/.agentx/channels/<channel-id>/agents/<actor-id>/workspace` |
-| `{agent.profile}` | `~/.agentx/agents/<actor-id>/profile`（per-actor 持久化状态：identity / memory / MCP 配置等） |
-| `{agent.logs}` | `~/.agentx/channels/<channel-id>/agents/<actor-id>/logs` |
-| `{agent.root}` | `~/.agentx/channels/<channel-id>/agents/<actor-id>` |
-| `{agent.bundle_root}` | `~/.agentx/agents/<actor-id>/bundles`（runtime 管理的版本化 bundle 根目录） |
+| `{agent.workspace}` | `<agent 数据根>/channels/<channel-id>/agents/<actor-id>/workspace` |
+| `{agent.profile}` | `<agent 数据根>/agents/<actor-id>/profile`（per-actor 持久化状态：identity / memory / MCP 配置等） |
+| `{agent.logs}` | `<agent 数据根>/channels/<channel-id>/agents/<actor-id>/logs` |
+| `{agent.root}` | `<agent 数据根>/channels/<channel-id>/agents/<actor-id>` |
+| `{agent.bundle_root}` | `<agent 数据根>/agents/<actor-id>/bundles`（runtime 管理的版本化 bundle 根目录） |
 | `{agent.bundle}` | 当前激活 bundle 的目录（通常是 `bundles/current` 指向的版本目录） |
-| `{channel.root}` | `~/.agentx/channels/<channel-id>` |
-| `{channel.shared}` | `~/.agentx/channels/<channel-id>/shared` |
-| `{channel.sharedArtifacts}` | `~/.agentx/channels/<channel-id>/shared/artifacts` |
+| `{channel.root}` | `<agent 数据根>/channels/<channel-id>` |
+| `{channel.shared}` | `<agent 数据根>/channels/<channel-id>/shared` |
+| `{channel.sharedArtifacts}` | `<agent 数据根>/channels/<channel-id>/shared/artifacts` |
 | `{env.NAME}` | agent client 进程的 env var |
 | `{session_id}` | 仅 `resume_args` 可用 |
 | `{prompt}` | 仅 `resume_args` / `args`（当 `prompt_via=args`）可用 |
@@ -469,7 +472,7 @@ session_id。
 
 人在 thread `thr_abc` 里发 `message` + `directed_to=actor_claude_cmd`。
 
-Agent client 查 `~/.agentx/sessions/actor_claude_cmd/thr_abc.json`：
+Agent client 查 `<agent 数据根>/sessions/actor_claude_cmd/thr_abc.json`：
 **不存在**。
 
 走 first run 路径：
@@ -587,14 +590,18 @@ IP。也可以用 `LOOM_AGENT_SERVER` 显式覆盖。
 | `LOOM_SCOPE_KIND` | 当前 turn 的 scope kind：`thread` 或 `channel` |
 | `LOOM_AGENT_PROFILE` | per-actor profile 目录 |
 | `LOOM_AGENT_BUNDLE_DIR` | 当前 bundle 目录 |
-| `AGENTX_CHANNEL_ID` | 当前 channel id |
-| `AGENTX_CHANNEL_ROOT` | 当前 channel 根目录 |
-| `AGENTX_CHANNEL_SHARED` | 当前 channel shared 目录 |
-| `AGENTX_CHANNEL_SHARED_ARTIFACTS` | 当前 channel artifacts 目录 |
-| `AGENTX_AGENT_ROOT` | 当前 channel 下该 agent 的私有根目录 |
-| `AGENTX_AGENT_WORKSPACE` | 当前 channel 下该 agent 的默认 workspace |
-| `AGENTX_AGENT_LOGS` | 当前 channel 下该 agent 的日志目录 |
+| `LOOM_CHANNEL_ID` | 当前 channel id |
+| `LOOM_CHANNEL_ROOT` | 当前 channel 根目录 |
+| `LOOM_CHANNEL_SHARED` | 当前 channel shared 目录 |
+| `LOOM_CHANNEL_SHARED_ARTIFACTS` | 当前 channel artifacts 目录 |
+| `LOOM_AGENT_ROOT` | 当前 channel 下该 agent 的私有根目录 |
+| `LOOM_AGENT_WORKSPACE` | 当前 channel 下该 agent 的默认 workspace |
+| `LOOM_AGENT_LOGS` | 当前 channel 下该 agent 的日志目录 |
 | `PATH` | 继承 `loom-daemon` 进程的 PATH |
+
+以上 channel-scoped 变量同时以旧名 `AGENTX_*` 注入（如
+`AGENTX_CHANNEL_ROOT`），用于兼容旧 provider manifest；新集成请使用
+`LOOM_*` 名称。
 
 ### 8.4 脚本里 shell out 回 loom
 

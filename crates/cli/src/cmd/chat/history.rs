@@ -959,7 +959,7 @@ mod tests {
     fn parent_and_reply() -> History {
         let mut history = History::default();
         history.bubbles.push(Bubble {
-            actor_id: "bojun.cbj".into(),
+            actor_id: "tester".into(),
             turn_id: None,
             kind: BubbleKind::Stream,
             text: "the original message that someone is going to reply to".into(),
@@ -984,7 +984,7 @@ mod tests {
     #[test]
     fn reply_target_label_omits_source_id() {
         let bubble = Bubble {
-            actor_id: "bojun.cbj".into(),
+            actor_id: "tester".into(),
             turn_id: None,
             kind: BubbleKind::Stream,
             text: "hello world".into(),
@@ -995,7 +995,7 @@ mod tests {
         };
         let (id, label) = reply_target_label(&bubble, &|id| id.to_string()).unwrap();
         assert_eq!(id, "evt_abc123def456");
-        assert_eq!(label, "@bojun.cbj: hello world");
+        assert_eq!(label, "@tester: hello world");
         assert!(!label.contains("evt_"));
     }
 
@@ -1007,7 +1007,7 @@ mod tests {
         // parent (header + body) + spacer + quote + reply (header + body) = 6 rows.
         assert_eq!(rendered.lines.len(), 6);
         let quote = line_text(&rendered.lines[3]);
-        assert!(quote.contains("↩ @bojun.cbj:"), "got: {quote:?}");
+        assert!(quote.contains("↩ @tester:"), "got: {quote:?}");
         assert!(quote.contains("the original"), "got: {quote:?}");
         assert!(!quote.contains("evt_"), "quote leaked source id: {quote:?}");
         let reply_header = line_text(&rendered.lines[4]);
@@ -1079,7 +1079,7 @@ mod tests {
             &HashSet::new(),
             &|id| {
                 if id == "actor_human_self" {
-                    "bojun.cbj".to_string()
+                    "tester".to_string()
                 } else {
                     id.to_string()
                 }
@@ -1094,7 +1094,7 @@ mod tests {
         );
         assert_eq!(rendered.lines.len(), 2);
         let header = line_text(&rendered.lines[0]);
-        assert!(header.contains("[bojun.cbj]"), "got: {header:?}");
+        assert!(header.contains("[tester]"), "got: {header:?}");
         assert!(header.contains("[human]"), "got: {header:?}");
         // Header has no `[HH:MM:SS]` prefix anymore.
         assert!(!header.contains("[HH"), "got: {header:?}");
@@ -1107,7 +1107,7 @@ mod tests {
         history.push_message(&message);
 
         let display_for = |id: &str| match id {
-            "actor_human_self" => "bojun.cbj".to_string(),
+            "actor_human_self" => "tester".to_string(),
             other => other.to_string(),
         };
         let rendered = history.render_lines(120, None, &HashSet::new(), &display_for, &|_| None);

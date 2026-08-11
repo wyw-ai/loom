@@ -4,6 +4,7 @@ import type {
   ChannelMemberConfig,
   MachineInfo,
   Message,
+  MessageContextResult,
   Workspace,
   Actor,
   Run,
@@ -28,6 +29,7 @@ import { Rail } from "@/components/layout/Rail";
 import { ResizeHandle } from "@/components/layout/ResizeHandle";
 import { Sidebar } from "@/components/layout/Sidebar";
 import { ThreadPanel } from "@/components/chat/ThreadPanel";
+import { SearchPanel } from "@/components/chat/SearchPanel";
 import { ChannelPanel } from "@/components/panels/ChannelPanels";
 import { MainContent } from "@/containers/MainContent";
 import { RemoteFilePanel } from "@/components/chat/RemoteFilePanel";
@@ -56,6 +58,18 @@ export interface WorkspaceShellProps {
   activeThreadId: string | null;
   agentActors: Actor[];
   runs: Record<string, Run>;
+  runsList: Run[];
+  runsLoading: boolean;
+  runsError: string | null;
+  refreshRuns: () => Promise<void>;
+  selectedRun: Run | null;
+  setSelectedRunId: (id: string | null | ((prev: string | null) => string | null)) => void;
+  cancelRun: (runId: string) => Promise<void>;
+  openScope: (scope: ScopeRef) => Promise<void>;
+  openMessageContext: (context: MessageContextResult) => Promise<void>;
+  messageAnchorId: string | null;
+  searchPanelOpen: boolean;
+  setSearchPanelOpen: (open: boolean | ((prev: boolean) => boolean)) => void;
   machines: MachineInfo[];
   threadsByChannel: Record<string, Thread[]>;
   createChannelWithTitle: (title: string) => Promise<void>;
@@ -265,6 +279,11 @@ export function WorkspaceShell(props: WorkspaceShellProps) {
           agentForm={p.agentForm}
           machines={p.machines}
           runs={p.runs}
+          runsList={p.runsList}
+          runsLoading={p.runsLoading}
+          runsError={p.runsError}
+          refreshRuns={p.refreshRuns}
+          selectedRun={p.selectedRun}
           settingsAgentId={p.settingsAgentId}
           actors={p.actors}
           threadsByChannel={p.threadsByChannel}
@@ -273,6 +292,12 @@ export function WorkspaceShell(props: WorkspaceShellProps) {
           setActiveChannelId={p.setActiveChannelId}
           setActiveThreadId={p.setActiveThreadId}
           setChannelPanelTab={p.setChannelPanelTab}
+          setSearchPanelOpen={p.setSearchPanelOpen}
+          setSelectedRunId={p.setSelectedRunId}
+          searchPanelOpen={p.searchPanelOpen}
+          cancelRun={p.cancelRun}
+          openScope={p.openScope}
+          messageAnchorId={p.messageAnchorId}
           setActiveDirectActorId={p.setActiveDirectActorId}
           setDraft={p.setDraft}
           setThreadDraft={p.setThreadDraft}
@@ -318,7 +343,18 @@ export function WorkspaceShell(props: WorkspaceShellProps) {
         />
       )}
       {p.showChatDetail && (
-        p.activeThread ? (
+        p.searchPanelOpen ? (
+          <SearchPanel
+            actors={p.actors}
+            channels={p.visibleChannels}
+            activeChannel={p.activeChannel ?? null}
+            activeThread={p.activeThread}
+            connection={p.connection}
+            className="fixed inset-y-0 right-0 z-40 flex w-[420px] max-w-[calc(100vw-2rem)] min-h-0 min-w-0 flex-col border-l border-[#e2e6ef] bg-white shadow-2xl xl:static xl:z-auto xl:w-auto xl:max-w-none xl:shadow-none"
+            onClose={() => p.setSearchPanelOpen(false)}
+            onOpenContext={p.openMessageContext}
+          />
+        ) : p.activeThread ? (
           <ThreadPanel
             actors={p.actors}
             channel={p.activeChannel ?? null}
@@ -330,6 +366,7 @@ export function WorkspaceShell(props: WorkspaceShellProps) {
             machines={p.machines}
             runs={p.runs}
             messages={p.threadMessages}
+            anchorMessageId={p.messageAnchorId}
             setDraft={p.setThreadDraft}
             task={p.activeThreadTask}
             thread={p.activeThread}

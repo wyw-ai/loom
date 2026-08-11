@@ -1,7 +1,7 @@
 # Windows 环境下构建 Loom 项目指南
 
 > **最后更新**: 2026-06-17  
-> **适用版本**: Loom Desktop v0.1.0 (dev 分支)  
+> **适用版本**: Loom Desktop v0.1.1
 > **本文档独立可读**，无需依赖 thread 对话历史即可完成构建。
 
 ---
@@ -93,15 +93,14 @@ winget install Microsoft.EdgeWebView2Runtime
 ## 2. 项目克隆与结构
 
 ```powershell
-git clone https://github.com/plumeink/joi-apps-temp.git
-cd joi-apps-temp
-git checkout dev
+git clone https://github.com/wyw-ai/loom.git
+cd loom
 ```
 
 ### Crate 结构概览
 
 ```
-joi-apps-temp/
+loom/
 ├── Cargo.toml                 # 工作区根配置
 ├── crates/
 │   ├── agent-runtime/         # Agent 运行时核心 (库)
@@ -203,7 +202,7 @@ cargo tauri build --ci --bundles nsis
 
 | 产物 | 路径 |
 |------|------|
-| 安装包 (.exe) | `target/release/bundle/nsis/Loom Desktop_0.1.0_x64-setup.exe` |
+| 安装包 (.exe) | `target/release/bundle/nsis/Loom Desktop_0.1.1_x64-setup.exe` |
 | 可执行文件 | `target/release/loom-gui.exe` |
 
 ---
@@ -362,7 +361,7 @@ winget install NSIS.NSIS
 | CLI | `loom-cli` | `cargo build -p loom-cli --release` | `target/release/loom.exe` |
 | Daemon | `loom-cli` | `cargo build -p loom-cli --release` | `target/release/loom-daemon.exe` |
 | Shell | `loom-shell` | `cargo build -p loom-shell --release` | `target/release/loom-shell.exe` |
-| GUI 安装包 | `loom-gui` | `cd crates/gui && cargo tauri build --ci --bundles nsis` | `target/release/bundle/nsis/Loom Desktop_0.1.0_x64-setup.exe` |
+| GUI 安装包 | `loom-gui` | `cd crates/gui && cargo tauri build --ci --bundles nsis` | `target/release/bundle/nsis/Loom Desktop_0.1.1_x64-setup.exe` |
 | GUI 可执行 | `loom-gui` | （同上） | `target/release/loom-gui.exe` |
 
 > **注意**：`loom` 和 `loom-daemon` 是同一个 Rust 包 `loom-cli` 下的两个二进制。构建 `loom-cli` 会同时产出两个 .exe。
@@ -375,5 +374,5 @@ winget install NSIS.NSIS
 1. **GitHub Actions CI 不适用**：当前 GitHub Actions 构建配额不足，本文档面向本地 Windows 构建。CI 配置（`.github/workflows/gui-build.yml`）已包含 NSIS 打包和 artifact 上传逻辑，配额恢复后可复用。
 2. **Tauri NSIS 安装包仅 Windows 产出**：macOS/Linux 需要各自平台构建（`--bundles dmg` / `--bundles deb`）。
 3. **GUI 构建时间较长**：首次构建需下载所有 Rust 依赖 + 前端 npm 包 + Tauri CLI，预计 15-30 分钟（取决于网络和机器性能）。
-4. **Windows 构建路径建议短路径**：尽管项目已做 UNC 前缀修复，仍建议将项目克隆到短路径（如 `C:\src\joi-apps`）以避免超出系统级路径限制。
+4. **Windows 构建路径建议短路径**：尽管项目已做 UNC 前缀修复，仍建议将项目克隆到短路径（如 `C:\src\loom`）以避免超出系统级路径限制。
 5. **loom-shell 与 GUI 的关系**：`loom-shell.exe` 是独立进程，不嵌入 Tauri GUI。GUI 通过进程间通信调用 shell。如果只构建 GUI 安装包，shell 不会自动包含 — 需单独分发或集成到安装脚本。

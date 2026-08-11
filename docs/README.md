@@ -11,7 +11,6 @@ runtime/provider behavior, GUI product flows, or local verification steps.
 
 - [current-app-implementation.md](./current-app-implementation.md) - current app topology, process composition, data locations, agent lifecycle, runtime configuration, and validation focus.
 - [architecture.md](./architecture.md) - process boundaries, data ownership, protocol model, scheduling loop, cancellation model, agent management commands, and code boundaries.
-- [loom-refactor-plan.md](./loom-refactor-plan.md) - target breaking-change specification for Loom's actor/channel/thread/task/service model.
 - [architecture-v1-agent-client.md](./architecture-v1-agent-client.md) - v1 agent client split, adapter model, registry ownership, wakeup flow, and deployment quick start.
 
 ## Protocol

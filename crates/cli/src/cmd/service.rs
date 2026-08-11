@@ -117,9 +117,7 @@ pub async fn serve(
     );
     let data_root = state::default_data_root();
     let mut host = ServiceHost::new(server_url, data_root).with_specs_dir(dir.clone());
-    // S3: scheduler is the first long-process plugin under the host.
-    // AM stays a short-lived `am-handler` subprocess (S2) and isn't
-    // registered here.
+    // The scheduler is the reference long-process plugin under the host.
     host.register(Arc::new(SchedulerPlugin::default()));
     host.serve(specs).await
 }
@@ -146,19 +144,6 @@ pub fn reload(service_id: String) -> Result<()> {
         println!("(host will respawn on next poll cycle; if no `loom service serve` is running this is a no-op)");
     }
     Ok(())
-}
-
-/// `loom service am-handler --service-id <id>` — per-message AM bridge
-/// handler. Stage 4 wires the CLI; the orchestrator + plugin logic
-/// lives in `crate::service::am::handler` (S2).
-pub async fn am_handler(
-    server_url: String,
-    service_id: String,
-    specs_dir: Option<PathBuf>,
-    async_reply: Option<String>,
-) -> Result<()> {
-    let dir = specs_dir.unwrap_or_else(default_specs_dir);
-    crate::service::am::run_handler(server_url, service_id, dir, async_reply).await
 }
 
 /// `loom service validate <path>` — read a single ServiceSpec JSON file,

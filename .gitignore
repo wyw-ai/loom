@@ -3,24 +3,22 @@
 /data/artifacts/
 /dist/
 /pages/build/
+# Local secrets / Docker stack config (only .env.example is tracked)
+.env
+.env.*
+!.env.example
 .idea
 .DS_Store
 /.claude/
-/.agents/
+/.agents/*
+!/.agents/skills/
 /.am/
 __pycache__/
 /docs/*
 !/docs/README.md
 !/docs/agent-turn-input-analysis.md
 !/docs/gui-actor-provider-management-design.md
-!/docs/loom-refactor-plan.md
 !/docs/loop-engineering.md
-!/docs/am-loom-bridge.md
-!/docs/article-loom-current-design.md
-!/docs/article-loom-image-1.md
-!/docs/article-loom-image-2.md
-!/docs/article-loom-image-3.md
-!/docs/ISSUES.md
 !/docs/protocol/
 !/docs/protocol/agent-coordination-workflow.md
 !/docs/protocol/turn-input-contract-v1.md
@@ -42,6 +40,7 @@ data
 /crates/gui/target/
 /logs/
 /tmp/
+/.tmp/
 # In-repo checkouts of official runtime content (CI checks these out here)
 /loom-guide/
 /loom-skills/

@@ -163,6 +163,50 @@ export interface RunFrame {
   createdAt: string;
 }
 
+export interface MessageSearchParams {
+  query: string;
+  target?: string;
+  /** RFC3339 UTC, inclusive boundary (`createdAt >= createdAfter`). */
+  createdAfter?: string;
+  /** RFC3339 UTC, exclusive boundary (`createdAt < createdBefore`). */
+  createdBefore?: string;
+  /** Defaults to 20 server-side. */
+  limit?: number;
+}
+
+export interface MessageSearchResult {
+  messages: Message[];
+}
+
+export interface MessageContextParams {
+  messageId: string;
+  /** Defaults to 20, hard-capped at 50 server-side. */
+  before?: number;
+  after?: number;
+}
+
+export interface MessageContextResult {
+  before: Message[];
+  anchor: Message;
+  after: Message[];
+}
+
+export interface RunListParams {
+  statuses?: RunStatus[];
+  actorId?: string;
+  target?: string;
+  /** Defaults to 50, hard-capped at 200 server-side. */
+  limit?: number;
+}
+
+export interface RunListResult {
+  runs: Run[];
+}
+
+export interface RunGetResult {
+  run: Run;
+}
+
 export type DeliveryState = "pending" | "delivered" | "failed";
 
 export interface Delivery {

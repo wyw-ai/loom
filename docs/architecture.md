@@ -131,9 +131,12 @@ runtime 代码集中在：
 | 协作 journal / actors / channels / messages / runs | `loom-server` | server `--data-dir` |
 | artifact 文件 | `loom-server` | `<data-dir>/artifacts` |
 | machine / agent 配置 | GUI / CLI 本地配置 | `~/.loom-apps/desktop.toml` |
-| actor-private profile / bundles | `loom-daemon` | `~/.agentx/agents/<actor_id>` |
-| channel-scoped workspace / logs | `loom-daemon` | `~/.agentx/channels/<channel_id>/agents/<actor_id>` |
-| shared channel artifacts for runtime | `loom-daemon` | `~/.agentx/channels/<channel_id>/shared/artifacts` |
+| actor-private profile / bundles | `loom-daemon` | `<agent 数据根>/agents/<actor_id>` |
+| channel-scoped workspace / logs | `loom-daemon` | `<agent 数据根>/channels/<channel_id>/agents/<actor_id>` |
+| shared channel artifacts for runtime | `loom-daemon` | `<agent 数据根>/channels/<channel_id>/shared/artifacts` |
+
+agent 数据根默认为平台数据目录下的 `loom/agents`（Linux 为
+`~/.local/share/loom/agents`），可用 `LOOM_AGENT_DATA_ROOT` 覆盖。
 
 workspace 不再是 actor-private 的单一目录。每次 prompt 会按 channel + actor 计算
 cwd，ACP 的 `session/new.cwd` 与 command transport 的 `current_dir` 都使用这个

@@ -2629,12 +2629,16 @@ fn run_cancel(state: &AppState, connection_id: &str, params: Option<Value>) -> H
     if !state.store.is_channel_member(&channel_id, &caller) {
         return Err(ErrorObject::new(ErrorCode::APP_NOT_FOUND, "run"));
     }
+    let visible_run = state
+        .store
+        .project_run_for_actor(&run, &caller)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "run"))?;
     if matches!(
         run.status,
         RunStatus::Completed | RunStatus::Failed | RunStatus::Canceled
     ) {
         return ok(RunCancelResult {
-            run,
+            run: visible_run,
             cancel_message: None,
         });
     }
@@ -2647,6 +2651,9 @@ fn run_cancel(state: &AppState, connection_id: &str, params: Option<Value>) -> H
     metadata.insert("kind".into(), json!("run.cancel"));
     metadata.insert("runId".into(), json!(run.id.clone()));
     metadata.insert("canceledBy".into(), json!(caller.clone()));
+    if state.store.run_private_actor_ids(&run).is_some() {
+        metadata.insert("privateTo".into(), json!([run.actor_id.clone()]));
+    }
     if let Some(reason) = p.reason.as_ref().filter(|value| !value.trim().is_empty()) {
         metadata.insert("reason".into(), json!(reason));
     }
@@ -2682,6 +2689,10 @@ fn run_cancel(state: &AppState, connection_id: &str, params: Option<Value>) -> H
         .store
         .close_run(&run.id, RunStatus::Canceled, None)
         .map_err(map_store_err)?;
+    let run = state
+        .store
+        .project_run_for_actor(&run, &caller)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "run"))?;
     ok(RunCancelResult {
         run,
         cancel_message: Some(cancel_message),
@@ -2725,6 +2736,10 @@ fn run_get(state: &AppState, connection_id: &str, params: Option<Value>) -> Hand
     if !state.store.is_channel_member(&channel_id, &caller) {
         return Err(ErrorObject::new(ErrorCode::APP_NOT_FOUND, "run"));
     }
+    let run = state
+        .store
+        .project_run_for_actor(&run, &caller)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "run"))?;
     ok(RunGetResult { run })
 }
 
@@ -5615,6 +5630,136 @@ mod tests {
         .await
         .expect_err("missing run must be not-found");
         assert_eq!(err.code, ErrorCode::APP_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn run_rpc_does_not_expose_private_trigger_metadata_to_scope_observers() {
+        let state = fresh_state("run-rpc-private-trigger");
+        open_conn(&state, "conn_player", "actor_player").await;
+        open_agent_conn(&state, "conn_host", "actor_agent_host").await;
+        open_conn(&state, "conn_observer", "actor_observer").await;
+        let channel = state
+            .store
+            .create_channel("public game".into(), None)
+            .expect("channel");
+        for actor_id in ["actor_player", "actor_agent_host", "actor_observer"] {
+            state.store.grant_channel(&channel.id, actor_id).unwrap();
+        }
+
+        let mut message_metadata = Meta::default();
+        message_metadata.insert("privateTo".into(), json!(["actor_agent_host"]));
+        let private_message = state
+            .store
+            .append_message(
+                "actor_player".into(),
+                format!("#{}", channel.id),
+                MessageKind::Human,
+                "secret night action".into(),
+                Vec::new(),
+                vec![AudienceRef {
+                    kind: AudienceKind::Actor,
+                    id: "actor_agent_host".into(),
+                    display: None,
+                }],
+                MessageIntent::RequestAction,
+                DeliveryPolicy::WakeAgent,
+                None,
+                None,
+                Vec::new(),
+                message_metadata,
+                None,
+            )
+            .expect("private trigger");
+        let config = state
+            .store
+            .publish_agent_config_version(
+                "actor_agent_host".into(),
+                Some("v1".into()),
+                String::new(),
+                "test-model".into(),
+                "test-adapter".into(),
+                Value::Null,
+                Vec::new(),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                "actor_agent_host".into(),
+                Meta::default(),
+            )
+            .expect("config");
+        let mut run_metadata = Meta::default();
+        run_metadata.insert("noReplyReason".into(), json!("all players' secret roles"));
+        let run = state
+            .store
+            .open_run(
+                "actor_agent_host".into(),
+                private_message.scope.clone(),
+                Some(private_message.id.clone()),
+                Some(private_message.id),
+                config.id,
+                run_metadata,
+            )
+            .expect("run");
+
+        let observer_list: RunListResult = serde_json::from_value(
+            dispatch(&state, "conn_observer", method::RUN_LIST, Some(json!({})))
+                .await
+                .expect("observer list"),
+        )
+        .expect("observer list result");
+        assert!(observer_list.runs.is_empty());
+        for rpc_method in [method::RUN_GET, method::RUN_CANCEL] {
+            let error = dispatch(
+                &state,
+                "conn_observer",
+                rpc_method,
+                Some(json!({ "runId": run.id })),
+            )
+            .await
+            .expect_err("observer cannot inspect or mutate private run");
+            assert_eq!(error.code, ErrorCode::APP_NOT_FOUND);
+        }
+
+        let player_get: RunGetResult = serde_json::from_value(
+            dispatch(
+                &state,
+                "conn_player",
+                method::RUN_GET,
+                Some(json!({ "runId": run.id })),
+            )
+            .await
+            .expect("private sender gets lifecycle projection"),
+        )
+        .expect("player run result");
+        assert!(player_get.run.metadata.is_empty());
+        assert!(player_get.run.start_reason.is_none());
+
+        let canceled: RunCancelResult = serde_json::from_value(
+            dispatch(
+                &state,
+                "conn_player",
+                method::RUN_CANCEL,
+                Some(json!({ "runId": run.id, "reason": "stop private turn" })),
+            )
+            .await
+            .expect("private sender cancels run"),
+        )
+        .expect("cancel result");
+        assert_eq!(canceled.run.status, RunStatus::Canceled);
+        assert!(canceled.run.metadata.is_empty());
+        let cancel_message = canceled.cancel_message.expect("cancel message");
+        assert!(Store::message_visible_to_actor(
+            &cancel_message,
+            "actor_player"
+        ));
+        assert!(Store::message_visible_to_actor(
+            &cancel_message,
+            "actor_agent_host"
+        ));
+        assert!(!Store::message_visible_to_actor(
+            &cancel_message,
+            "actor_observer"
+        ));
     }
 
     #[tokio::test]

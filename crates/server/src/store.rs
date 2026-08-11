@@ -3869,11 +3869,60 @@ impl Store {
             })
             .filter(|run| statuses.is_none_or(|set| set.contains(&run.status)))
             .filter(|run| run_actor_id.is_none_or(|id| run.actor_id == id))
-            .cloned()
+            .filter_map(|run| Self::project_run_for_actor_inner(&inner, run, actor_id))
             .collect();
         runs.sort_by(|a, b| b.opened_at.cmp(&a.opened_at).then_with(|| b.id.cmp(&a.id)));
         runs.truncate(limit);
         Ok(runs)
+    }
+
+    fn run_private_actor_ids_inner(inner: &Inner, run: &Run) -> Option<HashSet<String>> {
+        let source_id = run.delivery_id.as_deref()?;
+        match inner.messages.get(source_id) {
+            Some(message) => Self::message_private_actor_ids(message).map(|mut allowed| {
+                allowed.insert(run.actor_id.clone());
+                allowed
+            }),
+            // A retained run may outlive its triggering message under a
+            // bounded retention policy. Fail closed instead of widening a
+            // formerly-private run to every member of the scope.
+            None => Some(HashSet::from([run.actor_id.clone()])),
+        }
+    }
+
+    /// Return the actor ids that may learn a run triggered by a same-scope
+    /// private message. `None` means the trigger was not private. The run
+    /// actor is always included defensively.
+    pub fn run_private_actor_ids(&self, run: &Run) -> Option<HashSet<String>> {
+        Self::run_private_actor_ids_inner(&self.inner.read(), run)
+    }
+
+    /// Project a run for a caller without letting private-message execution
+    /// metadata become a side channel. The worker gets its canonical run;
+    /// another participant in the private trigger gets only lifecycle data;
+    /// unrelated scope members do not learn that the run exists.
+    fn project_run_for_actor_inner(inner: &Inner, run: &Run, actor_id: &str) -> Option<Run> {
+        let Some(allowed) = Self::run_private_actor_ids_inner(inner, run) else {
+            return Some(run.clone());
+        };
+        if actor_id == run.actor_id {
+            return Some(run.clone());
+        }
+        if !allowed.contains(actor_id) {
+            return None;
+        }
+        Some(Self::redact_private_run(run))
+    }
+
+    pub fn project_run_for_actor(&self, run: &Run, actor_id: &str) -> Option<Run> {
+        Self::project_run_for_actor_inner(&self.inner.read(), run, actor_id)
+    }
+
+    pub fn redact_private_run(run: &Run) -> Run {
+        let mut projected = run.clone();
+        projected.start_reason = None;
+        projected.metadata.clear();
+        projected
     }
 
     pub fn message_target_for_scope(&self, scope: &ScopeRef) -> StoreResult<String> {
@@ -10238,6 +10287,105 @@ mod tests {
             .unwrap();
         assert_eq!(runs.len(), 1, "alice should see the run, got {:?}", runs);
         assert_eq!(runs[0].id, run.id);
+    }
+
+    #[test]
+    fn private_triggered_runs_do_not_leak_execution_metadata() {
+        let store = fresh_store();
+        for (id, kind, name) in [
+            ("actor_player", ActorKind::Human, "Player"),
+            ("actor_agent_host", ActorKind::Agent, "Host"),
+            ("actor_observer", ActorKind::Human, "Observer"),
+        ] {
+            store.upsert_actor(test_actor(id, kind, name)).unwrap();
+        }
+        let channel = store.create_channel("public".into(), None).unwrap();
+        for actor_id in ["actor_player", "actor_agent_host", "actor_observer"] {
+            store.grant_channel(&channel.id, actor_id).unwrap();
+        }
+
+        let mut message_metadata = Meta::default();
+        message_metadata.insert("privateTo".into(), serde_json::json!(["actor_agent_host"]));
+        let private_message = store
+            .append_message(
+                "actor_player".into(),
+                format!("#{}", channel.id),
+                MessageKind::Human,
+                "my secret role is seer".into(),
+                Vec::new(),
+                vec![AudienceRef {
+                    kind: AudienceKind::Actor,
+                    id: "actor_agent_host".into(),
+                    display: None,
+                }],
+                MessageIntent::RequestAction,
+                DeliveryPolicy::WakeAgent,
+                None,
+                None,
+                Vec::new(),
+                message_metadata,
+                None,
+            )
+            .expect("append private trigger");
+        let config = store
+            .publish_agent_config_version(
+                "actor_agent_host".into(),
+                Some("v1".into()),
+                String::new(),
+                "test-model".into(),
+                "test-adapter".into(),
+                serde_json::Value::Null,
+                Vec::new(),
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                "actor_agent_host".into(),
+                Meta::default(),
+            )
+            .expect("publish config");
+        let mut run_metadata = Meta::default();
+        run_metadata.insert(
+            "noReplyReason".into(),
+            serde_json::json!("all secret roles and night actions"),
+        );
+        let run = store
+            .open_run(
+                "actor_agent_host".into(),
+                private_message.scope.clone(),
+                Some(private_message.id.clone()),
+                Some(private_message.id.clone()),
+                config.id,
+                run_metadata,
+            )
+            .expect("open private-triggered run");
+
+        let worker_runs = store
+            .list_runs("actor_agent_host", None, None, None, 50)
+            .unwrap();
+        assert_eq!(worker_runs.len(), 1);
+        assert_eq!(
+            worker_runs[0]
+                .metadata
+                .get("noReplyReason")
+                .and_then(serde_json::Value::as_str),
+            Some("all secret roles and night actions")
+        );
+
+        let sender_runs = store
+            .list_runs("actor_player", None, None, None, 50)
+            .unwrap();
+        assert_eq!(sender_runs.len(), 1);
+        assert_eq!(sender_runs[0].id, run.id);
+        assert!(sender_runs[0].metadata.is_empty());
+        assert!(sender_runs[0].start_reason.is_none());
+
+        assert!(store
+            .list_runs("actor_observer", None, None, None, 50)
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .project_run_for_actor(&run, "actor_observer")
+            .is_none());
     }
 
     #[test]

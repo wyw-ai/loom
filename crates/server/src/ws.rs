@@ -607,6 +607,50 @@ fn fanout(state: &AppState, ev: StoreEvent) {
         return;
     }
 
+    // A run triggered by a same-scope private message inherits that message's
+    // privacy boundary. Send the canonical metadata only to the worker; the
+    // other private participants receive lifecycle-only data, and unrelated
+    // channel members receive no event at all.
+    if let StoreEvent::RunUpdated(run) = &ev {
+        if let Some(private_allowed) = state.store.run_private_actor_ids(run) {
+            let scope = run.scope.clone();
+            let full_allowed = std::collections::HashSet::from([run.actor_id.clone()]);
+            let full_payload = json!({
+                "kind": sk::RUN_UPDATED,
+                "scope": scope,
+                "data": { "run": run },
+            });
+            broadcast_filtered(
+                state,
+                &scope,
+                method::STREAM_UPDATE,
+                &full_payload,
+                &full_allowed,
+            );
+
+            let redacted_allowed = private_allowed
+                .into_iter()
+                .filter(|actor_id| actor_id != &run.actor_id)
+                .collect::<std::collections::HashSet<_>>();
+            if !redacted_allowed.is_empty() {
+                let projected = Store::redact_private_run(run);
+                let redacted_payload = json!({
+                    "kind": sk::RUN_UPDATED,
+                    "scope": scope,
+                    "data": { "run": projected },
+                });
+                broadcast_filtered(
+                    state,
+                    &scope,
+                    method::STREAM_UPDATE,
+                    &redacted_payload,
+                    &redacted_allowed,
+                );
+            }
+            return;
+        }
+    }
+
     let scope = ev.scope();
     let (kind, data) = match &ev {
         StoreEvent::MessageCreated(m) => (sk::MESSAGE_CREATED, json!({ "message": m })),
@@ -830,7 +874,8 @@ mod tests {
     use std::time::Duration;
 
     use proto::types::{
-        Actor, AudienceKind, AudienceRef, DeliveryPolicy, MessageIntent, MessageKind, Meta,
+        Actor, AudienceKind, AudienceRef, DeliveryPolicy, MessageIntent, MessageKind, Meta, Run,
+        RunStatus,
     };
     use tokio::sync::oneshot;
 
@@ -1056,6 +1101,118 @@ mod tests {
         assert!(
             rx_carol.try_recv().is_err(),
             "non-recipient subscriber must not receive private message frames"
+        );
+    }
+
+    #[test]
+    fn fanout_private_triggered_run_redacts_sender_and_hides_observer() {
+        let state = fresh_state("private-run-fanout");
+        for (id, kind, name) in [
+            ("actor_player", ActorKind::Human, "Player"),
+            ("actor_agent_host", ActorKind::Agent, "Host"),
+            ("actor_observer", ActorKind::Human, "Observer"),
+        ] {
+            state
+                .store
+                .upsert_actor(Actor {
+                    id: id.into(),
+                    display_name: name.into(),
+                    kind,
+                    capabilities: None,
+                    _meta: None,
+                })
+                .expect("actor");
+        }
+        let channel = state
+            .store
+            .create_channel("private run".into(), None)
+            .expect("channel");
+        for actor_id in ["actor_player", "actor_agent_host", "actor_observer"] {
+            state.store.grant_channel(&channel.id, actor_id).unwrap();
+        }
+        let scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: channel.id.clone(),
+        };
+
+        let mut receivers = Vec::new();
+        for (connection_id, actor_id) in [
+            ("conn_player", "actor_player"),
+            ("conn_host", "actor_agent_host"),
+            ("conn_observer", "actor_observer"),
+        ] {
+            let (tx, rx) = mpsc::unbounded_channel::<String>();
+            state.subscriptions.add_connection(Connection {
+                id: connection_id.into(),
+                actor_id: Some(actor_id.into()),
+                tx,
+            });
+            assert!(state.subscriptions.subscribe(connection_id, scope.clone()));
+            receivers.push((actor_id, rx));
+        }
+
+        let mut message_metadata = Meta::default();
+        message_metadata.insert("privateTo".into(), json!(["actor_agent_host"]));
+        let private_message = state
+            .store
+            .append_message(
+                "actor_player".into(),
+                format!("#{}", channel.id),
+                MessageKind::Human,
+                "secret role".into(),
+                Vec::new(),
+                vec![AudienceRef {
+                    kind: AudienceKind::Actor,
+                    id: "actor_agent_host".into(),
+                    display: None,
+                }],
+                MessageIntent::RequestAction,
+                DeliveryPolicy::WakeAgent,
+                None,
+                None,
+                Vec::new(),
+                message_metadata,
+                None,
+            )
+            .expect("private trigger");
+        let mut run_metadata = Meta::default();
+        run_metadata.insert(
+            "noReplyReason".into(),
+            json!("player is the seer and inspected the wolf"),
+        );
+        let run = Run {
+            id: "run_private".into(),
+            actor_id: "actor_agent_host".into(),
+            scope,
+            delivery_id: Some(private_message.id.clone()),
+            start_reason: Some(private_message.id),
+            agent_config_version_id: "config_private".into(),
+            status: RunStatus::Running,
+            opened_at: chrono::Utc::now(),
+            closed_at: None,
+            metadata: run_metadata,
+        };
+
+        fanout(&state, StoreEvent::RunUpdated(run));
+
+        let (_, mut player_rx) = receivers.remove(0);
+        let (_, mut host_rx) = receivers.remove(0);
+        let (_, mut observer_rx) = receivers.remove(0);
+        let player: Value =
+            serde_json::from_str(&player_rx.try_recv().expect("private sender gets lifecycle"))
+                .expect("player frame");
+        assert_eq!(player["params"]["data"]["run"]["metadata"], json!({}));
+        assert!(player["params"]["data"]["run"].get("startReason").is_none());
+
+        let host: Value = serde_json::from_str(&host_rx.try_recv().expect("worker gets full run"))
+            .expect("host frame");
+        assert_eq!(
+            host["params"]["data"]["run"]["metadata"]["noReplyReason"],
+            "player is the seer and inspected the wolf"
+        );
+        assert!(
+            observer_rx.try_recv().is_err(),
+            "unrelated observer must not learn that a private run exists"
         );
     }
 

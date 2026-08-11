@@ -4620,7 +4620,7 @@ mod tests {
     fn spawn_and_collect_releases_slot_before_finished_dispatch() {
         let mut cfg = cfg();
         cfg.command = "sh".into();
-        cfg.args = vec!["-c".into(), "printf 'done\\n'".into()];
+        cfg.args = vec!["-c".into(), "cat >/dev/null; printf 'done\\n'".into()];
         cfg.prompt_via = PromptVia::Stdin;
         let request = prompt("ignored");
         let (tx, mut rx) = mpsc::unbounded_channel();

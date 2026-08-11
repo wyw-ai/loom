@@ -10,6 +10,7 @@ OUT_DIR="$TEST_DIR/packages"
 LINUX_DIR="$DIST_DIR/release/x86_64-unknown-linux-gnu"
 WINDOWS_DIR="$DIST_DIR/release/x86_64-pc-windows-msvc"
 INSTALL_DIR="$TEST_DIR/install"
+VERSION="$(node "$ROOT_DIR/scripts/check-release-version.mjs" --print-version)"
 
 MAKE_DRY_RUN="$(
   make -C "$ROOT_DIR" -n linux-x86-release \
@@ -29,25 +30,25 @@ for binary in loom loom-daemon loom-server; do
   printf 'fake %s.exe\n' "$binary" >"$WINDOWS_DIR/$binary.exe"
 done
 
-DOWNLOAD_BASE_URL="https://github.com/wyw-ai/loom/releases/download/v0.1.1" \
+DOWNLOAD_BASE_URL="https://github.com/wyw-ai/loom/releases/download/v$VERSION" \
   bash "$ROOT_DIR/scripts/package-release.sh" \
     --skip-build \
     --skip-gui \
     --dist-dir "$DIST_DIR" \
     --out-dir "$OUT_DIR"
 
-test -f "$OUT_DIR/loom-runtime-0.1.1-x86_64-unknown-linux-gnu.tar.gz"
-test -f "$OUT_DIR/loom-runtime-0.1.1-x86_64-pc-windows-msvc.zip"
+test -f "$OUT_DIR/loom-runtime-$VERSION-x86_64-unknown-linux-gnu.tar.gz"
+test -f "$OUT_DIR/loom-runtime-$VERSION-x86_64-pc-windows-msvc.zip"
 
 node "$ROOT_DIR/scripts/write-release-downloads.mjs" \
   --package-dir "$OUT_DIR" \
   --out "$TEST_DIR/release-downloads.js" \
-  --version 0.1.1 \
-  --tag v0.1.1 \
-  --download-base-url "https://github.com/wyw-ai/loom/releases/download/v0.1.1"
+  --version "$VERSION" \
+  --tag "v$VERSION" \
+  --download-base-url "https://github.com/wyw-ai/loom/releases/download/v$VERSION"
 
 grep -q '"label": "x86_64-pc-windows-msvc"' "$TEST_DIR/release-downloads.js"
-grep -q 'loom-runtime-0.1.1-x86_64-pc-windows-msvc.zip' "$TEST_DIR/release-downloads.js"
+grep -q "loom-runtime-$VERSION-x86_64-pc-windows-msvc.zip" "$TEST_DIR/release-downloads.js"
 
 sh "$OUT_DIR/install.sh" \
   --target x86_64-pc-windows-msvc \

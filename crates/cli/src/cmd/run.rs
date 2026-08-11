@@ -501,6 +501,31 @@ fn parse_run_status(raw: &str) -> Result<RunStatus> {
 mod tests {
     use super::*;
 
+    fn temp_marker(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "loom-{name}-{}-{}.json",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ))
+    }
+
+    #[test]
+    fn visible_output_guard_allows_missing_marker() {
+        let marker = temp_marker("missing-no-reply");
+        assert!(ensure_visible_output_allowed_for_path(&marker).is_ok());
+    }
+
+    #[test]
+    fn visible_output_guard_rejects_existing_marker() {
+        let marker = temp_marker("existing-no-reply");
+        std::fs::write(&marker, "{}").expect("write marker");
+
+        let err = ensure_visible_output_allowed_for_path(&marker).expect_err("guard should reject");
+
+        assert!(err.to_string().contains("--allow-after-no-reply"));
+        std::fs::remove_file(marker).ok();
+    }
+
     #[test]
     fn human_status_names_match_canonical_wire_values() {
         let cases = [
@@ -555,30 +580,5 @@ mod tests {
                 "Cancel run `run_1`? [y/N] "
             );
         }
-    }
-
-    fn temp_marker(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "loom-{name}-{}-{}.json",
-            std::process::id(),
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ))
-    }
-
-    #[test]
-    fn visible_output_guard_allows_missing_marker() {
-        let marker = temp_marker("missing-no-reply");
-        assert!(ensure_visible_output_allowed_for_path(&marker).is_ok());
-    }
-
-    #[test]
-    fn visible_output_guard_rejects_existing_marker() {
-        let marker = temp_marker("existing-no-reply");
-        std::fs::write(&marker, "{}").expect("write marker");
-
-        let err = ensure_visible_output_allowed_for_path(&marker).expect_err("guard should reject");
-
-        assert!(err.to_string().contains("--allow-after-no-reply"));
-        std::fs::remove_file(marker).ok();
     }
 }

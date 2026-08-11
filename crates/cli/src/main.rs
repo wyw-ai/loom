@@ -2208,8 +2208,8 @@ async fn async_main() -> Result<()> {
 
     let explicit_server_arg = explicit_server_arg_present();
     let inferred_actor_kind = local_agent_spec_actor_kind(&cfg.actor_id)?;
-    let observer = args.observer || (args.actor_kind.is_none() && inferred_actor_kind.is_some());
     let connection_actor_kind = args.actor_kind.or(inferred_actor_kind);
+    let observer = args.observer || (args.actor_kind.is_none() && inferred_actor_kind.is_some());
     let client = connect_bound_client(
         &cfg.server_url,
         explicit_server_arg,
@@ -2842,6 +2842,7 @@ async fn async_main() -> Result<()> {
                 let actor_id = cfg.actor_id.clone();
                 let display_name = cfg.display_name.clone();
                 let actor_kind = connection_actor_kind;
+                let observer_mode = observer;
                 cmd::run::watch(client, run_id, move || {
                     let server_url = server_url.clone();
                     let actor_id = actor_id.clone();
@@ -2853,7 +2854,7 @@ async fn async_main() -> Result<()> {
                             &actor_id,
                             &display_name,
                             actor_kind,
-                            observer,
+                            observer_mode,
                         )
                         .await
                     }

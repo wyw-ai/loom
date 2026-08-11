@@ -607,48 +607,57 @@ fn fanout(state: &AppState, ev: StoreEvent) {
         return;
     }
 
-    // A run triggered by a same-scope private message inherits that message's
-    // privacy boundary. Send the canonical metadata only to the worker; the
-    // other private participants receive lifecycle-only data, and unrelated
-    // channel members receive no event at all.
+    // Run metadata is worker-controlled and may contain prompt-derived text or
+    // private state even when the trigger itself was public. Send the canonical
+    // run only to its worker. Other eligible scope participants receive a
+    // lifecycle-only projection; for private triggers, unrelated members do
+    // not learn that the run exists at all.
     if let StoreEvent::RunUpdated(run) = &ev {
-        if let Some(private_allowed) = state.store.run_private_actor_ids(run) {
-            let scope = run.scope.clone();
-            let full_allowed = std::collections::HashSet::from([run.actor_id.clone()]);
-            let full_payload = json!({
+        let scope = run.scope.clone();
+        let full_allowed = std::collections::HashSet::from([run.actor_id.clone()]);
+        let full_payload = json!({
+            "kind": sk::RUN_UPDATED,
+            "scope": scope,
+            "data": { "run": run },
+        });
+        broadcast_filtered(
+            state,
+            &scope,
+            method::STREAM_UPDATE,
+            &full_payload,
+            &full_allowed,
+        );
+
+        let mut observer_allowed = match state.store.run_private_actor_ids(run) {
+            Some(private_allowed) => private_allowed,
+            None => scope_acl_filter(state, &scope).unwrap_or_else(|| {
+                state
+                    .subscriptions
+                    .scope_subscribers(&scope)
+                    .into_iter()
+                    .filter_map(|connection_id| {
+                        state.subscriptions.actor_for_connection(&connection_id)
+                    })
+                    .collect()
+            }),
+        };
+        observer_allowed.remove(&run.actor_id);
+        if !observer_allowed.is_empty() {
+            let projected = Store::redact_run_for_observer(run);
+            let observer_payload = json!({
                 "kind": sk::RUN_UPDATED,
                 "scope": scope,
-                "data": { "run": run },
+                "data": { "run": projected },
             });
             broadcast_filtered(
                 state,
                 &scope,
                 method::STREAM_UPDATE,
-                &full_payload,
-                &full_allowed,
+                &observer_payload,
+                &observer_allowed,
             );
-
-            let redacted_allowed = private_allowed
-                .into_iter()
-                .filter(|actor_id| actor_id != &run.actor_id)
-                .collect::<std::collections::HashSet<_>>();
-            if !redacted_allowed.is_empty() {
-                let projected = Store::redact_private_run(run);
-                let redacted_payload = json!({
-                    "kind": sk::RUN_UPDATED,
-                    "scope": scope,
-                    "data": { "run": projected },
-                });
-                broadcast_filtered(
-                    state,
-                    &scope,
-                    method::STREAM_UPDATE,
-                    &redacted_payload,
-                    &redacted_allowed,
-                );
-            }
-            return;
         }
+        return;
     }
 
     let scope = ev.scope();
@@ -1102,6 +1111,84 @@ mod tests {
             rx_carol.try_recv().is_err(),
             "non-recipient subscriber must not receive private message frames"
         );
+    }
+
+    #[test]
+    fn fanout_public_run_redacts_worker_metadata_from_observers() {
+        let state = fresh_state("public-run-fanout");
+        for (id, kind, name) in [
+            ("actor_agent_bot", ActorKind::Agent, "Bot"),
+            ("actor_observer", ActorKind::Human, "Observer"),
+        ] {
+            state
+                .store
+                .upsert_actor(Actor {
+                    id: id.into(),
+                    display_name: name.into(),
+                    kind,
+                    capabilities: None,
+                    _meta: None,
+                })
+                .expect("actor");
+        }
+        let channel = state
+            .store
+            .create_channel("public run".into(), None)
+            .expect("channel");
+        let scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: channel.id,
+        };
+
+        let (worker_tx, mut worker_rx) = mpsc::unbounded_channel::<String>();
+        let (observer_tx, mut observer_rx) = mpsc::unbounded_channel::<String>();
+        for (connection_id, actor_id, tx) in [
+            ("conn_worker", "actor_agent_bot", worker_tx),
+            ("conn_observer", "actor_observer", observer_tx),
+        ] {
+            state.subscriptions.add_connection(Connection {
+                id: connection_id.into(),
+                actor_id: Some(actor_id.into()),
+                tx,
+            });
+            assert!(state.subscriptions.subscribe(connection_id, scope.clone()));
+        }
+
+        let mut metadata = Meta::default();
+        metadata.insert(
+            "noReplyReason".into(),
+            json!("private state inferred while handling a public message"),
+        );
+        let run = Run {
+            id: "run_public".into(),
+            actor_id: "actor_agent_bot".into(),
+            scope,
+            delivery_id: None,
+            start_reason: Some("worker diagnostic".into()),
+            agent_config_version_id: "config_public".into(),
+            status: RunStatus::Running,
+            opened_at: chrono::Utc::now(),
+            closed_at: None,
+            metadata,
+        };
+
+        fanout(&state, StoreEvent::RunUpdated(run));
+
+        let worker: Value =
+            serde_json::from_str(&worker_rx.try_recv().expect("worker gets canonical run"))
+                .expect("worker frame");
+        assert_eq!(
+            worker["params"]["data"]["run"]["metadata"]["noReplyReason"],
+            "private state inferred while handling a public message"
+        );
+
+        let observer: Value =
+            serde_json::from_str(&observer_rx.try_recv().expect("observer gets lifecycle run"))
+                .expect("observer frame");
+        assert_eq!(observer["params"]["data"]["run"]["metadata"], json!({}));
+        assert!(observer["params"]["data"]["run"]
+            .get("startReason")
+            .is_none());
     }
 
     #[test]

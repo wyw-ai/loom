@@ -5384,8 +5384,9 @@ mod tests {
             Some(json!({
                 "actorId": "actor_agent_bot",
                 "scope": { "kind": "channel", "id": channel.channel.id },
-                "startReason": "manual",
+                "startReason": "worker diagnostic that may contain private state",
                 "agentConfigVersionId": config.version.id,
+                "metadata": { "noReplyReason": "prompt-derived secret state" },
             })),
         )
         .await
@@ -5565,7 +5566,8 @@ mod tests {
         .expect_err("invisible run must be not-found");
         assert_eq!(err.code, ErrorCode::APP_NOT_FOUND);
 
-        // After joining the channel, Alice sees the same canonical run.
+        // After joining the channel, Alice sees the run lifecycle without any
+        // worker-controlled diagnostic text.
         dispatch(
             &state,
             "conn_agent",
@@ -5587,6 +5589,8 @@ mod tests {
         .expect("run.get alice");
         let got: RunGetResult = serde_json::from_value(get_value).expect("alice run get result");
         assert_eq!(got.run.id, opened.run.id);
+        assert!(got.run.metadata.is_empty());
+        assert!(got.run.start_reason.is_none());
 
         // Limit is applied after canonical `(openedAt DESC, id DESC)`
         // sorting, so a one-row page always returns the canonical head.

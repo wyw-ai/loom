@@ -3897,28 +3897,34 @@ impl Store {
         Self::run_private_actor_ids_inner(&self.inner.read(), run)
     }
 
-    /// Project a run for a caller without letting private-message execution
-    /// metadata become a side channel. The worker gets its canonical run;
-    /// another participant in the private trigger gets only lifecycle data;
-    /// unrelated scope members do not learn that the run exists.
+    /// Project a run for a caller without letting worker-controlled execution
+    /// metadata become a side channel. The worker gets its canonical run. Any
+    /// other actor that may see the run gets lifecycle data only; for a run
+    /// triggered by a private message, unrelated scope members do not learn
+    /// that the run exists at all.
     fn project_run_for_actor_inner(inner: &Inner, run: &Run, actor_id: &str) -> Option<Run> {
-        let Some(allowed) = Self::run_private_actor_ids_inner(inner, run) else {
-            return Some(run.clone());
-        };
         if actor_id == run.actor_id {
             return Some(run.clone());
         }
-        if !allowed.contains(actor_id) {
-            return None;
+
+        if let Some(allowed) = Self::run_private_actor_ids_inner(inner, run) {
+            if !allowed.contains(actor_id) {
+                return None;
+            }
         }
-        Some(Self::redact_private_run(run))
+
+        Some(Self::redact_run_for_observer(run))
     }
 
     pub fn project_run_for_actor(&self, run: &Run, actor_id: &str) -> Option<Run> {
         Self::project_run_for_actor_inner(&self.inner.read(), run, actor_id)
     }
 
-    pub fn redact_private_run(run: &Run) -> Run {
+    /// Strip every worker-controlled diagnostic field from a run shown to a
+    /// different actor. In particular, `startReason` and metadata such as
+    /// `noReplyReason` may contain prompt-derived text, private conversation
+    /// state, or model reasoning even when the triggering message was public.
+    pub fn redact_run_for_observer(run: &Run) -> Run {
         let mut projected = run.clone();
         projected.start_reason = None;
         projected.metadata.clear();
@@ -10287,6 +10293,82 @@ mod tests {
             .unwrap();
         assert_eq!(runs.len(), 1, "alice should see the run, got {:?}", runs);
         assert_eq!(runs[0].id, run.id);
+    }
+
+    #[test]
+    fn public_runs_hide_worker_metadata_from_other_scope_members() {
+        let store = fresh_store();
+        store
+            .upsert_actor(test_actor("actor_agent_bot", ActorKind::Agent, "Bot"))
+            .unwrap();
+        store
+            .upsert_actor(test_actor("actor_observer", ActorKind::Human, "Observer"))
+            .unwrap();
+        let channel = store.create_channel("public".into(), None).unwrap();
+        let config = store
+            .publish_agent_config_version(
+                "actor_agent_bot".into(),
+                Some("v1".into()),
+                String::new(),
+                "test-model".into(),
+                "test-adapter".into(),
+                serde_json::Value::Null,
+                Vec::new(),
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                "actor_agent_bot".into(),
+                Meta::default(),
+            )
+            .expect("publish config");
+        let mut metadata = Meta::default();
+        metadata.insert(
+            "noReplyReason".into(),
+            serde_json::json!("prompt-derived secret state"),
+        );
+        let run = store
+            .open_run(
+                "actor_agent_bot".into(),
+                ScopeRef {
+                    kind: ScopeKind::Channel,
+                    id: channel.id,
+                },
+                None,
+                Some("worker-provided diagnostic".into()),
+                config.id,
+                metadata,
+            )
+            .expect("open run");
+
+        let worker = store
+            .project_run_for_actor(&run, "actor_agent_bot")
+            .expect("worker projection");
+        assert_eq!(
+            worker
+                .metadata
+                .get("noReplyReason")
+                .and_then(serde_json::Value::as_str),
+            Some("prompt-derived secret state")
+        );
+        assert_eq!(
+            worker.start_reason.as_deref(),
+            Some("worker-provided diagnostic")
+        );
+
+        let observer = store
+            .project_run_for_actor(&run, "actor_observer")
+            .expect("public lifecycle projection");
+        assert_eq!(observer.id, run.id);
+        assert_eq!(observer.status, run.status);
+        assert!(observer.metadata.is_empty());
+        assert!(observer.start_reason.is_none());
+
+        let listed = store
+            .list_runs("actor_observer", None, None, None, 50)
+            .expect("observer list");
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].metadata.is_empty());
+        assert!(listed[0].start_reason.is_none());
     }
 
     #[test]

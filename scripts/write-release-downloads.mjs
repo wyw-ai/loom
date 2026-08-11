@@ -54,11 +54,15 @@ function classify(fileName, version) {
   }
 
   const runtimePrefix = `loom-runtime-${version}-`;
-  if (fileName.startsWith(runtimePrefix) && fileName.endsWith(".tar.gz")) {
-    return {
-      kind: "runtime",
-      label: fileName.slice(runtimePrefix.length, -".tar.gz".length),
-    };
+  if (fileName.startsWith(runtimePrefix)) {
+    for (const extension of [".tar.gz", ".zip"]) {
+      if (fileName.endsWith(extension)) {
+        return {
+          kind: "runtime",
+          label: fileName.slice(runtimePrefix.length, -extension.length),
+        };
+      }
+    }
   }
 
   const guiPrefix = `loom-gui-${version}-`;
@@ -93,7 +97,7 @@ if (!downloadBaseUrl) {
 const artifacts = fs
   .readdirSync(packageDir)
   .filter((fileName) => fs.statSync(path.join(packageDir, fileName)).isFile())
-  .filter((fileName) => /\.(tar\.gz|dmg)$/.test(fileName) || ["SHA256SUMS", "install.sh", "manifest.txt"].includes(fileName))
+  .filter((fileName) => /\.(tar\.gz|zip|dmg)$/.test(fileName) || ["SHA256SUMS", "install.sh", "manifest.txt"].includes(fileName))
   .sort((a, b) => a.localeCompare(b))
   .map((fileName) => {
     const filePath = path.join(packageDir, fileName);

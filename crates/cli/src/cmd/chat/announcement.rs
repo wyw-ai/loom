@@ -102,7 +102,7 @@ mod tests {
                 &a,
                 &|id| {
                     if id == "actor_human_self" {
-                        "bojun".into()
+                        "tester".into()
                     } else {
                         id.into()
                     }
@@ -124,6 +124,6 @@ mod tests {
             "title missing in:\n{joined}"
         );
         assert!(joined.contains("hello world"), "body missing in:\n{joined}");
-        assert!(joined.contains("@bojun"), "footer missing in:\n{joined}");
+        assert!(joined.contains("@tester"), "footer missing in:\n{joined}");
     }
 }

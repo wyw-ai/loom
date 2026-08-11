@@ -3286,6 +3286,45 @@ impl Store {
         self.inner.read().runs.get(run_id).cloned()
     }
 
+    /// Lists runs visible to `actor_id` under the existing scope ACL model,
+    /// optionally filtered by status set, run actor, or message-style target
+    /// scope. Sorted by `(openedAt DESC, id DESC)` for a stable order.
+    pub fn list_runs(
+        &self,
+        actor_id: &str,
+        statuses: Option<&[RunStatus]>,
+        run_actor_id: Option<&str>,
+        target: Option<&str>,
+        limit: u32,
+    ) -> StoreResult<Vec<Run>> {
+        let scope_filter = match target {
+            Some(target) => {
+                let scope = self
+                    .resolve_message_target_for_read(target, actor_id)?
+                    .scope;
+                self.check_scope_access(&scope, actor_id)?;
+                Some(scope)
+            }
+            None => None,
+        };
+        let limit = limit.max(1) as usize;
+        let inner = self.inner.read();
+        let mut runs: Vec<Run> = inner
+            .runs
+            .values()
+            .filter(|run| scope_filter.as_ref().is_none_or(|s| &run.scope == s))
+            .filter(|run| {
+                scope_filter.is_some() || can_access_scope_inner(&inner, &run.scope, actor_id)
+            })
+            .filter(|run| statuses.is_none_or(|set| set.contains(&run.status)))
+            .filter(|run| run_actor_id.is_none_or(|id| run.actor_id == id))
+            .cloned()
+            .collect();
+        runs.sort_by(|a, b| b.opened_at.cmp(&a.opened_at).then_with(|| b.id.cmp(&a.id)));
+        runs.truncate(limit);
+        Ok(runs)
+    }
+
     pub fn message_target_for_scope(&self, scope: &ScopeRef) -> StoreResult<String> {
         match scope.kind {
             ScopeKind::Channel => {
@@ -4229,6 +4268,8 @@ impl Store {
         query: &str,
         target: Option<&str>,
         limit: u32,
+        created_after: Option<Timestamp>,
+        created_before: Option<Timestamp>,
     ) -> StoreResult<Vec<Message>> {
         let needle = query.trim().to_ascii_lowercase();
         if needle.is_empty() {
@@ -4254,6 +4295,8 @@ impl Store {
                 scope_filter.is_some() || can_access_scope_inner(&inner, &message.scope, actor_id)
             })
             .filter(|message| Self::message_visible_to_actor(message, actor_id))
+            .filter(|message| created_after.is_none_or(|bound| message.created_at >= bound))
+            .filter(|message| created_before.is_none_or(|bound| message.created_at < bound))
             .filter(|message| message.body.to_ascii_lowercase().contains(&needle))
             .cloned()
             .collect();
@@ -4264,6 +4307,63 @@ impl Store {
         });
         messages.truncate(limit);
         Ok(messages)
+    }
+
+    /// Returns up to `before` earlier and `after` later visible messages
+    /// around `message_id` within the same canonical scope, ordered by
+    /// `(createdAt ASC, id ASC)` independently of append/index order.
+    /// The anchor and every neighbor pass the same scope ACL and per-message
+    /// visibility checks; a missing or invisible anchor is a not-found.
+    pub fn message_context(
+        &self,
+        actor_id: &str,
+        message_id: &str,
+        before: u32,
+        after: u32,
+    ) -> StoreResult<(Vec<Message>, Message, Vec<Message>)> {
+        let inner = self.inner.read();
+        let anchor = inner
+            .messages
+            .get(message_id)
+            .cloned()
+            .ok_or_else(|| StoreError::NotFound(format!("message {message_id}")))?;
+        if !can_access_scope_inner(&inner, &anchor.scope, actor_id)
+            || !Self::message_visible_to_actor(&anchor, actor_id)
+        {
+            return Err(StoreError::NotFound(format!("message {message_id}")));
+        }
+        let ids = inner
+            .messages_by_scope
+            .get(&anchor.scope)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let mut visible_messages: Vec<Message> = ids
+            .iter()
+            .filter_map(|id| inner.messages.get(id))
+            .filter(|message| Self::message_visible_to_actor(message, actor_id))
+            .cloned()
+            .collect();
+        visible_messages.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let Some(pos) = visible_messages
+            .iter()
+            .position(|message| message.id == message_id)
+        else {
+            // The anchor exists but is not indexed in its scope timeline;
+            // treat it like any other missing anchor.
+            return Err(StoreError::NotFound(format!("message {message_id}")));
+        };
+        let before_start = pos.saturating_sub(before as usize);
+        let earlier = visible_messages[before_start..pos].to_vec();
+        let after_start = pos + 1;
+        let after_end = after_start
+            .saturating_add(after as usize)
+            .min(visible_messages.len());
+        let later = visible_messages[after_start..after_end].to_vec();
+        Ok((earlier, anchor, later))
     }
 
     fn resolve_message_target_for_append(
@@ -8218,12 +8318,12 @@ mod tests {
         );
 
         assert!(store
-            .search_message_records("actor_bob", "needle", None, 10)
+            .search_message_records("actor_bob", "needle", None, 10, None, None)
             .unwrap()
             .is_empty());
         store.grant_channel(&channel.id, "actor_bob").unwrap();
         let results = store
-            .search_message_records("actor_bob", "needle", None, 10)
+            .search_message_records("actor_bob", "needle", None, 10, None, None)
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, message.id);
@@ -8304,19 +8404,511 @@ mod tests {
         );
         assert_eq!(
             store
-                .search_message_records("actor_bob", "seer", None, 10)
+                .search_message_records("actor_bob", "seer", None, 10, None, None)
                 .expect("bob search")
                 .len(),
             1
         );
         assert!(store
-            .search_message_records("actor_carol", "seer", None, 10)
+            .search_message_records("actor_carol", "seer", None, 10, None, None)
             .expect("carol search")
             .is_empty());
         assert!(matches!(
             store.toggle_message_reaction("actor_carol".into(), &message.id, "👀".into()),
             Err(StoreError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn search_message_records_applies_time_bounds() {
+        let store = fresh_store();
+        store
+            .upsert_actor(test_actor("actor_alice", ActorKind::Human, "Alice"))
+            .unwrap();
+        let channel = store.create_channel("public".into(), None).unwrap();
+        let target = format!("#{}", channel.id);
+        let first = send_test_message(&store, "actor_alice", &target, "needle one");
+        // Keep createdAt distinct even on coarse wall-clock resolutions.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let second = send_test_message(&store, "actor_alice", &target, "needle two");
+        assert!(second.created_at > first.created_at);
+
+        let all = store
+            .search_message_records("actor_alice", "needle", Some(&target), 10, None, None)
+            .unwrap();
+        assert_eq!(all.len(), 2);
+        // Stable order: createdAt DESC, then id DESC.
+        assert_eq!(all[0].id, second.id);
+        assert_eq!(all[1].id, first.id);
+
+        // createdAfter is inclusive: the boundary message stays.
+        let from_second = store
+            .search_message_records(
+                "actor_alice",
+                "needle",
+                Some(&target),
+                10,
+                Some(second.created_at),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            from_second
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![second.id.as_str()]
+        );
+
+        // createdBefore is exclusive: the boundary message drops out.
+        let until_second = store
+            .search_message_records(
+                "actor_alice",
+                "needle",
+                Some(&target),
+                10,
+                None,
+                Some(second.created_at),
+            )
+            .unwrap();
+        assert_eq!(
+            until_second
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![first.id.as_str()]
+        );
+
+        // A window holding only the first message.
+        let window = store
+            .search_message_records(
+                "actor_alice",
+                "needle",
+                Some(&target),
+                10,
+                Some(first.created_at),
+                Some(second.created_at),
+            )
+            .unwrap();
+        assert_eq!(window.len(), 1);
+        assert_eq!(window[0].id, first.id);
+
+        // Time bounds apply before limit: only one message is inside the
+        // window, so limit=1 returns it rather than the latest overall hit.
+        let limited = store
+            .search_message_records(
+                "actor_alice",
+                "needle",
+                Some(&target),
+                1,
+                Some(first.created_at),
+                Some(second.created_at),
+            )
+            .unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].id, first.id);
+    }
+
+    #[test]
+    fn message_context_returns_visible_neighbors_in_order() {
+        let store = fresh_store();
+        for (id, name) in [
+            ("actor_alice", "Alice"),
+            ("actor_bob", "Bob"),
+            ("actor_carol", "Carol"),
+        ] {
+            store
+                .upsert_actor(test_actor(id, ActorKind::Human, name))
+                .unwrap();
+        }
+        let channel = store.create_channel("public".into(), None).unwrap();
+        store.grant_channel(&channel.id, "actor_alice").unwrap();
+        store.grant_channel(&channel.id, "actor_bob").unwrap();
+        store.grant_channel(&channel.id, "actor_carol").unwrap();
+        let target = format!("#{}", channel.id);
+        let m1 = send_test_message(&store, "actor_alice", &target, "m1");
+        let mut metadata = Meta::default();
+        metadata.insert("private".into(), serde_json::json!(true));
+        metadata.insert("privateTo".into(), serde_json::json!(["actor_bob"]));
+        let m2 = store
+            .append_message(
+                "actor_alice".into(),
+                target.clone(),
+                MessageKind::Human,
+                "m2 secret".into(),
+                Vec::new(),
+                Vec::new(),
+                MessageIntent::Chat,
+                DeliveryPolicy::NotifyOnly,
+                None,
+                None,
+                Vec::new(),
+                metadata,
+                None,
+            )
+            .expect("append private message");
+        let m3 = send_test_message(&store, "actor_alice", &target, "m3 anchor");
+        let m4 = send_test_message(&store, "actor_alice", &target, "m4");
+        let m5 = send_test_message(&store, "actor_alice", &target, "m5");
+
+        let (before, anchor, after) = store
+            .message_context("actor_alice", &m3.id, 10, 10)
+            .expect("alice context");
+        assert_eq!(anchor.id, m3.id);
+        assert_eq!(
+            before.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec![m1.id.as_str(), m2.id.as_str()]
+        );
+        assert_eq!(
+            after.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec![m4.id.as_str(), m5.id.as_str()]
+        );
+
+        // Carol must not see the private neighbor.
+        let (before, _, _) = store
+            .message_context("actor_carol", &m3.id, 10, 10)
+            .expect("carol context");
+        assert_eq!(
+            before.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec![m1.id.as_str()]
+        );
+
+        // Bob sees the private neighbor addressed to him.
+        let (before, _, _) = store
+            .message_context("actor_bob", &m3.id, 10, 10)
+            .expect("bob context");
+        assert_eq!(
+            before.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec![m1.id.as_str(), m2.id.as_str()]
+        );
+
+        // Window limits take the nearest visible messages.
+        let (before, _, after) = store
+            .message_context("actor_alice", &m3.id, 1, 1)
+            .expect("narrow context");
+        assert_eq!(
+            before.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec![m2.id.as_str()]
+        );
+        assert_eq!(
+            after.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec![m4.id.as_str()]
+        );
+
+        // Invisible or missing anchors are not-found.
+        assert!(matches!(
+            store.message_context("actor_carol", &m2.id, 5, 5),
+            Err(StoreError::NotFound(_))
+        ));
+        assert!(matches!(
+            store.message_context("actor_carol", "msg_missing", 5, 5),
+            Err(StoreError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn message_context_hides_anchor_in_inaccessible_channel() {
+        let store = fresh_store();
+        store
+            .upsert_actor(test_actor("actor_alice", ActorKind::Human, "Alice"))
+            .unwrap();
+        store
+            .upsert_actor(test_actor("actor_bob", ActorKind::Human, "Bob"))
+            .unwrap();
+        let channel = store
+            .create_channel("private".into(), Some("actor_alice".into()))
+            .unwrap();
+        let message =
+            send_test_message(&store, "actor_alice", &format!("#{}", channel.id), "secret");
+        assert!(matches!(
+            store.message_context("actor_bob", &message.id, 5, 5),
+            Err(StoreError::NotFound(_))
+        ));
+        let (_, anchor, _) = store
+            .message_context("actor_alice", &message.id, 5, 5)
+            .expect("alice context");
+        assert_eq!(anchor.id, message.id);
+    }
+
+    #[test]
+    fn message_context_sorts_by_created_at_then_id_and_handles_boundaries() {
+        let store = fresh_store();
+        store
+            .upsert_actor(test_actor("actor_alice", ActorKind::Human, "Alice"))
+            .unwrap();
+        let channel = store.create_channel("public".into(), None).unwrap();
+        let target = format!("#{}", channel.id);
+        let mut expected: Vec<Message> = (0..5)
+            .map(|index| {
+                send_test_message(&store, "actor_alice", &target, &format!("message {index}"))
+            })
+            .collect();
+
+        // Deliberately make timestamp order differ from append/index order,
+        // with a tie that must be broken by message id.
+        let base = expected[0].created_at;
+        for (message, seconds) in expected.iter_mut().zip([3, 1, 2, 2, 4]) {
+            message.created_at = base + ChronoDuration::seconds(seconds);
+        }
+        expected.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        {
+            let mut inner = store.inner.write();
+            for message in &expected {
+                inner
+                    .messages
+                    .get_mut(&message.id)
+                    .expect("stored message")
+                    .created_at = message.created_at;
+            }
+            *inner
+                .messages_by_scope
+                .get_mut(&expected[0].scope)
+                .expect("scope index") = expected
+                .iter()
+                .rev()
+                .map(|message| message.id.clone())
+                .collect();
+        }
+
+        let expected_ids = expected
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect::<Vec<_>>();
+        let (before, anchor, after) = store
+            .message_context("actor_alice", &expected[2].id, 10, 10)
+            .expect("full context");
+        let actual_ids = before
+            .iter()
+            .chain(std::iter::once(&anchor))
+            .chain(after.iter())
+            .map(|message| message.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(actual_ids, expected_ids);
+
+        let (before, anchor, after) = store
+            .message_context("actor_alice", &expected[0].id, 10, 1)
+            .expect("first-message context");
+        assert!(before.is_empty());
+        assert_eq!(anchor.id, expected[0].id);
+        assert_eq!(
+            after.iter().map(|m| &m.id).collect::<Vec<_>>(),
+            vec![&expected[1].id]
+        );
+
+        let (before, anchor, after) = store
+            .message_context("actor_alice", &expected[4].id, 1, 10)
+            .expect("last-message context");
+        assert_eq!(
+            before.iter().map(|m| &m.id).collect::<Vec<_>>(),
+            vec![&expected[3].id]
+        );
+        assert_eq!(anchor.id, expected[4].id);
+        assert!(after.is_empty());
+
+        let (before, anchor, after) = store
+            .message_context("actor_alice", &expected[2].id, 0, 0)
+            .expect("zero-width context");
+        assert!(before.is_empty());
+        assert_eq!(anchor.id, expected[2].id);
+        assert!(after.is_empty());
+    }
+
+    #[test]
+    fn list_runs_live_repro_creator_member() {
+        let store = fresh_store();
+        store
+            .upsert_actor(test_actor("actor_alice", ActorKind::Human, "Alice"))
+            .unwrap();
+        store
+            .upsert_actor(test_actor("actor_agent_bot", ActorKind::Agent, "Bot"))
+            .unwrap();
+        let channel = store
+            .create_channel("smoke".into(), Some("actor_alice".into()))
+            .unwrap();
+        store.grant_channel(&channel.id, "actor_agent_bot").unwrap();
+        let config = store
+            .publish_agent_config_version(
+                "actor_agent_bot".into(),
+                Some("v1".into()),
+                String::new(),
+                "test-model".into(),
+                "test-adapter".into(),
+                serde_json::Value::Null,
+                Vec::new(),
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                "actor_agent_bot".into(),
+                Meta::default(),
+            )
+            .expect("publish config");
+        let run = store
+            .open_run(
+                "actor_agent_bot".into(),
+                ScopeRef {
+                    kind: ScopeKind::Channel,
+                    id: channel.id.clone(),
+                },
+                None,
+                Some("manual".into()),
+                config.id.clone(),
+                Meta::default(),
+            )
+            .expect("open run");
+        let runs = store
+            .list_runs("actor_alice", None, None, None, 50)
+            .unwrap();
+        assert_eq!(runs.len(), 1, "alice should see the run, got {:?}", runs);
+        assert_eq!(runs[0].id, run.id);
+    }
+
+    #[test]
+    fn list_runs_filters_sorts_and_respects_acl() {
+        let store = fresh_store();
+        store
+            .upsert_actor(test_actor("actor_agent_bot", ActorKind::Agent, "Bot"))
+            .unwrap();
+        store
+            .upsert_actor(test_actor("actor_alice", ActorKind::Human, "Alice"))
+            .unwrap();
+        let private = store
+            .create_channel("private".into(), Some("actor_agent_bot".into()))
+            .unwrap();
+        let public = store.create_channel("public".into(), None).unwrap();
+        let config = store
+            .publish_agent_config_version(
+                "actor_agent_bot".into(),
+                Some("v1".into()),
+                String::new(),
+                "test-model".into(),
+                "test-adapter".into(),
+                serde_json::Value::Null,
+                Vec::new(),
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                "actor_agent_bot".into(),
+                Meta::default(),
+            )
+            .expect("publish config");
+        let open = |channel_id: &str, reason: &str| {
+            store
+                .open_run(
+                    "actor_agent_bot".into(),
+                    ScopeRef {
+                        kind: ScopeKind::Channel,
+                        id: channel_id.into(),
+                    },
+                    None,
+                    Some(reason.into()),
+                    config.id.clone(),
+                    Meta::default(),
+                )
+                .expect("open run")
+        };
+        let run_private = open(&private.id, "private run");
+        let mut run_public = open(&public.id, "public run");
+
+        // Force an openedAt tie so this test exercises the id DESC
+        // tiebreaker rather than merely restating timestamp order.
+        let tied_opened_at = run_private.opened_at;
+        run_public.opened_at = tied_opened_at;
+        {
+            let mut inner = store.inner.write();
+            inner
+                .runs
+                .get_mut(&run_private.id)
+                .expect("private run")
+                .opened_at = tied_opened_at;
+            inner
+                .runs
+                .get_mut(&run_public.id)
+                .expect("public run")
+                .opened_at = tied_opened_at;
+        }
+
+        // The bot is a member of both channels: both runs in canonical
+        // (openedAt DESC, id DESC) order.
+        let runs = store
+            .list_runs("actor_agent_bot", None, None, None, 50)
+            .unwrap();
+        let mut expected = vec![run_private.clone(), run_public.clone()];
+        expected.sort_by(|a, b| b.opened_at.cmp(&a.opened_at).then_with(|| b.id.cmp(&a.id)));
+        assert_eq!(
+            runs.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            expected.iter().map(|r| r.id.as_str()).collect::<Vec<_>>()
+        );
+
+        // Alice only sees runs in scopes she can access.
+        let runs = store
+            .list_runs("actor_alice", None, None, None, 50)
+            .unwrap();
+        assert_eq!(
+            runs.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec![run_public.id.as_str()]
+        );
+
+        // Status filter.
+        store
+            .close_run(&run_public.id, RunStatus::Failed)
+            .expect("close run");
+        let runs = store
+            .list_runs(
+                "actor_agent_bot",
+                Some(&[RunStatus::Failed]),
+                None,
+                None,
+                50,
+            )
+            .unwrap();
+        assert_eq!(
+            runs.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec![run_public.id.as_str()]
+        );
+        let runs = store
+            .list_runs(
+                "actor_agent_bot",
+                Some(&[RunStatus::Queued]),
+                None,
+                None,
+                50,
+            )
+            .unwrap();
+        assert_eq!(
+            runs.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec![run_private.id.as_str()]
+        );
+
+        // Actor filter.
+        assert!(store
+            .list_runs("actor_agent_bot", None, Some("actor_alice"), None, 50)
+            .unwrap()
+            .is_empty());
+
+        // Target filter restricts to one scope and enforces its ACL.
+        let target = format!("#{}", private.id);
+        let runs = store
+            .list_runs("actor_agent_bot", None, None, Some(&target), 50)
+            .unwrap();
+        assert_eq!(
+            runs.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec![run_private.id.as_str()]
+        );
+        assert!(matches!(
+            store.list_runs("actor_alice", None, None, Some(&target), 50),
+            Err(StoreError::InvalidState(_))
+        ));
+
+        // Limit truncates after sorting: the single row is the canonical head.
+        let runs = store
+            .list_runs("actor_agent_bot", None, None, None, 1)
+            .unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id, expected[0].id);
     }
 
     #[test]
@@ -8389,7 +8981,10 @@ mod tests {
             .set_channel_instructions(&ch.id, Some("  ".into()), "actor_owner")
             .expect("clear instructions");
         assert!(cleared.instructions.is_none());
-        assert_eq!(cleared.instructions_modified_by.as_deref(), Some("actor_owner"));
+        assert_eq!(
+            cleared.instructions_modified_by.as_deref(),
+            Some("actor_owner")
+        );
 
         // Re-open from journal: the last (cleared) state must replay.
         let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
@@ -8503,10 +9098,20 @@ mod tests {
         let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
         let replayed = Store::open(journal).unwrap();
         let v_replay_channel = replayed.get_channel(&ch.id).unwrap().instructions.clone();
-        let v_replay_thread = replayed.get_thread(&thread.id).unwrap().instructions.clone();
+        let v_replay_thread = replayed
+            .get_thread(&thread.id)
+            .unwrap()
+            .instructions
+            .clone();
 
-        assert_eq!(v_online_channel, v_replay_channel, "channel V_online != V_replay");
-        assert_eq!(v_online_thread, v_replay_thread, "thread V_online != V_replay");
+        assert_eq!(
+            v_online_channel, v_replay_channel,
+            "channel V_online != V_replay"
+        );
+        assert_eq!(
+            v_online_thread, v_replay_thread,
+            "thread V_online != V_replay"
+        );
         assert_eq!(v_online_channel.as_deref(), Some("final"));
         assert_eq!(v_online_thread.as_deref(), Some("final"));
     }
@@ -8529,7 +9134,10 @@ mod tests {
                 .set_channel_instructions(&ch.id, Some("v1".into()), "actor_owner")
                 .expect("set channel v1");
             let ts = ch_updated.instructions_modified_at.expect("ts stamped");
-            assert_eq!(ch_updated.instructions_modified_by.as_deref(), Some("actor_owner"));
+            assert_eq!(
+                ch_updated.instructions_modified_by.as_deref(),
+                Some("actor_owner")
+            );
             store
                 .set_thread_instructions(&thread.id, Some("v1".into()), "actor_owner")
                 .expect("set thread v1");
@@ -8543,7 +9151,10 @@ mod tests {
                 .set_channel_instructions(&ch.id, Some("v2".into()), "actor_bob")
                 .expect("set channel v2");
             let ts = ch_updated.instructions_modified_at.expect("ts stamped");
-            assert_eq!(ch_updated.instructions_modified_by.as_deref(), Some("actor_bob"));
+            assert_eq!(
+                ch_updated.instructions_modified_by.as_deref(),
+                Some("actor_bob")
+            );
             assert!(ts > first_ts, "timestamp must advance on second edit");
             store
                 .set_thread_instructions(&thread.id, Some("v2".into()), "actor_bob")
@@ -8555,21 +9166,33 @@ mod tests {
         // Live state reflects the latest caller.
         let live_ch = store.get_channel(&ch.id).unwrap();
         assert_eq!(live_ch.instructions.as_deref(), Some("v2"));
-        assert_eq!(live_ch.instructions_modified_by.as_deref(), Some("actor_bob"));
+        assert_eq!(
+            live_ch.instructions_modified_by.as_deref(),
+            Some("actor_bob")
+        );
         let live_th = store.get_thread(&thread.id).unwrap();
         assert_eq!(live_th.instructions.as_deref(), Some("v2"));
-        assert_eq!(live_th.instructions_modified_by.as_deref(), Some("actor_bob"));
+        assert_eq!(
+            live_th.instructions_modified_by.as_deref(),
+            Some("actor_bob")
+        );
 
         // Audit fields survive journal replay.
         let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
         let replayed = Store::open(journal).unwrap();
         let replayed_ch = replayed.get_channel(&ch.id).unwrap();
         assert_eq!(replayed_ch.instructions.as_deref(), Some("v2"));
-        assert_eq!(replayed_ch.instructions_modified_by.as_deref(), Some("actor_bob"));
+        assert_eq!(
+            replayed_ch.instructions_modified_by.as_deref(),
+            Some("actor_bob")
+        );
         assert!(replayed_ch.instructions_modified_at.is_some());
         let replayed_th = replayed.get_thread(&thread.id).unwrap();
         assert_eq!(replayed_th.instructions.as_deref(), Some("v2"));
-        assert_eq!(replayed_th.instructions_modified_by.as_deref(), Some("actor_bob"));
+        assert_eq!(
+            replayed_th.instructions_modified_by.as_deref(),
+            Some("actor_bob")
+        );
         assert!(replayed_th.instructions_modified_at.is_some());
 
         // Clear also stamps the audit fields with the clearing caller.
@@ -8577,7 +9200,10 @@ mod tests {
             .set_channel_instructions(&ch.id, None, "actor_carol")
             .expect("clear channel");
         assert!(cleared.instructions.is_none());
-        assert_eq!(cleared.instructions_modified_by.as_deref(), Some("actor_carol"));
+        assert_eq!(
+            cleared.instructions_modified_by.as_deref(),
+            Some("actor_carol")
+        );
     }
 
     /// Regression for issue #7 (concurrency): multiple threads concurrently
@@ -8616,7 +9242,10 @@ mod tests {
         let replayed = Store::open(journal).unwrap();
         let v_replay = replayed.get_channel(&ch.id).unwrap().instructions.clone();
 
-        assert_eq!(v_online, v_replay, "V_online != V_replay after concurrent sets");
+        assert_eq!(
+            v_online, v_replay,
+            "V_online != V_replay after concurrent sets"
+        );
         assert!(v_online.is_some(), "some writer must have won");
     }
 

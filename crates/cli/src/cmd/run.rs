@@ -1,16 +1,286 @@
+use std::future::Future;
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{SecondsFormat, Utc};
 use proto::methods::*;
-use proto::types::{RunStatus, ScopeKind, ScopeRef};
+use proto::types::{Run, RunStatus, ScopeKind, ScopeRef};
 use serde_json::{json, Value};
 
 use crate::client::Client;
 use crate::render;
 
 pub(crate) const LOOM_NO_REPLY_FILE_ENV: &str = "LOOM_NO_REPLY_FILE";
+const WATCH_RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(1);
+const WATCH_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(5);
+
+fn run_status_name(status: RunStatus) -> &'static str {
+    match status {
+        RunStatus::Queued => "queued",
+        RunStatus::PreparingContext => "preparing_context",
+        RunStatus::Running => "running",
+        RunStatus::WaitingTool => "waiting_tool",
+        RunStatus::Completed => "completed",
+        RunStatus::Failed => "failed",
+        RunStatus::Canceled => "canceled",
+    }
+}
+
+fn print_run_line(run: &Run) {
+    let scope = match run.scope.kind {
+        ScopeKind::Channel => format!("#{}", run.scope.id),
+        ScopeKind::Thread => format!("thread:{}", run.scope.id),
+    };
+    let opened = run.opened_at.to_rfc3339_opts(SecondsFormat::Secs, true);
+    let closed = run
+        .closed_at
+        .map(|ts| ts.to_rfc3339_opts(SecondsFormat::Secs, true))
+        .unwrap_or_else(|| "-".into());
+    let reason = run.start_reason.as_deref().unwrap_or("-");
+    println!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        run.id,
+        run_status_name(run.status),
+        run.actor_id,
+        scope,
+        opened,
+        closed,
+        reason
+    );
+}
+
+pub async fn list(
+    client: Arc<Client>,
+    statuses: Vec<String>,
+    actor_id: Option<String>,
+    target: Option<String>,
+) -> Result<()> {
+    let statuses = statuses
+        .iter()
+        .map(|raw| parse_run_status(raw))
+        .collect::<Result<Vec<_>>>()?;
+    let res: RunListResult = client
+        .call(
+            method::RUN_LIST,
+            json!({
+                "statuses": if statuses.is_empty() { None } else { Some(statuses) },
+                "actorId": actor_id,
+                "target": target,
+            }),
+        )
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+        return Ok(());
+    }
+    if res.runs.is_empty() {
+        println!("(no runs)");
+    }
+    for run in res.runs {
+        print_run_line(&run);
+    }
+    Ok(())
+}
+
+pub async fn get(client: Arc<Client>, run_id: String) -> Result<()> {
+    let res: RunGetResult = client
+        .call(method::RUN_GET, json!({ "runId": run_id }))
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+    } else {
+        print_run_line(&res.run);
+    }
+    Ok(())
+}
+
+pub async fn watch<F, Fut>(mut client: Arc<Client>, run_id: String, mut reconnect: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Arc<Client>>>,
+{
+    let mut last_emitted = None;
+    loop {
+        if watch_connected_session(&client, &run_id, &mut last_emitted).await? {
+            return Ok(());
+        }
+
+        // Release the dead transport before attempting a replacement. This is
+        // especially important for daemon/local-socket clients whose writer
+        // half can otherwise remain alive while reconnection is retried.
+        drop(client);
+        eprintln!("run watch connection lost; reconnecting...");
+        let mut delay = WATCH_RECONNECT_INITIAL_DELAY;
+        client = loop {
+            match reconnect().await {
+                Ok(reconnected) => {
+                    break reconnected;
+                }
+                Err(err) => {
+                    eprintln!(
+                        "run watch reconnect failed: {err}; retrying in {}s",
+                        delay.as_secs()
+                    );
+                    tokio::time::sleep(delay).await;
+                    delay = delay.saturating_mul(2).min(WATCH_RECONNECT_MAX_DELAY);
+                }
+            }
+        };
+    }
+}
+
+/// Watches one established, initialized, actor-bound client session.
+/// Returns `true` when the run is terminal and `false` when the stream closes.
+async fn watch_connected_session(
+    client: &Arc<Client>,
+    run_id: &str,
+    last_emitted: &mut Option<Value>,
+) -> Result<bool> {
+    let res: RunGetResult = client
+        .call(method::RUN_GET, json!({ "runId": run_id }))
+        .await
+        .context("run.get before watch subscribe")?;
+    let mut run = res.run;
+    print_update_if_changed(&run, last_emitted)?;
+    // run.updated only reaches subscribers of the run's scope — subscribe
+    // before draining notifications or the watch never sees updates.
+    if !is_terminal_run_status(run.status) {
+        client
+            .call_raw(method::SCOPE_SUBSCRIBE, Some(json!({ "scope": run.scope })))
+            .await?;
+        // Reconcile once after subscribing so an update that landed between
+        // run.get and scope/subscribe is not missed.
+        let res: RunGetResult = client
+            .call(method::RUN_GET, json!({ "runId": run_id }))
+            .await
+            .context("run.get after watch subscribe")?;
+        print_update_if_changed(&res.run, last_emitted)?;
+        run = res.run;
+    }
+    while !is_terminal_run_status(run.status) {
+        let notification = {
+            let mut rx = client.notifications.lock().await;
+            rx.recv().await
+        };
+        let Some(notification) = notification else {
+            return Ok(false);
+        };
+        if notification.method != method::STREAM_UPDATE {
+            continue;
+        }
+        let Some(params) = notification.params else {
+            continue;
+        };
+        if params.get("kind").and_then(Value::as_str) != Some(stream_kind::RUN_UPDATED) {
+            continue;
+        }
+        let Some(run_value) = params.get("data").and_then(|data| data.get("run")).cloned() else {
+            continue;
+        };
+        let Ok(updated) = serde_json::from_value::<Run>(run_value) else {
+            continue;
+        };
+        if updated.id != run.id {
+            continue;
+        }
+        // A burst can queue multiple run.updated payloads before the
+        // post-subscribe run.get completes. Re-read the canonical object so an
+        // older queued payload cannot regress output after a newer snapshot.
+        let res: RunGetResult = client
+            .call(method::RUN_GET, json!({ "runId": run_id }))
+            .await
+            .context("run.get after run.updated")?;
+        print_update_if_changed(&res.run, last_emitted)?;
+        run = res.run;
+    }
+    Ok(true)
+}
+
+fn print_update_if_changed(run: &Run, last_emitted: &mut Option<Value>) -> Result<()> {
+    let snapshot = serde_json::to_value(run)?;
+    if last_emitted.as_ref() == Some(&snapshot) {
+        return Ok(());
+    }
+    if render::is_json() {
+        render::print_json(run);
+    } else {
+        print_run_line(run);
+    }
+    *last_emitted = Some(snapshot);
+    Ok(())
+}
+
+pub async fn cancel(
+    client: Arc<Client>,
+    run_id: String,
+    reason: Option<String>,
+    yes: bool,
+) -> Result<()> {
+    if !confirm_cancel(&run_id, yes)? {
+        eprintln!("run cancel aborted");
+        return Ok(());
+    }
+    let res: RunCancelResult = client
+        .call(
+            method::RUN_CANCEL,
+            json!({
+                "runId": run_id,
+                "reason": reason,
+            }),
+        )
+        .await?;
+    if render::is_json() {
+        render::print_json(&res);
+    } else {
+        println!("run {}\t{}", res.run.id, run_status_name(res.run.status));
+    }
+    Ok(())
+}
+
+fn confirm_cancel(run_id: &str, yes: bool) -> Result<bool> {
+    let stdin = io::stdin();
+    let interactive = stdin.is_terminal();
+    let mut input = stdin.lock();
+    let stderr = io::stderr();
+    let mut output = stderr.lock();
+    confirm_cancel_with_io(run_id, yes, interactive, &mut input, &mut output)
+}
+
+fn confirm_cancel_with_io<R: BufRead, W: Write>(
+    run_id: &str,
+    yes: bool,
+    interactive: bool,
+    input: &mut R,
+    output: &mut W,
+) -> Result<bool> {
+    if yes {
+        return Ok(true);
+    }
+    if !interactive {
+        anyhow::bail!(
+            "refusing to cancel run `{run_id}` without confirmation; pass --yes in non-interactive environments"
+        );
+    }
+
+    write!(output, "Cancel run `{run_id}`? [y/N] ")?;
+    output.flush()?;
+    let mut answer = String::new();
+    input.read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+fn is_terminal_run_status(status: RunStatus) -> bool {
+    matches!(
+        status,
+        RunStatus::Completed | RunStatus::Failed | RunStatus::Canceled
+    )
+}
 
 pub async fn open(
     client: Arc<Client>,
@@ -35,7 +305,7 @@ pub async fn open(
     if render::is_json() {
         render::print_json(&res);
     } else {
-        println!("run {}\t{:?}", res.run.id, res.run.status);
+        println!("run {}\t{}", res.run.id, run_status_name(res.run.status));
     }
     Ok(())
 }
@@ -193,7 +463,7 @@ pub async fn close(client: Arc<Client>, run_id: String, status: String) -> Resul
     if render::is_json() {
         render::print_json(&res);
     } else {
-        println!("run {}\t{:?}", res.run.id, res.run.status);
+        println!("run {}\t{}", res.run.id, run_status_name(res.run.status));
     }
     Ok(())
 }
@@ -254,5 +524,61 @@ mod tests {
 
         assert!(err.to_string().contains("--allow-after-no-reply"));
         std::fs::remove_file(marker).ok();
+    }
+
+    #[test]
+    fn human_status_names_match_canonical_wire_values() {
+        let cases = [
+            (RunStatus::Queued, "queued"),
+            (RunStatus::PreparingContext, "preparing_context"),
+            (RunStatus::Running, "running"),
+            (RunStatus::WaitingTool, "waiting_tool"),
+            (RunStatus::Completed, "completed"),
+            (RunStatus::Failed, "failed"),
+            (RunStatus::Canceled, "canceled"),
+        ];
+        for (status, expected) in cases {
+            assert_eq!(run_status_name(status), expected);
+            assert_eq!(serde_json::to_value(status).unwrap(), json!(expected));
+        }
+    }
+
+    #[test]
+    fn cancel_yes_is_safe_for_non_interactive_scripts() {
+        let mut input = io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        assert!(confirm_cancel_with_io("run_1", true, false, &mut input, &mut output).unwrap());
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn cancel_without_yes_is_rejected_when_non_interactive() {
+        let mut input = io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+        let err = confirm_cancel_with_io("run_1", false, false, &mut input, &mut output)
+            .expect_err("non-interactive cancellation must require --yes");
+        assert!(err.to_string().contains("--yes"));
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn interactive_cancel_requires_explicit_yes() {
+        for (answer, expected) in [
+            ("y\n", true),
+            ("YES\n", true),
+            ("\n", false),
+            ("no\n", false),
+        ] {
+            let mut input = io::Cursor::new(answer.as_bytes());
+            let mut output = Vec::new();
+            assert_eq!(
+                confirm_cancel_with_io("run_1", false, true, &mut input, &mut output).unwrap(),
+                expected
+            );
+            assert_eq!(
+                String::from_utf8(output).unwrap(),
+                "Cancel run `run_1`? [y/N] "
+            );
+        }
     }
 }

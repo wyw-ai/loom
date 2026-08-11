@@ -139,7 +139,10 @@ fn read_registry(path: &Path) -> io::Result<SkillRegistry> {
                     "skill registry JSON corrupt, falling back to .bak (issue #6 defense-in-depth)"
                 );
                 read_bak_registry(path).or_else(|bak_err| {
-                    Err(io::Error::new(io::ErrorKind::InvalidData, format!("{parse_err}; .bak also unavailable: {bak_err}")))
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("{parse_err}; .bak also unavailable: {bak_err}"),
+                    ))
                 })
             }
         },
@@ -520,13 +523,8 @@ mod tests {
     #[test]
     fn rejects_channel_id_with_path_traversal() {
         let tmp = TempDir::new().unwrap();
-        let err = add_channel_skill(
-            tmp.path(),
-            "../escape",
-            "skill1".into(),
-            "/src".into(),
-        )
-        .unwrap_err();
+        let err =
+            add_channel_skill(tmp.path(), "../escape", "skill1".into(), "/src".into()).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
 
         let err = read_channel_skills(tmp.path(), "..").unwrap_err();
@@ -626,8 +624,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         add_channel_skill(root, "chan1", "obs".into(), "/p".into()).unwrap();
-        let on_disk =
-            fs::read_to_string(channel_skill_registry_path(root, "chan1")).unwrap();
+        let on_disk = fs::read_to_string(channel_skill_registry_path(root, "chan1")).unwrap();
         assert!(
             on_disk.contains("\"addedAt\""),
             "on-disk file must use camelCase: {on_disk}"
@@ -654,7 +651,9 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert!(
-            !files.iter().any(|f| f.starts_with(".tmp") || f.contains("tmp")),
+            !files
+                .iter()
+                .any(|f| f.starts_with(".tmp") || f.contains("tmp")),
             "leftover temp file: {files:?}"
         );
         assert!(files.iter().any(|f| f == "channel-skills.json"));
@@ -668,13 +667,8 @@ mod tests {
         for i in 0..8 {
             let root = root.clone();
             handles.push(std::thread::spawn(move || {
-                add_channel_skill(
-                    &root,
-                    "chan1",
-                    format!("skill_{i}"),
-                    format!("/src/{i}"),
-                )
-                .expect("add channel skill");
+                add_channel_skill(&root, "chan1", format!("skill_{i}"), format!("/src/{i}"))
+                    .expect("add channel skill");
             }));
         }
         for h in handles {
@@ -711,7 +705,11 @@ mod tests {
         // read should fall back to .bak and return the saved skill(s).
         let recovered = read_channel_skills(root, "chan1").unwrap();
         // .bak has the state from the first write (1 skill: obsidian).
-        assert_eq!(recovered.skills.len(), 1, "bak should have 1 skill (from first write)");
+        assert_eq!(
+            recovered.skills.len(),
+            1,
+            "bak should have 1 skill (from first write)"
+        );
         assert_eq!(recovered.skills[0].id, "obsidian");
     }
 
@@ -736,14 +734,22 @@ mod tests {
         // .bak should contain the state from the first write (1 skill: skill_a).
         let bak_text = fs::read_to_string(&bak_path).unwrap();
         let bak_reg: SkillRegistry = serde_json::from_str(&bak_text).unwrap();
-        assert_eq!(bak_reg.skills.len(), 1, "bak should have 1 skill (from first write)");
+        assert_eq!(
+            bak_reg.skills.len(),
+            1,
+            "bak should have 1 skill (from first write)"
+        );
         assert_eq!(bak_reg.skills[0].id, "skill_a");
 
         // Third write: .bak should now reflect the second write (2 skills).
         add_channel_skill(root, "chan1", "skill_c".into(), "/c".into()).unwrap();
         let bak_text = fs::read_to_string(&bak_path).unwrap();
         let bak_reg: SkillRegistry = serde_json::from_str(&bak_text).unwrap();
-        assert_eq!(bak_reg.skills.len(), 2, "bak should have 2 skills (from second write)");
+        assert_eq!(
+            bak_reg.skills.len(),
+            2,
+            "bak should have 2 skills (from second write)"
+        );
     }
 
     /// Regression for issue #6 (defense-in-depth): if both the main file

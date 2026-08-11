@@ -21,12 +21,16 @@ pub fn agent_data_root() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
-    // SAFETY: env var mutation is process-local; each test saves and
-    // restores LOOM_AGENT_DATA_ROOT to avoid leaking state.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    // SAFETY: environment variables are process-global. The lock serializes
+    // these tests, and each test restores LOOM_AGENT_DATA_ROOT before release.
 
     #[test]
     fn agent_data_root_honors_env_override() {
+        let _guard = ENV_LOCK.lock().expect("environment lock");
         let key = "LOOM_AGENT_DATA_ROOT";
         let saved = std::env::var_os(key);
         std::env::set_var(key, "/tmp/loom-cli-test-data-root");
@@ -40,6 +44,7 @@ mod tests {
 
     #[test]
     fn agent_data_root_ignores_empty_env() {
+        let _guard = ENV_LOCK.lock().expect("environment lock");
         // An empty LOOM_AGENT_DATA_ROOT must fall through to the default
         // (covers defect D2 — previously spec.rs produced an empty PathBuf).
         let key = "LOOM_AGENT_DATA_ROOT";
@@ -60,6 +65,7 @@ mod tests {
 
     #[test]
     fn agent_data_root_falls_back_to_data_dir() {
+        let _guard = ENV_LOCK.lock().expect("environment lock");
         // With no env var set, the result should end with loom.
         let key = "LOOM_AGENT_DATA_ROOT";
         let saved = std::env::var_os(key);

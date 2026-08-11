@@ -16,11 +16,13 @@ export const FeedScrollManager = memo(function FeedScrollManager({
   feedItems,
   renderItem,
   headerRenderer,
+  anchorMessageId,
 }: {
   feedKey: string;
   feedItems: FeedItem[];
   renderItem: (index: number) => ReactNode;
   headerRenderer?: () => ReactNode;
+  anchorMessageId?: string | null;
 }) {
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const [firstVisibleIndex, setFirstVisibleIndex] = useState(0);
@@ -28,6 +30,15 @@ export const FeedScrollManager = memo(function FeedScrollManager({
   const [isAtBottom, setIsAtBottom] = useState(true);
   const [newMessageCount, setNewMessageCount] = useState(0);
   const prevCountRef = useRef(feedItems.length);
+  const anchorIndex = useMemo(
+    () =>
+      anchorMessageId
+        ? feedItems.findIndex(
+            (item) => item.kind === "message" && item.message.id === anchorMessageId,
+          )
+        : -1,
+    [anchorMessageId, feedItems],
+  );
 
   const showJumpToTop = firstVisibleIndex > 2;
   const showJumpToBottom = lastVisibleIndex < feedItems.length - 3;
@@ -52,7 +63,7 @@ export const FeedScrollManager = memo(function FeedScrollManager({
 
   // Auto-scroll to latest on thread/channel entry
   useEffect(() => {
-    if (feedItems.length === 0) return;
+    if (feedItems.length === 0 || anchorIndex >= 0) return;
     const threshold = 200;
     const timer = setTimeout(() => {
       virtuosoRef.current?.scrollToIndex({
@@ -62,7 +73,21 @@ export const FeedScrollManager = memo(function FeedScrollManager({
     }, 50);
     return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [feedKey]);
+  }, [anchorIndex, feedKey]);
+
+  // Search navigation supplies a bounded context window. Once its anchor is
+  // present in the virtualized data, center it instead of jumping to latest.
+  useEffect(() => {
+    if (anchorIndex < 0) return;
+    const timer = window.setTimeout(() => {
+      virtuosoRef.current?.scrollToIndex({
+        index: anchorIndex,
+        align: "center",
+        behavior: "smooth",
+      });
+    }, 50);
+    return () => window.clearTimeout(timer);
+  }, [anchorIndex, feedKey]);
 
   const onJumpToTop = useCallback(
     () => virtuosoRef.current?.scrollToIndex({ index: 0, behavior: "smooth" }),

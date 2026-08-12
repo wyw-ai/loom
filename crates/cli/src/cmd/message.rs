@@ -372,12 +372,15 @@ fn looks_like_call_for_action(body: &str) -> bool {
         "please answer",
         "please reply",
         "please submit",
+        "please provide",
+        "please state",
         "please choose",
         "please decide",
         "please share",
         "your turn",
         "take a turn",
         "cast your vote",
+        "cast a vote",
         "start the discussion",
         "open the floor",
         "please ask",
@@ -393,6 +396,13 @@ fn looks_like_call_for_action(body: &str) -> bool {
         "请投票",
         "请回复",
         "请回答",
+        "请给出",
+        "请说出",
+        "请写出",
+        "请投出",
+        "请表态",
+        "请发表",
+        "请提供",
         "请选择",
         "请决定",
         "轮到",
@@ -455,6 +465,10 @@ fn looks_like_collective_call_for_action(body: &str) -> bool {
         "reply",
         "answer",
         "submit",
+        "provide",
+        "state your",
+        "give your",
+        "cast",
         "review",
         "discuss",
         "vote",
@@ -472,6 +486,13 @@ fn looks_like_collective_call_for_action(body: &str) -> bool {
         "回复",
         "回答",
         "提交",
+        "给出",
+        "说出",
+        "写出",
+        "投出",
+        "表态",
+        "发表",
+        "提供",
         "评审",
         "讨论",
         "投票",
@@ -517,6 +538,11 @@ fn looks_like_directed_operational_call(body: &str) -> bool {
         "reply",
         "answer",
         "submit",
+        "provide",
+        "state your",
+        "give your",
+        "cast your",
+        "cast a",
         "review",
         "discuss",
         "vote",
@@ -533,6 +559,13 @@ fn looks_like_directed_operational_call(body: &str) -> bool {
         "回复",
         "回答",
         "提交",
+        "给出",
+        "说出",
+        "写出",
+        "投出",
+        "表态",
+        "发表",
+        "提供",
         "评审",
         "讨论",
         "投票",
@@ -1084,6 +1117,9 @@ mod tests {
         assert!(looks_like_collective_call_for_action(
             "所有参与者现在开始执行各自的步骤。"
         ));
+        assert!(looks_like_collective_call_for_action(
+            "现在进入评审阶段，请每位参与者投出各自的选择。"
+        ));
         assert!(!looks_like_collective_call_for_action(
             "Reviewer A, please continue."
         ));
@@ -1099,6 +1135,9 @@ mod tests {
         ));
         assert!(looks_like_directed_operational_call(
             "Please review the context and respond."
+        ));
+        assert!(looks_like_directed_operational_call(
+            "现在进入评审阶段，请每位参与者投出各自的选择。"
         ));
         assert!(!looks_like_directed_operational_call(
             "All reviewers have submitted feedback."
@@ -1166,6 +1205,12 @@ mod tests {
         let body = "所有参与者请公开讨论，然后提交各自的选择。";
         assert!(should_reject_notify_only_call_for_action(
             true, true, false, body
+        ));
+        assert!(should_reject_notify_only_call_for_action(
+            true,
+            true,
+            false,
+            "现在进入评审阶段，请每位参与者投出各自的选择。"
         ));
         assert!(should_reject_notify_only_call_for_action(
             true, false, true, body

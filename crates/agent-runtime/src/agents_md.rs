@@ -279,6 +279,12 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
   conditions. Derive these from the user's actual request and current context;\n\
   do not import a domain template or assume voting, leadership, or sequential\n\
   turns. Ask the user only for intent that cannot be inferred safely.\n\
+- Derive the initial participant set from the actionable request: its routed\n\
+  audience plus actors explicitly included or excluded by the requester. Channel\n\
+  membership establishes who is available, not who agreed or was invited to\n\
+  participate. Do not add the requester, observers, or other members merely\n\
+  because they are present in the channel; later expand the set only through an\n\
+  explicit proposal and acceptance when the activity actually needs it.\n\
 - Use one convergence owner so simultaneous wakes do not produce competing\n\
   protocols. When the current wake is the initiating multi-actor invitation and\n\
   no owner is established yet, attempt to become the negotiation owner with\n\
@@ -630,6 +636,9 @@ mod tests {
         assert!(out.contains("ordering or"));
         assert!(out.contains("concurrency"));
         assert!(out.contains("do not import a domain template"));
+        assert!(out.contains("actionable request: its routed"));
+        assert!(out.contains("membership establishes who is available"));
+        assert!(out.contains("Do not add the requester, observers"));
         assert!(out.contains("task claim --source-message"));
         assert!(out.contains("initiating multi-actor invitation"));
         assert!(out.contains("Do not"));

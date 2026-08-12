@@ -7,7 +7,8 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use proto::methods::*;
 use proto::types::{
-    AudienceKind, AudienceRef, DeliveryPolicy, DeliveryState, Message, MessageIntent,
+    AudienceKind, AudienceRef, DeliveryPolicy, DeliveryState, Message, MessageIntent, Reminder,
+    ReminderStatus,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -63,6 +64,14 @@ pub async fn send(
         agent_turn_is_active(),
         !is_private && target.starts_with('#'),
     )?;
+    check_clock_fallback_has_reminder(
+        client.as_ref(),
+        &actor_id,
+        &target,
+        &body,
+        agent_turn_is_active(),
+    )
+    .await?;
     let mut intent = parse_message_intent(intent)?;
     let mut delivery_policy = parse_delivery_policy(delivery_policy)?;
     let explicit_notify_intent = matches!(intent, Some(MessageIntent::Notify));
@@ -170,7 +179,7 @@ pub async fn send(
 
 pub async fn ask(
     client: Arc<Client>,
-    _actor_id: String,
+    actor_id: String,
     target: Option<String>,
     thread: Option<String>,
     recipients: Vec<String>,
@@ -199,6 +208,14 @@ pub async fn ask(
     )?;
     check_artifact_attachment_claim(&body, &attachment_ids, agent_turn_is_active())?;
     check_public_sensitive_payload_claim(&body, agent_turn_is_active(), target.starts_with('#'))?;
+    check_clock_fallback_has_reminder(
+        client.as_ref(),
+        &actor_id,
+        &target,
+        &body,
+        agent_turn_is_active(),
+    )
+    .await?;
     let params = build_ask_params(
         target.clone(),
         recipients,
@@ -275,6 +292,72 @@ fn looks_like_sensitive_payload(body: &str) -> bool {
     ];
     PRIVATE_ROUTE_CUES.iter().any(|cue| lower.contains(cue))
         && DIRECT_ASSIGNMENT_CUES.iter().any(|cue| lower.contains(cue))
+}
+
+async fn check_clock_fallback_has_reminder(
+    client: &Client,
+    actor_id: &str,
+    target: &str,
+    body: &str,
+    agent_turn_active: bool,
+) -> Result<()> {
+    if !agent_turn_active || !looks_like_clock_fallback_promise(body) {
+        return Ok(());
+    }
+    let res: ReminderListResult = client
+        .call(
+            method::REMINDER_LIST,
+            json!({
+                "actorId": actor_id,
+                "statuses": ["scheduled"],
+                "all": false,
+            }),
+        )
+        .await
+        .context("verify scheduled reminder before publishing a clock fallback")?;
+    if has_scheduled_reminder_for_target(&res.reminders, target) {
+        return Ok(());
+    }
+    bail!(
+        "this message promises a clock-based deadline or timeout fallback, but actor `{actor_id}` has no scheduled reminder bound to `{target}`. This is blocked inside an agent run. Schedule the same-scope reminder first (so it records this reply target), then publish the time-bound contract; otherwise replace the clock fallback with an observable completion condition."
+    )
+}
+
+fn has_scheduled_reminder_for_target(reminders: &[Reminder], target: &str) -> bool {
+    reminders.iter().any(|reminder| {
+        reminder.status == ReminderStatus::Scheduled
+            && reminder
+                ._meta
+                .as_ref()
+                .and_then(|meta| meta.get("loomReplyTarget"))
+                .and_then(Value::as_str)
+                .is_some_and(|reply_target| reply_target == target)
+    })
+}
+
+fn looks_like_clock_fallback_promise(body: &str) -> bool {
+    let lower = body.to_lowercase();
+    const TIME_UNITS: &[&str] = &[
+        "second", "seconds", "minute", "minutes", "hour", "hours", "秒", "分钟", "小时",
+    ];
+    const CLOCK_CUES: &[&str] = &[
+        "timeout",
+        "time out",
+        "deadline",
+        "when time expires",
+        "once time expires",
+        "if time expires",
+        "or time expires",
+        "by then",
+        "超时",
+        "截止",
+        "到时",
+        "届时",
+        "时间到",
+    ];
+    let has_duration = lower.chars().any(|ch| ch.is_ascii_digit())
+        && TIME_UNITS.iter().any(|unit| lower.contains(unit));
+    has_duration && CLOCK_CUES.iter().any(|cue| lower.contains(cue))
 }
 
 /// Best-effort, non-blocking heuristic: does this body read like a request for
@@ -1122,6 +1205,59 @@ mod tests {
         ));
         assert!(!looks_like_sensitive_payload(
             "Publicly assigned roles are listed below."
+        ));
+    }
+
+    #[test]
+    fn clock_fallback_heuristic_requires_duration_and_fallback_language() {
+        assert!(looks_like_clock_fallback_promise(
+            "请在 3 分钟内回复；集齐结果或超时后继续。"
+        ));
+        assert!(looks_like_clock_fallback_promise(
+            "The deadline is 5 minutes; on timeout the owner will continue."
+        ));
+        assert!(!looks_like_clock_fallback_promise(
+            "Please reply when ready; the owner continues after every required response."
+        ));
+        assert!(!looks_like_clock_fallback_promise(
+            "The report took 5 minutes to prepare."
+        ));
+    }
+
+    #[test]
+    fn only_scheduled_reminder_for_exact_target_satisfies_clock_fallback() {
+        fn reminder(status: ReminderStatus, target: &str) -> Reminder {
+            Reminder {
+                id: "rem_demo".into(),
+                actor_id: "actor_agent_owner".into(),
+                title: "recheck".into(),
+                scope: None,
+                msg_id: None,
+                fire_at: chrono::Utc::now(),
+                repeat: None,
+                status,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                last_fired_at: None,
+                _meta: Some(proto::types::Meta::from([(
+                    "loomReplyTarget".into(),
+                    json!(target),
+                )])),
+            }
+        }
+
+        let target = "#chan_demo:msg_root";
+        assert!(has_scheduled_reminder_for_target(
+            &[reminder(ReminderStatus::Scheduled, target)],
+            target,
+        ));
+        assert!(!has_scheduled_reminder_for_target(
+            &[reminder(ReminderStatus::Fired, target)],
+            target,
+        ));
+        assert!(!has_scheduled_reminder_for_target(
+            &[reminder(ReminderStatus::Scheduled, "#chan_demo:msg_other")],
+            target,
         ));
     }
 

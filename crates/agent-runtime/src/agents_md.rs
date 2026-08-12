@@ -9,6 +9,11 @@ use std::path::Path;
 
 const BEGIN_MARKER: &str = "<!-- BEGIN loom -->";
 const END_MARKER: &str = "<!-- END loom -->";
+const CLAUDE_BRIDGE_BEGIN_MARKER: &str = "<!-- BEGIN loom claude bridge -->";
+const CLAUDE_BRIDGE_END_MARKER: &str = "<!-- END loom claude bridge -->";
+const CLAUDE_BRIDGE_BLOCK: &str = "<!-- BEGIN loom claude bridge -->\n\
+@AGENTS.md\n\
+<!-- END loom claude bridge -->";
 
 #[derive(Debug, Clone, Default)]
 pub struct AgentsMdContext {
@@ -112,8 +117,54 @@ pub fn remove_agents_md(workspace: &Path) -> io::Result<()> {
     }
 }
 
+/// Ensure Claude Code discovers the authoritative workspace `AGENTS.md` through
+/// its native project-memory file. The bridge contains only an import, so Loom
+/// operating rules still have one source of truth. Project-owned `CLAUDE.md`
+/// content outside the bridge markers is preserved.
+pub fn ensure_claude_md_bridge(workspace: &Path) -> io::Result<()> {
+    let path = workspace.join("CLAUDE.md");
+    let new_content = match std::fs::read_to_string(&path) {
+        Ok(existing) => {
+            let updated = update_marked_block(
+                &existing,
+                CLAUDE_BRIDGE_BLOCK,
+                CLAUDE_BRIDGE_BEGIN_MARKER,
+                CLAUDE_BRIDGE_END_MARKER,
+            );
+            if updated == existing {
+                return Ok(());
+            }
+            updated
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            format!("{CLAUDE_BRIDGE_BLOCK}\n")
+        }
+        Err(error) => return Err(error),
+    };
+    std::fs::write(path, new_content)
+}
+
+/// Remove only Loom's Claude bridge and preserve project-owned `CLAUDE.md`
+/// instructions. A file containing only the bridge is removed entirely.
+pub fn remove_claude_md_bridge(workspace: &Path) -> io::Result<()> {
+    remove_marked_block(
+        &workspace.join("CLAUDE.md"),
+        CLAUDE_BRIDGE_BEGIN_MARKER,
+        CLAUDE_BRIDGE_END_MARKER,
+    )
+}
+
 fn update_block(existing: &str, new_block: &str) -> String {
-    if let Some((begin, end_past)) = marker_span(existing) {
+    update_marked_block(existing, new_block, BEGIN_MARKER, END_MARKER)
+}
+
+fn update_marked_block(
+    existing: &str,
+    new_block: &str,
+    begin_marker: &str,
+    end_marker: &str,
+) -> String {
+    if let Some((begin, end_past)) = marker_span_for(existing, begin_marker, end_marker) {
         let mut out = String::with_capacity(existing.len() + new_block.len());
         out.push_str(&existing[..begin]);
         out.push_str(new_block);
@@ -132,11 +183,43 @@ fn update_block(existing: &str, new_block: &str) -> String {
 }
 
 fn marker_span(existing: &str) -> Option<(usize, usize)> {
-    let begin = existing.find(BEGIN_MARKER)?;
-    let search_from = begin + BEGIN_MARKER.len();
-    let end_rel = existing[search_from..].find(END_MARKER)?;
+    marker_span_for(existing, BEGIN_MARKER, END_MARKER)
+}
+
+fn marker_span_for(existing: &str, begin_marker: &str, end_marker: &str) -> Option<(usize, usize)> {
+    let begin = existing.find(begin_marker)?;
+    let search_from = begin + begin_marker.len();
+    let end_rel = existing[search_from..].find(end_marker)?;
     let end = search_from + end_rel;
-    Some((begin, end + END_MARKER.len()))
+    Some((begin, end + end_marker.len()))
+}
+
+fn remove_marked_block(path: &Path, begin_marker: &str, end_marker: &str) -> io::Result<()> {
+    let existing = match std::fs::read_to_string(path) {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let Some((begin, end_past)) = marker_span_for(&existing, begin_marker, end_marker) else {
+        return Ok(());
+    };
+    let mut after = &existing[end_past..];
+    if begin == 0 {
+        after = after
+            .strip_prefix("\r\n\r\n")
+            .or_else(|| after.strip_prefix("\n\n"))
+            .or_else(|| after.strip_prefix("\r\n"))
+            .or_else(|| after.strip_prefix('\n'))
+            .unwrap_or(after);
+    }
+    let mut content = String::with_capacity(existing.len());
+    content.push_str(&existing[..begin]);
+    content.push_str(after);
+    if content.is_empty() {
+        std::fs::remove_file(path)
+    } else {
+        std::fs::write(path, content)
+    }
 }
 
 fn loom_block(context: &AgentsMdContext) -> String {
@@ -184,16 +267,41 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
   participant/contributor, assignee/reviewer, observer, or no-action recipient.\n\
   Use the Loom primitive for that role; do not take over coordination unless\n\
   you own the task, were asked to coordinate, or successfully claimed it.\n\
-- When a user initiates a multi-actor activity without a concrete objective or\n\
-  coordination model, do not begin independent substantive work immediately.\n\
-  First communicate briefly with the other relevant actors through Loom and\n\
-  establish the smallest shared collaboration protocol the activity needs:\n\
-  clarify a workable outcome;\n\
-  choose an initiator or facilitator only when useful; and agree on applicable\n\
-  roles, ordering or concurrency, handoffs, and completion or stop conditions.\n\
-  Do not assume that voting, leadership, or sequential turns are always needed.\n\
-  Begin after the relevant participants share the protocol; ask the user only\n\
-  when the intended outcome cannot be inferred safely.\n\
+- A recognizable activity is not yet an executable collaboration contract.\n\
+  When several actors are invited to participate but the current conversation\n\
+  does not already establish how they will work together, negotiate that shape\n\
+  before doing the activity itself. This applies even when the activity's\n\
+  subject or desired outcome is obvious.\n\
+- Treat this as a brief, visible protocol-negotiation phase. Relevant actors\n\
+  should exchange concrete proposals about only the dimensions the activity\n\
+  needs: participation, facilitation or state ownership, roles, ordering or\n\
+  concurrency, handoff signals, shared-state updates, and completion or stop\n\
+  conditions. Derive these from the user's actual request and current context;\n\
+  do not import a domain template or assume voting, leadership, or sequential\n\
+  turns. Ask the user only for intent that cannot be inferred safely.\n\
+- Use one convergence owner so simultaneous wakes do not produce competing\n\
+  protocols. When the current wake is the initiating multi-actor invitation and\n\
+  no owner is established yet, attempt to become the negotiation owner with\n\
+  `loom --json task claim --source-message \"$LOOM_TRIGGER_MESSAGE_ID\"`. Do not\n\
+  claim again when an established owner asks for a proposal, announces the\n\
+  contract, or hands off activity work; answer or act in the requested role. A\n\
+  successful claimant facilitates and explicitly asks other relevant actors for\n\
+  proposals with `message ask`, naming the expected respondents and convergence\n\
+  condition; it does not start substantive participation yet.\n\
+  On a claim conflict, use same-scope task state to identify the established\n\
+  owner and do not start the activity or a second negotiation. If the owner has\n\
+  already requested a proposal, answer once with `message ask`; otherwise end\n\
+  no-reply and let the owner's required solicitation wake you. The owner treats\n\
+  proposal replies as negotiation input, not as fresh activities that need a\n\
+  new claim, and does not launch while required respondents remain unaccounted\n\
+  for under the announced convergence condition. Claiming this role grants\n\
+  coordination responsibility, not authority to invent the result.\n\
+- Negotiation is complete only when the owner publishes one concise operational\n\
+  contract in the shared scope, resolves material disagreements, identifies who\n\
+  owns shared progress, and explicitly wakes the first actor or actor set. Only\n\
+  then begin substantive participation. Afterward, follow the agreed protocol\n\
+  and use explicit Loom handoffs whenever another actor must act next. At the\n\
+  agreed stop, the owner closes the bootstrap task with the outcome.\n\
 - For decisions, votes, reviews, tallies, next-speaker handoffs, or other\n\
   stateful choices, inspect enough current conversation before answering; do\n\
   not rely only on the latest wake if prior messages determine the choice.\n\
@@ -499,11 +607,25 @@ mod tests {
         assert!(out.contains("stdin/heredoc"));
         assert!(out.contains("identify your role for this wake"));
         assert!(out.contains("participant/contributor"));
-        assert!(out.contains("without a concrete objective or"));
-        assert!(out.contains("communicate briefly with the other relevant actors"));
-        assert!(out.contains("smallest shared collaboration protocol"));
-        assert!(out.contains("ordering or concurrency"));
-        assert!(out.contains("Do not assume that voting, leadership"));
+        assert!(out.contains("not yet an executable collaboration contract"));
+        assert!(out.contains("subject or desired outcome is obvious"));
+        assert!(out.contains("visible protocol-negotiation phase"));
+        assert!(out.contains("ordering or"));
+        assert!(out.contains("concurrency"));
+        assert!(out.contains("do not import a domain template"));
+        assert!(out.contains("task claim --source-message"));
+        assert!(out.contains("initiating multi-actor invitation"));
+        assert!(out.contains("Do not"));
+        assert!(out.contains("claim again when an established owner asks"));
+        assert!(out.contains("explicitly asks other relevant actors"));
+        assert!(out.contains("On a claim conflict"));
+        assert!(out.contains("expected respondents and convergence"));
+        assert!(out.contains("proposal replies as negotiation input"));
+        assert!(out.contains("required respondents remain unaccounted"));
+        assert!(out.contains("do not start the"));
+        assert!(out.contains("publishes one concise operational"));
+        assert!(out.contains("explicitly wakes the first actor or actor set"));
+        assert!(out.contains("closes the bootstrap task"));
         assert!(out.contains("durable"));
         assert!(out.contains("Workspace-local files are derived state"));
         assert!(out.contains("message-anchored task"));
@@ -522,6 +644,27 @@ mod tests {
         assert!(out.contains("loom guide show <topic>"));
         assert!(!out.contains("### Read-only CLI"));
         assert!(!out.contains("### Write CLI"));
+    }
+
+    #[test]
+    fn collaboration_bootstrap_is_domain_neutral() {
+        let out = loom_block(&context("actor_demo", "chan_demo"));
+        for domain_term in [
+            "counting game",
+            "number counting",
+            "turtle soup",
+            "lateral thinking puzzle",
+            "werewolf game",
+            "Mafia game",
+            "报数",
+            "海龟汤",
+            "狼人杀",
+        ] {
+            assert!(
+                !out.to_ascii_lowercase().contains(domain_term),
+                "generated collaboration contract must not embed scenario-specific rules: {domain_term}"
+            );
+        }
     }
 
     #[test]
@@ -571,6 +714,44 @@ mod tests {
         assert!(content.contains("project before"));
         assert!(content.contains("project after"));
         assert!(!content.contains(BEGIN_MARKER));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn claude_bridge_imports_agents_md_and_preserves_project_content() {
+        let root = std::env::temp_dir().join(format!("loom-claude-bridge-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("workspace");
+        let path = root.join("CLAUDE.md");
+        std::fs::write(&path, "# Project Claude rules\n\nKeep this.\n").expect("project claude");
+
+        ensure_claude_md_bridge(&root).expect("inject Claude bridge");
+        ensure_claude_md_bridge(&root).expect("idempotent Claude bridge");
+
+        let content = std::fs::read_to_string(&path).expect("Claude bridge");
+        assert_eq!(content.matches(CLAUDE_BRIDGE_BEGIN_MARKER).count(), 1);
+        assert_eq!(content.matches("@AGENTS.md").count(), 1);
+        assert!(content.contains("# Project Claude rules"));
+        assert!(content.contains("Keep this."));
+
+        remove_claude_md_bridge(&root).expect("remove Claude bridge");
+        let content = std::fs::read_to_string(path).expect("preserved project Claude rules");
+        assert!(content.contains("# Project Claude rules"));
+        assert!(content.contains("Keep this."));
+        assert!(!content.contains(CLAUDE_BRIDGE_BEGIN_MARKER));
+        assert!(!content.contains("@AGENTS.md"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn claude_bridge_only_file_is_removed_cleanly() {
+        let root =
+            std::env::temp_dir().join(format!("loom-claude-bridge-only-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("workspace");
+
+        ensure_claude_md_bridge(&root).expect("inject Claude bridge");
+        assert!(root.join("CLAUDE.md").exists());
+        remove_claude_md_bridge(&root).expect("remove Claude bridge");
+        assert!(!root.join("CLAUDE.md").exists());
         std::fs::remove_dir_all(root).ok();
     }
 

@@ -30,7 +30,8 @@ pub use adapter::{
     AdapterStartInfo, PromptPart, PromptRoleHint, TokenUsage,
 };
 pub use agents_md::{
-    ensure_agents_md, remove_agents_md, AgentsMdContext, AgentsMdMember, AgentsMdWakePolicy,
+    ensure_agents_md, ensure_claude_md_bridge, remove_agents_md, remove_claude_md_bridge,
+    AgentsMdContext, AgentsMdMember, AgentsMdWakePolicy,
 };
 pub use bundle::{
     prepare_bundle_install, resolved_bundle_version, validate_bundle_current, PreparedBundleInstall,

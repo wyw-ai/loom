@@ -404,6 +404,41 @@ fn looks_like_directed_operational_call(body: &str) -> bool {
         })
 }
 
+/// Recognize messages that explicitly keep work with the sender or merely
+/// report progress. Default reply inference is a convenience for returning an
+/// answer to the triggering agent; it must not turn an obvious wait/status
+/// update into a new handoff. An explicit wake policy still wins.
+fn looks_like_no_action_update(body: &str) -> bool {
+    if looks_like_directed_operational_call(body) {
+        return false;
+    }
+    let lower = body.to_lowercase();
+    const CUES: &[&str] = &[
+        "please wait",
+        "please stand by",
+        "no reply needed",
+        "no response needed",
+        "for your information",
+        "currently waiting",
+        "still waiting",
+        "waiting for the remaining",
+        "more to follow",
+        "请稍候",
+        "请稍等",
+        "无需回复",
+        "不用回复",
+        "不必回复",
+        "目前进度",
+        "确认进度",
+        "还在等待",
+        "等待其余",
+        "等待剩余",
+        "稍后我会",
+        "完成后我会",
+    ];
+    CUES.iter().any(|cue| lower.contains(cue))
+}
+
 fn notify_only_call_for_action_warning() -> &'static str {
     "loom: warning: this message is notify_only and will wake nobody, but its text looks \
      like a call for others to act (discuss/vote/answer/your turn). If you expect a \
@@ -839,6 +874,7 @@ fn inferred_reply_audience<'a>(
     let should_wake = delivery_policy == Some(DeliveryPolicy::WakeAgent)
         || (delivery_policy.is_none()
             && infer_default_agent_reply
+            && !looks_like_no_action_update(body)
             && trigger_actor.starts_with("actor_agent_"));
     if !should_wake {
         return None;
@@ -1196,6 +1232,41 @@ mod tests {
                 false,
             ),
             None
+        );
+    }
+
+    #[test]
+    fn default_reply_inference_does_not_turn_wait_or_status_into_handoffs() {
+        for body in [
+            "目前进度：已收到三份结果，还在等待其余结果。",
+            "我现在处理汇总，完成后我会公布。请稍候。",
+            "Please stand by; more to follow.",
+        ] {
+            assert_eq!(
+                inferred_reply_audience(
+                    "#chan:msg_root",
+                    "actor_agent_owner",
+                    body,
+                    None,
+                    Some("actor_agent_contributor"),
+                    true,
+                ),
+                None,
+                "obvious no-action status must not infer a reply audience: {body}"
+            );
+        }
+
+        assert_eq!(
+            inferred_reply_audience(
+                "#chan:msg_root",
+                "actor_agent_owner",
+                "请继续处理下一步。",
+                Some(DeliveryPolicy::WakeAgent),
+                Some("actor_agent_contributor"),
+                true,
+            ),
+            Some("actor_agent_contributor"),
+            "an explicit wake policy must override the no-action heuristic"
         );
     }
 

@@ -186,8 +186,9 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
   you own the task, were asked to coordinate, or successfully claimed it.\n\
 - When a user initiates a multi-actor activity without a concrete objective or\n\
   coordination model, do not begin independent substantive work immediately.\n\
-  First use Loom-visible communication to establish the smallest shared\n\
-  collaboration protocol the activity needs: clarify a workable outcome;\n\
+  First communicate briefly with the other relevant actors through Loom and\n\
+  establish the smallest shared collaboration protocol the activity needs:\n\
+  clarify a workable outcome;\n\
   choose an initiator or facilitator only when useful; and agree on applicable\n\
   roles, ordering or concurrency, handoffs, and completion or stop conditions.\n\
   Do not assume that voting, leadership, or sequential turns are always needed.\n\
@@ -499,7 +500,8 @@ mod tests {
         assert!(out.contains("identify your role for this wake"));
         assert!(out.contains("participant/contributor"));
         assert!(out.contains("without a concrete objective or"));
-        assert!(out.contains("smallest shared"));
+        assert!(out.contains("communicate briefly with the other relevant actors"));
+        assert!(out.contains("smallest shared collaboration protocol"));
         assert!(out.contains("ordering or concurrency"));
         assert!(out.contains("Do not assume that voting, leadership"));
         assert!(out.contains("durable"));

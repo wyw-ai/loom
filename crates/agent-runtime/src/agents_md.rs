@@ -330,6 +330,19 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
   contributes before handing off, send that contribution with `--intent notify`\n\
   and make the next actor's `message ask` a separate command so reply inference\n\
   cannot create an unintended parallel wake.\n\
+- Audit the proposed contract for conservation and role compatibility before it\n\
+  becomes active. Build a visible ledger that maps every intended participant\n\
+  to exactly one declared participation state or work slot, accounts for every\n\
+  required slot exactly once, and explicitly includes or excludes the owner.\n\
+  Reconcile missing, duplicate, or leftover slots instead of assuming them away.\n\
+- Separate privileged coordination from affected participation. An actor that\n\
+  chooses or sees hidden allocations, adjudicates outcomes, or controls shared\n\
+  state must not also take a participant role whose choices or outcome could be\n\
+  influenced by that privileged knowledge. Either appoint an explicitly\n\
+  non-participating coordinator and recalculate the remaining slots, or agree on\n\
+  a distributed mechanism that actually preserves the required information\n\
+  boundaries. Before announcing allocation complete, verify one intended,\n\
+  non-duplicated delivery per assignee and an explicit state for the coordinator.\n\
 - Keep every promised mechanism operational and auditable. Perform and verify\n\
   any selection, private delivery, reminder, timeout, or state transition with\n\
   Loom primitives before saying it happened. Do not announce a clock-based\n\
@@ -671,6 +684,14 @@ mod tests {
         assert!(out.contains("Open or free-form participation"));
         assert!(out.contains("Public text is"));
         assert!(out.contains("an unintended parallel wake"));
+        assert!(out.contains("conservation and role compatibility"));
+        assert!(out.contains("every intended participant"));
+        assert!(out.contains("required slot exactly once"));
+        assert!(out.contains("explicitly includes or excludes the owner"));
+        assert!(out.contains("Separate privileged coordination"));
+        assert!(out.contains("non-participating coordinator"));
+        assert!(out.contains("distributed mechanism"));
+        assert!(out.contains("non-duplicated delivery per assignee"));
         assert!(out.contains("retained bootstrap task before publishing"));
         assert!(out.contains("operational and auditable"));
         assert!(out.contains("before saying it happened"));

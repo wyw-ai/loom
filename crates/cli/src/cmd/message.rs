@@ -72,6 +72,11 @@ pub async fn send(
         agent_turn_is_active(),
     )
     .await?;
+    check_collection_followup_has_latest_guard(
+        &body,
+        if_latest.as_deref(),
+        agent_turn_is_active(),
+    )?;
     let mut intent = parse_message_intent(intent)?;
     let mut delivery_policy = parse_delivery_policy(delivery_policy)?;
     let explicit_notify_intent = matches!(intent, Some(MessageIntent::Notify));
@@ -216,6 +221,11 @@ pub async fn ask(
         agent_turn_is_active(),
     )
     .await?;
+    check_collection_followup_has_latest_guard(
+        &body,
+        if_latest.as_deref(),
+        agent_turn_is_active(),
+    )?;
     let params = build_ask_params(
         target.clone(),
         recipients,
@@ -247,6 +257,90 @@ fn check_public_sensitive_payload_claim(
     bail!(
         "this public message appears to contain a secret, hidden allocation, or actor-specific private instruction. An `audience` controls delivery, not visibility. This is blocked inside an agent run; use same-scope `message send --private-to @actor_id ...` addressed once to the complete intended private group."
     )
+}
+
+fn check_collection_followup_has_latest_guard(
+    body: &str,
+    if_latest: Option<&str>,
+    agent_turn_active: bool,
+) -> Result<()> {
+    if !agent_turn_active
+        || !looks_like_collection_followup(body)
+        || if_latest.is_some_and(|value| !value.trim().is_empty())
+    {
+        return Ok(());
+    }
+    bail!(
+        "this message says a response, submission, decision, or participant is still missing, \
+         or re-asks/calls out a non-responder. That conclusion can become stale while this \
+         agent turn is running. Re-read the current scope, rebuild the latest-effective \
+         response ledger, then send with `--if-latest <latest_message_id>`. If a new message \
+         arrives first, the server will reject the stale follow-up; read and reconcile again."
+    )
+}
+
+fn looks_like_collection_followup(body: &str) -> bool {
+    let lower = body.to_lowercase();
+    const MISSING_CUES: &[&str] = &[
+        "still missing",
+        "still waiting for",
+        "has not responded",
+        "have not responded",
+        "hasn't responded",
+        "haven't responded",
+        "has not replied",
+        "have not replied",
+        "hasn't replied",
+        "haven't replied",
+        "has not submitted",
+        "have not submitted",
+        "hasn't submitted",
+        "haven't submitted",
+        "no response from",
+        "no reply from",
+        "missing response",
+        "missing submission",
+        "missing decision",
+        "awaiting response from",
+        "waiting on",
+        "尚未回复",
+        "尚未回应",
+        "尚未提交",
+        "仍未回复",
+        "仍未回应",
+        "仍未提交",
+        "还没回复",
+        "还没回应",
+        "还没提交",
+        "未回复者",
+        "未回应者",
+        "未提交者",
+        "缺少回复",
+        "缺少回应",
+        "缺少提交",
+        "等待回复",
+        "等待回应",
+        "等待提交",
+    ];
+    const REASK_CUES: &[&str] = &[
+        "remind the remaining",
+        "reminding the remaining",
+        "follow up with the remaining",
+        "please respond again",
+        "please reply again",
+        "please submit again",
+        "再次回复",
+        "重新回复",
+        "再次提交",
+        "重新提交",
+        "催办",
+        "催促",
+        "补充回复",
+        "请补回复",
+        "请尽快回复",
+    ];
+    MISSING_CUES.iter().any(|cue| lower.contains(cue))
+        || REASK_CUES.iter().any(|cue| lower.contains(cue))
 }
 
 fn looks_like_sensitive_payload(body: &str) -> bool {
@@ -1147,6 +1241,26 @@ mod tests {
         ));
         assert!(!looks_like_directed_operational_call(
             "请阅读上方状态。下一阶段开始后会进行讨论。"
+        ));
+    }
+
+    #[test]
+    fn collection_followup_requires_send_time_rebase_in_agent_turn() {
+        let stale = "已收到 6 位参与者回复，灰太狼尚未回复，请尽快回复。";
+        assert!(looks_like_collection_followup(stale));
+        let error = check_collection_followup_has_latest_guard(stale, None, true)
+            .expect_err("missing-response claims require optimistic concurrency");
+        assert!(error.to_string().contains("--if-latest"));
+        check_collection_followup_has_latest_guard(stale, Some("msg_latest"), true)
+            .expect("a fresh-read CAS base makes the follow-up safe");
+        check_collection_followup_has_latest_guard(stale, None, false)
+            .expect("manual operator messages are not forced through agent CAS");
+
+        assert!(!looks_like_collection_followup(
+            "请所有参与者首次提交各自的方案。"
+        ));
+        assert!(!looks_like_collection_followup(
+            "所有参与者已经提交，下面公布汇总结果。"
         ));
     }
 

@@ -25,10 +25,9 @@ from creating the same candidate.
 
 ## One-time bot setup
 
-GitHub's built-in `GITHUB_TOKEN` can be used as a fallback, but pull requests it
-creates may require a separate **Approve workflows** action. To keep the human
-gate to reviewing and merging the release PR, install a repository-scoped
-GitHub App with these repository permissions:
+The `wyw-ai` organization does not allow the built-in `GITHUB_TOKEN` to create
+pull requests. Install a repository-scoped GitHub App with these repository
+permissions:
 
 - Contents: read and write
 - Pull requests: read and write

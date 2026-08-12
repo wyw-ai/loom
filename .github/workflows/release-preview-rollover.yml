@@ -7,8 +7,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
+  pull-requests: read
 
 concurrency:
   group: release-preview-rollover
@@ -21,7 +21,6 @@ jobs:
     steps:
       - name: Create release bot token
         id: app-token
-        if: ${{ vars.LOOM_RELEASE_APP_ID != '' }}
         uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ vars.LOOM_RELEASE_APP_ID }}
@@ -35,7 +34,7 @@ jobs:
           ref: main
           fetch-depth: 0
           persist-credentials: false
-          token: ${{ steps.app-token.outputs.token || github.token }}
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Install Node
         uses: actions/setup-node@v4
@@ -43,7 +42,6 @@ jobs:
           node-version: 22
 
       - name: Configure authenticated Git access
-        if: ${{ steps.app-token.outputs.token != '' }}
         shell: bash
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -53,7 +51,7 @@ jobs:
         id: trigger
         shell: bash
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
 
@@ -92,7 +90,7 @@ jobs:
         id: plan
         shell: bash
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
 
@@ -124,25 +122,13 @@ jobs:
           echo "current-version=$current_version" >> "$GITHUB_OUTPUT"
           echo "Rollover plan: $plan"
 
-      - name: Guard against a partial bot configuration
-        if: steps.trigger.outputs.eligible == 'true' && vars.LOOM_RELEASE_APP_ID == ''
-        shell: bash
-        env:
-          HAS_APP_PRIVATE_KEY: ${{ secrets.LOOM_RELEASE_APP_PRIVATE_KEY != '' }}
-        run: |
-          if [[ "$HAS_APP_PRIVATE_KEY" == "true" ]]; then
-            echo "::error::LOOM_RELEASE_APP_PRIVATE_KEY is configured, but LOOM_RELEASE_APP_ID is missing."
-            exit 1
-          fi
-
       - name: Validate reused preview branch
         if: steps.trigger.outputs.eligible == 'true' && steps.plan.outputs.action == 'reuse'
         shell: bash
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           PREVIEW_BRANCH: ${{ steps.plan.outputs.branch }}
           PREVIEW_VERSION: ${{ steps.plan.outputs.version }}
-          RELEASE_APP_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
 
@@ -170,7 +156,7 @@ jobs:
         if: steps.trigger.outputs.eligible == 'true' && steps.plan.outputs.action == 'create'
         shell: bash
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           PREVIEW_BRANCH: ${{ steps.plan.outputs.branch }}
           PREVIEW_VERSION: ${{ steps.plan.outputs.version }}
         run: |
@@ -178,9 +164,6 @@ jobs:
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if [[ -z "$RELEASE_APP_TOKEN" ]]; then
-            gh auth setup-git
-          fi
           git switch --create "$PREVIEW_BRANCH" origin/main
           node scripts/set-release-version.mjs "$PREVIEW_VERSION"
           node scripts/check-release-version.mjs "v$PREVIEW_VERSION"
@@ -199,7 +182,7 @@ jobs:
         id: pull-request
         shell: bash
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           PREVIEW_BRANCH: ${{ steps.plan.outputs.branch }}
           PREVIEW_VERSION: ${{ steps.plan.outputs.version }}
           PREVIOUS_VERSION: ${{ steps.plan.outputs.current-version }}
@@ -231,15 +214,12 @@ jobs:
             '- Rollover: merging this PR will ensure the next minor preview exists.' \
             > "$body_file"
 
-          if ! pr_url="$(gh pr create \
+          pr_url="$(gh pr create \
             --repo "$GITHUB_REPOSITORY" \
             --base main \
             --head "$PREVIEW_BRANCH" \
             --title "chore(release): preview $PREVIEW_VERSION" \
-            --body-file "$body_file")"; then
-            echo "::error::Unable to create the release-preview PR. Configure the Loom release GitHub App described in docs/release-preview-workflow.md."
-            exit 1
-          fi
+            --body-file "$body_file")"
           echo "url=$pr_url" >> "$GITHUB_OUTPUT"
           echo "Created pull request: $pr_url"
 

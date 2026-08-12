@@ -19,39 +19,11 @@ jobs:
     name: Ensure next release preview
     runs-on: ubuntu-latest
     steps:
-      - name: Create release bot token
-        id: app-token
-        uses: actions/create-github-app-token@v3
-        with:
-          app-id: ${{ vars.LOOM_RELEASE_APP_ID }}
-          private-key: ${{ secrets.LOOM_RELEASE_APP_PRIVATE_KEY }}
-          permission-contents: write
-          permission-pull-requests: write
-
-      - name: Checkout main
-        uses: actions/checkout@v6.0.3
-        with:
-          ref: main
-          fetch-depth: 0
-          persist-credentials: false
-          token: ${{ steps.app-token.outputs.token }}
-
-      - name: Install Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      - name: Configure authenticated Git access
-        shell: bash
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: gh auth setup-git
-
       - name: Verify rollover trigger
         id: trigger
         shell: bash
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -84,6 +56,50 @@ jobs:
           echo "eligible=true" >> "$GITHUB_OUTPUT"
           echo "merged-preview=$merged_preview" >> "$GITHUB_OUTPUT"
           echo "Detected merged release preview: $merged_preview"
+
+      - name: Verify release bot configuration
+        if: steps.trigger.outputs.eligible == 'true'
+        shell: bash
+        env:
+          RELEASE_APP_ID: ${{ vars.LOOM_RELEASE_APP_ID }}
+          HAS_RELEASE_APP_KEY: ${{ secrets.LOOM_RELEASE_APP_PRIVATE_KEY != '' }}
+        run: |
+          if [[ -z "$RELEASE_APP_ID" || "$HAS_RELEASE_APP_KEY" != "true" ]]; then
+            echo "::error::Configure LOOM_RELEASE_APP_ID and LOOM_RELEASE_APP_PRIVATE_KEY as described in docs/release-preview-workflow.md."
+            exit 1
+          fi
+
+      - name: Create release bot token
+        if: steps.trigger.outputs.eligible == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.LOOM_RELEASE_APP_ID }}
+          private-key: ${{ secrets.LOOM_RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Checkout main
+        if: steps.trigger.outputs.eligible == 'true'
+        uses: actions/checkout@v6.0.3
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Install Node
+        if: steps.trigger.outputs.eligible == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Configure authenticated Git access
+        if: steps.trigger.outputs.eligible == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: gh auth setup-git
 
       - name: Plan next 0.x release preview
         if: steps.trigger.outputs.eligible == 'true'

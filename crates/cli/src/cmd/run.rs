@@ -428,17 +428,36 @@ pub(crate) fn mark_local_no_reply(run_id: &str, payload: &Value) -> std::io::Res
 }
 
 pub(crate) fn ensure_visible_output_allowed(allow_after_no_reply: bool) -> Result<()> {
-    if allow_after_no_reply {
-        return Ok(());
-    }
     let Some(path) = std::env::var_os(LOOM_NO_REPLY_FILE_ENV) else {
         return Ok(());
     };
-    ensure_visible_output_allowed_for_path(PathBuf::from(path).as_path())
+    ensure_visible_output_allowed_for_path(PathBuf::from(path).as_path(), allow_after_no_reply)
 }
 
-fn ensure_visible_output_allowed_for_path(path: &std::path::Path) -> Result<()> {
+fn ensure_visible_output_allowed_for_path(
+    path: &std::path::Path,
+    allow_after_no_reply: bool,
+) -> Result<()> {
     if !path.exists() {
+        return Ok(());
+    }
+    let reason = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|marker| {
+            marker
+                .pointer("/payload/reason")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    if reason.as_deref() == Some("task_claim_conflict_for_current_trigger") {
+        anyhow::bail!(
+            "this initiating agent run lost the atomic task claim for its trigger and is sealed \
+             no-reply. A newer routed delivery must run independently; \
+             --allow-after-no-reply cannot bypass this convergence guard"
+        );
+    }
+    if allow_after_no_reply {
         return Ok(());
     }
     anyhow::bail!(
@@ -512,7 +531,7 @@ mod tests {
     #[test]
     fn visible_output_guard_allows_missing_marker() {
         let marker = temp_marker("missing-no-reply");
-        assert!(ensure_visible_output_allowed_for_path(&marker).is_ok());
+        assert!(ensure_visible_output_allowed_for_path(&marker, false).is_ok());
     }
 
     #[test]
@@ -520,9 +539,30 @@ mod tests {
         let marker = temp_marker("existing-no-reply");
         std::fs::write(&marker, "{}").expect("write marker");
 
-        let err = ensure_visible_output_allowed_for_path(&marker).expect_err("guard should reject");
+        let err = ensure_visible_output_allowed_for_path(&marker, false)
+            .expect_err("guard should reject");
 
         assert!(err.to_string().contains("--allow-after-no-reply"));
+        assert!(ensure_visible_output_allowed_for_path(&marker, true).is_ok());
+        std::fs::remove_file(marker).ok();
+    }
+
+    #[test]
+    fn lost_trigger_claim_marker_cannot_be_bypassed() {
+        let marker = temp_marker("lost-trigger-claim");
+        std::fs::write(
+            &marker,
+            serde_json::to_vec(&json!({
+                "payload": { "reason": "task_claim_conflict_for_current_trigger" }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let err = ensure_visible_output_allowed_for_path(&marker, true)
+            .expect_err("convergence guard must be terminal for this run");
+
+        assert!(err.to_string().contains("cannot bypass"));
         std::fs::remove_file(marker).ok();
     }
 

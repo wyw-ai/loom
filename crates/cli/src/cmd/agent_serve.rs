@@ -1028,6 +1028,7 @@ impl AgentPaths {
         scope_ref: &ScopeRef,
         workspace_override: Option<&Path>,
         agents_md_context: &agent_runtime::AgentsMdContext,
+        claude_project_memory: bool,
         runtime_awareness: RuntimeAwareness,
     ) -> std::io::Result<ScopePaths> {
         let scope =
@@ -1094,6 +1095,27 @@ impl AgentPaths {
                         e
                     },
                 )?;
+                if claude_project_memory {
+                    agent_runtime::ensure_claude_md_bridge(&scope.workspace).map_err(|e| {
+                        tracing::error!(
+                            actor = %actor_id,
+                            workspace = %scope.workspace.display(),
+                            %e,
+                            "ensure_scope: ensure Claude AGENTS.md bridge failed"
+                        );
+                        e
+                    })?;
+                } else {
+                    agent_runtime::remove_claude_md_bridge(&scope.workspace).map_err(|e| {
+                        tracing::error!(
+                            actor = %actor_id,
+                            workspace = %scope.workspace.display(),
+                            %e,
+                            "ensure_scope: remove stale Claude AGENTS.md bridge failed"
+                        );
+                        e
+                    })?;
+                }
             }
             RuntimeAwareness::Hidden => {
                 agent_runtime::remove_agents_md(&scope.workspace).map_err(|e| {
@@ -1102,6 +1124,15 @@ impl AgentPaths {
                         workspace = %scope.workspace.display(),
                         %e,
                         "ensure_scope: remove_agents_md failed"
+                    );
+                    e
+                })?;
+                agent_runtime::remove_claude_md_bridge(&scope.workspace).map_err(|e| {
+                    tracing::error!(
+                        actor = %actor_id,
+                        workspace = %scope.workspace.display(),
+                        %e,
+                        "ensure_scope: remove Claude AGENTS.md bridge failed"
                     );
                     e
                 })?;
@@ -1363,6 +1394,21 @@ impl AgentPaths {
             .map(|parent| parent.join("agents"))
             .unwrap_or_else(|| self.data_root.join("agents"))
     }
+}
+
+fn transport_uses_claude_project_memory(transport: &AgentTransport) -> bool {
+    transport
+        .provider
+        .as_ref()
+        .is_some_and(|provider| provider.kind.eq_ignore_ascii_case("claude"))
+        || matches!(
+            transport.output_format,
+            Some(proto::methods::CommandOutputFormat::ClaudeStreamJson)
+        ) && transport
+            .decoder
+            .as_ref()
+            .and_then(|decoder| decoder.name.as_deref())
+            == Some("claude_stream_json")
 }
 
 fn scope_kind_name(kind: ScopeKind) -> &'static str {
@@ -2489,6 +2535,9 @@ struct WorkerState {
     actor_id: String,
     /// Cached copy of the on-disk spec. Reads only; specs are load-once in v1.
     spec: AgentSpec,
+    /// Provider-native project-memory compatibility selected from the resolved
+    /// transport, including local providers that extend a built-in provider.
+    claude_project_memory: bool,
     /// Resolved profile dir — same one `AgentPaths.profile` points at. Copied
     /// here so prompt-envelope code can read legacy profile fields and memory without
     /// threading `paths` through every call.
@@ -2734,9 +2783,11 @@ impl WorkerState {
         let selected_model = load_model_state(&profile_dir)
             .filter(|model| persisted_model_is_allowed(&spec, &transport, model))
             .or_else(|| default_model_for_spec(&spec));
+        let claude_project_memory = transport_uses_claude_project_memory(&transport);
         Self {
             actor_id,
             spec,
+            claude_project_memory,
             profile_dir,
             paths,
             agent_server_url,
@@ -5692,6 +5743,7 @@ async fn build_adapter_prompt(
         scope,
         workspace_override.as_deref(),
         &agents_md_context,
+        state.claude_project_memory,
         state.spec.runtime_awareness,
     )?;
     let skill_targets = current_scope_skill_targets(client, state, &channel_id, thread_id).await;
@@ -10159,7 +10211,8 @@ mod tests {
     use proto::methods::{
         AgentBundleSkillSpec, AgentBundleSpec, AgentModelChoice, AgentModelSpec,
         AgentPromptAssemblySpec, AgentPromptFileSpec, AgentPromptOutputSpec, AgentPromptRoleHint,
-        AgentProviderRef, ProviderPromptOutputSpec, ProviderPromptSpec, TriggerSpec,
+        AgentProviderRef, CommandOutputFormat, InteractiveProviderSpec, ProviderDecoderSpec,
+        ProviderPromptOutputSpec, ProviderPromptSpec, TriggerSpec,
     };
     use proto::types::{Actor, ActorKind, MessageKind, Ref, Relation};
 
@@ -10180,6 +10233,30 @@ mod tests {
                 )
         );
         assert!(distinct_delays.len() > 1);
+    }
+
+    #[test]
+    fn claude_project_memory_is_selected_from_resolved_transport() {
+        let mut transport = test_command_transport();
+        assert!(!transport_uses_claude_project_memory(&transport));
+
+        transport.provider = Some(InteractiveProviderSpec {
+            kind: "ClAuDe".into(),
+            settings: None,
+        });
+        assert!(transport_uses_claude_project_memory(&transport));
+
+        transport.provider = None;
+        transport.output_format = Some(CommandOutputFormat::ClaudeStreamJson);
+        transport.decoder = Some(ProviderDecoderSpec {
+            format: "builtin".into(),
+            name: Some("claude_stream_json".into()),
+            ..Default::default()
+        });
+        assert!(transport_uses_claude_project_memory(&transport));
+
+        transport.decoder.as_mut().expect("decoder").name = Some("qoder_stream_json".into());
+        assert!(!transport_uses_claude_project_memory(&transport));
     }
 
     fn sample_spec(bundle: Option<AgentBundleSpec>) -> AgentSpec {
@@ -10605,6 +10682,7 @@ mod tests {
                 &scope,
                 None,
                 &agents_md_context,
+                false,
                 RuntimeAwareness::Native,
             )
             .expect("ensure scope");
@@ -10631,6 +10709,8 @@ mod tests {
         let workspace = root.join("workspace");
         std::fs::create_dir_all(&workspace).expect("workspace");
         std::fs::write(workspace.join("AGENTS.md"), "# Project rules\n").expect("project rules");
+        std::fs::write(workspace.join("CLAUDE.md"), "# Project Claude rules\n")
+            .expect("project Claude rules");
         let context = agent_runtime::AgentsMdContext {
             actor_id: "actor_demo".into(),
             actor_display_name: "Demo".into(),
@@ -10644,12 +10724,17 @@ mod tests {
                 &scope,
                 Some(&workspace),
                 &context,
+                true,
                 RuntimeAwareness::Native,
             )
             .expect("native scope");
         assert!(std::fs::read_to_string(workspace.join("AGENTS.md"))
             .expect("native agents")
             .contains("# Loom runtime bootstrap"));
+        let claude =
+            std::fs::read_to_string(workspace.join("CLAUDE.md")).expect("native Claude bridge");
+        assert!(claude.contains("@AGENTS.md"));
+        assert!(claude.contains("# Project Claude rules"));
 
         paths
             .ensure_scope(
@@ -10658,6 +10743,7 @@ mod tests {
                 &scope,
                 Some(&workspace),
                 &context,
+                true,
                 RuntimeAwareness::Hidden,
             )
             .expect("hidden scope");
@@ -10665,6 +10751,10 @@ mod tests {
         let agents = std::fs::read_to_string(workspace.join("AGENTS.md")).expect("project agents");
         assert_eq!(agents, "# Project rules\n");
         assert!(!agents.contains("Loom"));
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("CLAUDE.md")).expect("project Claude rules"),
+            "# Project Claude rules\n"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -11066,6 +11156,7 @@ mod tests {
                 &scope,
                 Some(&custom_workspace),
                 &agents_md_context,
+                false,
                 RuntimeAwareness::Native,
             )
             .expect("ensure scope");

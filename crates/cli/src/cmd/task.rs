@@ -180,7 +180,10 @@ pub async fn claim(
     if task_id.is_some() == source_message.is_some() {
         bail!("pass exactly one of <task_id> or --source-message");
     }
-    let res: TaskUpdateResult = client
+    let source_message_for_guard = source_message.clone();
+    let current_actor = std::env::var("LOOM_ACTOR").ok();
+    let delegated_actor = is_delegated_claim(actor.as_deref(), current_actor.as_deref());
+    let result: Result<TaskUpdateResult> = client
         .call(
             method::TASK_CLAIM,
             json!({
@@ -189,9 +192,144 @@ pub async fn claim(
                 "actorId": actor,
             }),
         )
-        .await?;
+        .await;
+    let res = match result {
+        Ok(res) => res,
+        Err(error) => {
+            let current_trigger_claim = is_current_trigger_source_claim(
+                source_message_for_guard.as_deref(),
+                delegated_actor,
+                std::env::var("LOOM_RUN_ID").ok().as_deref(),
+                std::env::var("LOOM_TRIGGER_MESSAGE_ID").ok().as_deref(),
+            );
+            let source_task_blocks_claim = if current_trigger_claim {
+                match (
+                    source_message_for_guard.as_deref(),
+                    current_actor.as_deref(),
+                ) {
+                    (Some(source_message), Some(current_actor)) => {
+                        failed_source_claim_has_converged_task(
+                            client.as_ref(),
+                            source_message,
+                            current_actor,
+                        )
+                        .await
+                    }
+                    _ => false,
+                }
+            } else {
+                false
+            };
+            if source_task_blocks_claim {
+                let run_id = std::env::var("LOOM_RUN_ID")
+                    .expect("a matching active run was checked before sealing the claim");
+                let payload = json!({
+                    "noReply": true,
+                    "replyMode": "none",
+                    "reason": "task_claim_conflict_for_current_trigger",
+                    "triggerSourceId": source_message_for_guard,
+                });
+                match run::mark_local_no_reply(&run_id, &payload) {
+                    Ok(true) => {
+                        bail!(
+                            "{error}. This initiating run lost the atomic task claim and has been \
+                             marked no-reply automatically. Do not repurpose it using newer \
+                             conversation state or bypass the guard; only a separately routed \
+                             delivery may produce the requested response."
+                        );
+                    }
+                    Ok(false) => {
+                        bail!(
+                            "{error}. This initiating run lost the atomic task claim. End it with \
+                             `loom --json run ignore --reason task_claim_conflict`; do not \
+                             repurpose it using newer conversation state."
+                        );
+                    }
+                    Err(mark_error) => {
+                        bail!(
+                            "{error}. This initiating run lost the atomic task claim, and its \
+                             local no-reply guard could not be recorded: {mark_error}. Do not \
+                             publish from this run; end it with `loom --json run ignore`."
+                        );
+                    }
+                }
+            }
+            return Err(error);
+        }
+    };
     print_task_update(res);
     Ok(())
+}
+
+fn is_current_trigger_source_claim(
+    source_message: Option<&str>,
+    delegated_actor: bool,
+    run_id: Option<&str>,
+    trigger_message_id: Option<&str>,
+) -> bool {
+    let source_message = source_message
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let run_id = run_id.map(str::trim).filter(|value| !value.is_empty());
+    let trigger_message_id = trigger_message_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    !delegated_actor
+        && run_id.is_some()
+        && source_message.is_some()
+        && source_message == trigger_message_id
+}
+
+fn is_delegated_claim(requested_actor: Option<&str>, current_actor: Option<&str>) -> bool {
+    match (
+        requested_actor
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+        current_actor
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+    ) {
+        (None, _) => false,
+        (Some(requested), Some(current)) => requested != current,
+        (Some(_), None) => true,
+    }
+}
+
+async fn failed_source_claim_has_converged_task(
+    client: &Client,
+    source_message: &str,
+    current_actor: &str,
+) -> bool {
+    let result: Result<TaskListResult> = client
+        .call(
+            method::TASK_LIST,
+            json!({
+                "sourceMessageId": source_message,
+                "statuses": [],
+            }),
+        )
+        .await;
+    result.is_ok_and(|result| {
+        result.tasks.into_iter().any(|task| {
+            task.source_message_id == source_message
+                && task_blocks_current_trigger_claim(
+                    task.status,
+                    task.owner_actor_id.as_deref(),
+                    current_actor,
+                )
+        })
+    })
+}
+
+fn task_blocks_current_trigger_claim(
+    status: TaskStatus,
+    owner_actor_id: Option<&str>,
+    current_actor: &str,
+) -> bool {
+    matches!(
+        status,
+        TaskStatus::Done | TaskStatus::Failed | TaskStatus::Canceled
+    ) || owner_actor_id.is_some_and(|owner| owner != current_actor)
 }
 
 pub async fn complete(
@@ -1110,8 +1248,11 @@ fn normalize(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{expand_cli_values, is_terminal_assignment_status};
-    use proto::types::TaskAssignmentStatus;
+    use super::{
+        expand_cli_values, is_current_trigger_source_claim, is_delegated_claim,
+        is_terminal_assignment_status, task_blocks_current_trigger_claim,
+    };
+    use proto::types::{TaskAssignmentStatus, TaskStatus};
 
     #[test]
     fn expand_cli_values_splits_commas_trims_and_dedupes() {
@@ -1137,6 +1278,66 @@ mod tests {
         ));
         assert!(!is_terminal_assignment_status(
             TaskAssignmentStatus::Running
+        ));
+    }
+
+    #[test]
+    fn only_current_trigger_source_claim_conflicts_seal_agent_run() {
+        assert!(is_current_trigger_source_claim(
+            Some("msg_root"),
+            false,
+            Some("run_1"),
+            Some("msg_root")
+        ));
+        assert!(!is_current_trigger_source_claim(
+            Some("msg_other"),
+            false,
+            Some("run_1"),
+            Some("msg_root")
+        ));
+        assert!(!is_current_trigger_source_claim(
+            Some("msg_root"),
+            true,
+            Some("run_1"),
+            Some("msg_root")
+        ));
+    }
+
+    #[test]
+    fn same_connection_actor_is_not_a_delegated_claim() {
+        assert!(!is_delegated_claim(None, Some("actor_current")));
+        assert!(!is_delegated_claim(
+            Some("actor_current"),
+            Some("actor_current")
+        ));
+        assert!(is_delegated_claim(
+            Some("actor_other"),
+            Some("actor_current")
+        ));
+        assert!(is_delegated_claim(Some("actor_other"), None));
+    }
+
+    #[test]
+    fn source_task_blocks_only_other_owner_or_terminal_state() {
+        assert!(task_blocks_current_trigger_claim(
+            TaskStatus::Claimed,
+            Some("actor_other"),
+            "actor_current"
+        ));
+        assert!(!task_blocks_current_trigger_claim(
+            TaskStatus::Claimed,
+            Some("actor_current"),
+            "actor_current"
+        ));
+        assert!(!task_blocks_current_trigger_claim(
+            TaskStatus::Todo,
+            None,
+            "actor_current"
+        ));
+        assert!(task_blocks_current_trigger_claim(
+            TaskStatus::Canceled,
+            Some("actor_current"),
+            "actor_current"
         ));
     }
 }

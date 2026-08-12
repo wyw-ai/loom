@@ -342,6 +342,21 @@ provider adapter 中，而不是放回共享的 Loom system prompt。
 instruction path 指向同一份 workspace bootstrap 内容。这是 provider adapter
 层的职责，不应该改变 prompt assembly 契约。
 
+Claude Code 原生读取 `CLAUDE.md`，而不直接读取 `AGENTS.md`。当解析后的 transport
+声明其原生 provider kind 为 `claude`（包括继承 Claude manifest 的本地 provider）
+时，adapter 在 workspace `CLAUDE.md` 中维护一个带独立 marker 的兼容区块：
+
+```text
+<!-- BEGIN loom claude bridge -->
+@AGENTS.md
+<!-- END loom claude bridge -->
+```
+
+该区块只引用同目录的 `AGENTS.md`，不复制 Loom 规则，因此 `AGENTS.md` 仍是唯一
+权威来源。Loom 必须保留 marker 外的项目自有 `CLAUDE.md` 内容；切换到不需要该
+桥接的 transport 或启用 hidden runtime awareness 时，只移除兼容区块。如果文件
+仅包含兼容区块，则移除整个文件。
+
 已经包含 Loom marker 的既有 `AGENTS.md` 会在 actor/channel 级基础上下文或稳定规则
 变化时同步 marker 内部。marker 外的用户内容不应被改写。可变的详细手册由
 `loom-guide` 承担。

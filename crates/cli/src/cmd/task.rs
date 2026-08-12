@@ -195,13 +195,32 @@ pub async fn claim(
     let res = match result {
         Ok(res) => res,
         Err(error) => {
-            if should_seal_lost_trigger_claim(
+            let current_actor = std::env::var("LOOM_ACTOR").ok();
+            let current_trigger_claim = is_current_trigger_source_claim(
                 source_message_for_guard.as_deref(),
                 explicit_actor,
-                &error.to_string(),
                 std::env::var("LOOM_RUN_ID").ok().as_deref(),
                 std::env::var("LOOM_TRIGGER_MESSAGE_ID").ok().as_deref(),
-            ) {
+            );
+            let source_task_blocks_claim = if current_trigger_claim {
+                match (
+                    source_message_for_guard.as_deref(),
+                    current_actor.as_deref(),
+                ) {
+                    (Some(source_message), Some(current_actor)) => {
+                        failed_source_claim_has_converged_task(
+                            client.as_ref(),
+                            source_message,
+                            current_actor,
+                        )
+                        .await
+                    }
+                    _ => false,
+                }
+            } else {
+                false
+            };
+            if source_task_blocks_claim {
                 let run_id = std::env::var("LOOM_RUN_ID")
                     .expect("a matching active run was checked before sealing the claim");
                 let payload = json!({
@@ -242,10 +261,9 @@ pub async fn claim(
     Ok(())
 }
 
-fn should_seal_lost_trigger_claim(
+fn is_current_trigger_source_claim(
     source_message: Option<&str>,
     explicit_actor: bool,
-    error: &str,
     run_id: Option<&str>,
     trigger_message_id: Option<&str>,
 ) -> bool {
@@ -260,9 +278,43 @@ fn should_seal_lost_trigger_claim(
         && run_id.is_some()
         && source_message.is_some()
         && source_message == trigger_message_id
-        && error.contains("rpc `task.claim` failed")
-        && error.contains("already claimed by")
-        && error.contains("code -32001")
+}
+
+async fn failed_source_claim_has_converged_task(
+    client: &Client,
+    source_message: &str,
+    current_actor: &str,
+) -> bool {
+    let result: Result<TaskListResult> = client
+        .call(
+            method::TASK_LIST,
+            json!({
+                "sourceMessageId": source_message,
+                "statuses": [],
+            }),
+        )
+        .await;
+    result.is_ok_and(|result| {
+        result.tasks.into_iter().any(|task| {
+            task.source_message_id == source_message
+                && task_blocks_current_trigger_claim(
+                    task.status,
+                    task.owner_actor_id.as_deref(),
+                    current_actor,
+                )
+        })
+    })
+}
+
+fn task_blocks_current_trigger_claim(
+    status: TaskStatus,
+    owner_actor_id: Option<&str>,
+    current_actor: &str,
+) -> bool {
+    matches!(
+        status,
+        TaskStatus::Done | TaskStatus::Failed | TaskStatus::Canceled
+    ) || owner_actor_id.is_some_and(|owner| owner != current_actor)
 }
 
 pub async fn complete(
@@ -1181,8 +1233,11 @@ fn normalize(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{expand_cli_values, is_terminal_assignment_status, should_seal_lost_trigger_claim};
-    use proto::types::TaskAssignmentStatus;
+    use super::{
+        expand_cli_values, is_current_trigger_source_claim, is_terminal_assignment_status,
+        task_blocks_current_trigger_claim,
+    };
+    use proto::types::{TaskAssignmentStatus, TaskStatus};
 
     #[test]
     fn expand_cli_values_splits_commas_trims_and_dedupes() {
@@ -1213,35 +1268,47 @@ mod tests {
 
     #[test]
     fn only_current_trigger_source_claim_conflicts_seal_agent_run() {
-        let conflict =
-            "rpc `task.claim` failed: task task_1 is already claimed by actor_a (code -32001)";
-        assert!(should_seal_lost_trigger_claim(
+        assert!(is_current_trigger_source_claim(
             Some("msg_root"),
             false,
-            conflict,
             Some("run_1"),
             Some("msg_root")
         ));
-        assert!(!should_seal_lost_trigger_claim(
+        assert!(!is_current_trigger_source_claim(
             Some("msg_other"),
             false,
-            conflict,
             Some("run_1"),
             Some("msg_root")
         ));
-        assert!(!should_seal_lost_trigger_claim(
+        assert!(!is_current_trigger_source_claim(
             Some("msg_root"),
             true,
-            conflict,
             Some("run_1"),
             Some("msg_root")
         ));
-        assert!(!should_seal_lost_trigger_claim(
-            Some("msg_root"),
-            false,
-            "rpc `task.claim` failed: temporary unavailable (code -32000)",
-            Some("run_1"),
-            Some("msg_root")
+    }
+
+    #[test]
+    fn source_task_blocks_only_other_owner_or_terminal_state() {
+        assert!(task_blocks_current_trigger_claim(
+            TaskStatus::Claimed,
+            Some("actor_other"),
+            "actor_current"
+        ));
+        assert!(!task_blocks_current_trigger_claim(
+            TaskStatus::Claimed,
+            Some("actor_current"),
+            "actor_current"
+        ));
+        assert!(!task_blocks_current_trigger_claim(
+            TaskStatus::Todo,
+            None,
+            "actor_current"
+        ));
+        assert!(task_blocks_current_trigger_claim(
+            TaskStatus::Canceled,
+            Some("actor_current"),
+            "actor_current"
         ));
     }
 }

@@ -296,9 +296,12 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
   naming the expected respondents and convergence condition; it does not start\n\
   substantive participation yet.\n\
   On a claim conflict, use same-scope task state to identify the established\n\
-  owner and do not start the activity or a second negotiation. If the owner has\n\
-  already requested a proposal, answer once with `message ask`; otherwise end\n\
-  no-reply and let the owner's required solicitation wake you. The owner treats\n\
+  owner and do not start the activity or a second negotiation. The failed\n\
+  claimant's current invitation turn must end with `run ignore` even if a newer\n\
+  proposal solicitation has appeared while that turn was executing: the newer\n\
+  solicitation has its own routed delivery and is the only turn allowed to\n\
+  answer it. Do not use newly visible work to repurpose an older trigger. The\n\
+  owner treats\n\
   proposal replies as negotiation input, not as fresh activities that need a\n\
   new claim, and does not launch while required respondents remain unaccounted\n\
   for under the announced convergence condition. Claiming this role grants\n\
@@ -677,6 +680,9 @@ mod tests {
         assert!(out.contains("claim again when an established owner asks"));
         assert!(out.contains("explicitly asks other relevant actors"));
         assert!(out.contains("On a claim conflict"));
+        assert!(out.contains("claimant's current invitation turn"));
+        assert!(out.contains("only turn allowed to"));
+        assert!(out.contains("Do not use newly visible work"));
         assert!(out.contains("expected respondents and convergence"));
         assert!(out.contains("proposal replies as negotiation input"));
         assert!(out.contains("required respondents remain unaccounted"));

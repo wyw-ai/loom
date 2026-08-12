@@ -310,7 +310,10 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
   missing respondents, re-asking, converging, or launching, the owner must read\n\
   the current conversation (for example, `loom --json message read --target\n\
   \"$LOOM_REPLY_TARGET\"`) and rebuild one latest-effective-response entry per\n\
-  expected actor. A delayed wake is not evidence that another reply is absent.\n\
+  expected actor. When reporting someone missing or re-asking a non-responder,\n\
+  send with --if-latest set to the latest message id returned by that read. If\n\
+  the atomic send is rejected, read and reconcile again instead of publishing a\n\
+  stale conclusion. A delayed wake is not evidence that another reply is absent.\n\
   On any duplicate delivery of the same solicitation, a participant that has\n\
   already supplied an effective response must not send it again; inspect the\n\
   conversation and end with `run ignore` instead. A later explicit correction\n\
@@ -695,6 +698,8 @@ mod tests {
         assert!(out.contains("required respondents remain unaccounted"));
         assert!(out.contains("read-before-write and idempotent"));
         assert!(out.contains("latest-effective-response entry"));
+        assert!(out.contains("send with --if-latest"));
+        assert!(out.contains("read and reconcile again"));
         assert!(out.contains("duplicate delivery of the same solicitation"));
         assert!(out.contains("A delayed wake is not evidence"));
         assert!(out.contains("do not start the"));

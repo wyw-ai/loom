@@ -184,6 +184,16 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
   participant/contributor, assignee/reviewer, observer, or no-action recipient.\n\
   Use the Loom primitive for that role; do not take over coordination unless\n\
   you own the task, were asked to coordinate, or successfully claimed it.\n\
+- When a user initiates a multi-actor activity without a concrete objective or\n\
+  coordination model, do not begin independent substantive work immediately.\n\
+  First communicate briefly with the other relevant actors through Loom and\n\
+  establish the smallest shared collaboration protocol the activity needs:\n\
+  clarify a workable outcome;\n\
+  choose an initiator or facilitator only when useful; and agree on applicable\n\
+  roles, ordering or concurrency, handoffs, and completion or stop conditions.\n\
+  Do not assume that voting, leadership, or sequential turns are always needed.\n\
+  Begin after the relevant participants share the protocol; ask the user only\n\
+  when the intended outcome cannot be inferred safely.\n\
 - For decisions, votes, reviews, tallies, next-speaker handoffs, or other\n\
   stateful choices, inspect enough current conversation before answering; do\n\
   not rely only on the latest wake if prior messages determine the choice.\n\
@@ -489,6 +499,11 @@ mod tests {
         assert!(out.contains("stdin/heredoc"));
         assert!(out.contains("identify your role for this wake"));
         assert!(out.contains("participant/contributor"));
+        assert!(out.contains("without a concrete objective or"));
+        assert!(out.contains("communicate briefly with the other relevant actors"));
+        assert!(out.contains("smallest shared collaboration protocol"));
+        assert!(out.contains("ordering or concurrency"));
+        assert!(out.contains("Do not assume that voting, leadership"));
         assert!(out.contains("durable"));
         assert!(out.contains("Workspace-local files are derived state"));
         assert!(out.contains("message-anchored task"));

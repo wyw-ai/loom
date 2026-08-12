@@ -180,7 +180,9 @@ pub async fn claim(
     if task_id.is_some() == source_message.is_some() {
         bail!("pass exactly one of <task_id> or --source-message");
     }
-    let res: TaskUpdateResult = client
+    let source_message_for_guard = source_message.clone();
+    let explicit_actor = actor.is_some();
+    let result: Result<TaskUpdateResult> = client
         .call(
             method::TASK_CLAIM,
             json!({
@@ -189,9 +191,78 @@ pub async fn claim(
                 "actorId": actor,
             }),
         )
-        .await?;
+        .await;
+    let res = match result {
+        Ok(res) => res,
+        Err(error) => {
+            if should_seal_lost_trigger_claim(
+                source_message_for_guard.as_deref(),
+                explicit_actor,
+                &error.to_string(),
+                std::env::var("LOOM_RUN_ID").ok().as_deref(),
+                std::env::var("LOOM_TRIGGER_MESSAGE_ID").ok().as_deref(),
+            ) {
+                let run_id = std::env::var("LOOM_RUN_ID")
+                    .expect("a matching active run was checked before sealing the claim");
+                let payload = json!({
+                    "noReply": true,
+                    "replyMode": "none",
+                    "reason": "task_claim_conflict_for_current_trigger",
+                    "triggerSourceId": source_message_for_guard,
+                });
+                match run::mark_local_no_reply(&run_id, &payload) {
+                    Ok(true) => {
+                        bail!(
+                            "{error}. This initiating run lost the atomic task claim and has been \
+                             marked no-reply automatically. Do not repurpose it using newer \
+                             conversation state or bypass the guard; only a separately routed \
+                             delivery may produce the requested response."
+                        );
+                    }
+                    Ok(false) => {
+                        bail!(
+                            "{error}. This initiating run lost the atomic task claim. End it with \
+                             `loom --json run ignore --reason task_claim_conflict`; do not \
+                             repurpose it using newer conversation state."
+                        );
+                    }
+                    Err(mark_error) => {
+                        bail!(
+                            "{error}. This initiating run lost the atomic task claim, and its \
+                             local no-reply guard could not be recorded: {mark_error}. Do not \
+                             publish from this run; end it with `loom --json run ignore`."
+                        );
+                    }
+                }
+            }
+            return Err(error);
+        }
+    };
     print_task_update(res);
     Ok(())
+}
+
+fn should_seal_lost_trigger_claim(
+    source_message: Option<&str>,
+    explicit_actor: bool,
+    error: &str,
+    run_id: Option<&str>,
+    trigger_message_id: Option<&str>,
+) -> bool {
+    let source_message = source_message
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let run_id = run_id.map(str::trim).filter(|value| !value.is_empty());
+    let trigger_message_id = trigger_message_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    !explicit_actor
+        && run_id.is_some()
+        && source_message.is_some()
+        && source_message == trigger_message_id
+        && error.contains("rpc `task.claim` failed")
+        && error.contains("already claimed by")
+        && error.contains("code -32001")
 }
 
 pub async fn complete(
@@ -1110,7 +1181,7 @@ fn normalize(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{expand_cli_values, is_terminal_assignment_status};
+    use super::{expand_cli_values, is_terminal_assignment_status, should_seal_lost_trigger_claim};
     use proto::types::TaskAssignmentStatus;
 
     #[test]
@@ -1137,6 +1208,40 @@ mod tests {
         ));
         assert!(!is_terminal_assignment_status(
             TaskAssignmentStatus::Running
+        ));
+    }
+
+    #[test]
+    fn only_current_trigger_source_claim_conflicts_seal_agent_run() {
+        let conflict =
+            "rpc `task.claim` failed: task task_1 is already claimed by actor_a (code -32001)";
+        assert!(should_seal_lost_trigger_claim(
+            Some("msg_root"),
+            false,
+            conflict,
+            Some("run_1"),
+            Some("msg_root")
+        ));
+        assert!(!should_seal_lost_trigger_claim(
+            Some("msg_other"),
+            false,
+            conflict,
+            Some("run_1"),
+            Some("msg_root")
+        ));
+        assert!(!should_seal_lost_trigger_claim(
+            Some("msg_root"),
+            true,
+            conflict,
+            Some("run_1"),
+            Some("msg_root")
+        ));
+        assert!(!should_seal_lost_trigger_claim(
+            Some("msg_root"),
+            false,
+            "rpc `task.claim` failed: temporary unavailable (code -32000)",
+            Some("run_1"),
+            Some("msg_root")
         ));
     }
 }

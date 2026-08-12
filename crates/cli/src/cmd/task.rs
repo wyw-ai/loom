@@ -181,7 +181,8 @@ pub async fn claim(
         bail!("pass exactly one of <task_id> or --source-message");
     }
     let source_message_for_guard = source_message.clone();
-    let explicit_actor = actor.is_some();
+    let current_actor = std::env::var("LOOM_ACTOR").ok();
+    let delegated_actor = is_delegated_claim(actor.as_deref(), current_actor.as_deref());
     let result: Result<TaskUpdateResult> = client
         .call(
             method::TASK_CLAIM,
@@ -195,10 +196,9 @@ pub async fn claim(
     let res = match result {
         Ok(res) => res,
         Err(error) => {
-            let current_actor = std::env::var("LOOM_ACTOR").ok();
             let current_trigger_claim = is_current_trigger_source_claim(
                 source_message_for_guard.as_deref(),
-                explicit_actor,
+                delegated_actor,
                 std::env::var("LOOM_RUN_ID").ok().as_deref(),
                 std::env::var("LOOM_TRIGGER_MESSAGE_ID").ok().as_deref(),
             );
@@ -263,7 +263,7 @@ pub async fn claim(
 
 fn is_current_trigger_source_claim(
     source_message: Option<&str>,
-    explicit_actor: bool,
+    delegated_actor: bool,
     run_id: Option<&str>,
     trigger_message_id: Option<&str>,
 ) -> bool {
@@ -274,10 +274,25 @@ fn is_current_trigger_source_claim(
     let trigger_message_id = trigger_message_id
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    !explicit_actor
+    !delegated_actor
         && run_id.is_some()
         && source_message.is_some()
         && source_message == trigger_message_id
+}
+
+fn is_delegated_claim(requested_actor: Option<&str>, current_actor: Option<&str>) -> bool {
+    match (
+        requested_actor
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+        current_actor
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+    ) {
+        (None, _) => false,
+        (Some(requested), Some(current)) => requested != current,
+        (Some(_), None) => true,
+    }
 }
 
 async fn failed_source_claim_has_converged_task(
@@ -1234,8 +1249,8 @@ fn normalize(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        expand_cli_values, is_current_trigger_source_claim, is_terminal_assignment_status,
-        task_blocks_current_trigger_claim,
+        expand_cli_values, is_current_trigger_source_claim, is_delegated_claim,
+        is_terminal_assignment_status, task_blocks_current_trigger_claim,
     };
     use proto::types::{TaskAssignmentStatus, TaskStatus};
 
@@ -1286,6 +1301,20 @@ mod tests {
             Some("run_1"),
             Some("msg_root")
         ));
+    }
+
+    #[test]
+    fn same_connection_actor_is_not_a_delegated_claim() {
+        assert!(!is_delegated_claim(None, Some("actor_current")));
+        assert!(!is_delegated_claim(
+            Some("actor_current"),
+            Some("actor_current")
+        ));
+        assert!(is_delegated_claim(
+            Some("actor_other"),
+            Some("actor_current")
+        ));
+        assert!(is_delegated_claim(Some("actor_other"), None));
     }
 
     #[test]

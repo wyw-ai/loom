@@ -424,6 +424,27 @@ impl AcpAdapter {
         .map_err(|e| e.to_string())?
     }
 
+    /// Reset the session for a scope: remove the scope→session mapping so the
+    /// next `ensure_session` allocates a fresh ACP session. Also removes the
+    /// reverse session→scope mapping and per-session usage/model state so the
+    /// old session is fully forgotten.
+    async fn reset_session_internal(&self, scope_id: &str) -> Result<(), String> {
+        let (shared, old_session_id) = {
+            let mut inner = self.inner.lock();
+            let removed = inner.sessions.remove(scope_id);
+            let shared = inner.shared.clone();
+            (shared, removed.map(|s| s.id))
+        };
+        if let Some(shared) = shared {
+            if let Some(sid) = old_session_id {
+                shared.sessions_by_id.lock().remove(&sid);
+                shared.model_options_by_session.lock().remove(&sid);
+                shared.usage_by_session.lock().remove(&sid);
+            }
+        }
+        Ok(())
+    }
+
     async fn stop_internal(&self) -> Result<(), String> {
         let (shared, session_ids, mut child) = {
             let mut inner = self.inner.lock();
@@ -506,6 +527,10 @@ impl Adapter for AcpAdapter {
 
     async fn cancel(&self, scope: ScopeRef) -> Result<(), String> {
         self.cancel_internal(scope).await
+    }
+
+    async fn reset_session(&self, scope_id: &str) -> Result<(), String> {
+        self.reset_session_internal(scope_id).await
     }
 
     async fn stop(&self) -> Result<(), String> {

@@ -244,6 +244,24 @@ impl Adapter for InteractiveCommandAdapter {
         Ok(())
     }
 
+    async fn reset_session(&self, scope_id: &str) -> Result<(), String> {
+        // Delete the session file so the next send_prompt starts a fresh
+        // conversation. The scope ref is reconstructed minimally — only
+        // scope.id is used by session_path.
+        let scope = ScopeRef {
+            id: scope_id.to_string(),
+            kind: ScopeKind::Thread,
+        };
+        if let Err(e) = delete_session(&self.cfg, &scope) {
+            tracing::debug!(
+                scope = scope_id,
+                error = %e,
+                "interactive: failed to delete session file during reset (may not exist)"
+            );
+        }
+        Ok(())
+    }
+
     async fn stop(&self) -> Result<(), String> {
         let slots = {
             let mut inner = self.inner.lock();

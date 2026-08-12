@@ -71,6 +71,18 @@ pub trait Adapter: Send + Sync {
     /// event stream just like a normal completion.
     async fn cancel(&self, scope: ScopeRef) -> Result<(), String>;
 
+    /// Reset the provider session for `scope_id`, discarding conversation
+    /// history so the next `send_prompt` starts a fresh session. Used by the
+    /// Warm-summary session-reset flow (ARCH §C): after a summary is
+    /// generated and persisted, the session is reset and the original
+    /// trigger is re-queued with the summary injected as Warm context.
+    ///
+    /// Default implementation is a no-op (transports without persistent
+    /// sessions have nothing to reset).
+    async fn reset_session(&self, _scope_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Stop the agent. Implementations should be idempotent.
     async fn stop(&self) -> Result<(), String>;
 }

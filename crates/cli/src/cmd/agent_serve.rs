@@ -2575,6 +2575,9 @@ struct WorkerState {
     /// Per-scope first-turn set used by prompt templates that distinguish the
     /// first turn in a scope from later resumed turns.
     seeded: Mutex<HashSet<String>>,
+    /// Per-scope count of completed turns. Used by session-reset detection
+    /// (ARCH §B2) to decide when the conversation is long enough to summarize.
+    scope_turn_counts: Mutex<HashMap<String, u64>>,
     /// thread_id → channel_id cache. Populated on miss by an exact `thread/get`
     /// RPC and reused from then on. Channel scopes don't need resolution
     /// (scope.id IS the channel id) so those don't populate it.
@@ -2648,6 +2651,17 @@ struct ActiveTurn {
     /// Set only after Adapter::send_prompt confirms that the provider accepted
     /// this prompt's execution boundary.
     provider_started: bool,
+    /// When true, this turn is a Warm-summary generation turn triggered by
+    /// session-reset detection. The provider is asked to summarize the
+    /// conversation; on Finished the collected text is persisted as the Warm
+    /// summary, the adapter session is reset, and `pending_trigger_batch` is
+    /// re-queued so the original work resumes in a fresh session with the
+    /// summary injected.
+    summary_generation: bool,
+    /// The original trigger batch that was pending when a summary-generation
+    /// turn was started. Re-queued after the summary is persisted and the
+    /// session is reset.
+    pending_trigger_batch: Option<Vec<AgentTrigger>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2800,6 +2814,7 @@ impl WorkerState {
             last_provider_usage: Mutex::new(HashMap::new()),
             last_prompt_by_scope: Mutex::new(HashMap::new()),
             seeded: Mutex::new(HashSet::new()),
+            scope_turn_counts: Mutex::new(HashMap::new()),
             scope_channel_cache: Mutex::new(HashMap::new()),
             seen_sources: Mutex::new(HashSet::new()),
             action_map: Mutex::new(HashMap::new()),
@@ -3403,6 +3418,42 @@ impl WorkerState {
         let total = totals.entry(scope_id.to_string()).or_default();
         usage::add_usage(total, increment);
         usage::normalized_usage(total.clone())
+    }
+
+    /// Read the cumulative token usage for a scope without modifying it.
+    fn scope_total_tokens(&self, scope_id: &str) -> u64 {
+        let totals = self.usage_totals.lock().unwrap_or_else(|e| e.into_inner());
+        totals.get(scope_id).map(|u| u.total_tokens).unwrap_or(0)
+    }
+
+    /// Read the completed-turn count for a scope.
+    fn scope_turn_count(&self, scope_id: &str) -> u64 {
+        let counts = self.scope_turn_counts.lock().unwrap_or_else(|e| e.into_inner());
+        counts.get(scope_id).copied().unwrap_or(0)
+    }
+
+    /// Increment the completed-turn count for a scope.
+    fn increment_scope_turn_count(&self, scope_id: &str) {
+        let mut counts = self.scope_turn_counts.lock().unwrap_or_else(|e| e.into_inner());
+        *counts.entry(scope_id.to_string()).or_default() += 1;
+    }
+
+    /// Reset per-scope tracking after a session reset. Clears the cumulative
+    /// token usage and turn count so session-reset detection starts fresh
+    /// for the new session.
+    fn reset_scope_tracking(&self, scope_id: &str) {
+        self.usage_totals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(scope_id);
+        self.last_provider_usage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(scope_id);
+        self.scope_turn_counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(scope_id);
     }
 
     fn take_seed_slot(&self, scope_id: &str) -> bool {
@@ -5503,7 +5554,36 @@ async fn dispatch_trigger_batch(
             render_trigger_prompt(client, state, &batch, first_turn, &run_res.run.id).await;
         extend_unique_source_ids(&mut source_ids, turn_input.ack_source_ids.clone());
         state.drop_pending_sources(&source_ids);
-        let prompt = compose_envelope_prompt(client, state, &batch, &turn_input, first_turn).await;
+
+        // Session-reset detection (ARCH §B2, §C): when the conversation is
+        // long enough and token usage approaches the budget, intercept this
+        // turn and ask the provider to generate a Warm summary instead of
+        // processing the trigger normally. The original trigger batch is
+        // saved in `pending_trigger_batch` and re-queued after the summary is
+        // persisted and the session is reset.
+        let scope_id = &primary.scope().id;
+        let budget = wake_context_token_budget(&state.spec);
+        let token_usage = state.scope_total_tokens(scope_id);
+        let turn_count = state.scope_turn_count(scope_id);
+        let trigger_reset = !first_turn
+            && should_trigger_session_reset(false, turn_count as usize, token_usage, budget);
+
+        let (prompt, is_summary_turn) = if trigger_reset {
+            tracing::info!(
+                actor = %state.actor_id,
+                scope = %scope_id,
+                token_usage,
+                budget,
+                turn_count,
+                "session reset triggered; generating Warm summary before processing trigger"
+            );
+            let summary_prompt = compose_summary_generation_prompt(state, &turn_input);
+            (summary_prompt, true)
+        } else {
+            let prompt = compose_envelope_prompt(client, state, &batch, &turn_input, first_turn).await;
+            (prompt, false)
+        };
+
         let no_reply_file =
             no_reply_file_for_turn(client, state, primary.scope(), &run_res.run.id).await;
         let reply_target = reply_target_for_trigger(client, &state.actor_id, &primary).await;
@@ -5516,7 +5596,7 @@ async fn dispatch_trigger_batch(
             trigger_source_id: primary.id().to_string(),
             trigger_source_ids: source_ids.clone(),
             trigger_batch: batch.clone(),
-            ack_on_finish: true,
+            ack_on_finish: !is_summary_turn,
             trigger_is_message: primary.is_message(),
             assignment_id: assignment_id_for_start(&primary).map(str::to_owned),
             reply_target,
@@ -5530,9 +5610,17 @@ async fn dispatch_trigger_batch(
                 AgentTrigger::Event(_) => Vec::new(),
             },
             no_reply_file,
-            no_reply_requested: false,
+            // Summary turns must not publish visible output — the response is
+            // captured internally and persisted as the Warm summary.
+            no_reply_requested: is_summary_turn,
             cancel_requested: false,
             provider_started: false,
+            summary_generation: is_summary_turn,
+            pending_trigger_batch: if is_summary_turn {
+                Some(batch.clone())
+            } else {
+                None
+            },
         };
         state.set_turn(active.clone());
 
@@ -8331,6 +8419,200 @@ fn normalize_timezone_value(value: &str) -> Option<String> {
     Some(value.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Context Layer MVP — Warm summary persistence + injection
+//
+// ARCH v2 design §B1-B5, §C. The Warm layer stores a provider-generated
+// structured summary on the local filesystem (keyed by scope id) and injects
+// it into compose_envelope_prompt between delivery_context and user_message.
+//
+// Constraints satisfied:
+//   C-1: Summary is provider-generated (Loom never writes summary content)
+//   C-2: Summary persists to disk, survives restart/crash
+//   C-3: Loom does no keyword extraction / truncation / semantic compression
+//   C-5: Summary is produced via a dedicated provider call (summary prompt)
+// ---------------------------------------------------------------------------
+
+/// Directory under the actor profile where Warm summaries are stored.
+fn warm_summary_dir(profile_dir: &Path) -> PathBuf {
+    profile_dir.join("summaries")
+}
+
+/// File path for a given scope's Warm summary.
+fn warm_summary_path(profile_dir: &Path, scope_id: &str) -> PathBuf {
+    warm_summary_dir(profile_dir).join(format!("{scope_id}.md"))
+}
+
+/// Load a persisted Warm summary for the given scope. Returns `None` if no
+/// summary exists or the file cannot be read (treated as "no summary
+/// available" — the turn proceeds without Warm context).
+fn load_warm_summary(profile_dir: &Path, scope_id: &str) -> Option<String> {
+    let path = warm_summary_path(profile_dir, scope_id);
+    let text = std::fs::read_to_string(&path).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Persist a provider-generated Warm summary for the given scope. The summary
+/// is written atomically (write to temp + rename) so a crash mid-write does
+/// not corrupt an existing summary.
+fn persist_warm_summary(profile_dir: &Path, scope_id: &str, summary: &str) -> Result<()> {
+    let dir = warm_summary_dir(profile_dir);
+    create_dir_all_unc(&dir)
+        .with_context(|| format!("create warm summary dir {}", dir.display()))?;
+    let final_path = warm_summary_path(profile_dir, scope_id);
+    let temp_path = final_path.with_extension("md.tmp");
+    std::fs::write(&temp_path, summary)
+        .with_context(|| format!("write warm summary tmp {}", temp_path.display()))?;
+    std::fs::rename(&temp_path, &final_path)
+        .with_context(|| format!("rename warm summary {}", final_path.display()))?;
+    Ok(())
+}
+
+/// Remove a persisted Warm summary (e.g. when the scope is deleted). Errors
+/// are logged but not propagated — a stale summary file is harmless.
+fn clear_warm_summary(profile_dir: &Path, scope_id: &str) {
+    let path = warm_summary_path(profile_dir, scope_id);
+    if path.exists() {
+        if let Err(err) = std::fs::remove_file(&path) {
+            tracing::debug!(path = %path.display(), %err, "failed to remove warm summary");
+        }
+    }
+}
+
+/// Maximum fraction of the wake-context token budget that the Warm summary
+/// section may occupy (ARCH §B5: 20%).
+const WARM_SUMMARY_BUDGET_FRACTION: f64 = 0.2;
+
+/// Build the Warm summary prompt section for the current scope. Returns
+/// `None` when no summary is persisted or the summary exceeds its token
+/// budget allocation.
+///
+/// This function only **reads** persisted summaries — it never generates,
+/// truncates, or modifies summary content (C-1, C-3).
+fn warm_summary_section(
+    profile_dir: &Path,
+    scope_id: &str,
+    total_budget: u64,
+) -> Option<agent_runtime::PromptSection> {
+    let raw = load_warm_summary(profile_dir, scope_id)?;
+    let summary_budget = ((total_budget as f64) * WARM_SUMMARY_BUDGET_FRACTION) as u64;
+    let summary_tokens = usage::estimate_tokens(&raw);
+    if summary_tokens > summary_budget && summary_budget > 0 {
+        tracing::debug!(
+            scope = scope_id,
+            summary_tokens,
+            budget = summary_budget,
+            "warm summary exceeds budget; skipping injection (not truncating per C-3)"
+        );
+        return None;
+    }
+    Some(agent_runtime::PromptSection {
+        name: "warm_summary",
+        content: format!("=== Context: Warm summary ===\n\
+            The following structured summary was generated by the provider to \
+            preserve context from earlier in this session. Use it as background \
+            for the current turn.\n\n{raw}"),
+    })
+}
+
+/// Threshold multiplier: session reset triggers when estimated token usage
+/// exceeds budget × this factor (ARCH §B2, §C Step 1).
+const SESSION_RESET_TOKEN_THRESHOLD: f64 = 0.8;
+
+/// Message count above which session reset triggers (ARCH §B2).
+const SESSION_RESET_MESSAGE_THRESHOLD: usize = 50;
+
+/// Minimum message count below which session reset never triggers (ARCH §B2).
+const SESSION_RESET_MIN_MESSAGES: usize = 20;
+
+/// Determine whether a session reset / Warm summary generation should trigger
+/// for this scope on this turn.
+///
+/// Triggers when:
+///   - token usage > budget × 0.8 **OR** message count > 50
+///
+/// Does **not** trigger when:
+///   - first turn (first_turn = true)
+///   - message count < 20
+fn should_trigger_session_reset(
+    first_turn: bool,
+    message_count: usize,
+    token_usage: u64,
+    budget: u64,
+) -> bool {
+    if first_turn {
+        return false;
+    }
+    if message_count < SESSION_RESET_MIN_MESSAGES {
+        return false;
+    }
+    token_usage > ((budget as f64) * SESSION_RESET_TOKEN_THRESHOLD) as u64
+        || message_count > SESSION_RESET_MESSAGE_THRESHOLD
+}
+
+/// The structured summary prompt sent to the provider to generate a Warm
+/// summary. Requests the 5 sections defined in ARCH §B3.
+///
+/// This prompt is the **only** mechanism by which Warm summaries are
+/// generated — Loom never constructs summary content itself (C-1, C-5).
+const SUMMARY_GENERATION_PROMPT: &str = "\
+You are generating a structured context summary to preserve the most important \
+information from this session before it is reset. This summary will be injected \
+into a fresh session so continuity is maintained.\n\n\
+Produce a concise summary with exactly these 5 sections, using markdown headers:\n\n\
+## SESSION INTENT\n\
+The primary goal or objective of this thread/channel.\n\n\
+## KEY DECISIONS\n\
+Design decisions, approval outcomes, and resolved questions.\n\n\
+## DELIVERABLES\n\
+References to produced artifacts (artifact numbers, file paths, document links).\n\n\
+## TASK STATE\n\
+Current task status (in_progress / done / blocked) and what remains.\n\n\
+## ACTOR CONTEXT\n\
+Each actor's latest position, contribution, or stance relevant to ongoing work.\n\n\
+Rules:\n\
+- Be concise but complete. Each section should be 2-5 bullet points.\n\
+- Include only information that is essential for continuing the work.\n\
+- Use exact identifiers (task IDs, message IDs, file paths) where available.\n\
+- Do not include greetings, acknowledgements, or meta-commentary.\n\
+- Output ONLY the 5 sections with their headers, nothing else.";
+
+/// Build the full summary-generation prompt that includes the conversation
+/// context for the provider to summarize.
+fn build_summary_generation_prompt(delivery_context: &str) -> String {
+    format!(
+        "{SUMMARY_GENERATION_PROMPT}\n\n\
+         === Conversation context to summarize ===\n\
+         {delivery_context}"
+    )
+}
+
+/// Compose a summary-generation prompt for a session-reset turn. This bypasses
+/// the normal envelope composition and sends only the summary generation
+/// instruction + delivery context as the user message. The provider's
+/// response text will be persisted as the Warm summary.
+fn compose_summary_generation_prompt(
+    state: &Arc<WorkerState>,
+    trigger_prompt: &TriggerPromptText,
+) -> PromptTelemetry {
+    let summary_text = build_summary_generation_prompt(&trigger_prompt.delivery_context);
+    let sections = vec![agent_runtime::PromptSection {
+        name: "user_message",
+        content: format!("=== User message ===\n{summary_text}"),
+    }];
+    let content = sections
+        .iter()
+        .map(|s| s.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    prompt_telemetry(content, &sections)
+}
+
 /// Per-turn prompt composition for v1. Mirrors
 /// `server::runtime::wakeup::compose_envelope_prompt` — agents that don't
 /// configure legacy profile fields / memory fall back to the pre-envelope shape.
@@ -8365,6 +8647,9 @@ async fn compose_envelope_prompt(
 
     let memory_spec = state.spec.memory.as_ref();
 
+    let budget = wake_context_token_budget(&state.spec);
+    let warm_summary = warm_summary_section(&state.profile_dir, &scope.id, budget);
+
     if memory_spec.is_none() {
         let mut sections = Vec::new();
         push_profile_prompt_files_section(&mut sections, profile_prompt_files.clone());
@@ -8372,6 +8657,11 @@ async fn compose_envelope_prompt(
             name: "runtime_context",
             content: runtime_context.clone(),
         });
+        // Warm summary injected after runtime_context, before user_message
+        // (ARCH §A4, §B5).
+        if let Some(summary) = &warm_summary {
+            sections.push(summary.clone());
+        }
         sections.push(agent_runtime::PromptSection {
             name: "user_message",
             content: format!("=== User message ===\n{turn_input}"),
@@ -8402,6 +8692,11 @@ async fn compose_envelope_prompt(
             user_message: &turn_input,
         });
     push_profile_prompt_files_section(&mut sections, profile_prompt_files);
+    // Warm summary injected after profile_prompt_files / runtime_context,
+    // before user_message (ARCH §A4, §B5).
+    if let Some(summary) = &warm_summary {
+        insert_warm_summary_section(&mut sections, summary.clone());
+    }
     let prompt = sections
         .iter()
         .map(|section| section.content.as_str())
@@ -8441,6 +8736,19 @@ fn push_profile_prompt_files_section(
             content,
         },
     );
+}
+
+/// Insert the Warm summary section just before `user_message`, preserving
+/// the ARCH §A4 ordering: ... → runtime_context → warm_summary → user_message.
+fn insert_warm_summary_section(
+    sections: &mut Vec<agent_runtime::PromptSection>,
+    summary: agent_runtime::PromptSection,
+) {
+    let insert_at = sections
+        .iter()
+        .position(|section| section.name == "user_message")
+        .unwrap_or(sections.len());
+    sections.insert(insert_at, summary);
 }
 
 fn add_turn_input_prompt_parts(
@@ -8717,7 +9025,8 @@ fn prompt_part_from_section(section: &agent_runtime::PromptSection) -> PromptPar
             | "agent_instructions"
             | "bootstrap_memory"
             | "scope_bootstrap"
-            | "profile_prompt_files" => PromptRoleHint::System,
+            | "profile_prompt_files"
+            | "warm_summary" => PromptRoleHint::System,
             _ => PromptRoleHint::User,
         },
     }
@@ -8763,6 +9072,7 @@ fn prompt_section_title(name: &str) -> &str {
         "runtime_context" => "Context: Runtime context",
         "scope_bootstrap" => "System: Loom multi-actor context",
         "profile_prompt_files" => "System: Profile prompt files",
+        "warm_summary" => "Context: Warm summary",
         "trigger_prefix" => "Trigger prefix",
         "latest_message" => "Loom turn input",
         "assignment_context" => "Loom assignment context",
@@ -8800,6 +9110,7 @@ fn prompt_section_label(name: &str) -> &str {
         "runtime_context" => "Runtime Context",
         "scope_bootstrap" => "Scope Bootstrap",
         "profile_prompt_files" => "Profile Prompt Files",
+        "warm_summary" => "Warm Summary",
         "trigger_prefix" => "Trigger Prefix",
         "latest_message" => "Turn Input",
         "assignment_context" => "Assignment Context",
@@ -8929,7 +9240,15 @@ async fn translate_one_with_gate(
             if active.cancel_requested {
                 return Ok(());
             }
-            if turn_no_reply_requested(&active) {
+            // Summary-generation turns buffer text internally (for later
+            // persistence as the Warm summary) but never publish it to chat.
+            if active.summary_generation {
+                if is_partial {
+                    state.push_text(&active.id, &content);
+                } else {
+                    state.push_text(&active.id, &content);
+                }
+            } else if turn_no_reply_requested(&active) {
                 if !is_partial {
                     let _ = state.take_text(&active.id);
                 }
@@ -9106,6 +9425,87 @@ async fn translate_one_with_gate(
                 );
                 return Ok(());
             };
+
+            // --- Summary-generation turn (session reset) ---
+            // When this turn was a Warm-summary generation turn, capture the
+            // provider's response text, persist it as the Warm summary, reset
+            // the adapter session, and re-queue the original trigger batch so
+            // it processes in a fresh session with the summary injected.
+            if active.summary_generation {
+                let summary_text = state.take_text(&active.id).unwrap_or_default();
+                let scope_id = active.scope.id.clone();
+
+                if success && !summary_text.trim().is_empty() {
+                    // Persist the provider-generated summary (C-1, C-2, C-5).
+                    if let Err(err) = persist_warm_summary(
+                        &state.profile_dir,
+                        &scope_id,
+                        &summary_text,
+                    ) {
+                        tracing::warn!(
+                            actor = %actor_id,
+                            scope = %scope_id,
+                            %err,
+                            "failed to persist Warm summary; session will reset without summary injection"
+                        );
+                    }
+
+                    // Reset the adapter session so the next turn starts fresh.
+                    adapter.reset_session(&scope_id).await;
+                    // Clear per-scope usage/turn tracking so session-reset
+                    // detection starts fresh for the new session.
+                    state.reset_scope_tracking(&scope_id);
+                    tracing::info!(
+                        actor = %actor_id,
+                        scope = %scope_id,
+                        "Warm summary persisted and adapter session reset"
+                    );
+                } else {
+                    tracing::warn!(
+                        actor = %actor_id,
+                        scope = %scope_id,
+                        success,
+                        "summary generation turn did not produce output; skipping session reset"
+                    );
+                }
+
+                // Close the run without publishing visible output.
+                let _ = close_run(
+                    client,
+                    &active.run_id,
+                    if success { RunStatus::Completed } else { RunStatus::Failed },
+                    None,
+                    &[],
+                )
+                .await;
+
+                // Re-queue the original trigger batch so it processes in the
+                // new session. We do NOT ack the source deliveries — the
+                // re-queued turn will handle that.
+                let pending_batch = active.pending_trigger_batch.clone().unwrap_or_default();
+                // Release the slot and collect any other queued triggers for
+                // this scope. The pending batch goes to the front so the
+                // original work resumes first.
+                let mut queued = state.finish_and_next_batch(
+                    &scope_id,
+                    wake_coalesce_enabled(&state.spec),
+                );
+                let mut next_batch = pending_batch;
+                next_batch.append(&mut queued);
+                let next_batch = rebase_queued_batch_or_release(client, state, next_batch).await;
+                if !next_batch.is_empty() {
+                    if let Err(e) = dispatch_trigger_batch(client, state, adapter, next_batch).await {
+                        tracing::error!(
+                            actor = %actor_id,
+                            %e,
+                            "failed to dispatch re-queued trigger after session reset"
+                        );
+                    }
+                }
+                return Ok(());
+            }
+
+            // --- Normal turn processing ---
             // Resolve the per-turn usage increment once, up front: apply the
             // session-cumulative diff for providers that report running
             // totals, and fall back to an estimate from the buffered
@@ -9297,6 +9697,8 @@ async fn translate_one_with_gate(
             let scope_id = scope
                 .map(|s| s.id)
                 .unwrap_or_else(|| active.scope.id.clone());
+            // Track completed turns for session-reset detection (ARCH §B2).
+            state.increment_scope_turn_count(&scope_id);
             let next_batch =
                 state.finish_and_next_batch(&scope_id, wake_coalesce_enabled(&state.spec));
             let next_batch = rebase_queued_batch_or_release(client, state, next_batch).await;
@@ -10516,6 +10918,8 @@ mod tests {
             no_reply_requested: false,
             cancel_requested: false,
             provider_started: false,
+            summary_generation: false,
+            pending_trigger_batch: None,
         }
     }
 
@@ -11435,6 +11839,8 @@ mod tests {
             no_reply_requested: false,
             cancel_requested: false,
             provider_started: false,
+            summary_generation: false,
+            pending_trigger_batch: None,
         };
         let env = paths.scope_env(
             "actor_demo",
@@ -12129,6 +12535,8 @@ mod tests {
             no_reply_requested: false,
             cancel_requested: false,
             provider_started: false,
+            summary_generation: false,
+            pending_trigger_batch: None,
         };
 
         assert_eq!(
@@ -12187,6 +12595,8 @@ mod tests {
             no_reply_requested: false,
             cancel_requested: false,
             provider_started: false,
+            summary_generation: false,
+            pending_trigger_batch: None,
         };
 
         assert_eq!(
@@ -13536,6 +13946,8 @@ mod tests {
             no_reply_requested: false,
             cancel_requested: false,
             provider_started: false,
+            summary_generation: false,
+            pending_trigger_batch: None,
         });
 
         assert!(state
@@ -13957,6 +14369,8 @@ mod tests {
             no_reply_requested: false,
             cancel_requested: false,
             provider_started: false,
+            summary_generation: false,
+            pending_trigger_batch: None,
         });
         let queued_channel = Event {
             id: "evt_channel_route".into(),
@@ -14065,6 +14479,8 @@ mod tests {
             no_reply_requested: false,
             cancel_requested: false,
             provider_started: false,
+            summary_generation: false,
+            pending_trigger_batch: None,
         });
         assert!(!state.begin_or_enqueue(turn_key, queued.clone()));
         assert!(state.take_seed_slot(&scope.id));
@@ -14140,6 +14556,8 @@ mod tests {
             no_reply_requested: false,
             cancel_requested: false,
             provider_started: false,
+            summary_generation: false,
+            pending_trigger_batch: None,
         });
 
         let service = Event {
@@ -14223,6 +14641,8 @@ mod tests {
             no_reply_requested: false,
             cancel_requested: false,
             provider_started: false,
+            summary_generation: false,
+            pending_trigger_batch: None,
         });
         assert_eq!(
             state
@@ -14251,6 +14671,8 @@ mod tests {
             no_reply_requested: false,
             cancel_requested: false,
             provider_started: false,
+            summary_generation: false,
+            pending_trigger_batch: None,
         });
         assert_eq!(
             state
@@ -14279,6 +14701,8 @@ mod tests {
             no_reply_requested: false,
             cancel_requested: false,
             provider_started: false,
+            summary_generation: false,
+            pending_trigger_batch: None,
         });
         assert!(state.clear_turn(&active_scope.id).is_none());
         std::fs::remove_dir_all(root).ok();
@@ -14336,6 +14760,8 @@ mod tests {
                 no_reply_requested: false,
                 cancel_requested: false,
                 provider_started: false,
+                summary_generation: false,
+                pending_trigger_batch: None,
             });
         };
 
@@ -14428,6 +14854,8 @@ mod tests {
             no_reply_requested: false,
             cancel_requested: false,
             provider_started: false,
+            summary_generation: false,
+            pending_trigger_batch: None,
         });
 
         assert!(!state.begin_or_enqueue(&turn_key, mk("msg_folded")));
@@ -14565,6 +14993,8 @@ mod tests {
             no_reply_requested: false,
             cancel_requested: false,
             provider_started: false,
+            summary_generation: false,
+            pending_trigger_batch: None,
         });
         assert!(!state.begin_or_enqueue(&turn_key, mk("msg_new")));
 
@@ -14632,6 +15062,8 @@ mod tests {
             no_reply_requested: false,
             cancel_requested: false,
             provider_started: false,
+            summary_generation: false,
+            pending_trigger_batch: None,
         });
         // A burst arrives while busy, followed by a non-coalescible event.
         assert!(!state.begin_or_enqueue(&turn_key, mk("msg_2")));
@@ -14670,6 +15102,8 @@ mod tests {
             no_reply_requested: false,
             cancel_requested: false,
             provider_started: false,
+            summary_generation: false,
+            pending_trigger_batch: None,
         });
         // Batched sources are visible for inbox dedupe.
         assert!(state.has_active_trigger("msg_3"));
@@ -14701,6 +15135,8 @@ mod tests {
             no_reply_requested: false,
             cancel_requested: false,
             provider_started: false,
+            summary_generation: false,
+            pending_trigger_batch: None,
         });
         assert!(state.finish_and_next_batch(&scope.id, true).is_empty());
         assert!(state.begin_or_enqueue(&turn_key, mk("msg_5")));

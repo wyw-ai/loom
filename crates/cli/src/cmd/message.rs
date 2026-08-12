@@ -131,18 +131,22 @@ pub async fn send(
     }
     let will_wake = !private_to.is_empty() || delivery_policy == Some(DeliveryPolicy::WakeAgent);
     let has_targeted_audience = !private_to.is_empty() || inferred_reply.is_some();
-    if !will_wake && !has_targeted_audience && looks_like_call_for_action(&body) {
+    if !will_wake
+        && !has_targeted_audience
+        && (looks_like_call_for_action(&body) || looks_like_directed_operational_call(&body))
+    {
         let warning = notify_only_call_for_action_warning();
         if should_reject_notify_only_call_for_action(
             agent_turn_is_active(),
             explicit_notify_intent,
             explicit_silent_policy,
+            &body,
         ) {
             bail!(
                 "{warning} This is blocked inside an agent run. Use `loom message ask @actor_id ...` \
                  or `loom message send --private-to @actor_id --target \"$LOOM_REPLY_TARGET\" ...` \
-                 for hidden same-scope work. If this is intentionally a no-action notification, \
-                 rerun with `--intent notify`."
+                 for hidden same-scope work. If this is intentionally no-action context, remove \
+                 the directed action request and send that context separately with `--intent notify`."
             );
         }
         eprintln!("{warning}");
@@ -337,6 +341,69 @@ fn looks_like_collective_call_for_action(body: &str) -> bool {
     has_collective_addressee && has_operation
 }
 
+/// Detect an instruction addressed to somebody else, independently of whether
+/// the text happens to use one of the compact phrase cues above. This closes a
+/// dangerous escape hatch where an agent could mark "please ... act" as an
+/// explicit notification: notifications intentionally wake nobody, so an
+/// imperative in one cannot be the operational handoff.
+fn looks_like_directed_operational_call(body: &str) -> bool {
+    let lower = body.to_lowercase();
+    const DIRECTIVE_CUES: &[&str] = &[
+        "please",
+        "you must",
+        "you should",
+        "your turn",
+        "each of you",
+        "请",
+        "你们要",
+        "你需要",
+        "你们需要",
+        "必须",
+        "轮到",
+    ];
+    const OPERATION_CUES: &[&str] = &[
+        "act",
+        "execute",
+        "proceed",
+        "participate",
+        "respond",
+        "reply",
+        "answer",
+        "submit",
+        "review",
+        "discuss",
+        "vote",
+        "choose",
+        "decide",
+        "continue",
+        "begin",
+        "start",
+        "行动",
+        "执行",
+        "推进",
+        "处理",
+        "参与",
+        "回复",
+        "回答",
+        "提交",
+        "评审",
+        "讨论",
+        "投票",
+        "选择",
+        "决定",
+        "发言",
+        "提问",
+        "继续",
+        "开始",
+    ];
+    lower
+        .split(['\n', '.', '!', '?', '。', '！', '？', ';', '；'])
+        .any(|segment| {
+            DIRECTIVE_CUES.iter().any(|cue| segment.contains(cue))
+                && OPERATION_CUES.iter().any(|cue| segment.contains(cue))
+        })
+}
+
 fn notify_only_call_for_action_warning() -> &'static str {
     "loom: warning: this message is notify_only and will wake nobody, but its text looks \
      like a call for others to act (discuss/vote/answer/your turn). If you expect a \
@@ -463,8 +530,11 @@ fn should_reject_notify_only_call_for_action(
     agent_turn_active: bool,
     explicit_notify_intent: bool,
     explicit_silent_policy: bool,
+    body: &str,
 ) -> bool {
-    agent_turn_active && !explicit_notify_intent && !explicit_silent_policy
+    agent_turn_active
+        && (looks_like_directed_operational_call(body)
+            || (!explicit_notify_intent && !explicit_silent_policy))
 }
 
 fn should_reject_inferred_single_recipient_collective_call(
@@ -840,6 +910,25 @@ mod tests {
     }
 
     #[test]
+    fn directed_operation_heuristic_distinguishes_requests_from_status() {
+        assert!(looks_like_directed_operational_call(
+            "所有参与者请公开讨论，然后提交各自的选择。"
+        ));
+        assert!(looks_like_directed_operational_call(
+            "Please review the context and respond."
+        ));
+        assert!(!looks_like_directed_operational_call(
+            "All reviewers have submitted feedback."
+        ));
+        assert!(!looks_like_directed_operational_call(
+            "The next phase will include discussion and review."
+        ));
+        assert!(!looks_like_directed_operational_call(
+            "请阅读上方状态。下一阶段开始后会进行讨论。"
+        ));
+    }
+
+    #[test]
     fn agent_turn_rejects_collective_call_with_inferred_single_recipient() {
         assert!(should_reject_inferred_single_recipient_collective_call(
             true,
@@ -862,18 +951,41 @@ mod tests {
     }
 
     #[test]
-    fn agent_turn_rejects_notify_only_call_for_action_unless_explicitly_notify() {
+    fn agent_turn_requires_explicit_notify_only_for_non_directive_context() {
         assert!(should_reject_notify_only_call_for_action(
-            true, false, false
+            true,
+            false,
+            false,
+            "Open the floor for discussion."
         ));
         assert!(!should_reject_notify_only_call_for_action(
-            false, false, false
+            false,
+            false,
+            false,
+            "Open the floor for discussion."
         ));
         assert!(!should_reject_notify_only_call_for_action(
-            true, true, false
+            true,
+            true,
+            false,
+            "The next phase will include discussion and review."
         ));
         assert!(!should_reject_notify_only_call_for_action(
-            true, false, true
+            true,
+            false,
+            true,
+            "The next phase will include discussion and review."
+        ));
+    }
+
+    #[test]
+    fn agent_turn_rejects_directed_action_even_when_marked_notify_or_silent() {
+        let body = "所有参与者请公开讨论，然后提交各自的选择。";
+        assert!(should_reject_notify_only_call_for_action(
+            true, true, false, body
+        ));
+        assert!(should_reject_notify_only_call_for_action(
+            true, false, true, body
         ));
     }
 

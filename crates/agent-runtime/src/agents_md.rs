@@ -330,6 +330,7 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
   contributes before handing off, send that contribution with `--intent notify`\n\
   and make the next actor's `message ask` a separate command so reply inference\n\
   cannot create an unintended parallel wake.\n\
+- Treat every phase transition as two different facts: a no-action shared-state\n+  announcement and, when work is due now, an explicit actionable route. Never\n+  put directions such as asking people to begin, discuss, choose, or submit into\n+  a notify-only message; `--intent notify` is not an override for an operational\n+  handoff. Before ending the coordinator turn, compare the contract's actors due\n+  now with the returned audience of the actionable message. Each must be routed\n+  exactly once, and an actor not due now must not be woken. If a phase is open,\n+  route all currently eligible actors or route one recorded starter who owns the\n+  next handoff.\n\
 - Audit the proposed contract for conservation and role compatibility before it\n\
   becomes active. Build a visible ledger that maps every intended participant\n\
   to exactly one declared participation state or work slot, accounts for every\n\
@@ -684,6 +685,10 @@ mod tests {
         assert!(out.contains("Open or free-form participation"));
         assert!(out.contains("Public text is"));
         assert!(out.contains("an unintended parallel wake"));
+        assert!(out.contains("every phase transition as two different facts"));
+        assert!(out.contains("`--intent notify` is not an override"));
+        assert!(out.contains("contract's actors due"));
+        assert!(out.contains("Each must be routed"));
         assert!(out.contains("conservation and role compatibility"));
         assert!(out.contains("every intended participant"));
         assert!(out.contains("required slot exactly once"));

@@ -4,7 +4,14 @@ import { isHiddenProtocolMessage } from "@/lib/message-utils";
 import { groupMessagesByDate } from "@/lib/message-utils";
 import { displayName } from "@/lib/format-utils";
 import { cn } from "@/lib/utils";
-import { X, Split, MessageSquare, FolderOpen } from "lucide-react";
+import {
+  ArrowLeft,
+  FolderOpen,
+  MessageSquare,
+  Minimize2,
+  Split,
+  X,
+} from "lucide-react";
 import { EmptyState } from "@/components/shared/EmptyState";
 import { MutedLine } from "@/components/shared/MutedLine";
 import { TaskStateBadge } from "@/components/chat/TaskStateBadge";
@@ -34,7 +41,9 @@ export function ThreadPanel({
   thread,
   busy,
   className,
+  maximized = false,
   onClose,
+  onRestore,
   onSend,
   onToggleReaction,
   onOpenAgentSettings,
@@ -57,7 +66,9 @@ export function ThreadPanel({
   thread: Thread | null;
   busy: string | null;
   className?: string;
+  maximized?: boolean;
   onClose: () => void;
+  onRestore?: () => void;
   onSend: (attachments?: import("@/lib/attachment-utils").PendingAttachment[]) => void;
   onToggleReaction: (message: Message, emoji: string) => void;
   onOpenAgentSettings: (actorId: string) => void;
@@ -209,15 +220,40 @@ export function ThreadPanel({
                 <FolderOpen size={15} />
               </button>
             )}
-            <button
-              className="composer-icon"
-              type="button"
-              title={t("Close thread")}
-              aria-label={t("Close thread")}
-              onClick={onClose}
-            >
-              <X size={16} />
-            </button>
+            {maximized ? (
+              <>
+                <button
+                  className="composer-icon"
+                  type="button"
+                  title={t("Back to channel")}
+                  aria-label={t("Back to channel")}
+                  onClick={onClose}
+                >
+                  <ArrowLeft size={16} />
+                </button>
+                {onRestore && (
+                  <button
+                    className="composer-icon"
+                    type="button"
+                    title={t("Restore default size")}
+                    aria-label={t("Restore default size")}
+                    onClick={onRestore}
+                  >
+                    <Minimize2 size={16} />
+                  </button>
+                )}
+              </>
+            ) : (
+              <button
+                className="composer-icon"
+                type="button"
+                title={t("Close thread")}
+                aria-label={t("Close thread")}
+                onClick={onClose}
+              >
+                <X size={16} />
+              </button>
+            )}
           </div>
         </div>
       </div>

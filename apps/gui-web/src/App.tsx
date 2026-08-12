@@ -6,7 +6,11 @@ import {
   type ScopeRef,
   type Workspace,
 } from "@/ipc/types";
-import { detailPanelBreakpoint, machineStatusPollIntervalMs } from "@/lib/constants";
+import {
+  defaultPanelSizes,
+  detailPanelBreakpoint,
+  machineStatusPollIntervalMs,
+} from "@/lib/constants";
 import type { AgentFormState } from "@/lib/types";
 import { defaultWakeSpec } from "@/lib/wake-utils";
 import { useI18n } from "@/lib/i18n";
@@ -76,6 +80,7 @@ export function App() {
   >({});
   const [messageAnchorId, setMessageAnchorId] = useState<string | null>(null);
   const [serverPasswordPrompt, setServerPasswordPrompt] = useState<ServerPasswordPrompt | null>(null);
+  const [threadPanelMaximized, setThreadPanelMaximized] = useState(false);
 
   const activeScopeRef = useRef<ScopeRef | null>(null);
   const activeThreadScopeRef = useRef<ScopeRef | null>(null);
@@ -476,6 +481,21 @@ export function App() {
   const detailVisibleInGrid =
     showChatDetail && viewportWidth >= detailPanelBreakpoint;
 
+  const restoreThreadPanel = useCallback(() => {
+    setThreadPanelMaximized(false);
+    setPanelSizes((current) => ({
+      ...current,
+      detail: defaultPanelSizes.detail,
+    }));
+  }, [setPanelSizes]);
+  const maximizeThreadPanel = useCallback(() => setThreadPanelMaximized(true), []);
+
+  useEffect(() => {
+    if (!activeThread || searchPanelOpen || view !== "chat") {
+      setThreadPanelMaximized(false);
+    }
+  }, [activeThread, searchPanelOpen, view]);
+
   const {
     shellStyle,
     cleanupPanelResize,
@@ -487,6 +507,8 @@ export function App() {
     viewportWidth,
     detailVisibleInGrid,
     showChatDetail,
+    allowDetailExpansion: Boolean(activeThread) && !searchPanelOpen && !threadPanelMaximized,
+    onDetailSnap: maximizeThreadPanel,
     setResizingPanel,
   });
 
@@ -561,7 +583,8 @@ export function App() {
   }
 
   const shellProps = {
-    shellStyle, showWorkspaceChrome, showChatDetail, resizingPanel, notice,
+    shellStyle, showWorkspaceChrome, showChatDetail, threadPanelMaximized,
+    restoreThreadPanel, resizingPanel, notice,
     account, busy, connection, workspace, workspaces, selectWorkspace, setView,
     view, visibleChannels, channelGroups, activeChannelId, activeDirectActorId,
     activeThreadId, agentActors, runs, runsList, selectedRun, setSelectedRunId,

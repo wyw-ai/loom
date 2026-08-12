@@ -93,4 +93,62 @@ describe("ThreadPanel vertical layout", () => {
     expect(activity?.nextElementSibling).toBe(composer);
     expect(panel?.lastElementChild).toBe(composer);
   });
+
+  it("shows separate back and default-size controls when maximized", () => {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    roots.push(root);
+    const onClose = vi.fn();
+    const onRestore = vi.fn();
+
+    React.act(() => root.render(React.createElement(ThreadPanel, {
+      actors: {},
+      channel: {
+        id: "channel-one",
+        title: "General",
+        visibility: "public",
+        members: [],
+      },
+      channelMessages: [],
+      currentActorId: "actor-human",
+      disabled: false,
+      draft: "",
+      mentionAgents: [],
+      machines: [],
+      runs: {},
+      messages: [],
+      setDraft: vi.fn(),
+      task: null,
+      thread: {
+        id: "thread-one",
+        channelId: "channel-one",
+        title: "Maximized controls",
+        rootMessageId: "message-missing",
+      },
+      busy: null,
+      maximized: true,
+      onClose,
+      onRestore,
+      onSend: vi.fn(),
+      onToggleReaction: vi.fn(),
+      onOpenAgentSettings: vi.fn(),
+    })));
+
+    const back = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Back to channel"]',
+    );
+    const restore = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Restore default size"]',
+    );
+
+    expect(back).not.toBeNull();
+    expect(restore).not.toBeNull();
+    expect(container.querySelector('button[aria-label="Close thread"]')).toBeNull();
+
+    React.act(() => back?.click());
+    React.act(() => restore?.click());
+    expect(onClose).toHaveBeenCalledOnce();
+    expect(onRestore).toHaveBeenCalledOnce();
+  });
 });

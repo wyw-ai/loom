@@ -19,6 +19,8 @@ import {
   resizeHandleWidth,
   sidebarMaxWidth,
   sidebarMinWidth,
+  threadPanelDragMainMinWidth,
+  threadPanelMaximizeSnapMainWidth,
 } from "@/lib/constants";
 import type { Thread } from "@/ipc/types";
 import type { MessageMention, Workspace } from "@/ipc/types";
@@ -71,6 +73,7 @@ export function fitPanelSizes(
   sizes: PanelSizes,
   viewportWidth: number,
   detailVisible: boolean,
+  options: { allowWideDetail?: boolean } = {},
 ): PanelSizes {
   const sidebarMaxForViewport = detailVisible
     ? viewportWidth -
@@ -84,18 +87,33 @@ export function fitPanelSizes(
     sidebarMinWidth,
     Math.max(sidebarMinWidth, Math.min(sidebarMaxWidth, sidebarMaxForViewport)),
   );
+  const allowWideDetail = detailVisible && options.allowWideDetail === true;
   const detailMaxForViewport =
     viewportWidth -
     railWidth -
     resizeHandleWidth * 2 -
     sidebar -
-    mainMinWidth;
+    (allowWideDetail ? threadPanelDragMainMinWidth : mainMinWidth);
   const detail = clampNumber(
     sizes.detail,
     detailMinWidth,
-    Math.max(detailMinWidth, Math.min(detailMaxWidth, detailMaxForViewport)),
+    Math.max(
+      detailMinWidth,
+      allowWideDetail
+        ? detailMaxForViewport
+        : Math.min(detailMaxWidth, detailMaxForViewport),
+    ),
   );
   return { sidebar, detail };
+}
+
+export function shouldSnapThreadPanel(clientX: number, sidebarWidth: number) {
+  const snapBoundary =
+    railWidth +
+    sidebarWidth +
+    resizeHandleWidth +
+    threadPanelMaximizeSnapMainWidth;
+  return clientX <= snapBoundary;
 }
 
 export function clampNumber(value: number, min: number, max: number) {

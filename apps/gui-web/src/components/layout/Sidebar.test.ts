@@ -222,7 +222,12 @@ describe("Sidebar section and context menus", () => {
     );
 
     React.act(() => addButton!.click());
-    const moveButton = buttonWithText(container, "Move #beta here");
+    const menu = document.body.querySelector<HTMLElement>(
+      '[role="menu"][aria-label="Channels available for Work"]',
+    );
+    const moveButton = buttonWithText(menu!, "Move #beta here");
+    expect(menu).not.toBeNull();
+    expect(container.contains(menu)).toBe(false);
     expect(moveButton).toBeDefined();
 
     React.act(() => moveButton!.click());

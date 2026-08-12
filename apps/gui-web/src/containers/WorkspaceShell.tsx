@@ -43,6 +43,8 @@ export interface WorkspaceShellProps {
   shellStyle: React.CSSProperties;
   showWorkspaceChrome: boolean;
   showChatDetail: boolean;
+  threadPanelMaximized: boolean;
+  restoreThreadPanel: () => void;
   resizingPanel: "sidebar" | "detail" | null;
   notice: string | null;
   // Rail
@@ -220,7 +222,12 @@ export function WorkspaceShell(props: WorkspaceShellProps) {
         thread={p.activeThread}
         busy={p.busy}
         className="flex min-h-0 min-w-0 flex-col bg-white"
-        onClose={() => p.setActiveThreadId(null)}
+        maximized={p.threadPanelMaximized}
+        onClose={() => {
+          if (p.threadPanelMaximized) p.restoreThreadPanel();
+          p.setActiveThreadId(null);
+        }}
+        onRestore={p.restoreThreadPanel}
         onSend={p.sendThreadMessage}
         onToggleReaction={p.toggleMessageReaction}
         onOpenAgentSettings={p.openAgentSettings}
@@ -475,7 +482,7 @@ export function WorkspaceShell(props: WorkspaceShellProps) {
           setError={p.setError}
         />
       </main>
-      {p.showChatDetail && (
+      {p.showChatDetail && !p.threadPanelMaximized && (
         <ResizeHandle
           active={p.resizingPanel === "detail"}
           className="hidden xl:block"
@@ -485,7 +492,12 @@ export function WorkspaceShell(props: WorkspaceShellProps) {
         />
       )}
       {detailContent && (
-        <section className="detail-panel-shell">
+        <section
+          className={cn(
+            "detail-panel-shell",
+            p.threadPanelMaximized && "detail-panel-shell-thread-maximized",
+          )}
+        >
           {detailContent}
         </section>
       )}

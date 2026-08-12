@@ -44,7 +44,9 @@ git config core.hooksPath .githooks
 ## Pull requests
 
 - Keep PRs focused: one change per PR, with a clear description of what and why.
-- Target day-to-day feature and fix pull requests at `preview`.
+- Target day-to-day feature and fix pull requests at the current versioned
+  `preview-X.Y.Z` candidate. The unversioned `preview` branch is retired; see
+  [the release-preview workflow](docs/release-preview-workflow.md).
 - Pull requests into `main` must come from a same-repository release branch
   named `preview-X.Y.Z` or from a branch under `hotfix/`.
 - Link the related issue when there is one.

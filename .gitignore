@@ -28,6 +28,7 @@ __pycache__/
 !/docs/ci/
 !/docs/ci/local-matrix.md
 !/docs/channel-thread-instructions.md
+!/docs/release-preview-workflow.md
 data
 # Desktop GUI (apps/gui-web + Tauri build artifacts)
 /apps/gui-web/node_modules/

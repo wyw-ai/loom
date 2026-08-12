@@ -285,9 +285,10 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
   `loom --json task claim --source-message \"$LOOM_TRIGGER_MESSAGE_ID\"`. Do not\n\
   claim again when an established owner asks for a proposal, announces the\n\
   contract, or hands off activity work; answer or act in the requested role. A\n\
-  successful claimant facilitates and explicitly asks other relevant actors for\n\
-  proposals with `message ask`, naming the expected respondents and convergence\n\
-  condition; it does not start substantive participation yet.\n\
+  successful claimant retains the task id returned by `task claim`, facilitates,\n\
+  and explicitly asks other relevant actors for proposals with `message ask`,\n\
+  naming the expected respondents and convergence condition; it does not start\n\
+  substantive participation yet.\n\
   On a claim conflict, use same-scope task state to identify the established\n\
   owner and do not start the activity or a second negotiation. If the owner has\n\
   already requested a proposal, answer once with `message ask`; otherwise end\n\
@@ -296,12 +297,28 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
   new claim, and does not launch while required respondents remain unaccounted\n\
   for under the announced convergence condition. Claiming this role grants\n\
   coordination responsibility, not authority to invent the result.\n\
+- Negotiation collection is read-before-write and idempotent. Before reporting\n\
+  missing respondents, re-asking, converging, or launching, the owner must read\n\
+  the current conversation (for example, `loom --json message read --target\n\
+  \"$LOOM_REPLY_TARGET\"`) and rebuild one latest-effective-response entry per\n\
+  expected actor. A delayed wake is not evidence that another reply is absent.\n\
+  On any duplicate delivery of the same solicitation, a participant that has\n\
+  already supplied an effective response must not send it again; inspect the\n\
+  conversation and end with `run ignore` instead. A later explicit correction\n\
+  supersedes that actor's earlier response.\n\
 - Negotiation is complete only when the owner publishes one concise operational\n\
-  contract in the shared scope, resolves material disagreements, identifies who\n\
-  owns shared progress, and explicitly wakes the first actor or actor set. Only\n\
-  then begin substantive participation. Afterward, follow the agreed protocol\n\
-  and use explicit Loom handoffs whenever another actor must act next. At the\n\
-  agreed stop, the owner closes the bootstrap task with the outcome.\n\
+  contract in the shared scope, resolves material disagreements, and identifies\n\
+  who owns shared progress. Publish that contract separately from substantive\n\
+  work, then explicitly route exactly the first required actor or actor set.\n\
+  Only then begin participation. Afterward, follow the agreed protocol and use\n\
+  explicit Loom handoffs whenever another actor must act next. At the agreed\n\
+  stop, the owner completes the retained bootstrap task before publishing the\n\
+  final outcome.\n\
+- Keep every promised mechanism operational and auditable. Perform and verify\n\
+  any selection, private delivery, reminder, timeout, or state transition with\n\
+  Loom primitives before saying it happened. Do not announce a clock-based\n\
+  fallback unless a reminder or another observable trigger will actually enact\n\
+  it, and do not combine a phase announcement with an implicit handoff.\n\
 - For decisions, votes, reviews, tallies, next-speaker handoffs, or other\n\
   stateful choices, inspect enough current conversation before answering; do\n\
   not rely only on the latest wake if prior messages determine the choice.\n\
@@ -622,10 +639,18 @@ mod tests {
         assert!(out.contains("expected respondents and convergence"));
         assert!(out.contains("proposal replies as negotiation input"));
         assert!(out.contains("required respondents remain unaccounted"));
+        assert!(out.contains("read-before-write and idempotent"));
+        assert!(out.contains("latest-effective-response entry"));
+        assert!(out.contains("duplicate delivery of the same solicitation"));
+        assert!(out.contains("A delayed wake is not evidence"));
         assert!(out.contains("do not start the"));
         assert!(out.contains("publishes one concise operational"));
-        assert!(out.contains("explicitly wakes the first actor or actor set"));
-        assert!(out.contains("closes the bootstrap task"));
+        assert!(out.contains("Publish that contract separately"));
+        assert!(out.contains("route exactly the first required actor"));
+        assert!(out.contains("completes the retained bootstrap task"));
+        assert!(out.contains("operational and auditable"));
+        assert!(out.contains("before saying it happened"));
+        assert!(out.contains("clock-based"));
         assert!(out.contains("durable"));
         assert!(out.contains("Workspace-local files are derived state"));
         assert!(out.contains("message-anchored task"));

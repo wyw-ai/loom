@@ -28,7 +28,7 @@ pub mod runtime;
 pub mod scheduler;
 pub mod state;
 
-pub use host::ServiceHost;
+pub use host::{ServiceHost, ServiceRuntimeRegistry};
 // Re-exports for the eventual external surface; S1 wires only ServiceHost
 // (used by `cmd::service::serve`) and `state` (used by both serve + the
 // runtime). The rest are intentionally re-exported now so S2 plugin code

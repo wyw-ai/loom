@@ -63,7 +63,14 @@ manifest 负责声明这些值如何映射成 CLI 参数，例如 `--model {mode
 - `replyReminder` 控制每回合 reply contract 的重复频率；
 - `onHumanMessageWhileBusy` 可选 `queue`、`cancel_and_requeue`、`inject`；
 - `contextTokenBudget` 限制 bootstrap / pending delivery 上下文预算，超出时转为
-  `unreadGap` 提示。
+  `unreadGap` 提示；
+- `turnInputStyle` 可选 `minimal`（默认，紧凑纯文本消息清单）或 `structured`
+  （turn-input-contract v1 JSON header + fenced bodies）。
+
+GUI 的 Wake Policy 提供三个预设（映射到上述字段）：排队+合并
+（`coalesce=true, debounceMs=750, busy=queue`）、排队+逐条
+（`coalesce=false, debounceMs=0, busy=queue`）、打断+追加
+（`coalesce=true, debounceMs=250, busy=cancel_and_requeue`）。
 
 如果 agent 配置了 `bundle.source`，Loom 会把 bundle 安装到该 agent home 下，并把当前
 scope 可见的 agent bundles 以 symlink 方式挂到该 agent 自己的

@@ -19,6 +19,24 @@ export interface Channel {
   _meta?: Record<string, unknown>;
 }
 
+export interface ChannelLayoutSection {
+  id: string;
+  title: string;
+  channelIds: string[];
+  collapsed: boolean;
+}
+
+export interface ChannelLayout {
+  actorId: string;
+  sections: ChannelLayoutSection[];
+  revision: number;
+  updatedAt: string;
+}
+
+export interface ChannelLayoutResult {
+  layout: ChannelLayout;
+}
+
 export interface ChannelMemberConfig {
   channelId: string;
   actorId: string;
@@ -207,7 +225,7 @@ export interface RunGetResult {
   run: Run;
 }
 
-export type DeliveryState = "pending" | "delivered" | "failed";
+export type DeliveryState = "pending" | "delivered" | "failed" | "cancelled";
 
 export interface Delivery {
   sourceId: string;
@@ -220,6 +238,29 @@ export interface Delivery {
 export interface InboxListEntry {
   delivery: Delivery;
   message?: Message | null;
+}
+
+// ---- inbox.status / delivery.cancel / delivery.expedite (agent banner) ----
+
+export interface InboxStatusEntry {
+  sourceId: string;
+  updatedAt: string;
+}
+
+export interface InboxActorStatus {
+  actorId: string;
+  pending: number;
+  oldestPendingAt?: string | null;
+  entries?: InboxStatusEntry[];
+}
+
+export interface InboxStatusResult {
+  actors: InboxActorStatus[];
+}
+
+export interface PresenceChangedData {
+  actorId: string;
+  online: boolean;
 }
 
 export type TaskStatus =
@@ -260,6 +301,17 @@ export interface Workspace {
   actorId: string;
   displayName: string;
 }
+
+export interface WorkspaceConnectResult {
+  workspace: Workspace;
+  open: unknown;
+  /** Monotonically increasing id assigned by the desktop connection manager. */
+  connectionId: number;
+}
+
+export type ConnectionEvent =
+  | { state: "open"; connectionId: number }
+  | { state: "closed"; connectionId: number; reason?: string };
 
 export interface HumanAccount {
   provider: string;
@@ -345,6 +397,7 @@ export interface WakeSpec {
   replyReminder?: "every-turn" | "first-turn" | "off" | null;
   onHumanMessageWhileBusy?: "queue" | "cancel_and_requeue" | "inject" | null;
   contextTokenBudget?: number | null;
+  turnInputStyle?: "minimal" | "structured" | null;
 }
 
 export interface AgentInfo {
@@ -432,6 +485,7 @@ export interface MachineInfo {
   providers: MachineAgentProviderInfo[];
   agents: MachineAgentInfo[];
   services: MachineServiceInfo[];
+  serviceRuntimeStates: ServiceRuntimeState[];
   serveCommand: string;
   setupScript: string;
 }
@@ -444,6 +498,23 @@ export interface MachineServiceInfo {
   lifecycle?: string;
   autostart?: boolean;
   [key: string]: unknown;
+}
+
+export type ServiceRuntimePhase = "starting" | "running" | "failed";
+
+export interface ServiceRuntimeState {
+  runtimeId: string;
+  machineId: string;
+  serviceId: string;
+  actorId: string;
+  pluginKind: string;
+  lifecycle: "channel_singleton" | "thread_bound";
+  instanceId?: string | null;
+  scopes: ScopeRef[];
+  phase: ServiceRuntimePhase;
+  startedAt?: string | null;
+  updatedAt: string;
+  lastError?: string | null;
 }
 
 export interface MachineListResult {
@@ -481,7 +552,7 @@ export type TaskAssignmentType =
 
 export interface StreamUpdate {
   kind: string;
-  scope: ScopeRef;
+  scope?: ScopeRef | null;
   data: Record<string, unknown>;
 }
 
@@ -541,6 +612,18 @@ export function readMessageTokenUsage(
     increment: increment as TokenUsage,
     cumulative: cumulative as TokenUsage,
   };
+}
+
+/**
+ * Read `{ increment, cumulative }` token usage from a Run's metadata.
+ * Written by the server's `run.close` handler (crates/server store
+ * `close_run`); `cumulative` is the durable per-(actor, scope) counter that
+ * survives worker restarts, making this the preferred usage source.
+ */
+export function readRunTokenUsage(
+  meta: Record<string, unknown> | undefined | null,
+): MessageTokenUsageMeta | null {
+  return readMessageTokenUsage(meta);
 }
 
 export function readMessagePromptBreakdown(

@@ -1264,6 +1264,9 @@ enum MessageCmd {
         #[arg(long = "include-private")]
         include_private: bool,
     },
+    /// Fetch a single message by id with its full body. Bodies larger than
+    /// the inline limit are saved to a file and referenced in the output.
+    Get { message_id: String },
     /// Search visible message text.
     Search {
         #[arg(long)]
@@ -2450,6 +2453,9 @@ async fn async_main() -> Result<()> {
                     include_private,
                 )
                 .await?
+            }
+            MessageCmd::Get { message_id } => {
+                cmd::message::get(client, cfg.actor_id, message_id).await?
             }
             MessageCmd::Search {
                 query,

@@ -56,6 +56,7 @@ pub async fn send(
         allow_escaped_newlines,
         agent_turn_is_active(),
     )?;
+    check_artifact_attachment_claim(&body, &attachment_ids, agent_turn_is_active())?;
     let is_private = !private_to.is_empty();
     let mut intent = parse_message_intent(intent)?;
     let mut delivery_policy = parse_delivery_policy(delivery_policy)?;
@@ -172,6 +173,7 @@ pub async fn ask(
         allow_escaped_newlines,
         agent_turn_is_active(),
     )?;
+    check_artifact_attachment_claim(&body, &attachment_ids, agent_turn_is_active())?;
     let params = build_ask_params(
         target.clone(),
         recipients,
@@ -263,6 +265,86 @@ fn escaped_newline_warning(body: &str) -> Option<&'static str> {
          for multiline messages, omit `--text` and pipe stdin/heredoc so real newline \
          characters are sent.",
     )
+}
+
+fn check_artifact_attachment_claim(
+    body: &str,
+    attachment_ids: &[String],
+    agent_turn_active: bool,
+) -> Result<()> {
+    let Some(warning) = unattached_artifact_claim_warning(body, attachment_ids) else {
+        return Ok(());
+    };
+    if agent_turn_active {
+        bail!(
+            "{warning} This is blocked inside an agent run: uploading an artifact or writing its URI in message text does not attach it to chat. Send the message again with the returned id as `--attachment-id art_...`."
+        );
+    }
+    eprintln!("loom: warning: {warning}");
+    Ok(())
+}
+
+fn unattached_artifact_claim_warning(body: &str, attachment_ids: &[String]) -> Option<String> {
+    let lower = body.to_lowercase();
+    let claims_attachment = [
+        "uploaded file",
+        "uploaded attachment",
+        "uploaded image",
+        "attached file",
+        "attached image",
+        "attachment id",
+        "artifact id",
+        "artifact uri",
+        "已上传",
+        "已经上传",
+        "已附加",
+        "已发送文件",
+        "附件 id",
+        "附件id",
+    ]
+    .iter()
+    .any(|cue| lower.contains(cue));
+    if !claims_attachment {
+        return None;
+    }
+
+    let attached_ids = attachment_ids
+        .iter()
+        .flat_map(|value| artifact_ids_in_text(value))
+        .collect::<BTreeSet<_>>();
+    let missing_ids = artifact_ids_in_text(body)
+        .into_iter()
+        .filter(|id| !attached_ids.contains(id))
+        .collect::<BTreeSet<_>>();
+    if !attachment_ids.is_empty() && missing_ids.is_empty() {
+        return None;
+    }
+
+    if missing_ids.is_empty() {
+        Some(
+            "message text claims a file or image was uploaded, but the message has no attachment"
+                .into(),
+        )
+    } else {
+        Some(format!(
+            "message text claims an uploaded artifact, but {} is not attached",
+            missing_ids.into_iter().collect::<Vec<_>>().join(", ")
+        ))
+    }
+}
+
+fn artifact_ids_in_text(text: &str) -> Vec<String> {
+    let mut ids = BTreeSet::new();
+    for (start, _) in text.match_indices("art_") {
+        let id = text[start..]
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+            .collect::<String>();
+        if id.len() > "art_".len() {
+            ids.insert(id);
+        }
+    }
+    ids.into_iter().collect()
 }
 
 fn agent_turn_is_active() -> bool {
@@ -656,6 +738,29 @@ mod tests {
             .expect("real newline should pass");
         check_escaped_newlines("line one\\nline two", false, false, true)
             .expect("stdin body with literal sequence should only warn");
+    }
+
+    #[test]
+    fn agent_turn_rejects_claiming_an_upload_without_attaching_it() {
+        let body =
+            "已上传文件：hello.txt Artifact ID: art_demo123 URI: artifact://art_demo123/hello.txt";
+        let error = check_artifact_attachment_claim(body, &[], true)
+            .expect_err("agent must attach the uploaded artifact");
+        assert!(error.to_string().contains("art_demo123 is not attached"));
+        assert!(error.to_string().contains("--attachment-id"));
+
+        check_artifact_attachment_claim(body, &["art_demo123".into()], true)
+            .expect("the matching attachment id should pass");
+    }
+
+    #[test]
+    fn informational_artifact_references_are_not_forced_into_attachments() {
+        check_artifact_attachment_claim(
+            "The task output is recorded in artifact://art_demo123/result.json.",
+            &[],
+            true,
+        )
+        .expect("a plain durable-artifact reference is not an upload claim");
     }
 
     #[test]
@@ -1242,6 +1347,31 @@ fn parse_delivery_state_filter(raw: &str) -> Result<Option<DeliveryState>> {
         "all" => Ok(None),
         other => bail!("invalid --state `{other}`; expected pending, delivered, failed, or all"),
     }
+}
+
+/// Fetch one message by id (via `message.context` with a zero window) and
+/// print it with the full body, spilling oversized bodies to a file like
+/// `read` does. This is the command that prompt truncation notes point to.
+pub async fn get(client: Arc<Client>, _actor_id: String, message_id: String) -> Result<()> {
+    let res: MessageContextResult = client
+        .call(
+            method::MESSAGE_CONTEXT,
+            json!({
+                "messageId": message_id,
+                "before": 0,
+                "after": 0,
+            }),
+        )
+        .await?;
+    let mut messages = vec![res.anchor];
+    spill_long_message_bodies(&mut messages)?;
+    let message = &messages[0];
+    if render::is_json() {
+        render::print_json(message);
+    } else {
+        render::render_message(message);
+    }
+    Ok(())
 }
 
 pub async fn search(

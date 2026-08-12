@@ -11,6 +11,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { EmptyState } from "@/components/shared/EmptyState";
+import { useI18n } from "@/lib/i18n";
 
 type TimeChip = "all" | "today" | "7d" | "30d" | "custom";
 type ScopeChoice = "current" | "all";
@@ -19,11 +20,11 @@ const SEARCH_LIMIT = 20;
 const CONTEXT_WINDOW = 10;
 
 const TIME_CHIPS: Array<{ id: TimeChip; label: string }> = [
-  { id: "all", label: "全部时间" },
-  { id: "today", label: "今天" },
-  { id: "7d", label: "7 天" },
-  { id: "30d", label: "30 天" },
-  { id: "custom", label: "自定义" },
+  { id: "all", label: "All time" },
+  { id: "today", label: "Today" },
+  { id: "7d", label: "7 days" },
+  { id: "30d", label: "30 days" },
+  { id: "custom", label: "Custom" },
 ];
 
 function startOfLocalDay(date: Date): Date {
@@ -123,6 +124,7 @@ export function SearchPanel({
   onClose: () => void;
   onOpenContext: (context: MessageContextResult) => Promise<void> | void;
 }) {
+  const { t } = useI18n();
   const [query, setQuery] = useState("");
   const [scopeChoice, setScopeChoice] = useState<ScopeChoice>("current");
   const [timeChip, setTimeChip] = useState<TimeChip>("all");
@@ -148,10 +150,10 @@ export function SearchPanel({
       ? channelTarget(activeChannel.id)
       : null;
   const currentScopeLabel = activeThread
-    ? "This thread"
+    ? t("This thread")
     : activeChannel
       ? `#${activeChannel.title}`
-      : "Current channel";
+      : t("Current channel");
 
   const breadcrumb = (message: Message): string => {
     if (message.scope.kind === "channel") {
@@ -175,7 +177,7 @@ export function SearchPanel({
       range.createdBefore &&
       range.createdAfter >= range.createdBefore
     ) {
-      setError("Start date must be on or before end date.");
+      setError(t("Start date must be on or before end date."));
       return;
     }
     setBusy(true);
@@ -193,7 +195,7 @@ export function SearchPanel({
       if (!mountedRef.current) return;
       console.error("message.search failed", err);
       setResults(null);
-      setError(`Search failed: ${errorText(err)}`);
+      setError(t("Search failed: {{error}}", { error: errorText(err) }));
     } finally {
       if (mountedRef.current) setBusy(false);
     }
@@ -215,7 +217,9 @@ export function SearchPanel({
     } catch (err) {
       if (!mountedRef.current) return;
       console.error("message.context failed", err);
-      setContextError(isNotFoundError(err) ? "消息已删除或不可见" : `Context failed: ${errorText(err)}`);
+      setContextError(isNotFoundError(err)
+        ? t("The message was deleted or is not visible.")
+        : t("Context failed: {{error}}", { error: errorText(err) }));
     } finally {
       if (mountedRef.current) setContextBusy(false);
     }
@@ -233,13 +237,13 @@ export function SearchPanel({
         <div className="flex min-w-0 flex-1 items-center justify-between gap-3">
           <div className="min-w-0">
             <div className="min-w-0 truncate text-lg font-bold text-[#111827]">
-              Search messages
+              {t("Search messages")}
             </div>
             <div className="mt-0.5 truncate text-sm text-[#485063]">
-              {scopeChoice === "current" && currentTarget ? currentScopeLabel : "All channels"}
+              {scopeChoice === "current" && currentTarget ? currentScopeLabel : t("All channels")}
             </div>
           </div>
-          <button className="composer-icon" type="button" title="Close" onClick={onClose}>
+          <button className="composer-icon" type="button" title={t("Close")} onClick={onClose}>
             <X size={16} />
           </button>
         </div>
@@ -249,7 +253,7 @@ export function SearchPanel({
         {/* Query */}
         <div className="flex items-center gap-2">
           <Input
-            placeholder="Search messages..."
+            placeholder={t("Search messages...")}
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && void handleSearch()}
@@ -261,13 +265,13 @@ export function SearchPanel({
             onClick={() => void handleSearch()}
           >
             {busy ? <Loader2 size={14} className="animate-spin" /> : <Search size={14} />}
-            Search
+            {t("Search")}
           </Button>
         </div>
 
         {/* Scope selector */}
         <div className="flex items-center gap-2">
-          <span className="text-xs font-semibold uppercase tracking-wide text-[#596174]">Scope</span>
+          <span className="text-xs font-semibold uppercase tracking-wide text-[#596174]">{t("Scope")}</span>
           <Button
             variant={scopeChoice === "current" ? "default" : "outline"}
             size="sm"
@@ -281,7 +285,7 @@ export function SearchPanel({
             size="sm"
             onClick={() => setScopeChoice("all")}
           >
-            All
+            {t("All")}
           </Button>
         </div>
 
@@ -300,14 +304,14 @@ export function SearchPanel({
                   : "border-[#dfe3ec] bg-white text-[#485063] hover:bg-[#f7f8fb]",
               )}
             >
-              {chip.label}
+              {t(chip.label)}
             </button>
           ))}
         </div>
         {timeChip === "custom" && (
           <div className="grid grid-cols-2 gap-2">
             <label className="text-xs text-[#596174]">
-              From date
+              {t("From date")}
               <Input
                 type="date"
                 value={customAfter}
@@ -316,7 +320,7 @@ export function SearchPanel({
               />
             </label>
             <label className="text-xs text-[#596174]">
-              To date (inclusive)
+              {t("To date (inclusive)")}
               <Input
                 type="date"
                 value={customBefore}
@@ -327,12 +331,12 @@ export function SearchPanel({
           </div>
         )}
 
-        <div className="text-xs text-[#98a2b3]">At most {SEARCH_LIMIT} results are shown.</div>
+        <div className="text-xs text-[#98a2b3]">{t("At most {{count}} results are shown.", { count: SEARCH_LIMIT })}</div>
         {error && <div className="text-sm font-medium text-red-600">{error}</div>}
 
         {/* Results */}
         {results && results.length === 0 && !busy && (
-          <EmptyState icon={Search} text="No matches." />
+          <EmptyState icon={Search} text={t("No matches.")} />
         )}
         {results && results.length > 0 && (
           <div className="space-y-1.5">
@@ -349,7 +353,7 @@ export function SearchPanel({
                     <span className="truncate">{authorLabel(message)}</span>
                     <span className="shrink-0">{formatTime(message.createdAt)}</span>
                   </div>
-                  <div className="mt-0.5 line-clamp-2">{message.body || "(no body)"}</div>
+                  <div className="mt-0.5 line-clamp-2">{message.body || t("(no body)")}</div>
                 </button>
                 <div className="mt-1 flex justify-end">
                   <button
@@ -359,7 +363,7 @@ export function SearchPanel({
                     onClick={() => void handleLoadContext(message.id)}
                   >
                     <ExternalLink size={11} />
-                    Open source
+                    {t("Open source")}
                   </button>
                 </div>
               </div>
@@ -371,7 +375,7 @@ export function SearchPanel({
         {contextBusy && (
           <div className="flex items-center gap-2 text-sm text-[#667085]">
             <Loader2 size={14} className="animate-spin" />
-            Loading context and opening source…
+            {t("Loading context and opening source…")}
           </div>
         )}
         {contextError && <div className="text-sm font-medium text-red-600">{contextError}</div>}

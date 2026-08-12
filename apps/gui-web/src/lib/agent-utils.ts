@@ -236,8 +236,7 @@ export const runStatusLabel: Record<string, string> = {
 };
 
 /**
- * Shared status phrase for ChatHeader activity label and AgentIdentityBadge
- * working label (Iter#5 Part C §C4 AC-S5).
+ * Shared status phrase for agent activity surfaces and AgentIdentityBadge.
  *
  * Returns the base action phrase WITHOUT the health suffix; callers that need
  * the full label (with health/timing) should use `runStatusFullLabel`.
@@ -427,69 +426,6 @@ function stableHash(value: string) {
     hash = (hash * 31 + value.charCodeAt(index)) >>> 0;
   }
   return hash;
-}
-
-// ---------------------------------------------------------------------------
-// Channel agent activity (aggregate across all agents)
-// ---------------------------------------------------------------------------
-
-export interface ChannelAgentActivity {
-  /** Display name of the highest-priority active agent */
-  primaryAgentName: string;
-  /** Status of the highest-priority active agent */
-  primaryStatus: RunStatus;
-  /** The highest-priority active run, when any agent is active */
-  primaryRun: Run | null;
-  /** Total number of active (non-terminal) agent runs */
-  activeCount: number;
-  /** Whether any agent has a failed run */
-  hasFailed: boolean;
-  /** Whether all agents are idle (no active runs) */
-  isIdle: boolean;
-}
-
-const ACTIVITY_PRIORITY: Record<string, number> = {
-  running: 4,
-  waiting_tool: 3,
-  preparing_context: 2,
-  queued: 1,
-};
-
-export function getChannelAgentActivity(
-  runs: Record<string, Run>,
-  agentActors: Actor[],
-): ChannelAgentActivity | null {
-  let best: { actorId: string; status: RunStatus; priority: number; run: Run } | null = null;
-  let activeCount = 0;
-  let hasFailed = false;
-
-  for (const actor of agentActors) {
-    const ctx = getActorRunContext(runs, actor.id);
-    if (!ctx || ctx.isTerminal) {
-      if (ctx?.status === "failed") hasFailed = true;
-      continue;
-    }
-    activeCount++;
-    const p = ACTIVITY_PRIORITY[ctx.status] ?? 0;
-    if (p > (best?.priority ?? 0)) {
-      best = { actorId: actor.id, status: ctx.status, priority: p, run: ctx.run };
-    }
-  }
-
-  if (activeCount === 0 && !hasFailed) return null;
-
-  const primaryAgentName = best
-    ? displayName(agentActors.find((a) => a.id === best!.actorId) ?? agentActors[0])
-    : "";
-
-  return {
-    primaryAgentName,
-    primaryStatus: best?.status ?? "failed",
-    primaryRun: best?.run ?? null,
-    activeCount,
-    hasFailed,
-    isIdle: false,
-  };
 }
 
 // Channel panel helpers

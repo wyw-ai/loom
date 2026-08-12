@@ -36,6 +36,25 @@ paths = [
     "/response/token_usage",
 ]
 
+# Accounting semantics for TokenUsage slots. These drive how a missing
+# `total_tokens` is derived at extraction time and how per-turn increments are
+# produced from provider reports:
+#   - report: "delta" means each usage object describes just the finished
+#     turn; "session_cumulative" means the provider reports running totals for
+#     the whole (resumed) session, so the runtime must diff consecutive
+#     snapshots to recover the per-turn increment.
+#   - input_includes_cache_read: OpenAI-style APIs count cached prompt tokens
+#     inside `prompt_tokens`; Anthropic-style APIs report `input_tokens`
+#     EXCLUDING cache reads/creation. When false, cache tokens are added when
+#     deriving a missing total.
+#   - output_includes_reasoning: OpenAI-style APIs count reasoning tokens
+#     inside `completion_tokens`. When true (default), reasoning tokens are
+#     NOT added again when deriving a missing total (fixes double counting).
+[default.semantics]
+report = "delta"
+input_includes_cache_read = false
+output_includes_reasoning = true
+
 [default.fields]
 input_tokens = ["input_tokens", "inputTokens", "prompt_tokens", "promptTokens", "input", "prompt"]
 output_tokens = ["output_tokens", "outputTokens", "completion_tokens", "completionTokens", "output", "completion"]
@@ -63,6 +82,13 @@ paths = [
 # Anthropic-flavoured field names already covered by defaults; this section is
 # a hook for future divergence (e.g. tool-use-specific counters).
 
+[providers.claude.semantics]
+# Anthropic semantics: `input_tokens` excludes cache creation/read tokens, so
+# a derived total must add them back. Reported per invocation (delta).
+report = "delta"
+input_includes_cache_read = false
+output_includes_reasoning = true
+
 [providers.codex]
 paths = [
     "/msg/info/last_token_usage",
@@ -75,6 +101,14 @@ paths = [
 [providers.codex.fields]
 # Codex stream events nest usage one level deeper inside `msg.info`.
 
+[providers.codex.semantics]
+# Codex TokenUsage: `cached_input_tokens` is a subset of `input_tokens` and
+# `reasoning_output_tokens` is a subset of `output_tokens`; totals are
+# explicit. `last_token_usage` is per-turn (delta).
+report = "delta"
+input_includes_cache_read = true
+output_includes_reasoning = true
+
 [providers.copilot]
 paths = [
     "/usage",
@@ -84,6 +118,13 @@ paths = [
 
 [providers.copilot.fields]
 # Copilot CLI surfaces standard snake_case usage; defaults suffice.
+
+[providers.copilot.semantics]
+# OpenAI-flavoured accounting: cached prompt tokens are included in
+# input/prompt tokens and reasoning is included in completion tokens.
+report = "delta"
+input_includes_cache_read = true
+output_includes_reasoning = true
 
 [providers.opencode]
 paths = [

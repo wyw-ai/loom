@@ -16,13 +16,15 @@
 //! useful in S1 for end-to-end wiring tests: register a no-op plugin,
 //! call `serve`, prove the connection lifecycle works.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use proto::methods::{ServiceLifecycle, ServiceSpec};
+use chrono::Utc;
+use proto::methods::{ServiceLifecycle, ServiceRuntimePhase, ServiceRuntimeState, ServiceSpec};
+use proto::types::{ScopeKind, ScopeRef};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
@@ -30,10 +32,73 @@ use tokio::time::sleep;
 use crate::client::Client;
 use crate::cmd::reload;
 
-use super::plugin::{ServiceContext, ServicePlugin, ShutdownSignal};
+use super::plugin::{ServiceContext, ServicePlugin, ServiceReadiness, ShutdownSignal};
 use super::runtime::ServiceRuntime;
+use super::scheduler::spec::{SchedulerConfig, ScopeKind as SchedulerScopeKind};
 
 const RELOAD_POLL_INTERVAL: Duration = Duration::from_millis(1000);
+
+/// In-memory runtime projection shared with `loom-daemon`'s machine
+/// inventory. A `BTreeMap` keeps snapshots stable for revision fingerprints.
+#[derive(Clone, Default)]
+pub struct ServiceRuntimeRegistry {
+    inner: Arc<Mutex<BTreeMap<RuntimeKey, ServiceRuntimeState>>>,
+}
+
+/// Collision-free registry key. `runtime_id` is a convenient wire identifier;
+/// ownership and replacement semantics use the actual tuple contract.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RuntimeKey {
+    machine_id: String,
+    service_id: String,
+    instance_id: Option<String>,
+}
+
+impl ServiceRuntimeRegistry {
+    pub fn snapshot(&self) -> Vec<ServiceRuntimeState> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    fn insert(&self, state: ServiceRuntimeState) {
+        let key = RuntimeKey {
+            machine_id: state.machine_id.clone(),
+            service_id: state.service_id.clone(),
+            instance_id: state.instance_id.clone(),
+        };
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key, state);
+    }
+
+    fn update(&self, key: &RuntimeKey, update: impl FnOnce(&mut ServiceRuntimeState)) {
+        let mut states = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(state) = states.get_mut(key) {
+            update(state);
+        }
+    }
+
+    fn remove(&self, key: &RuntimeKey) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(key);
+    }
+}
+
+#[derive(Clone)]
+struct RuntimeReporting {
+    machine_id: String,
+    registry: ServiceRuntimeRegistry,
+}
 
 pub struct ServiceHost {
     plugins: HashMap<String, Arc<dyn ServicePlugin>>,
@@ -45,6 +110,7 @@ pub struct ServiceHost {
     /// preserves the legacy "load once, no reload" behavior used by
     /// existing tests.
     specs_dir: Option<PathBuf>,
+    runtime_reporting: Option<RuntimeReporting>,
 }
 
 impl ServiceHost {
@@ -54,6 +120,7 @@ impl ServiceHost {
             server_url,
             data_root,
             specs_dir: None,
+            runtime_reporting: None,
         }
     }
 
@@ -64,6 +131,21 @@ impl ServiceHost {
     /// spec. See design §7.1.
     pub fn with_specs_dir(mut self, dir: PathBuf) -> Self {
         self.specs_dir = Some(dir);
+        self
+    }
+
+    /// Publish concrete service supervisor state into the owning daemon's
+    /// machine inventory. Standalone `loom service serve` keeps the historical
+    /// no-reporting behavior.
+    pub fn with_runtime_reporting(
+        mut self,
+        machine_id: String,
+        registry: ServiceRuntimeRegistry,
+    ) -> Self {
+        self.runtime_reporting = Some(RuntimeReporting {
+            machine_id,
+            registry,
+        });
         self
     }
 
@@ -83,8 +165,14 @@ impl ServiceHost {
     /// immediately and no tasks start.
     pub async fn serve(self, specs: Vec<ServiceSpec>) -> Result<()> {
         for spec in &specs {
-            spec.validate()
-                .with_context(|| format!("invalid ServiceSpec `{}`", spec.id))?;
+            if let Err(error) = spec.validate() {
+                record_spec_failure(
+                    self.runtime_reporting.as_ref(),
+                    spec,
+                    format!("invalid ServiceSpec `{}`: {error}", spec.id),
+                );
+                return Err(error).with_context(|| format!("invalid ServiceSpec `{}`", spec.id));
+            }
         }
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let _signal_task = {
@@ -100,6 +188,11 @@ impl ServiceHost {
         for spec in specs {
             let kind = spec.kind.clone();
             let Some(plugin) = self.plugins.get(&kind).cloned() else {
+                record_spec_failure(
+                    self.runtime_reporting.as_ref(),
+                    &spec,
+                    format!("no plugin registered for kind `{kind}`"),
+                );
                 tracing::warn!(
                     spec_id = %spec.id,
                     %kind,
@@ -112,6 +205,7 @@ impl ServiceHost {
             let shutdown_rx = shutdown_rx.clone();
             let spec_id = spec.id.clone();
             let specs_dir = self.specs_dir.clone();
+            let runtime_reporting = self.runtime_reporting.clone();
             match spec.lifecycle {
                 ServiceLifecycle::ChannelSingleton => {
                     if !spec.autostart {
@@ -129,6 +223,7 @@ impl ServiceHost {
                             data_root,
                             shutdown_rx,
                             specs_dir,
+                            runtime_reporting,
                         )
                         .await
                         {
@@ -152,6 +247,7 @@ impl ServiceHost {
                             data_root,
                             shutdown_rx,
                             specs_dir,
+                            runtime_reporting,
                         )
                         .await
                         {
@@ -183,9 +279,19 @@ async fn supervise_spec(
     data_root: PathBuf,
     shutdown: ShutdownSignal,
     specs_dir: Option<PathBuf>,
+    runtime_reporting: Option<RuntimeReporting>,
 ) -> Result<()> {
     let Some(dir) = specs_dir else {
-        return run_one_spec(initial_spec, plugin, server_url, data_root, shutdown, None).await;
+        return run_one_spec(
+            initial_spec,
+            plugin,
+            server_url,
+            data_root,
+            shutdown,
+            None,
+            runtime_reporting,
+        )
+        .await;
     };
 
     let spec_id = initial_spec.id.clone();
@@ -204,6 +310,7 @@ async fn supervise_spec(
         let shutdown_clone = shutdown.clone();
         let spec_for_run = current_spec.clone();
         let spec_path = resolve_spec_path(Some(&dir), &spec_id);
+        let reporting_clone = runtime_reporting.clone();
         let worker = tokio::spawn(async move {
             run_one_spec(
                 spec_for_run,
@@ -212,6 +319,7 @@ async fn supervise_spec(
                 data_clone,
                 shutdown_clone,
                 spec_path,
+                reporting_clone,
             )
             .await
         });
@@ -326,6 +434,190 @@ fn resolve_spec_path(specs_dir: Option<&Path>, spec_id: &str) -> Option<PathBuf>
     None
 }
 
+fn runtime_id(machine_id: &str, service_id: &str, instance_id: Option<&str>) -> String {
+    match instance_id {
+        Some(instance_id) => format!("{machine_id}:{service_id}:{instance_id}"),
+        None => format!("{machine_id}:{service_id}"),
+    }
+}
+
+fn push_scope(scopes: &mut Vec<ScopeRef>, kind: ScopeKind, id: &str) {
+    let id = id.trim();
+    // Runtime placeholders are not an effective binding. They are resolved
+    // for thread-bound instances from InstanceRequest instead.
+    if id.is_empty() || id.contains('{') || id.contains('}') {
+        return;
+    }
+    let scope = ScopeRef {
+        kind,
+        id: id.to_string(),
+    };
+    if !scopes.contains(&scope) {
+        scopes.push(scope);
+    }
+}
+
+fn instance_scopes(instance: Option<&super::instance::InstanceRequest>) -> Vec<ScopeRef> {
+    let mut scopes = Vec::new();
+    let Some(instance) = instance else {
+        return scopes;
+    };
+    if instance.scope.kind == "thread" {
+        push_scope(&mut scopes, ScopeKind::Thread, &instance.scope.id);
+    }
+    if let Some(channel_id) = instance.scope.channel_id.as_deref() {
+        push_scope(&mut scopes, ScopeKind::Channel, channel_id);
+    }
+    scopes
+}
+
+/// Validate the currently bundled plugin configuration before it can report
+/// readiness, and project only concrete effective scopes. Unknown future
+/// plugins deliberately publish no scopes rather than guessing from opaque
+/// config.
+fn prepared_runtime_scopes(
+    spec: &ServiceSpec,
+    instance: Option<&super::instance::InstanceRequest>,
+) -> Result<Vec<ScopeRef>> {
+    if spec.kind != super::scheduler::plugin::KIND {
+        return Ok(instance_scopes(instance));
+    }
+    let config: SchedulerConfig = if spec.config.is_null() || spec.config == serde_json::json!({}) {
+        SchedulerConfig::default()
+    } else {
+        serde_json::from_value(spec.config.clone())
+            .context("parse spec.config as SchedulerConfig")?
+    };
+    config.validate().context("validate scheduler config")?;
+
+    if matches!(spec.lifecycle, ServiceLifecycle::ThreadBound) {
+        return Ok(instance_scopes(instance));
+    }
+
+    let mut scopes = Vec::new();
+    for job in &config.jobs {
+        match job.scope.kind {
+            SchedulerScopeKind::Channel => {
+                push_scope(&mut scopes, ScopeKind::Channel, &job.scope.id);
+            }
+            SchedulerScopeKind::Thread => {
+                push_scope(&mut scopes, ScopeKind::Thread, &job.scope.id);
+                if let Some(channel_id) = job.scope.channel_id.as_deref() {
+                    // Publish the exact parent too, allowing a channel activity
+                    // view to aggregate thread-targeted singleton jobs.
+                    push_scope(&mut scopes, ScopeKind::Channel, channel_id);
+                }
+            }
+        }
+    }
+    Ok(scopes)
+}
+
+#[derive(Clone)]
+struct RuntimeStateHandle {
+    registry: ServiceRuntimeRegistry,
+    key: RuntimeKey,
+}
+
+impl RuntimeStateHandle {
+    fn mark_running(&self) {
+        let now = Utc::now().to_rfc3339();
+        self.registry.update(&self.key, |state| {
+            if state.phase != ServiceRuntimePhase::Starting {
+                return;
+            }
+            state.phase = ServiceRuntimePhase::Running;
+            state.started_at.get_or_insert_with(|| now.clone());
+            state.updated_at = now;
+            state.last_error = None;
+        });
+    }
+}
+
+/// Cancellation-safe state owner. Aborting a supervisor drops the guard and
+/// removes a starting/running row. Explicit failures are retained for
+/// diagnostics until the same runtime key is attempted again.
+struct RuntimeStateGuard {
+    handle: RuntimeStateHandle,
+    retain_failure: bool,
+}
+
+impl RuntimeStateGuard {
+    fn starting(
+        reporting: Option<&RuntimeReporting>,
+        spec: &ServiceSpec,
+        instance_id: Option<&str>,
+        scopes: Vec<ScopeRef>,
+    ) -> Option<Self> {
+        let reporting = reporting?;
+        let key = RuntimeKey {
+            machine_id: reporting.machine_id.clone(),
+            service_id: spec.id.clone(),
+            instance_id: instance_id.map(ToString::to_string),
+        };
+        let runtime_id = runtime_id(&key.machine_id, &key.service_id, key.instance_id.as_deref());
+        let now = Utc::now().to_rfc3339();
+        reporting.registry.insert(ServiceRuntimeState {
+            runtime_id: runtime_id.clone(),
+            machine_id: reporting.machine_id.clone(),
+            service_id: spec.id.clone(),
+            actor_id: spec.actor.id.clone(),
+            plugin_kind: spec.kind.clone(),
+            lifecycle: spec.lifecycle,
+            instance_id: instance_id.map(ToString::to_string),
+            scopes,
+            phase: ServiceRuntimePhase::Starting,
+            started_at: None,
+            updated_at: now,
+            last_error: None,
+        });
+        Some(Self {
+            handle: RuntimeStateHandle {
+                registry: reporting.registry.clone(),
+                key,
+            },
+            retain_failure: false,
+        })
+    }
+
+    fn set_scopes(&self, scopes: Vec<ScopeRef>) {
+        self.handle
+            .registry
+            .update(&self.handle.key, |state| state.scopes = scopes);
+    }
+
+    fn readiness(&self) -> ServiceReadiness {
+        let handle = self.handle.clone();
+        ServiceReadiness::new(Arc::new(move || handle.mark_running()))
+    }
+
+    fn fail(&mut self, error: &anyhow::Error) {
+        let now = Utc::now().to_rfc3339();
+        let message = format!("{error:#}");
+        self.handle.registry.update(&self.handle.key, |state| {
+            state.phase = ServiceRuntimePhase::Failed;
+            state.updated_at = now;
+            state.last_error = Some(message);
+        });
+        self.retain_failure = true;
+    }
+}
+
+impl Drop for RuntimeStateGuard {
+    fn drop(&mut self) {
+        if !self.retain_failure {
+            self.handle.registry.remove(&self.handle.key);
+        }
+    }
+}
+
+fn record_spec_failure(reporting: Option<&RuntimeReporting>, spec: &ServiceSpec, message: String) {
+    let Some(mut guard) = RuntimeStateGuard::starting(reporting, spec, None, Vec::new()) else {
+        return;
+    };
+    guard.fail(&anyhow::anyhow!(message));
+}
+
 async fn run_one_spec(
     spec: ServiceSpec,
     plugin: Arc<dyn ServicePlugin>,
@@ -333,42 +625,66 @@ async fn run_one_spec(
     data_root: PathBuf,
     shutdown: ShutdownSignal,
     spec_path: Option<PathBuf>,
+    runtime_reporting: Option<RuntimeReporting>,
 ) -> Result<()> {
-    let actor_id = spec.actor.id.clone();
-    let display = spec.actor.display_name.clone();
-    let display_opt = if display.is_empty() {
-        None
-    } else {
-        Some(display.as_str())
-    };
+    let mut runtime_state =
+        RuntimeStateGuard::starting(runtime_reporting.as_ref(), &spec, None, Vec::new());
 
-    // Per §9.4 the second open_connection from a `loom service serve`
-    // restart preempts the previous (now-dead) binding — the server's
-    // `bind_actor` extends the agent preempt rule to Service kind.
-    let client = Client::connect(&server_url)
-        .await
-        .with_context(|| format!("ws connect {server_url}"))?;
-    client.initialize().await.context("rpc initialize")?;
-    client
-        .open_connection_as(&actor_id, "service", display_opt)
-        .await
-        .with_context(|| format!("connection/open as {actor_id}"))?;
+    let result: Result<()> = async {
+        let scopes = prepared_runtime_scopes(&spec, None)?;
+        if let Some(state) = runtime_state.as_ref() {
+            state.set_scopes(scopes);
+        }
 
-    let runtime = ServiceRuntime::start(spec.id.clone(), actor_id.clone(), client, &data_root)?;
-    runtime
-        .actor_upsert(spec.actor.clone())
-        .await
-        .with_context(|| format!("actor/upsert for {actor_id}"))?;
+        let actor_id = spec.actor.id.clone();
+        let display = spec.actor.display_name.clone();
+        let display_opt = if display.is_empty() {
+            None
+        } else {
+            Some(display.as_str())
+        };
 
-    plugin
-        .run(ServiceContext {
-            spec,
-            spec_path,
-            runtime,
-            shutdown,
-            instance: None,
-        })
-        .await
+        // Per §9.4 the second open_connection from a `loom service serve`
+        // restart preempts the previous (now-dead) binding — the server's
+        // `bind_actor` extends the agent preempt rule to Service kind.
+        let client = Client::connect(&server_url)
+            .await
+            .with_context(|| format!("ws connect {server_url}"))?;
+        client.initialize().await.context("rpc initialize")?;
+        client
+            .open_connection_as(&actor_id, "service", display_opt)
+            .await
+            .with_context(|| format!("connection/open as {actor_id}"))?;
+
+        let runtime = ServiceRuntime::start(spec.id.clone(), actor_id.clone(), client, &data_root)?;
+        runtime
+            .actor_upsert(spec.actor.clone())
+            .await
+            .with_context(|| format!("actor/upsert for {actor_id}"))?;
+
+        let readiness = runtime_state
+            .as_ref()
+            .map(RuntimeStateGuard::readiness)
+            .unwrap_or_default();
+        plugin
+            .run(ServiceContext {
+                spec,
+                spec_path,
+                runtime,
+                shutdown,
+                instance: None,
+                readiness,
+            })
+            .await
+    }
+    .await;
+
+    if let Err(error) = &result {
+        if let Some(state) = runtime_state.as_mut() {
+            state.fail(error);
+        }
+    }
+    result
 }
 
 /// Per-instance plugin task for a `lifecycle = thread_bound` spec.
@@ -383,46 +699,74 @@ async fn run_one_instance(
     shutdown: ShutdownSignal,
     request: super::instance::InstanceRequest,
     spec_path: Option<PathBuf>,
+    runtime_reporting: Option<RuntimeReporting>,
 ) -> Result<()> {
-    let actor_id = spec.actor.id.clone();
     let instance_id = request.scope.id.clone();
-    let display = spec.actor.display_name.clone();
-    let display_opt = if display.is_empty() {
-        None
-    } else {
-        Some(display.as_str())
-    };
+    let mut runtime_state = RuntimeStateGuard::starting(
+        runtime_reporting.as_ref(),
+        &spec,
+        Some(&instance_id),
+        instance_scopes(Some(&request)),
+    );
 
-    let client = Client::connect(&server_url)
-        .await
-        .with_context(|| format!("ws connect {server_url}"))?;
-    client.initialize().await.context("rpc initialize")?;
-    client
-        .open_connection_as(&actor_id, "service", display_opt)
-        .await
-        .with_context(|| format!("connection/open as {actor_id}"))?;
+    let result: Result<()> = async {
+        let scopes = prepared_runtime_scopes(&spec, Some(&request))?;
+        if let Some(state) = runtime_state.as_ref() {
+            state.set_scopes(scopes);
+        }
 
-    let runtime = ServiceRuntime::start_instance(
-        spec.id.clone(),
-        actor_id.clone(),
-        instance_id,
-        client,
-        &data_root,
-    )?;
-    runtime
-        .actor_upsert(spec.actor.clone())
-        .await
-        .with_context(|| format!("actor/upsert for {actor_id}"))?;
+        let actor_id = spec.actor.id.clone();
+        let display = spec.actor.display_name.clone();
+        let display_opt = if display.is_empty() {
+            None
+        } else {
+            Some(display.as_str())
+        };
 
-    plugin
-        .run(ServiceContext {
-            spec,
-            spec_path,
-            runtime,
-            shutdown,
-            instance: Some(request),
-        })
-        .await
+        let client = Client::connect(&server_url)
+            .await
+            .with_context(|| format!("ws connect {server_url}"))?;
+        client.initialize().await.context("rpc initialize")?;
+        client
+            .open_connection_as(&actor_id, "service", display_opt)
+            .await
+            .with_context(|| format!("connection/open as {actor_id}"))?;
+
+        let runtime = ServiceRuntime::start_instance(
+            spec.id.clone(),
+            actor_id.clone(),
+            instance_id,
+            client,
+            &data_root,
+        )?;
+        runtime
+            .actor_upsert(spec.actor.clone())
+            .await
+            .with_context(|| format!("actor/upsert for {actor_id}"))?;
+
+        let readiness = runtime_state
+            .as_ref()
+            .map(RuntimeStateGuard::readiness)
+            .unwrap_or_default();
+        plugin
+            .run(ServiceContext {
+                spec,
+                spec_path,
+                runtime,
+                shutdown,
+                instance: Some(request),
+                readiness,
+            })
+            .await
+    }
+    .await;
+
+    if let Err(error) = &result {
+        if let Some(state) = runtime_state.as_mut() {
+            state.fail(error);
+        }
+    }
+    result
 }
 
 /// Watcher loop for `lifecycle = thread_bound` specs (§4.7.3).
@@ -460,6 +804,7 @@ async fn supervise_instances(
     data_root: PathBuf,
     mut shutdown: ShutdownSignal,
     specs_dir: Option<PathBuf>,
+    runtime_reporting: Option<RuntimeReporting>,
 ) -> Result<()> {
     let mut active: HashMap<String, JoinHandle<()>> = HashMap::new();
     let spec_id = spec.id.clone();
@@ -661,6 +1006,7 @@ async fn supervise_instances(
             let inst_for_log = instance_id.clone();
             let spec_for_log = spec_id.clone();
             let spec_path_c = resolve_spec_path(specs_dir.as_deref(), &spec_id);
+            let reporting_c = runtime_reporting.clone();
             let join = tokio::spawn(async move {
                 if let Err(e) = run_one_instance(
                     spec_c,
@@ -670,6 +1016,7 @@ async fn supervise_instances(
                     shutdown_c,
                     request,
                     spec_path_c,
+                    reporting_c,
                 )
                 .await
                 {
@@ -773,6 +1120,7 @@ fn diff_instances(listed: &[String], active: &HashSet<String>) -> (Vec<String>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::service::instance::{InstanceRequest, InstanceScope};
     use proto::methods::{ServiceLifecycle, ServiceSpec};
     use proto::types::{Actor, ActorKind};
 
@@ -915,5 +1263,152 @@ mod tests {
             .auto_stop_on
             .push("thread.closed".into());
         assert!(watches_thread_closed(&spec));
+    }
+
+    #[test]
+    fn singleton_runtime_scopes_come_from_validated_scheduler_jobs() {
+        let mut spec = minimal_spec("runtime-scopes");
+        spec.config = serde_json::json!({
+            "jobs": [
+                {
+                    "id": "channel-job",
+                    "schedule": "*/5 * * * *",
+                    "source": { "kind": "command", "command": "echo" },
+                    "scope": { "kind": "channel", "id": "chan_a" }
+                },
+                {
+                    "id": "thread-job",
+                    "schedule": "*/5 * * * *",
+                    "source": { "kind": "command", "command": "echo" },
+                    "scope": {
+                        "kind": "thread",
+                        "id": "thread_b",
+                        "channelId": "chan_b"
+                    }
+                },
+                {
+                    "id": "placeholder-job",
+                    "schedule": "*/5 * * * *",
+                    "source": { "kind": "command", "command": "echo" },
+                    "scope": {
+                        "kind": "thread",
+                        "id": "{thread.id}",
+                        "channelId": "{channel.id}"
+                    }
+                }
+            ]
+        });
+
+        let scopes = prepared_runtime_scopes(&spec, None).expect("validated scheduler scopes");
+
+        assert_eq!(
+            scopes,
+            vec![
+                ScopeRef {
+                    kind: ScopeKind::Channel,
+                    id: "chan_a".into(),
+                },
+                ScopeRef {
+                    kind: ScopeKind::Thread,
+                    id: "thread_b".into(),
+                },
+                ScopeRef {
+                    kind: ScopeKind::Channel,
+                    id: "chan_b".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn thread_bound_runtime_scopes_come_from_instance_request() {
+        let mut spec = minimal_spec("thread-runtime");
+        spec.lifecycle = ServiceLifecycle::ThreadBound;
+        spec.config = serde_json::json!({
+            "jobs": [{
+                "id": "bound-job",
+                "schedule": "*/5 * * * *",
+                "source": { "kind": "command", "command": "echo" },
+                "scope": {
+                    "kind": "thread",
+                    "id": "{thread.id}",
+                    "channelId": "{channel.id}"
+                }
+            }]
+        });
+        let request = InstanceRequest {
+            version: 1,
+            spec_id: spec.id.clone(),
+            scope: InstanceScope {
+                kind: "thread".into(),
+                id: "thread_actual".into(),
+                channel_id: Some("chan_parent".into()),
+            },
+            params: serde_json::json!({}),
+            created_at: None,
+        };
+
+        let scopes =
+            prepared_runtime_scopes(&spec, Some(&request)).expect("validated instance scopes");
+
+        assert_eq!(
+            scopes,
+            vec![
+                ScopeRef {
+                    kind: ScopeKind::Thread,
+                    id: "thread_actual".into(),
+                },
+                ScopeRef {
+                    kind: ScopeKind::Channel,
+                    id: "chan_parent".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_guard_transitions_to_running_and_removes_on_exit() {
+        let registry = ServiceRuntimeRegistry::default();
+        let reporting = RuntimeReporting {
+            machine_id: "machine_a".into(),
+            registry: registry.clone(),
+        };
+        let spec = minimal_spec("runtime-state");
+
+        {
+            let guard = RuntimeStateGuard::starting(Some(&reporting), &spec, None, Vec::new())
+                .expect("runtime reporting enabled");
+            assert_eq!(registry.snapshot()[0].phase, ServiceRuntimePhase::Starting);
+
+            guard.readiness().mark_running();
+            let running = registry.snapshot();
+            assert_eq!(running[0].phase, ServiceRuntimePhase::Running);
+            assert!(running[0].started_at.is_some());
+        }
+
+        assert!(registry.snapshot().is_empty());
+    }
+
+    #[test]
+    fn runtime_guard_retains_explicit_failure() {
+        let registry = ServiceRuntimeRegistry::default();
+        let reporting = RuntimeReporting {
+            machine_id: "machine_a".into(),
+            registry: registry.clone(),
+        };
+        let spec = minimal_spec("runtime-failure");
+
+        {
+            let mut guard = RuntimeStateGuard::starting(Some(&reporting), &spec, None, Vec::new())
+                .expect("runtime reporting enabled");
+            guard.fail(&anyhow::anyhow!("configuration rejected"));
+        }
+
+        let failed = registry.snapshot();
+        assert_eq!(failed[0].phase, ServiceRuntimePhase::Failed);
+        assert_eq!(
+            failed[0].last_error.as_deref(),
+            Some("configuration rejected")
+        );
     }
 }

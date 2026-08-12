@@ -31,19 +31,19 @@ use proto::methods::{
     InboxListResult, MessageListResult, MessageSendResult, OnHumanMessageWhileBusy,
     PromptTemplateSpec, ReplyReminderMode, RunAppendResult, RunCloseResult, RunOpenResult,
     RuntimeAwareness, TaskAssignmentContextResult, TaskAssignmentUpdateResult, ThreadGetResult,
-    TriggerPrefixApplyOn,
+    TriggerPrefixApplyOn, TurnInputStyle,
 };
 use proto::types::trace::TraceKind;
 use proto::types::{
-    ActorKind, AudienceKind, DeliveryPolicy, Message, MessageIntent, MessageKind, Meta, Run,
-    RunStatus, ScopeKind, ScopeRef, TaskAssignmentStatus, Timestamp,
+    ActorKind, AudienceKind, Delivery, DeliveryPolicy, DeliveryState, Message, MessageIntent,
+    MessageKind, Meta, Run, RunStatus, ScopeKind, ScopeRef, TaskAssignmentStatus, Timestamp,
 };
 use proto::types::{Event, RefKind, RelationKind};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::error::TryRecvError;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{interval, interval_at, sleep, Duration, Instant, MissedTickBehavior};
 
 use agent_runtime::acp::{create_dir_all_unc, normalize_path_separators, AcpAdapter, AcpConfig};
@@ -509,6 +509,9 @@ pub struct MachineHostSpec {
     pub actor_id: String,
     pub display_name: String,
     pub metadata: Arc<Mutex<Value>>,
+    /// Revision signal for inventory changes. The daemon updates `metadata`
+    /// before advancing this receiver, so the host can publish immediately.
+    pub metadata_changed: watch::Receiver<u64>,
     pub command_tx: Option<mpsc::UnboundedSender<MachineCommandTask>>,
 }
 
@@ -553,6 +556,7 @@ async fn run_machine_host_once(host: &MachineHostSpec, server_url: &str) -> Resu
     );
 
     let mut notifications = client.notifications.lock().await;
+    let mut metadata_changed = host.metadata_changed.clone();
     let mut in_progress = HashSet::new();
     drain_machine_commands(&client, host, &mut in_progress).await?;
     let mut command_poll = interval_at(
@@ -564,6 +568,12 @@ async fn run_machine_host_once(host: &MachineHostSpec, server_url: &str) -> Resu
         tokio::select! {
             _ = command_poll.tick() => {
                 drain_machine_commands(&client, host, &mut in_progress).await?;
+            }
+            changed = metadata_changed.changed() => {
+                if changed.is_err() {
+                    return Err(anyhow!("machine inventory publisher closed"));
+                }
+                upsert_machine_actor(&client, host).await?;
             }
             maybe_notification = notifications.recv() => {
                 let Some(notification) = maybe_notification else {
@@ -2506,6 +2516,10 @@ struct WorkerState {
     /// Provider session usage accumulated per scope. ACP, command, and
     /// interactive transports all use scope as the session boundary here.
     usage_totals: Mutex<HashMap<String, TokenUsage>>,
+    /// Last raw usage snapshot reported by the provider per scope. Used to
+    /// recover per-turn increments from providers whose usage-manifest
+    /// semantics declare `report = "session_cumulative"`.
+    last_provider_usage: Mutex<HashMap<String, TokenUsage>>,
     /// Last rendered provider prompt per scope, used only for duplicate
     /// injection telemetry. The value is overwritten every turn.
     last_prompt_by_scope: Mutex<HashMap<String, String>>,
@@ -2732,6 +2746,7 @@ impl WorkerState {
             pending_triggers: Mutex::new(HashMap::new()),
             text_buffer: Mutex::new(HashMap::new()),
             usage_totals: Mutex::new(HashMap::new()),
+            last_provider_usage: Mutex::new(HashMap::new()),
             last_prompt_by_scope: Mutex::new(HashMap::new()),
             seeded: Mutex::new(HashSet::new()),
             scope_channel_cache: Mutex::new(HashMap::new()),
@@ -2947,6 +2962,41 @@ impl WorkerState {
         }
     }
 
+    /// Drop a queued (not yet dispatched) trigger after its delivery was
+    /// cancelled server-side. Returns true when a trigger was removed.
+    fn remove_pending_trigger(&self, source_id: &str) -> bool {
+        let mut pending = self
+            .pending_triggers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut removed = false;
+        pending.retain(|_, queue| {
+            let before = queue.len();
+            queue.retain(|t| t.id() != source_id);
+            removed = removed || queue.len() != before;
+            !queue.is_empty()
+        });
+        removed
+    }
+
+    /// Move a queued trigger to the front of its queue (delivery.expedite).
+    /// Returns true when the trigger was found and promoted.
+    fn promote_pending_trigger(&self, source_id: &str) -> bool {
+        let mut pending = self
+            .pending_triggers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for queue in pending.values_mut() {
+            if let Some(idx) = queue.iter().position(|t| t.id() == source_id) {
+                if let Some(trigger) = queue.remove(idx) {
+                    queue.push_front(trigger);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
     /// Atomically decide whether to dispatch `trigger` now or queue it. Returns
     /// `true` if the caller acquired the turn key and must dispatch; `false` if
     /// the conversation was already busy and the trigger was enqueued. The
@@ -3016,6 +3066,71 @@ impl WorkerState {
             busy.remove(&turn_key);
         }
         batch
+    }
+
+    /// Release every in-memory reservation for a dispatch that failed before
+    /// the provider accepted its prompt. The durable inbox rows deliberately
+    /// remain Pending; forgetting their local de-dup markers lets a later
+    /// inbox reconciliation retry them instead of treating them as handled.
+    fn abandon_unexecuted_dispatch(
+        &self,
+        turn_key: &str,
+        scope_id: &str,
+        source_ids: &[String],
+        restore_first_turn: bool,
+    ) -> Vec<String> {
+        let mut retry_source_ids = source_ids.to_vec();
+        let active = self
+            .active_turns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(scope_id);
+        if let Some(active) = active {
+            if active.turn_key == turn_key {
+                retry_source_ids.extend(turn_source_ids(&active).into_iter().map(str::to_owned));
+                let _ = self.take_text(&active.id);
+            } else {
+                // This should be unreachable while `turn_key` is reserved,
+                // but do not tear down an unrelated live turn if state was
+                // replaced concurrently.
+                self.active_turns
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(scope_id.to_string(), active);
+            }
+        }
+
+        let mut busy = self
+            .busy_turn_keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut pending = self
+            .pending_triggers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(queued) = pending.remove(turn_key) {
+            retry_source_ids.extend(queued.into_iter().map(|trigger| trigger.id().to_string()));
+        }
+        drop(pending);
+
+        let mut unique = HashSet::new();
+        retry_source_ids.retain(|source_id| unique.insert(source_id.clone()));
+        let mut seen = self.seen_sources.lock().unwrap_or_else(|e| e.into_inner());
+        for source_id in &retry_source_ids {
+            seen.remove(source_id);
+        }
+        drop(seen);
+        if restore_first_turn {
+            self.seeded
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(scope_id);
+        }
+        // Release the busy gate last so a new notification cannot begin a
+        // retry between restoring first-turn/de-dup state and this cleanup.
+        busy.remove(turn_key);
+        drop(busy);
+        retry_source_ids
     }
 
     fn drop_pending_sources(&self, source_ids: &[String]) {
@@ -3201,6 +3316,35 @@ impl WorkerState {
     fn take_text(&self, turn_id: &str) -> Option<String> {
         let mut buf = self.text_buffer.lock().unwrap_or_else(|e| e.into_inner());
         buf.remove(turn_id).filter(|s| !s.is_empty())
+    }
+
+    /// Non-consuming view of the buffered assistant text for a turn. Used to
+    /// derive an estimated usage increment before the buffer is drained by
+    /// one of the `Finished` branches.
+    fn peek_text(&self, turn_id: &str) -> Option<String> {
+        let buf = self.text_buffer.lock().unwrap_or_else(|e| e.into_inner());
+        buf.get(turn_id).filter(|s| !s.is_empty()).cloned()
+    }
+
+    /// Convert the provider-reported usage for a finished turn into a
+    /// per-turn increment. For providers whose usage-manifest semantics
+    /// declare `report = "session_cumulative"`, consecutive snapshots per
+    /// scope are diffed; delta providers pass through unchanged.
+    fn turn_usage_increment(&self, scope_id: &str, reported: TokenUsage) -> TokenUsage {
+        let provider = usage_provider_hint(&self.spec.provider_ref.id);
+        let semantics = usage::usage_semantics(provider.as_deref());
+        if semantics.report != usage::UsageReportKind::SessionCumulative {
+            return reported;
+        }
+        let mut last = self
+            .last_provider_usage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = last.insert(scope_id.to_string(), reported.clone());
+        match previous {
+            Some(previous) => usage::diff_usage(&reported, &previous),
+            None => reported,
+        }
     }
 
     fn accumulate_usage(&self, scope_id: &str, increment: &TokenUsage) -> TokenUsage {
@@ -3694,6 +3838,18 @@ async fn publish_runtime_agent_config(
     Ok(activated.version.id)
 }
 
+/// Normalize the provider-catalog id from `AgentSpec.provider_ref` into the
+/// key space of the usage manifest (`[providers.<id>]`). Empty ids yield
+/// `None` so extraction falls back to the manifest defaults.
+fn usage_provider_hint(provider_ref_id: &str) -> Option<String> {
+    let id = provider_ref_id.trim().to_ascii_lowercase();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id)
+    }
+}
+
 fn build_adapter(
     spec: &AgentSpec,
     transport: &AgentTransport,
@@ -3794,7 +3950,7 @@ fn build_adapter(
             Ok(Arc::new(AcpAdapter::new(cfg)))
         }
         "command" => {
-            let cfg = CommandConfig::from_transport(
+            let mut cfg = CommandConfig::from_transport(
                 spec.actor.id.clone(),
                 transport.command.clone(),
                 transport.args.clone(),
@@ -3802,6 +3958,7 @@ fn build_adapter(
                 transport,
                 paths.sessions.clone(),
             );
+            cfg.usage_provider = usage_provider_hint(&spec.provider_ref.id);
             Ok(Arc::new(CommandAdapter::new(cfg)))
         }
         "interactive_command" => {
@@ -3811,7 +3968,7 @@ fn build_adapter(
                 .as_ref()
                 .and_then(|m| m.default.clone())
                 .or_else(|| transport.model.clone());
-            let cfg = InteractiveCommandConfig::new(
+            let mut cfg = InteractiveCommandConfig::new(
                 spec.actor.id.clone(),
                 transport.command.clone(),
                 &transport.args,
@@ -3823,6 +3980,7 @@ fn build_adapter(
                 paths.sessions.clone(),
                 paths.profile.clone(),
             );
+            cfg.usage_provider = usage_provider_hint(&spec.provider_ref.id);
             Ok(Arc::new(InteractiveCommandAdapter::new(cfg)))
         }
         other => Err(anyhow!(
@@ -3840,7 +3998,18 @@ async fn notification_loop(
     actor_id: &str,
 ) -> Result<()> {
     let mut started = false;
-    let inbox_poll_every = Duration::from_secs(15);
+    // Durable-inbox polling is a reconciliation safety net behind the WS
+    // notification stream, not the primary wake path, so a relaxed default
+    // keeps N idle agents from generating constant background load on the
+    // server. Override with LOOM_INBOX_POLL_SECS (min 5s) when a deployment
+    // needs tighter recovery after missed notifications.
+    let inbox_poll_every = Duration::from_secs(
+        std::env::var("LOOM_INBOX_POLL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.max(5))
+            .unwrap_or(60),
+    );
     let mut inbox_poll = interval(inbox_poll_every);
     if let Err(e) =
         drain_pending_inbox(&client, &state, &adapter, &event_tx, &mut started, actor_id).await
@@ -3974,6 +4143,73 @@ async fn notification_loop(
             };
             if run.actor_id == actor_id && run_requests_no_reply(&run) {
                 let _ = state.mark_no_reply_requested(&run.id);
+            }
+            continue;
+        }
+        if kind == stream_kind::DELIVERY_UPDATED {
+            let Some(delivery_value) = params.get("data").and_then(|d| d.get("delivery")).cloned()
+            else {
+                continue;
+            };
+            let Ok(delivery) = serde_json::from_value::<Delivery>(delivery_value) else {
+                continue;
+            };
+            if delivery.actor_id != actor_id {
+                continue;
+            }
+            match delivery.state {
+                DeliveryState::Cancelled => {
+                    // A human withdrew this wake from the GUI before we
+                    // consumed it. Drop the queued trigger; an actively
+                    // running turn is run.cancel's job, not ours.
+                    if state.remove_pending_trigger(&delivery.source_id) {
+                        tracing::info!(
+                            actor = %actor_id,
+                            source = %delivery.source_id,
+                            "queued trigger dropped after delivery.cancel"
+                        );
+                    }
+                }
+                DeliveryState::Pending => {
+                    let expedited = delivery
+                        ._meta
+                        .as_ref()
+                        .and_then(|meta| meta.get("expedite"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if !expedited {
+                        continue;
+                    }
+                    if state.promote_pending_trigger(&delivery.source_id) {
+                        tracing::info!(
+                            actor = %actor_id,
+                            source = %delivery.source_id,
+                            "queued trigger promoted after delivery.expedite"
+                        );
+                    } else {
+                        // Not queued locally (missed notification or worker
+                        // restart): a drain picks the delivery up now.
+                        if let Err(e) = drain_pending_inbox(
+                            &client,
+                            &state,
+                            &adapter,
+                            &event_tx,
+                            &mut started,
+                            actor_id,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                actor = %actor_id,
+                                source = %delivery.source_id,
+                                %e,
+                                "expedite-triggered inbox drain failed"
+                            );
+                        }
+                        state.promote_pending_trigger(&delivery.source_id);
+                    }
+                }
+                _ => {}
             }
             continue;
         }
@@ -5174,18 +5410,43 @@ async fn dispatch_trigger_batch(
         if batch.len() > 1 {
             run_metadata["coalescedSourceIds"] = json!(source_ids);
         }
-        let run_res: RunOpenResult = client
+        let run_res: RunOpenResult = match client
             .call(
                 method::RUN_OPEN,
                 json!({
                     "actorId": state.actor_id,
                     "scope": primary.scope(),
+                    "deliveryId": primary.id(),
                     "startReason": primary.id(),
                     "agentConfigVersionId": state.agent_config_version_id.clone(),
                     "metadata": run_metadata,
                 }),
             )
-            .await?;
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                let retry_ids = state.abandon_unexecuted_dispatch(
+                    &turn_key,
+                    &primary.scope().id,
+                    &source_ids,
+                    false,
+                );
+                tracing::warn!(
+                    actor = %state.actor_id,
+                    scope = %primary.scope().id,
+                    retry_sources = retry_ids.len(),
+                    %err,
+                    "run.open failed before provider execution; released slot and kept deliveries pending"
+                );
+                return Err(err).with_context(|| {
+                    format!(
+                        "run.open before provider execution for scope {}",
+                        primary.scope().id
+                    )
+                });
+            }
+        };
         let first_turn = state.take_seed_slot(&primary.scope().id);
         let turn_input =
             render_trigger_prompt(client, state, &batch, first_turn, &run_res.run.id).await;
@@ -5224,7 +5485,7 @@ async fn dispatch_trigger_batch(
         };
         state.set_turn(active.clone());
 
-        let adapter_prompt = build_adapter_prompt(
+        let adapter_prompt = match build_adapter_prompt(
             client,
             state,
             primary.scope(),
@@ -5232,7 +5493,57 @@ async fn dispatch_trigger_batch(
             Some(&active),
             Some(&primary),
         )
-        .await?;
+        .await
+        {
+            Ok(prompt) => prompt,
+            Err(err) => {
+                // No provider work ran, so terminate the bookkeeping run but
+                // deliberately send no ack ids. Canceled runs do not infer a
+                // legacy trigger ack on the server; the durable deliveries
+                // remain Pending and can be retried after local reconciliation.
+                if let Err(close_err) =
+                    close_run(client, &active.run_id, RunStatus::Canceled, None, &[]).await
+                {
+                    tracing::warn!(
+                        actor = %state.actor_id,
+                        run = %active.run_id,
+                        scope = %active.scope.id,
+                        %close_err,
+                        "failed to close pre-provider run; releasing local slot anyway"
+                    );
+                }
+                let retry_ids = state.abandon_unexecuted_dispatch(
+                    &turn_key,
+                    &active.scope.id,
+                    &source_ids,
+                    first_turn,
+                );
+                tracing::warn!(
+                    actor = %state.actor_id,
+                    run = %active.run_id,
+                    scope = %active.scope.id,
+                    retry_sources = retry_ids.len(),
+                    %err,
+                    "prompt preparation failed before provider execution; deliveries remain pending"
+                );
+                publish_runtime_warning_once(
+                    client,
+                    state,
+                    &active,
+                    &state.actor_id,
+                    "prompt.prepare",
+                    "failed to prepare the provider prompt; pending work will be retried",
+                    &err,
+                )
+                .await;
+                return Err(err).with_context(|| {
+                    format!(
+                        "prepare provider prompt for run={} scope={}",
+                        active.run_id, active.scope.id
+                    )
+                });
+            }
+        };
 
         match adapter.send_prompt(adapter_prompt).await {
             Ok(()) => {
@@ -5279,7 +5590,7 @@ async fn dispatch_trigger_batch(
                     None,
                 )
                 .await;
-                let _ = close_run(client, &active.run_id, RunStatus::Failed).await;
+                let _ = close_run(client, &active.run_id, RunStatus::Failed, None, &[]).await;
                 tracing::warn!(
                     actor = %state.actor_id,
                     sources = ?source_ids,
@@ -6037,16 +6348,25 @@ async fn render_trigger_prompt(
                 ack_source_ids: Vec::new(),
             }
         });
-    let latest_message = render_turn_input_contract_with_names(
-        &state.actor_id,
-        &state.spec.actor.display_name,
-        batch,
-        &actor_names,
-        reminder,
-        run_id,
-        first_turn,
-        &delivery_context.unread_gap,
-    );
+    let latest_message = match turn_input_style_for_spec(&state.spec) {
+        TurnInputStyle::Minimal => render_minimal_turn_input(
+            &state.actor_id,
+            batch,
+            &actor_names,
+            reminder,
+            &delivery_context.unread_gap,
+        ),
+        TurnInputStyle::Structured => render_turn_input_contract_with_names(
+            &state.actor_id,
+            &state.spec.actor.display_name,
+            batch,
+            &actor_names,
+            reminder,
+            run_id,
+            first_turn,
+            &delivery_context.unread_gap,
+        ),
+    };
     let assignment_context = assignment_context_for_prompt(client, primary)
         .await
         .unwrap_or_default();
@@ -6613,7 +6933,7 @@ fn format_recent_conversation_context(
             message.metadata.get("kind").and_then(Value::as_str) != Some("run.started_ack")
         })
         .filter_map(|message| {
-            let body = compact_message_body(&message.body);
+            let body = compact_message_body(&message.body).text;
             if body.is_empty() {
                 return None;
             }
@@ -6661,7 +6981,7 @@ fn format_hidden_visible_history(
         })
         .filter(|message| message_visible_to_actor_for_prompt(message, local_actor_id))
     {
-        let body = compact_message_body(&message_body_for_prompt(message));
+        let body = compact_message_body(&message_body_for_prompt(message)).text;
         if body.is_empty() {
             continue;
         }
@@ -6711,12 +7031,32 @@ fn render_hidden_history_lines(header: &str, newest_first: &[String]) -> String 
     out
 }
 
-fn compact_message_body(body: &str) -> String {
+struct CompactBody {
+    text: String,
+    /// Original char count when the body was truncated to
+    /// `CONTEXT_MESSAGE_BODY_MAX_CHARS`.
+    truncated_from: Option<usize>,
+}
+
+fn compact_message_body(body: &str) -> CompactBody {
     let compact = body.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.chars().count() <= 800 {
-        compact
+    let total = compact.chars().count();
+    if total <= CONTEXT_MESSAGE_BODY_MAX_CHARS {
+        CompactBody {
+            text: compact,
+            truncated_from: None,
+        }
     } else {
-        format!("{}...", compact.chars().take(800).collect::<String>())
+        CompactBody {
+            text: format!(
+                "{}...",
+                compact
+                    .chars()
+                    .take(CONTEXT_MESSAGE_BODY_MAX_CHARS)
+                    .collect::<String>()
+            ),
+            truncated_from: Some(total),
+        }
     }
 }
 
@@ -6802,6 +7142,7 @@ const RESPONSE_DELIVERY_POINTER: &str =
 with Loom CLI before ending. Use `$LOOM_REPLY_TARGET` by default for the current workflow; \
 use bare `#channel` only for intentional channel-level updates outside the active thread. \
 For multiline messages, omit `--text` and pipe stdin/heredoc; quoted `\\n` is stored literally. \
+To send a file or image, run `loom --json attachment upload --target \"$LOOM_REPLY_TARGET\" --path <path>`, then include the returned artifact id on the visible reply with `--attachment-id <art_id>`; upload alone and artifact URI text are not chat attachments. \
 In coordinated workflows, wake the requester/coordinator with your result unless you own or were delegated the next handoff. \
 Short requested answers like joining, choosing, voting, approving, or completing a step are actionable; wake the collector instead of notify-only. \
 When you own the handoff, or no coordinator exists and another actor or group must continue, use `message ask` \
@@ -6943,6 +7284,121 @@ a step for that requester/coordinator and they must continue after your reply, w
         "Use plain `message send --target \"$LOOM_REPLY_TARGET\"` only when your public reply \
 does not require any actor to act next.\n",
     );
+}
+
+fn turn_input_style_for_spec(spec: &AgentSpec) -> TurnInputStyle {
+    spec.wake
+        .as_ref()
+        .and_then(|wake| wake.turn_input_style)
+        .unwrap_or_default()
+}
+
+fn message_kind_label(kind: MessageKind) -> &'static str {
+    match kind {
+        MessageKind::Human => "Human",
+        MessageKind::Agent => "Agent",
+        MessageKind::System => "System",
+        MessageKind::Attention => "Attention",
+        MessageKind::TaskUpdate => "TaskUpdate",
+        MessageKind::Artifact => "Artifact",
+    }
+}
+
+/// Minimal plain-text turn input (`WakeSpec.turnInputStyle = minimal`,
+/// default). One line of metadata + capped body per delivered message, a
+/// one-line scope/queue summary, and a short rule footer — no JSON header,
+/// no fenced blocks. Full bodies stay one `loom message get <id>` away.
+fn render_minimal_turn_input(
+    local_actor_id: &str,
+    batch: &[AgentTrigger],
+    actor_names: &HashMap<String, String>,
+    reminder: ReminderRender,
+    unread_gap: &TurnUnreadGap,
+) -> String {
+    let Some(primary) = batch.last() else {
+        return String::new();
+    };
+    let mut out = String::new();
+    if batch.len() > 1 {
+        out.push_str("Pending message digest (oldest first):\n");
+    } else {
+        out.push_str("New message:\n");
+    }
+    for trigger in batch {
+        match trigger {
+            AgentTrigger::Message(message) => {
+                let display = actor_names
+                    .get(&message.author_actor_id)
+                    .map(String::as_str)
+                    .unwrap_or(message.author_actor_id.as_str());
+                let at = message
+                    .created_at
+                    .with_timezone(&Local)
+                    .format("%Y-%m-%d %H:%M:%S");
+                out.push_str(&format!(
+                    "[unread] {at} {display}({})[id={}][msgId={}]:\n",
+                    message_kind_label(message.kind),
+                    message.author_actor_id,
+                    message.id,
+                ));
+                let compact = compact_message_body(&message_body_for_prompt(message));
+                out.push_str(&compact.text);
+                if compact.truncated_from.is_some() {
+                    out.push_str(&format!(
+                        "（消息最多展示{CONTEXT_MESSAGE_BODY_MAX_CHARS}个字符，全文用 `loom --json message get {}` 查看）",
+                        message.id
+                    ));
+                }
+                out.push('\n');
+            }
+            AgentTrigger::Event(event) => {
+                let display = actor_names
+                    .get(&event.actor_id)
+                    .map(String::as_str)
+                    .unwrap_or(event.actor_id.as_str());
+                let at = event
+                    .occurred_at
+                    .with_timezone(&Local)
+                    .format("%Y-%m-%d %H:%M:%S");
+                let payload = serde_json::to_string(&event.payload).unwrap_or_default();
+                let (payload, truncated) = truncate_chars(&payload, CONTEXT_MESSAGE_BODY_MAX_CHARS);
+                out.push_str(&format!(
+                    "[event] {at} {display}[id={}][eventId={}] {}:\n{payload}",
+                    event.actor_id, event.id, event.kind,
+                ));
+                if truncated.is_some() {
+                    out.push_str("…");
+                }
+                out.push('\n');
+            }
+        }
+    }
+    let scope_label = primary
+        .reply_target()
+        .unwrap_or_else(|| primary.scope().id.clone());
+    out.push_str(&format!(
+        "Scope {scope_label}: {} message(s) delivered this turn, {} more pending",
+        batch.len(),
+        unread_gap.count,
+    ));
+    if let Some(hint) = unread_gap.hint.as_deref() {
+        out.push_str(&format!(" ({hint})"));
+    }
+    out.push_str(".\n");
+    match reminder {
+        ReminderRender::Full | ReminderRender::Pointer => {
+            out.push_str(
+                "Rules: handle all messages above in this one turn; reply with \
+                 `loom --json message send --target \"$LOOM_REPLY_TARGET\" --text \"...\"`; \
+                 if no visible reply is needed run `loom --json run ignore --reason \"...\"`. \
+                 Full operating rules: AGENTS.md#loom-operating-rules.\n",
+            );
+        }
+        ReminderRender::Skip => {}
+    }
+    push_private_reply_instruction(&mut out, local_actor_id, batch);
+    push_public_wake_back_instruction(&mut out, local_actor_id, batch);
+    out
 }
 
 fn render_turn_input_contract_with_names(
@@ -7275,19 +7731,74 @@ fn body_ref_for_trigger(trigger: &AgentTrigger) -> String {
     }
 }
 
+/// Hard per-block caps for prompt injection. Every fenced body a turn input
+/// can carry is bounded so a single oversized message / event payload /
+/// assignment contract can no longer blow up the prompt (analysis doc
+/// `gui-lightweight-and-runtime-visibility-analysis.md` §2). Truncated
+/// blocks end with a pointer to the CLI so the agent can fetch the full
+/// fact on demand.
+const TRIGGER_MESSAGE_BODY_MAX_CHARS: usize = 4_000;
+const CONTEXT_MESSAGE_BODY_MAX_CHARS: usize = 500;
+const EVENT_PAYLOAD_MAX_CHARS: usize = 2_000;
+const ASSIGNMENT_CONTEXT_MAX_CHARS: usize = 4_000;
+
+/// Truncate `text` to `max_chars` characters. Returns the (possibly
+/// truncated) text and the original char count when truncation happened.
+fn truncate_chars(text: &str, max_chars: usize) -> (String, Option<usize>) {
+    let total = text.chars().count();
+    if total <= max_chars {
+        return (text.to_string(), None);
+    }
+    (text.chars().take(max_chars).collect(), Some(total))
+}
+
+fn truncation_note(kind: &str, shown: usize, total: usize, fetch_hint: &str) -> String {
+    format!("({kind} truncated: showing {shown} of {total} chars; {fetch_hint})")
+}
+
 fn render_trigger_body_block(trigger: &AgentTrigger) -> String {
     match trigger {
-        AgentTrigger::Message(message) => fenced_block(
-            &format!("loom-message id={}", fence_info_id(&message.id)),
-            &message_body_for_prompt(message),
-        ),
+        AgentTrigger::Message(message) => {
+            let (body, truncated_from) = truncate_chars(
+                &message_body_for_prompt(message),
+                TRIGGER_MESSAGE_BODY_MAX_CHARS,
+            );
+            let mut out = fenced_block(
+                &format!("loom-message id={}", fence_info_id(&message.id)),
+                &body,
+            );
+            if let Some(total) = truncated_from {
+                out.push('\n');
+                out.push_str(&truncation_note(
+                    "message body",
+                    TRIGGER_MESSAGE_BODY_MAX_CHARS,
+                    total,
+                    &format!(
+                        "run `loom --json message get {}` for the full text",
+                        message.id
+                    ),
+                ));
+            }
+            out
+        }
         AgentTrigger::Event(event) => {
             let payload = serde_json::to_string_pretty(&event.payload)
                 .unwrap_or_else(|_| event.payload.to_string());
-            fenced_block(
+            let (payload, truncated_from) = truncate_chars(&payload, EVENT_PAYLOAD_MAX_CHARS);
+            let mut out = fenced_block(
                 &format!("loom-event id={}", fence_info_id(&event.id)),
                 &payload,
-            )
+            );
+            if let Some(total) = truncated_from {
+                out.push('\n');
+                out.push_str(&truncation_note(
+                    "event payload",
+                    EVENT_PAYLOAD_MAX_CHARS,
+                    total,
+                    "query the scope via the Loom CLI for the full payload",
+                ));
+            }
+            out
         }
     }
 }
@@ -7309,17 +7820,30 @@ fn render_context_message_block(
         out.push_str(&visibility);
         out.push('\n');
     }
-    let body = compact_message_body(&message_body_for_prompt(message));
+    let compact = compact_message_body(&message_body_for_prompt(message));
     out.push_str(&fenced_block(
         &format!("loom-message id={}", fence_info_id(&message.id)),
-        &body,
+        &compact.text,
     ));
+    if let Some(total) = compact.truncated_from {
+        out.push('\n');
+        out.push_str(&truncation_note(
+            "message body",
+            CONTEXT_MESSAGE_BODY_MAX_CHARS,
+            total,
+            &format!(
+                "run `loom --json message get {}` for the full text",
+                message.id
+            ),
+        ));
+    }
     out
 }
 
 fn render_context_event_block(event: &Event, actor_names: &HashMap<String, String>) -> String {
     let payload =
         serde_json::to_string_pretty(&event.payload).unwrap_or_else(|_| event.payload.to_string());
+    let (payload, truncated_from) = truncate_chars(&payload, EVENT_PAYLOAD_MAX_CHARS);
     let mut out = format!(
         "Event id: {}\nAt: {}\nFrom: {}\nType: {}\n",
         event.id,
@@ -7331,6 +7855,15 @@ fn render_context_event_block(event: &Event, actor_names: &HashMap<String, Strin
         &format!("loom-event id={}", fence_info_id(&event.id)),
         &payload,
     ));
+    if let Some(total) = truncated_from {
+        out.push('\n');
+        out.push_str(&truncation_note(
+            "event payload",
+            EVENT_PAYLOAD_MAX_CHARS,
+            total,
+            "query the scope via the Loom CLI for the full payload",
+        ));
+    }
     out
 }
 
@@ -7532,6 +8065,22 @@ async fn assignment_context_for_prompt(
         Ok(context) => {
             let body = serde_json::to_string_pretty(&context)
                 .unwrap_or_else(|_| "{\"error\":\"failed to render assignment context\"}".into());
+            let (body, truncated_from) = truncate_chars(&body, ASSIGNMENT_CONTEXT_MAX_CHARS);
+            let note = truncated_from
+                .map(|total| {
+                    format!(
+                        "\n{}",
+                        truncation_note(
+                            "assignment context",
+                            ASSIGNMENT_CONTEXT_MAX_CHARS,
+                            total,
+                            &format!(
+                                "run `loom --json task assignment context {assignment_id}` for the full contract"
+                            ),
+                        )
+                    )
+                })
+                .unwrap_or_default();
             Some(format!(
                 "=== Loom assignment context ===\n\
                  This JSON is the authoritative task input. Read it before acting; use preflight before external side effects.\n\
@@ -7540,7 +8089,7 @@ async fn assignment_context_for_prompt(
                  - Record durable evidence with `loom task fact append`; do not use plain messages as gate evidence.\n\
                  - Finish this assignment with `loom task assignment update <assignment_id> --status completed --result <summary> --result-artifact-id <art_id> ... --result-fact-id <fact_id> ...`.\n\
                  - Do not route to another actor directly to finish an assignment; the assignment update returns the task to the assigning actor.\n\
-                 ```json\n{body}\n```"
+                 ```json\n{body}\n```{note}"
             ))
         }
         Err(err) => Some(format!(
@@ -8505,13 +9054,39 @@ async fn translate_one_with_gate(
                 );
                 return Ok(());
             };
+            // Resolve the per-turn usage increment once, up front: apply the
+            // session-cumulative diff for providers that report running
+            // totals, and fall back to an estimate from the buffered
+            // assistant text when the provider reported nothing. Every
+            // downstream consumer (message meta, failure notice, final trace
+            // frame, run.close) uses this same increment so the channels
+            // cannot drift apart.
+            let usage = usage.map(|u| state.turn_usage_increment(&active.scope.id, u));
+            let close_usage = usage.clone().or_else(|| {
+                state.peek_text(&active.id).map(|text| {
+                    usage::estimated_usage(active.prompt_stats.approx_token_count, &text)
+                })
+            });
             if active.cancel_requested || turn_no_reply_requested(&active) {
                 let _ = state.take_text(&active.id);
             } else if agent_text_auto_publish_enabled() {
                 if let Some(text) = state.take_text(&active.id) {
                     if let Some(text) = visible_agent_text_for_turn(&active, &text) {
                         let meta = build_turn_meta(state, &active, usage.as_ref(), &text);
-                        flush_text(client, actor_id, &active, text, Some(meta)).await?;
+                        if let Err(err) =
+                            flush_text(client, actor_id, &active, text, Some(meta)).await
+                        {
+                            publish_runtime_warning_once(
+                                client,
+                                state,
+                                &active,
+                                actor_id,
+                                "final-output",
+                                "failed to publish final agent output; run finalization will continue",
+                                &err,
+                            )
+                            .await;
+                        }
                     }
                 }
             } else {
@@ -8558,7 +9133,7 @@ async fn translate_one_with_gate(
             }
             if !effective_success {
                 if let Some(text) = failed_turn_text(&effective_summary) {
-                    append_trace_or_report(
+                    let _ = append_trace_or_report(
                         client,
                         state,
                         &active,
@@ -8567,7 +9142,7 @@ async fn translate_one_with_gate(
                         TraceKind::Error,
                         json!({ "message": text }),
                     )
-                    .await?;
+                    .await;
                 }
             }
             // U4 finalization: emit a terminal `agent.usage` trace frame so
@@ -8576,7 +9151,7 @@ async fn translate_one_with_gate(
             // mirroring the dual-write into the message metadata. Skip when
             // the adapter did not report any usage for this turn.
             if let Some(final_usage) = usage.as_ref() {
-                append_trace_or_report(
+                let _ = append_trace_or_report(
                     client,
                     state,
                     &active,
@@ -8589,7 +9164,7 @@ async fn translate_one_with_gate(
                         "isFinal": true,
                     }),
                 )
-                .await?;
+                .await;
             }
             let run_status = if active.cancel_requested {
                 RunStatus::Canceled
@@ -8598,27 +9173,53 @@ async fn translate_one_with_gate(
             } else {
                 RunStatus::Failed
             };
-            if let Err(e) = close_run(client, &active.run_id, run_status).await {
-                tracing::warn!(
-                    actor = %actor_id,
-                    run = %active.run_id,
-                    scope = %active.scope.id,
-                    %e,
-                    "run.close RPC failed; clearing slot anyway so the queue can drain"
-                );
-                publish_runtime_warning_once(
-                    client,
-                    state,
-                    &active,
-                    actor_id,
-                    "run.close",
-                    "failed to close run; queue will continue",
-                    &e,
-                )
-                .await;
-            }
+            let ack_source_ids = if active.ack_on_finish {
+                turn_source_ids(&active)
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            let atomically_acked = match close_run(
+                client,
+                &active.run_id,
+                run_status,
+                close_usage.as_ref(),
+                &ack_source_ids,
+            )
+            .await
+            {
+                Ok(acked) => acked,
+                Err(e) => {
+                    tracing::warn!(
+                        actor = %actor_id,
+                        run = %active.run_id,
+                        scope = %active.scope.id,
+                        %e,
+                        "run.close RPC failed; clearing slot anyway so the queue can drain"
+                    );
+                    publish_runtime_warning_once(
+                        client,
+                        state,
+                        &active,
+                        actor_id,
+                        "run.close",
+                        "failed to close run; queue will continue",
+                        &e,
+                    )
+                    .await;
+                    HashSet::new()
+                }
+            };
             if active.ack_on_finish {
-                for source_id in turn_source_ids(&active) {
+                for source_id in &ack_source_ids {
+                    // New servers finalize run + deliveries atomically. Empty
+                    // results identify an older server, where the legacy
+                    // individual acks remain the compatibility fallback.
+                    if atomically_acked.contains(source_id) {
+                        continue;
+                    }
                     if let Err(e) = record_delivery_seen_by_id(client, actor_id, source_id).await {
                         tracing::warn!(
                             actor = %actor_id,
@@ -9530,15 +10131,26 @@ async fn flush_text(
     })
 }
 
-async fn close_run(client: &Arc<Client>, run_id: &str, status: RunStatus) -> Result<()> {
-    let _: RunCloseResult = client
-        .call(
-            method::RUN_CLOSE,
-            json!({ "runId": run_id, "status": status }),
-        )
+async fn close_run(
+    client: &Arc<Client>,
+    run_id: &str,
+    status: RunStatus,
+    usage: Option<&TokenUsage>,
+    ack_source_ids: &[String],
+) -> Result<HashSet<String>> {
+    let mut params = json!({ "runId": run_id, "status": status });
+    if let Some(usage) = usage {
+        // Additive field: servers that predate `run.close.usage` ignore it.
+        params["usage"] = serde_json::to_value(usage).unwrap_or(Value::Null);
+    }
+    if !ack_source_ids.is_empty() {
+        params["ackSourceIds"] = json!(ack_source_ids);
+    }
+    let result: RunCloseResult = client
+        .call(method::RUN_CLOSE, params)
         .await
         .with_context(|| format!("run.close run={run_id}"))?;
-    Ok(())
+    Ok(result.acked_source_ids.into_iter().collect())
 }
 
 #[cfg(test)]
@@ -11749,6 +12361,94 @@ mod tests {
     }
 
     #[test]
+    fn minimal_turn_input_lists_messages_with_caps_and_summary() {
+        let mut actor_names = HashMap::new();
+        actor_names.insert("actor_human_x".into(), "canfuu".into());
+        let mut first = sample_message(
+            "msg_min_1",
+            ScopeRef {
+                kind: ScopeKind::Channel,
+                id: "chan_dev".into(),
+            },
+            "#chan_dev",
+            None,
+            None,
+        );
+        first.author_actor_id = "actor_human_x".into();
+        first.body = "帮我把登录页的样式改成深色主题".into();
+        let mut second = first.clone();
+        second.id = "msg_min_2".into();
+        second.body = "好".repeat(600);
+        let gap = TurnUnreadGap {
+            count: 3,
+            included: 0,
+            hint: Some("loom --json inbox list --state pending --no-ack".into()),
+        };
+
+        let prompt = render_minimal_turn_input(
+            "actor_agent_dev",
+            &[
+                AgentTrigger::Message(first),
+                AgentTrigger::Message(second.clone()),
+            ],
+            &actor_names,
+            ReminderRender::Full,
+            &gap,
+        );
+
+        assert!(prompt.starts_with("Pending message digest"));
+        assert!(
+            !prompt.contains("=== Loom turn input v1 ==="),
+            "no JSON header in minimal style"
+        );
+        assert!(prompt.contains("canfuu(Human)[id=actor_human_x][msgId=msg_min_1]"));
+        assert!(prompt.contains("帮我把登录页的样式改成深色主题"));
+        // 600-char body is capped at the 500-char context limit with a
+        // pointer to the full-text command.
+        assert!(prompt.contains(&format!("loom --json message get {}", second.id)));
+        assert!(prompt.contains("2 message(s) delivered this turn, 3 more pending"));
+        assert!(prompt.contains("run ignore"));
+    }
+
+    #[test]
+    fn minimal_turn_input_single_message_uses_new_message_header() {
+        let mut message = sample_message(
+            "msg_min_single",
+            ScopeRef {
+                kind: ScopeKind::Channel,
+                id: "chan_dev".into(),
+            },
+            "#chan_dev",
+            None,
+            None,
+        );
+        message.body = "just one".into();
+        let prompt = render_minimal_turn_input(
+            "actor_agent_dev",
+            &[AgentTrigger::Message(message)],
+            &HashMap::new(),
+            ReminderRender::Skip,
+            &TurnUnreadGap::empty(),
+        );
+        assert!(prompt.starts_with("New message:"));
+        assert!(
+            !prompt.contains("Rules:"),
+            "reminder off leaves no rule footer"
+        );
+    }
+
+    #[test]
+    fn turn_input_style_defaults_to_minimal_and_reads_spec() {
+        let mut spec = sample_spec(None);
+        assert_eq!(turn_input_style_for_spec(&spec), TurnInputStyle::Minimal);
+        spec.wake = Some(proto::methods::WakeSpec {
+            turn_input_style: Some(TurnInputStyle::Structured),
+            ..Default::default()
+        });
+        assert_eq!(turn_input_style_for_spec(&spec), TurnInputStyle::Structured);
+    }
+
+    #[test]
     fn latest_prompt_marks_private_visibility() {
         let mut actor_names = HashMap::new();
         actor_names.insert("actor_agent_coordinator".into(), "Coordinator".into());
@@ -13216,6 +13916,100 @@ mod tests {
         assert!(state.current_turn(&active_scope.id).is_none());
         assert!(state.clear_turn(&active_scope.id).is_none());
         assert!(state.has_pending_source(&queued_thread.id));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn abandoning_unexecuted_dispatch_releases_slot_and_retry_markers() {
+        let root = temp_path("pre-provider-abort");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        let state = WorkerState::new(
+            "actor_demo".into(),
+            sample_spec(None),
+            paths.profile.clone(),
+            paths,
+            "ws://127.0.0.1:0".into(),
+        );
+        let scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: "chan_retry".into(),
+        };
+        let turn_key = "scope:channel:chan_retry";
+        let current = AgentTrigger::Message(sample_message(
+            "msg_current",
+            scope.clone(),
+            "#chan_retry",
+            None,
+            None,
+        ));
+        let queued = AgentTrigger::Message(sample_message(
+            "msg_queued",
+            scope.clone(),
+            "#chan_retry",
+            None,
+            None,
+        ));
+        for source_id in ["msg_current", "msg_context", "msg_queued"] {
+            assert!(state.remember_source(source_id));
+        }
+        assert!(state.begin_or_enqueue(turn_key, current.clone()));
+        state.set_turn(ActiveTurn {
+            id: "run_pre_provider".into(),
+            run_id: "run_pre_provider".into(),
+            turn_key: turn_key.into(),
+            scope: scope.clone(),
+            opened_at: Utc::now(),
+            trigger_source_id: "msg_current".into(),
+            trigger_source_ids: vec!["msg_current".into(), "msg_context".into()],
+            trigger_batch: vec![current.clone()],
+            ack_on_finish: true,
+            trigger_is_message: true,
+            assignment_id: None,
+            reply_target: Some("#chan_retry".into()),
+            prompt_stats: empty_prompt_stats(),
+            prompt_breakdown: empty_prompt_breakdown(),
+            trigger_actor: "actor_human".into(),
+            trigger_private_to: Vec::new(),
+            no_reply_file: None,
+            no_reply_requested: false,
+            cancel_requested: false,
+            provider_started: false,
+        });
+        assert!(!state.begin_or_enqueue(turn_key, queued.clone()));
+        assert!(state.take_seed_slot(&scope.id));
+        state.push_text("run_pre_provider", "must be discarded");
+
+        let retry_ids = state.abandon_unexecuted_dispatch(
+            turn_key,
+            &scope.id,
+            &["msg_current".into(), "msg_context".into()],
+            true,
+        );
+
+        assert_eq!(
+            retry_ids.into_iter().collect::<HashSet<_>>(),
+            ["msg_current", "msg_context", "msg_queued"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        );
+        assert!(state.current_turn(&scope.id).is_none());
+        assert!(!state.has_pending_source("msg_queued"));
+        assert!(state.peek_text("run_pre_provider").is_none());
+        assert!(
+            state.take_seed_slot(&scope.id),
+            "failed prompt preparation must restore first-turn bootstrap"
+        );
+        for source_id in ["msg_current", "msg_context", "msg_queued"] {
+            assert!(
+                state.remember_source(source_id),
+                "{source_id} must be eligible for durable-inbox retry"
+            );
+        }
+        assert!(
+            state.begin_or_enqueue(turn_key, current),
+            "busy reservation must be released after pre-provider failure"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 

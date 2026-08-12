@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 use super::adapter::{Adapter, AdapterEvent, AdapterPrompt, AdapterStartInfo, TokenUsage};
 use crate::acp::create_dir_all_unc;
-use crate::usage::extract_token_usage_from_text;
+use crate::usage::extract_token_usage_from_text_for_provider;
 use loom_platform::path::unc_prefix_path;
 
 const STARTUP_HANDSHAKE_ENV: &str = "LOOM_PROVIDER_STARTUP_HANDSHAKE";
@@ -48,6 +48,9 @@ pub struct InteractiveCommandConfig {
     pub provider: Option<InteractiveProviderSpec>,
     pub sessions_dir: PathBuf,
     pub profile_dir: PathBuf,
+    /// Provider-catalog id used to resolve usage-manifest semantics when
+    /// parsing token usage from provider output.
+    pub usage_provider: Option<String>,
     pub command_signature: String,
 }
 
@@ -95,6 +98,7 @@ impl InteractiveCommandConfig {
             provider,
             sessions_dir,
             profile_dir,
+            usage_provider: None,
             command_signature: format!("sha256:{}", hex::encode(hasher.finalize())),
         }
     }
@@ -532,7 +536,10 @@ fn run_prompt_inner(
                 // latest token-usage snapshot. The text-extractor walks the
                 // collected blob and returns the most recent usage object;
                 // we emit only when it changed from the last snapshot.
-                if let Some(usage) = extract_token_usage_from_text(&collected) {
+                if let Some(usage) = extract_token_usage_from_text_for_provider(
+                    &collected,
+                    cfg.usage_provider.as_deref(),
+                ) {
                     if last_emitted_usage.as_ref() != Some(&usage) {
                         let _ = sender.send(AdapterEvent::UsageUpdate {
                             scope: Some(prompt.scope.clone()),
@@ -595,8 +602,11 @@ fn run_prompt_inner(
         s.cancel_requested = false;
     }
     let stderr = stderr_handle.join().unwrap_or_default();
-    let usage = extract_token_usage_from_text(&collected)
-        .or_else(|| extract_token_usage_from_text(&stderr));
+    let usage =
+        extract_token_usage_from_text_for_provider(&collected, cfg.usage_provider.as_deref())
+            .or_else(|| {
+                extract_token_usage_from_text_for_provider(&stderr, cfg.usage_provider.as_deref())
+            });
     Ok(RunOutcome {
         success: success && found_done,
         summary,

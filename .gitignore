@@ -18,6 +18,7 @@ __pycache__/
 !/docs/README.md
 !/docs/agent-turn-input-analysis.md
 !/docs/gui-actor-provider-management-design.md
+!/docs/gui-lightweight-and-runtime-visibility-analysis.md
 !/docs/loop-engineering.md
 !/docs/protocol/
 !/docs/protocol/agent-coordination-workflow.md

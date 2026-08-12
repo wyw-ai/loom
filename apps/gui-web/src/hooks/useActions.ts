@@ -3,6 +3,7 @@ import * as ipc from "@/ipc/bridge";
 import type {
   Channel,
   ChannelMemberConfig,
+  ChannelVisibility,
   MachineInfo,
   Message,
   MessageContextResult,
@@ -700,6 +701,29 @@ export function useActions(deps: ActionDeps) {
     }
   }, []);
 
+  const updateChannelVisibility = useCallback(async (
+    channel: Channel,
+    visibility: ChannelVisibility,
+  ): Promise<boolean> => {
+    if (visibility === channel.visibility) return true;
+    const d = depsRef.current;
+    d.setBusy(`channel:visibility:${channel.id}`);
+    d.setError(null);
+    try {
+      const result = await ipc.channelUpdate({
+        channelId: channel.id,
+        visibility,
+      });
+      d.setChannels((current) => sortChannels(upsert(current, result.channel)));
+      return true;
+    } catch (err) {
+      d.setError(errorText(err));
+      return false;
+    } finally {
+      d.setBusy(null);
+    }
+  }, []);
+
   const deleteChannel = useCallback(async (channel: Channel) => {
     const d = depsRef.current;
     d.setBusy(`channel:delete:${channel.id}`);
@@ -1298,6 +1322,7 @@ export function useActions(deps: ActionDeps) {
     openLocalPath,
     createChannelWithTitle,
     renameChannel,
+    updateChannelVisibility,
     deleteChannel,
     sendMessage,
     sendThreadMessage,

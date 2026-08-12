@@ -19,7 +19,9 @@ import { machineDirList } from "@/ipc/bridge";
 import { actorAvatarUrl, agentDisplayName, agentModelValue, agentSettingsDraft, getActorRunContext, providerAvailabilityGroups, providerForAgent, runStatusAnimationName, runStatusDotClass, runStatusFullLabel } from "@/lib/agent-utils";
 import { avatarLibraryUrls, reasoningEffortChoices } from "@/lib/constants";
 import { agentFormForMachine, capitalize, errorText, machineCanCreateAgent, machineCanRunCommands, resolveAgentProvider, statusDotClass } from "@/lib/format-utils";
+import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
+import { applyWakePreset, wakePresetIdFor, WAKE_PRESETS, type WakePresetId } from "@/lib/wake-utils";
 import { ArrowLeft, Bot, Check, ChevronLeft, FileText, Folder, HardDrive, Loader2, Plus, RefreshCw, Settings, Trash2, Wrench, X } from "lucide-react";
 import type { MachineAgentProviderInfo, MachineDirListResult, MachineInfo, Run } from "@/ipc/types";
 import type { AgentDetailTab, AgentFormState, AgentMemberEntry, AgentSettingsDraft, AgentUpdatePatch } from "@/lib/types";
@@ -36,10 +38,11 @@ export function MemberListItem({
   runs: Record<string, Run>;
   onSelect: () => void;
 }) {
+  const { t } = useI18n();
   const actor = entry.agent.spec.actor;
   const ctx = getActorRunContext(runs, actor.id);
   const working = ctx != null && !ctx.isTerminal;
-  const label = working ? (runStatusFullLabel(ctx) ?? "Processing…") : entry.machine.name;
+  const label = working ? t(runStatusFullLabel(ctx) ?? "Processing…") : entry.machine.name;
   const animationName = runStatusAnimationName(ctx);
 
   return (
@@ -95,6 +98,7 @@ export function AgentRosterOverview({
   onSelectAgent: (entry: AgentMemberEntry) => void;
   onRemoveAgent: (machineId: string, actorId: string) => void;
 }) {
+  const { t } = useI18n();
   const providerGroups = providerAvailabilityGroups(machines);
   const hostRows = machines.map((machine) => ({
     machine,
@@ -108,13 +112,13 @@ export function AgentRosterOverview({
       <section className="border-b border-[#dfe3ec] px-6 py-6 lg:px-8">
         <div className="flex flex-wrap items-start justify-between gap-6">
           <div className="min-w-0">
-            <h2 className="text-xl font-bold text-[#111827]">Agents</h2>
+            <h2 className="text-xl font-bold text-[#111827]">{t("Agents")}</h2>
             <div className="mt-2 flex flex-wrap items-center gap-2 text-sm text-[#667085]">
-              <span>{entries.length} registered</span>
+              <span>{t("{{count}} registered", { count: entries.length })}</span>
               <span className="text-[#a0a6b3]">/</span>
-              <span>{onlineAgents} online</span>
+              <span>{t("{{count}} online", { count: onlineAgents })}</span>
               <span className="text-[#a0a6b3]">/</span>
-              <span>{providerGroups.length} provider types</span>
+              <span>{t("{{count}} provider types", { count: providerGroups.length })}</span>
             </div>
           </div>
           <Button
@@ -123,16 +127,16 @@ export function AgentRosterOverview({
             className="rounded-lg"
           >
             <Plus size={15} />
-            Create Agent
+            {t("Create Agent")}
           </Button>
         </div>
       </section>
 
-      <HostDetailSection title="Agent Roster" count={entries.length}>
+      <HostDetailSection title={t("Agent Roster")} count={entries.length}>
         <div className="space-y-2">
           {entries.length === 0 ? (
             <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] p-4 text-sm text-[#667085]">
-              <div>No agents registered.</div>
+              <div>{t("No agents registered.")}</div>
               <Button
                 size="sm"
                 className="mt-3 rounded-lg"
@@ -140,7 +144,7 @@ export function AgentRosterOverview({
                 disabled={!canCreateAgent}
               >
                 <Plus size={14} />
-                Create Agent
+                {t("Create Agent")}
               </Button>
             </div>
           ) : (
@@ -159,7 +163,7 @@ export function AgentRosterOverview({
       </HostDetailSection>
 
       <HostDetailSection
-        title="Create Readiness"
+        title={t("Create Readiness")}
         action={
           <Button
             variant="outline"
@@ -169,7 +173,7 @@ export function AgentRosterOverview({
             className="h-8 rounded-lg border-[#dfe3ec] bg-white"
           >
             <Plus size={14} />
-            Add Provider
+            {t("Add Provider")}
           </Button>
         }
       >
@@ -178,7 +182,7 @@ export function AgentRosterOverview({
             <div className="mb-3 flex items-center gap-2">
               <div className="flex items-center gap-2">
                 <div className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
-                  Hosts
+                  {t("Hosts")}
                 </div>
                 <span className="font-mono text-xs font-semibold text-[#9aa1ae]">
                   {hostRows.length}
@@ -188,7 +192,7 @@ export function AgentRosterOverview({
             <div className="grid gap-2">
               {hostRows.length === 0 ? (
                 <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] p-4 text-sm text-[#667085]">
-                  No registered hosts.
+                  {t("No managed hosts.")}
                 </div>
               ) : (
                 hostRows.map(({ machine, canCreate }) => {
@@ -217,10 +221,14 @@ export function AgentRosterOverview({
                         <span className="min-w-0 flex-1 truncate text-sm font-bold text-[#111827]">
                           {machine.name}
                         </span>
-                        <Badge variant={canCreate ? "outline" : "warning"}>{reason}</Badge>
+                        <Badge variant={canCreate ? "outline" : "warning"}>{t(reason)}</Badge>
                       </div>
                       <div className="mt-2 truncate text-xs text-[#667085]">
-                        {machine.providers.length} providers / {machine.onlineAgentCount}/{machine.agentCount} online
+                        {t("{{providers}} providers / {{online}}/{{agents}} online", {
+                          providers: machine.providers.length,
+                          online: machine.onlineAgentCount,
+                          agents: machine.agentCount,
+                        })}
                       </div>
                     </button>
                   );
@@ -232,7 +240,7 @@ export function AgentRosterOverview({
           <div className="min-w-0 rounded-xl border border-[#edf0f5] bg-[#fbfbfd] p-3">
             <div className="mb-3 flex items-center gap-2">
               <div className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
-                Provider Availability
+                {t("Provider Availability")}
               </div>
               <span className="font-mono text-xs font-semibold text-[#9aa1ae]">
                 {providerGroups.length}
@@ -241,7 +249,7 @@ export function AgentRosterOverview({
             <div className="max-h-60 space-y-2 overflow-y-auto soft-scrollbar">
               {providerGroups.length === 0 ? (
                 <div className="rounded-lg border border-dashed border-[#dfe3ec] bg-white p-3 text-sm text-[#667085]">
-                  No providers detected.
+                  {t("No providers detected.")}
                 </div>
               ) : (
                 providerGroups.map((group) => (
@@ -270,6 +278,7 @@ export function AgentRosterRow({
   onSelect: () => void;
   onRemoveAgent: (machineId: string, actorId: string) => void;
 }) {
+  const { t } = useI18n();
   const actor = entry.agent.spec.actor;
   const provider = providerForAgent(entry.machine, entry.agent);
 
@@ -297,19 +306,19 @@ export function AgentRosterRow({
             <span className="text-[#a0a6b3]">/</span>
             <span>{provider?.name ?? entry.agent.spec.providerRef.id}</span>
             <span className="text-[#a0a6b3]">/</span>
-            <span className="font-mono">{agentModelValue(entry.agent) || "default"}</span>
+            <span className="font-mono">{agentModelValue(entry.agent) || t("default")}</span>
           </span>
         </span>
       </button>
       <div className="flex items-center gap-2">
         <Badge variant={entry.agent.status === "online" ? "success" : "outline"}>
-          {entry.agent.status}
+          {t(entry.agent.status)}
         </Badge>
         {machineCanRunCommands(entry.machine) && (
           <Button
             variant="ghost"
             size="icon"
-            title="Remove agent"
+            title={t("Remove agent")}
             onClick={() => onRemoveAgent(entry.machine.id, actor.id)}
             disabled={busy === `agent:remove:${actor.id}`}
             className="rounded-lg"
@@ -342,6 +351,7 @@ export function AgentCreateDialog({
   onAddAgent: (form: AgentFormState) => Promise<boolean> | boolean;
   onClose: () => void;
 }) {
+  const { t } = useI18n();
   const [draft, setDraft] = useState<AgentFormState>(() =>
     agentFormForMachine(agentForm, machine),
   );
@@ -364,12 +374,12 @@ export function AgentCreateDialog({
     (item) => machineCanCreateAgent(item) && item.providers.length > 0,
   );
   const createStatusText = machine.connectionStatus !== "online"
-    ? "Start the host daemon before creating agents."
+    ? t("Start the host daemon before creating agents.")
     : !machineCanRunCommands(machine)
-      ? "This host cannot run agent commands for the current account."
+      ? t("This host cannot run agent commands for the current account.")
     : !selectedProvider
-      ? "No runtime detected for this host."
-      : `${selectedProvider.name} on ${machine.name}`;
+      ? t("No runtime detected for this host.")
+      : t("{{provider}} on {{host}}", { provider: selectedProvider.name, host: machine.name });
   const createStatusBadge = machine.connectionStatus !== "online"
     ? "offline"
     : !machineCanRunCommands(machine)
@@ -478,7 +488,7 @@ export function AgentCreateDialog({
               <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-[#f1efff] text-[#503ed4]">
                 <Bot size={15} />
               </span>
-              New Agent
+              {t("New Agent")}
             </div>
             <div className="mt-2 flex flex-wrap items-center gap-2 text-sm text-[#667085]">
               <span className="font-semibold text-[#303849]">{machine.name}</span>
@@ -488,12 +498,12 @@ export function AgentCreateDialog({
           </div>
           <div className="flex items-center gap-2">
             <Badge variant={canCreateAgent && selectedProvider ? "outline" : "warning"}>
-              {createStatusBadge}
+              {t(createStatusBadge)}
             </Badge>
             <button
               type="button"
               className="composer-icon h-8 min-w-8"
-              title="Close"
+              title={t("Close")}
               onClick={onClose}
             >
               <X size={15} />
@@ -505,12 +515,12 @@ export function AgentCreateDialog({
           <div className="space-y-5">
             <section>
               <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-[#667085]">
-                Host
+                {t("Host")}
               </div>
               <div className="grid gap-2 sm:grid-cols-2">
                 {machines.length === 0 ? (
                   <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] p-4 text-sm text-[#667085]">
-                    Register a host before creating agents.
+                    {t("Register a host before creating agents.")}
                   </div>
                 ) : (
                   machines.map((item) => {
@@ -546,11 +556,15 @@ export function AgentCreateDialog({
                             {item.name}
                           </span>
                           <span className="mt-0.5 block truncate text-xs text-[#667085]">
-                            {item.providers.length} runtimes / {item.onlineAgentCount}/{item.agentCount} online
+                            {t("{{providers}} runtimes / {{online}}/{{agents}} online", {
+                              providers: item.providers.length,
+                              online: item.onlineAgentCount,
+                              agents: item.agentCount,
+                            })}
                           </span>
                         </span>
                         <Badge variant={ready ? "outline" : "warning"}>
-                          {ready ? "ready" : blockedReason}
+                          {t(ready ? "ready" : blockedReason)}
                         </Badge>
                       </button>
                     );
@@ -561,11 +575,11 @@ export function AgentCreateDialog({
 
             <section>
               <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-[#667085]">
-                Runtime
+                {t("Runtime")}
               </div>
               {machine.providers.length === 0 ? (
                 <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] p-4 text-sm text-[#667085]">
-                  No runtimes detected for this host.
+                  {t("No runtimes detected for this host.")}
                 </div>
               ) : (
                 <div className="grid gap-2 sm:grid-cols-2">
@@ -597,7 +611,7 @@ export function AgentCreateDialog({
                             {provider.name}
                           </span>
                           <span className="mt-0.5 block truncate text-xs text-[#667085]">
-                            {provider.defaultModel || `${provider.modelChoices.length} models`}
+                            {provider.defaultModel || t("{{count}} models", { count: provider.modelChoices.length })}
                           </span>
                         </span>
                         {selected && <Check size={16} className="shrink-0 text-[#503ed4]" />}
@@ -612,14 +626,14 @@ export function AgentCreateDialog({
               <Input
                 value={draft.name}
                 onChange={(event) => updateAgentForm({ name: event.target.value })}
-                placeholder="Agent name"
+                placeholder={t("Agent name")}
                 className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
                 disabled={!canCreateAgent}
               />
               <Input
                 value={draft.actorId}
                 onChange={(event) => updateAgentForm({ actorId: event.target.value })}
-                placeholder="Actor id (optional)"
+                placeholder={t("Actor id (optional)")}
                 className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
                 disabled={!canCreateAgent}
               />
@@ -640,20 +654,20 @@ export function AgentCreateDialog({
                     }}
                     disabled={!canCreateAgent}
                   >
-                    <option value="">Default model</option>
+                    <option value="">{t("Default model")}</option>
                     {modelChoices.map((choice) => (
                       <option key={choice.id} value={choice.id}>
                         {choice.label || choice.id}
                       </option>
                     ))}
-                    <option value={customModelOptionValue}>Custom...</option>
+                    <option value={customModelOptionValue}>{t("Custom...")}</option>
                   </StyledSelect>
                 ) : null}
                 {showCustomModel && (
                   <Input
                     value={draft.model}
                     onChange={(event) => updateAgentForm({ model: event.target.value })}
-                    placeholder="Custom model"
+                    placeholder={t("Custom model")}
                     className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
                     disabled={!canCreateAgent}
                   />
@@ -668,33 +682,33 @@ export function AgentCreateDialog({
                   }
                   disabled={!canCreateAgent}
                 />
-                Autostart
+                {t("Autostart")}
               </label>
               <Input
                 value={draft.description}
                 onChange={(event) => updateAgentForm({ description: event.target.value })}
-                placeholder="Description"
+                placeholder={t("Description")}
                 className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none md:col-span-2"
                 disabled={!canCreateAgent}
               />
               <Textarea
                 value={draft.instructions}
                 onChange={(event) => updateAgentForm({ instructions: event.target.value })}
-                placeholder="Agent instructions"
+                placeholder={t("Agent instructions")}
                 className="min-h-28 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none md:col-span-2"
                 disabled={!canCreateAgent}
               />
               <div className="space-y-2 md:col-span-2">
                 <div className="flex items-center gap-2">
                   <span className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
-                    Environment Variables
+                    {t("Environment Variables")}
                   </span>
                   <button
                     type="button"
                     onClick={addEnvEntry}
                     disabled={!canCreateAgent}
                     className="inline-flex h-6 w-6 items-center justify-center rounded-md border border-[#dfe3ec] bg-white text-[#596174] hover:bg-[#f0f2f5] disabled:opacity-40"
-                    title="Add environment variable"
+                    title={t("Add environment variable")}
                   >
                     <Plus size={12} />
                   </button>
@@ -704,14 +718,14 @@ export function AgentCreateDialog({
                     <Input
                       value={key}
                       onChange={(event) => updateEnvEntry(index, event.target.value, value)}
-                      placeholder="Key"
+                      placeholder={t("Key")}
                       className="h-9 flex-1 rounded-lg border-[#dfe3ec] bg-white text-sm font-mono shadow-none"
                       disabled={!canCreateAgent}
                     />
                     <Input
                       value={value}
                       onChange={(event) => updateEnvEntry(index, key, event.target.value)}
-                      placeholder="Value"
+                      placeholder={t("Value")}
                       className="h-9 flex-1 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
                       disabled={!canCreateAgent}
                     />
@@ -720,7 +734,7 @@ export function AgentCreateDialog({
                       onClick={() => removeEnvEntry(index)}
                       disabled={!canCreateAgent}
                       className="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-[#dfe3ec] bg-white text-[#9aa1ae] hover:border-red-300 hover:text-red-500 disabled:opacity-40"
-                      title="Remove"
+                      title={t("Remove")}
                     >
                       <X size={14} />
                     </button>
@@ -728,7 +742,7 @@ export function AgentCreateDialog({
                 ))}
                 {envEntries.length === 0 && (
                   <div className="rounded-lg border border-dashed border-[#dfe3ec] px-3 py-2 text-center text-xs text-[#9aa1ae]">
-                    No environment variables. Click <Plus size={10} className="inline align-middle" /> to add one.
+                    {t("No environment variables. Click + to add one.")}
                   </div>
                 )}
               </div>
@@ -738,7 +752,10 @@ export function AgentCreateDialog({
 
         <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[#edf0f5] px-5 py-4">
           <div className="text-xs font-medium text-[#667085]">
-            {readyHosts.length} ready hosts / {writableHosts.length} writable
+            {t("{{ready}} ready hosts / {{writable}} writable", {
+              ready: readyHosts.length,
+              writable: writableHosts.length,
+            })}
           </div>
           <Button
             type="submit"
@@ -750,7 +767,7 @@ export function AgentCreateDialog({
             ) : (
               <Plus size={15} />
             )}
-            Create Agent
+            {t("Create Agent")}
           </Button>
         </div>
       </form>
@@ -779,6 +796,7 @@ export function AgentMemberDetail({
   ) => Promise<boolean> | boolean;
   onRemoveAgent: (machineId: string, actorId: string) => void;
 }) {
+  const { t } = useI18n();
   const { machine, agent } = entry;
   const actor = agent.spec.actor;
   const agentDetailKey = `${machine.id}:${actor.id}`;
@@ -809,10 +827,10 @@ export function AgentMemberDetail({
     label: string;
     icon: ComponentType<{ size?: string | number; className?: string }>;
   }> = [
-    { id: "profile", label: "Profile", icon: Bot },
-    { id: "prompt", label: "Prompt Studio", icon: FileText },
-    { id: "skills", label: "Skills", icon: Wrench },
-    { id: "settings", label: "Settings", icon: Settings },
+    { id: "profile", label: t("Profile"), icon: Bot },
+    { id: "prompt", label: t("Prompt Studio"), icon: FileText },
+    { id: "skills", label: t("Skills"), icon: Wrench },
+    { id: "settings", label: t("Settings"), icon: Settings },
   ];
 
   useEffect(() => {
@@ -921,7 +939,7 @@ export function AgentMemberDetail({
           className="mb-4 rounded-lg px-2 text-[#596174] hover:bg-[#f5f3ff] hover:text-[#503ed4]"
         >
           <ArrowLeft size={15} />
-          All Agents
+          {t("All Agents")}
         </Button>
         <div className="flex flex-wrap items-start justify-between gap-6">
           <div className="flex min-w-0 items-start gap-4">
@@ -936,19 +954,19 @@ export function AgentMemberDetail({
               </h2>
               <div className="mt-1 flex flex-wrap items-center gap-2 text-sm text-[#667085]">
                 <span className={cn("h-2 w-2 rounded-full", statusDotClass(agent.status))} />
-                <span>{capitalize(agent.status)}</span>
+                <span>{t(capitalize(agent.status))}</span>
                 <span className="text-[#a0a6b3]">/</span>
                 <span className="font-mono text-xs">{actor.id}</span>
               </div>
               <div className="mt-3 flex flex-wrap gap-2">
                 <Badge variant={agent.status === "online" ? "success" : "outline"}>
-                  {agent.status}
+                  {t(agent.status)}
                 </Badge>
                 <Badge variant="secondary">{machine.name}</Badge>
                 {machine.connectionStatus !== "online" ? (
-                  <Badge variant="warning">host offline</Badge>
+                  <Badge variant="warning">{t("host offline")}</Badge>
                 ) : machine.readOnly ? (
-                  <Badge variant="warning">read only</Badge>
+                  <Badge variant="warning">{t("read only")}</Badge>
                 ) : null}
               </div>
             </div>
@@ -959,7 +977,7 @@ export function AgentMemberDetail({
             className="rounded-lg"
           >
             {saving ? <Loader2 className="animate-spin" size={15} /> : <Check size={15} />}
-            Save Changes
+            {t("Save Changes")}
           </Button>
         </div>
       </section>
@@ -991,18 +1009,18 @@ export function AgentMemberDetail({
 
       {activeTab === "profile" && (
         <>
-          <HostDetailSection title="Profile">
+          <HostDetailSection title={t("Profile")}>
             <div className="grid gap-5 xl:grid-cols-[minmax(260px,0.42fr)_minmax(0,1fr)]">
               <div className="min-w-0">
                 <div className="mb-3 text-[11px] font-semibold uppercase tracking-wide text-[#667085]">
-                  Avatar Library
+                  {t("Avatar Library")}
                 </div>
                 <div className="grid max-h-64 grid-cols-[repeat(auto-fill,minmax(38px,1fr))] gap-2 overflow-y-auto rounded-xl border border-[#edf0f5] bg-[#fbfbfd] p-3 soft-scrollbar">
                   {avatarLibraryUrls.map((url) => (
                     <button
                       key={url}
                       type="button"
-                      title={url.split("/").pop() ?? "Avatar"}
+                      title={url.split("/").pop() ?? t("Avatar")}
                       disabled={!canEdit}
                       className={cn(
                         "flex aspect-square items-center justify-center rounded-lg border bg-white p-1 transition-colors",
@@ -1022,7 +1040,7 @@ export function AgentMemberDetail({
                 <Input
                   value={draft.displayName}
                   onChange={(event) => updateDraft({ displayName: event.target.value })}
-                  placeholder="Display name"
+                  placeholder={t("Display name")}
                   className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
                   disabled={!canEdit}
                 />
@@ -1034,14 +1052,14 @@ export function AgentMemberDetail({
                 <Textarea
                   value={draft.description}
                   onChange={(event) => updateDraft({ description: event.target.value })}
-                  placeholder="Description"
+                  placeholder={t("Description")}
                   className="min-h-20 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none md:col-span-2"
                   disabled={!canEdit}
                 />
                 <Textarea
                   value={draft.instructions}
                   onChange={(event) => updateDraft({ instructions: event.target.value })}
-                  placeholder="Agent instructions"
+                  placeholder={t("Agent instructions")}
                   className="min-h-32 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none md:col-span-2"
                   disabled={!canEdit}
                 />
@@ -1049,7 +1067,7 @@ export function AgentMemberDetail({
             </div>
           </HostDetailSection>
 
-          <HostDetailSection title="Runtime Configuration">
+          <HostDetailSection title={t("Runtime Configuration")}>
             <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
               <StyledSelect
                 value={selectedProvider?.id ?? draft.providerId}
@@ -1066,7 +1084,7 @@ export function AgentMemberDetail({
                 disabled={!canEdit || machine.providers.length === 0}
               >
                 {machine.providers.length === 0 ? (
-                  <option value="">No runtimes</option>
+                  <option value="">{t("No runtimes")}</option>
                 ) : (
                   machine.providers.map((provider) => (
                     <option key={provider.id} value={provider.id}>
@@ -1092,19 +1110,19 @@ export function AgentMemberDetail({
                     }}
                     disabled={!canEdit}
                   >
-                    <option value="">Default model</option>
+                    <option value="">{t("Default model")}</option>
                     {modelChoices.map((choice) => (
                       <option key={choice.id} value={choice.id}>
                         {choice.label || choice.id}
                       </option>
                     ))}
-                    <option value={customModelOptionValue}>Custom...</option>
+                    <option value={customModelOptionValue}>{t("Custom...")}</option>
                   </StyledSelect>
                   {showCustomModel && (
                     <Input
                       value={draft.model}
                       onChange={(event) => updateDraft({ model: event.target.value })}
-                      placeholder="Custom model"
+                      placeholder={t("Custom model")}
                       className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
                       disabled={!canEdit}
                     />
@@ -1114,7 +1132,7 @@ export function AgentMemberDetail({
                 <Input
                   value={draft.model}
                   onChange={(event) => updateDraft({ model: event.target.value })}
-                  placeholder="Model"
+                  placeholder={t("Model")}
                   className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
                   disabled={!canEdit}
                 />
@@ -1128,9 +1146,9 @@ export function AgentMemberDetail({
                   <option key={choice || "default"} value={choice}>
                     {choice
                       ? choice === "xhigh"
-                        ? "Extra high"
-                        : capitalize(choice)
-                      : "Default reasoning"}
+                        ? t("Extra high")
+                        : t(capitalize(choice))
+                      : t("Default reasoning")}
                   </option>
                 ))}
               </StyledSelect>
@@ -1141,94 +1159,142 @@ export function AgentMemberDetail({
                   onChange={(event) => updateDraft({ autostart: event.target.checked })}
                   disabled={!canEdit}
                 />
-                Autostart
+                {t("Autostart")}
               </label>
             </div>
           </HostDetailSection>
-          <HostDetailSection title="Wake Policy">
-            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
-              <label className="flex h-10 items-center gap-2 rounded-lg border border-[#dfe3ec] bg-white px-3 text-sm text-[#303849]">
-                <input
-                  type="checkbox"
-                  checked={draft.wake.coalesce !== false}
-                  onChange={(event) => updateWake({ coalesce: event.target.checked })}
+          <HostDetailSection title={t("Wake Policy")}>
+            <div className="space-y-3">
+              <div className="grid gap-3 md:grid-cols-2">
+                <StyledSelect
+                  value={wakePresetIdFor(draft.wake)}
+                  onChange={(event) => {
+                    const value = event.target.value;
+                    if (value === "custom") return;
+                    updateWake(
+                      applyWakePreset(draft.wake, value as WakePresetId),
+                    );
+                  }}
                   disabled={!canEdit}
-                />
-                Coalesce
-              </label>
-              <Input
-                type="number"
-                min={0}
-                max={10000}
-                value={draft.wake.debounceMs ?? 0}
-                onChange={(event) =>
-                  updateWake({ debounceMs: Math.max(0, Number(event.target.value) || 0) })
-                }
-                placeholder="Debounce ms"
-                className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
-                disabled={!canEdit}
-              />
-              <StyledSelect
-                value={draft.wake.replyReminder ?? "first-turn"}
-                onChange={(event) =>
-                  updateWake({
-                    replyReminder: event.target.value as NonNullable<
-                      AgentSettingsDraft["wake"]["replyReminder"]
-                    >,
-                  })
-                }
-                disabled={!canEdit}
-              >
-                <option value="first-turn">Reminder first turn</option>
-                <option value="every-turn">Reminder every turn</option>
-                <option value="off">Reminder off</option>
-              </StyledSelect>
-              <StyledSelect
-                value={draft.wake.onHumanMessageWhileBusy ?? "queue"}
-                onChange={(event) =>
-                  updateWake({
-                    onHumanMessageWhileBusy: event.target.value as NonNullable<
-                      AgentSettingsDraft["wake"]["onHumanMessageWhileBusy"]
-                    >,
-                  })
-                }
-                disabled={!canEdit}
-              >
-                <option value="queue">Busy: queue</option>
-                <option value="cancel_and_requeue">Busy: cancel + requeue</option>
-                <option value="inject">Busy: inject</option>
-              </StyledSelect>
-              <Input
-                type="number"
-                min={1}
-                max={8000}
-                value={draft.wake.contextTokenBudget ?? 900}
-                onChange={(event) =>
-                  updateWake({
-                    contextTokenBudget: Math.max(1, Number(event.target.value) || 900),
-                  })
-                }
-                placeholder="Context tokens"
-                className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
-                disabled={!canEdit}
-              />
+                >
+                  {WAKE_PRESETS.map((preset) => (
+                    <option key={preset.id} value={preset.id}>
+                      {t(preset.label)}
+                    </option>
+                  ))}
+                  {wakePresetIdFor(draft.wake) === "custom" && (
+                    <option value="custom">{t("Custom (via Advanced)")}</option>
+                  )}
+                </StyledSelect>
+                <p className="flex items-center text-xs text-[#667085]">
+                  {t(WAKE_PRESETS.find((p) => p.id === wakePresetIdFor(draft.wake))
+                    ?.description ??
+                    "Custom combination of the advanced wake fields below.")}
+                </p>
+              </div>
+              <details className="rounded-lg border border-[#dfe3ec] bg-white px-3 py-2">
+                <summary className="cursor-pointer select-none text-xs font-semibold text-[#667085]">
+                  {t("Advanced")}
+                </summary>
+                <div className="mt-3 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                  <label className="flex h-10 items-center gap-2 rounded-lg border border-[#dfe3ec] bg-white px-3 text-sm text-[#303849]">
+                    <input
+                      type="checkbox"
+                      checked={draft.wake.coalesce !== false}
+                      onChange={(event) => updateWake({ coalesce: event.target.checked })}
+                      disabled={!canEdit}
+                    />
+                    {t("Coalesce")}
+                  </label>
+                  <Input
+                    type="number"
+                    min={0}
+                    max={10000}
+                    value={draft.wake.debounceMs ?? 0}
+                    onChange={(event) =>
+                      updateWake({ debounceMs: Math.max(0, Number(event.target.value) || 0) })
+                    }
+                    placeholder={t("Debounce ms")}
+                    className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
+                    disabled={!canEdit}
+                  />
+                  <StyledSelect
+                    value={draft.wake.replyReminder ?? "first-turn"}
+                    onChange={(event) =>
+                      updateWake({
+                        replyReminder: event.target.value as NonNullable<
+                          AgentSettingsDraft["wake"]["replyReminder"]
+                        >,
+                      })
+                    }
+                    disabled={!canEdit}
+                  >
+                    <option value="first-turn">{t("Reminder first turn")}</option>
+                    <option value="every-turn">{t("Reminder every turn")}</option>
+                    <option value="off">{t("Reminder off")}</option>
+                  </StyledSelect>
+                  <StyledSelect
+                    value={draft.wake.onHumanMessageWhileBusy ?? "queue"}
+                    onChange={(event) =>
+                      updateWake({
+                        onHumanMessageWhileBusy: event.target.value as NonNullable<
+                          AgentSettingsDraft["wake"]["onHumanMessageWhileBusy"]
+                        >,
+                      })
+                    }
+                    disabled={!canEdit}
+                  >
+                    <option value="queue">{t("Busy: queue")}</option>
+                    <option value="cancel_and_requeue">{t("Busy: cancel + requeue")}</option>
+                    <option value="inject">{t("Busy: inject")}</option>
+                  </StyledSelect>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={8000}
+                    value={draft.wake.contextTokenBudget ?? 900}
+                    onChange={(event) =>
+                      updateWake({
+                        contextTokenBudget: Math.max(1, Number(event.target.value) || 900),
+                      })
+                    }
+                    placeholder={t("Context tokens")}
+                    className="h-10 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
+                    disabled={!canEdit}
+                  />
+                  <StyledSelect
+                    value={draft.wake.turnInputStyle ?? "minimal"}
+                    onChange={(event) =>
+                      updateWake({
+                        turnInputStyle: event.target.value as NonNullable<
+                          AgentSettingsDraft["wake"]["turnInputStyle"]
+                        >,
+                      })
+                    }
+                    disabled={!canEdit}
+                  >
+                    <option value="minimal">{t("Turn input: minimal text")}</option>
+                    <option value="structured">{t("Turn input: structured JSON")}</option>
+                  </StyledSelect>
+                </div>
+              </details>
             </div>
           </HostDetailSection>
-          <HostDetailSection title="Environment Variables">
+          <HostDetailSection title={t("Environment Variables")}>
             <div className="space-y-2">
               {envEntries.map(([key, value], index) => (
                 <div key={index} className="flex items-center gap-2">
                   <Input
                     value={key}
                     onChange={(event) => updateEnvEntry(index, event.target.value, value)}
-                    placeholder="Key"
+                    placeholder={t("Key")}
                     className="h-9 flex-1 rounded-lg border-[#dfe3ec] bg-white text-sm font-mono shadow-none"
                     disabled={!canEdit}
                   />
                   <Input
                     value={value}
                     onChange={(event) => updateEnvEntry(index, key, event.target.value)}
-                    placeholder="Value"
+                    placeholder={t("Value")}
                     className="h-9 flex-1 rounded-lg border-[#dfe3ec] bg-white text-sm shadow-none"
                     disabled={!canEdit}
                   />
@@ -1237,7 +1303,7 @@ export function AgentMemberDetail({
                     onClick={() => removeEnvEntry(index)}
                     disabled={!canEdit}
                     className="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-[#dfe3ec] bg-white text-[#9aa1ae] hover:border-red-300 hover:text-red-500 disabled:opacity-40"
-                    title="Remove"
+                    title={t("Remove")}
                   >
                     <X size={14} />
                   </button>
@@ -1250,7 +1316,7 @@ export function AgentMemberDetail({
                 className="inline-flex items-center gap-1.5 rounded-lg border border-dashed border-[#dfe3ec] px-3 py-2 text-xs text-[#596174] hover:border-[#c0c7d2] hover:bg-[#f0f2f5] disabled:opacity-40"
               >
                 <Plus size={12} />
-                Add environment variable
+                {t("Add environment variable")}
               </button>
             </div>
           </HostDetailSection>
@@ -1264,7 +1330,7 @@ export function AgentMemberDetail({
       {activeTab === "skills" && (
         <>
           <HostDetailSection
-            title="Skills"
+            title={t("Skills")}
             count={draft.bundleSkills.length}
             action={
               <Button
@@ -1275,14 +1341,14 @@ export function AgentMemberDetail({
                 className="rounded-lg"
               >
                 <Plus size={14} />
-                Add Skill
+                {t("Add Skill")}
               </Button>
             }
           >
             <div className="space-y-3">
               {draft.bundleSkills.length === 0 ? (
                 <div className="rounded-lg border border-dashed border-[#dfe3ec] bg-[#fbfbfd] px-4 py-6 text-sm text-[#667085]">
-                  No custom skills configured.
+                  {t("No custom skills configured.")}
                 </div>
               ) : (
                 draft.bundleSkills.map((skill) => (
@@ -1301,7 +1367,7 @@ export function AgentMemberDetail({
                       onClick={() => removeSkill(skill.id)}
                       disabled={!canEdit || saving}
                       className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-[#dfe3ec] bg-white text-[#9aa1ae] hover:border-red-300 hover:text-red-500 disabled:opacity-40"
-                      title="Remove skill"
+                      title={t("Remove skill")}
                     >
                       <Trash2 size={14} />
                     </button>
@@ -1325,37 +1391,37 @@ export function AgentMemberDetail({
 
       {activeTab === "settings" && (
         <>
-          <HostDetailSection title="Info">
+          <HostDetailSection title={t("Info")}>
             <div className="divide-y divide-[#edf0f5]">
-              <HostInfoRow label="Host">{machine.name}</HostInfoRow>
-              <HostInfoRow label="Actor ID" mono>{actor.id}</HostInfoRow>
-              <HostInfoRow label="Profile Path" mono>{agent.profilePath || "Not set"}</HostInfoRow>
+              <HostInfoRow label={t("Host")}>{machine.name}</HostInfoRow>
+              <HostInfoRow label={t("Actor ID")} mono>{actor.id}</HostInfoRow>
+              <HostInfoRow label={t("Profile Path")} mono>{agent.profilePath || t("Not set")}</HostInfoRow>
             </div>
           </HostDetailSection>
 
-          <HostDetailSection title="Actions">
+          <HostDetailSection title={t("Actions")}>
             <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-[#dfe3ec] bg-[#fbfbfd] px-4 py-3">
               <div className="min-w-0">
-                <div className="text-sm font-bold text-[#111827]">Remove Agent</div>
+                <div className="text-sm font-bold text-[#111827]">{t("Remove Agent")}</div>
                 <div className="mt-1 text-sm text-[#667085]">
-                  Remove this member from {machine.name}.
+                  {t("Remove this member from {{host}}.", { host: machine.name })}
                 </div>
               </div>
               {canEdit ? (
                 <Button
                   variant="destructive"
                   size="sm"
-                  title="Remove agent"
+                  title={t("Remove agent")}
                   onClick={() => onRemoveAgent(machine.id, actor.id)}
                   disabled={removing}
                   className="rounded-lg"
                 >
                   {removing ? <Loader2 className="animate-spin" size={15} /> : <Trash2 size={15} />}
-                  Remove Agent
+                  {t("Remove Agent")}
                 </Button>
               ) : (
                 <Badge variant="warning">
-                  {machine.connectionStatus === "online" ? "unavailable" : "host offline"}
+                  {t(machine.connectionStatus === "online" ? "unavailable" : "host offline")}
                 </Badge>
               )}
             </div>
@@ -1379,6 +1445,7 @@ function AgentSkillAddDialog({
   onCancel: () => void;
   onAddSkill: (source: string) => Promise<boolean> | boolean;
 }) {
+  const { t } = useI18n();
   const canBrowseRemote = Boolean(
     machineCanRunCommands(machine) && machine.capabilities.includes("fs.dir.list"),
   );
@@ -1439,7 +1506,7 @@ function AgentSkillAddDialog({
       className="fixed inset-0 z-50 flex items-center justify-center bg-[#111827]/35 px-4 py-6 backdrop-blur-sm"
       role="dialog"
       aria-modal="true"
-      aria-label="Add skill"
+      aria-label={t("Add skill")}
       onMouseDown={onCancel}
     >
       <form
@@ -1449,10 +1516,10 @@ function AgentSkillAddDialog({
       >
         <div className="flex min-w-0 items-start justify-between gap-4 border-b border-[#edf0f5] px-5 py-4">
           <div className="min-w-0">
-            <div className="truncate text-sm font-bold text-[#111827]">Add Skill</div>
+            <div className="truncate text-sm font-bold text-[#111827]">{t("Add Skill")}</div>
             <div className="mt-0.5 truncate text-xs text-[#667085]">{machine.name}</div>
           </div>
-          <button className="composer-icon h-8 min-w-8" type="button" title="Close" onClick={onCancel}>
+          <button className="composer-icon h-8 min-w-8" type="button" title={t("Close")} onClick={onCancel}>
             <X size={14} />
           </button>
         </div>
@@ -1464,7 +1531,7 @@ function AgentSkillAddDialog({
                 htmlFor={skillDirectoryInputId}
                 className="mb-1 block text-xs font-bold text-[#596174]"
               >
-                Skill directory
+                {t("Skill directory")}
               </label>
               <div className="grid grid-cols-[minmax(0,1fr)_auto] gap-2">
                 <Input
@@ -1490,15 +1557,15 @@ function AgentSkillAddDialog({
                   className="h-10 rounded-lg"
                 >
                   <Folder size={13} />
-                  Browse
+                  {t("Browse")}
                 </Button>
               </div>
             </div>
             {!canBrowseRemote && (
               <div className="rounded-lg border border-[#edf0f5] bg-[#fbfbfd] px-3 py-2 text-xs text-[#667085]">
                 {machine.connectionStatus === "online"
-                  ? "Directory browsing is unavailable on this host."
-                  : "Start the host daemon to browse or add skills."}
+                  ? t("Directory browsing is unavailable on this host.")
+                  : t("Start the host daemon to browse or add skills.")}
               </div>
             )}
           </div>
@@ -1524,11 +1591,11 @@ function AgentSkillAddDialog({
                 size="sm"
                 onClick={() => openBrowserPath(browser?.parent)}
                 disabled={!canBrowseRemote || browserLoading || !browser?.parent}
-                title="Parent directory"
+                title={t("Parent directory")}
                 className="h-8 rounded-md"
               >
                 <ChevronLeft size={13} />
-                Up
+                {t("Up")}
               </Button>
               <Button
                 type="button"
@@ -1536,11 +1603,11 @@ function AgentSkillAddDialog({
                 size="sm"
                 onClick={() => browser?.path && setSelectedSkillPath(browser.path)}
                 disabled={!canEdit || !browser?.path}
-                title="Use current directory"
+                title={t("Use current directory")}
                 className="h-8 rounded-md"
               >
                 <Check size={13} />
-                Use Current
+                {t("Use Current")}
               </Button>
             </div>
 
@@ -1549,7 +1616,7 @@ function AgentSkillAddDialog({
                 className="flex h-9 min-w-0 items-center truncate rounded-lg border border-[#dfe3ec] bg-white px-3 font-mono text-xs text-[#667085]"
                 title={browser?.path}
               >
-                {browser?.path ?? "No directory open"}
+                {browser?.path ?? t("No directory open")}
               </div>
               <Button
                 type="button"
@@ -1557,7 +1624,7 @@ function AgentSkillAddDialog({
                 size="icon"
                 onClick={() => openBrowserPath(browser?.path ?? browserPath)}
                 disabled={!canBrowseRemote || browserLoading}
-                title="Refresh"
+                title={t("Refresh")}
                 className="h-9 w-9 rounded-lg"
               >
                 {browserLoading ? <Loader2 className="animate-spin" size={14} /> : <RefreshCw size={14} />}
@@ -1568,14 +1635,14 @@ function AgentSkillAddDialog({
               {browserLoading ? (
                 <div className="flex items-center gap-2 px-2 py-3 text-sm text-[#667085]">
                   <Loader2 className="animate-spin" size={15} />
-                  Loading
+                  {t("Loading")}
                 </div>
               ) : !browser ? (
                 <div className="px-2 py-8 text-center text-xs text-[#667085]">
-                  {canBrowseRemote ? "Open a directory." : "Browsing unavailable."}
+                  {canBrowseRemote ? t("Open a directory.") : t("Browsing unavailable.")}
                 </div>
               ) : entries.length === 0 ? (
-                <div className="px-2 py-8 text-center text-xs text-[#667085]">No child folders.</div>
+                <div className="px-2 py-8 text-center text-xs text-[#667085]">{t("No child folders.")}</div>
               ) : (
                 entries.map((entry) => (
                   <button
@@ -1602,7 +1669,7 @@ function AgentSkillAddDialog({
             </div>
             {browser?.truncated && (
               <div className="border-t border-[#edf0f5] px-3 py-2 text-xs text-[#8a93a5]">
-                Showing the first 500 folders.
+                {t("Showing the first 500 folders.")}
               </div>
             )}
             {browserError && (
@@ -1615,11 +1682,11 @@ function AgentSkillAddDialog({
 
         <div className="flex justify-end gap-2 border-t border-[#edf0f5] px-5 py-4">
           <Button variant="outline" size="sm" onClick={onCancel}>
-            Cancel
+            {t("Cancel")}
           </Button>
           <Button type="submit" size="sm" disabled={!canAdd}>
             {saving ? <Loader2 className="animate-spin" size={13} /> : <Plus size={13} />}
-            Add Skill
+            {t("Add Skill")}
           </Button>
         </div>
       </form>

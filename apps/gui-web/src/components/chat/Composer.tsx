@@ -14,11 +14,12 @@ import {
   ensurePasteFileName,
 } from "@/lib/attachment-utils";
 import { AutoGrowTextarea } from "@/components/ui/AutoGrowTextarea";
-import { Button } from "@/components/ui/button";
-import { Send, Loader2, X, Paperclip, AlertTriangle } from "lucide-react";
+import { X, AlertTriangle } from "lucide-react";
 import { MentionMenu } from "@/components/chat/MentionMenu";
 import { ComposerResizeHandle } from "@/components/chat/ComposerResizeHandle";
 import { AttachmentPreviewBar } from "@/components/chat/AttachmentPreviewBar";
+import { ComposerActions } from "@/components/chat/ComposerActions";
+import { useI18n } from "@/lib/i18n";
 
 export function Composer({
   draft,
@@ -29,8 +30,8 @@ export function Composer({
   onClearReply,
   onSend,
   mentionAgents,
-  placeholder = "Message",
-  disabledPlaceholder = "Connect and select a channel",
+  placeholder,
+  disabledPlaceholder,
   busy,
 }: {
   draft: string;
@@ -45,6 +46,7 @@ export function Composer({
   disabledPlaceholder?: string;
   busy: boolean;
 }) {
+  const { t } = useI18n();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [caretIndex, setCaretIndex] = useState(draft.length);
   const [selectedMentionIndex, setSelectedMentionIndex] = useState(0);
@@ -169,8 +171,10 @@ export function Composer({
         <div className="flex h-full flex-col">
           {replyTo && (
             <div className="mb-2 flex shrink-0 items-center gap-2 rounded-lg border border-[#dfe3ec] bg-[#f7f8fb] px-3 py-2 text-xs text-[#667085]">
-              <span className="min-w-0 flex-1 truncate">Replying to {actorName}</span>
-              <button onClick={onClearReply}>
+              <span className="min-w-0 flex-1 truncate">
+                {t("Replying to {{name}}", { name: actorName })}
+              </span>
+              <button onClick={onClearReply} aria-label={t("Cancel reply")}>
                 <X size={14} />
               </button>
             </div>
@@ -179,13 +183,17 @@ export function Composer({
             <div className="mb-2 flex shrink-0 items-center gap-1.5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-700">
               <AlertTriangle size={13} className="shrink-0" />
               {willConvertLongText
-                ? `Message exceeds ${LONG_TEXT_THRESHOLD} characters and will be sent as a .txt attachment.`
-                : `Message is approaching the ${LONG_TEXT_THRESHOLD} character limit.`}
+                ? t("Message exceeds {{count}} characters and will be sent as a .txt attachment.", {
+                    count: LONG_TEXT_THRESHOLD,
+                  })
+                : t("Message is approaching the {{count}} character limit.", {
+                    count: LONG_TEXT_THRESHOLD,
+                  })}
             </div>
           )}
           {attachmentError && (
             <div className="mb-2 shrink-0 rounded-lg border border-red-200 bg-red-50 px-3 py-1.5 text-xs font-medium text-red-700">
-              {attachmentError}
+              {t(attachmentError)}
             </div>
           )}
           <input
@@ -199,7 +207,7 @@ export function Composer({
             }}
           />
           <div
-            className={`composer-box relative flex-1${isManual ? " composer-box-manual" : ""}${dragHover ? " ring-2 ring-blue-400" : ""}`}
+            className={`composer-box relative min-w-0 flex-1${isManual ? " composer-box-manual" : ""}${dragHover ? " ring-2 ring-blue-400" : ""}`}
             onDrop={(e) => {
               e.preventDefault();
               setDragHover(false);
@@ -267,26 +275,20 @@ export function Composer({
                 }
               }}
               disabled={disabled}
-              placeholder={disabled ? disabledPlaceholder : placeholder}
-              className="max-h-full min-h-[44px] w-full flex-1 px-3 mr-12"
+              placeholder={disabled
+                ? t(disabledPlaceholder ?? "Connect and select a channel")
+                : t(placeholder ?? "Message — type @ to wake an agent")}
+              className="composer-textarea-with-actions box-border max-h-full min-h-[44px] w-full min-w-0 flex-1 pl-3"
             />
-            <Button
-              size="icon"
-              onClick={handleSend}
-              disabled={disabled || (!draft.trim() && attachments.length === 0) || busy}
-              className="absolute bottom-2 right-3 h-9 w-9 shrink-0 rounded-lg"
-            >
-              {busy ? <Loader2 className="animate-spin" size={17} /> : <Send size={17} />}
-            </Button>
-            <button
-              type="button"
-              onClick={openFilePicker}
-              disabled={disabled}
-              title="Attach files"
-              className="absolute bottom-[46px] right-3 z-10 flex h-9 w-9 items-center justify-center rounded-lg text-[#667085] transition-colors hover:bg-[#f0f2f7] hover:text-[#1d2939] disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              <Paperclip size={16} />
-            </button>
+            <ComposerActions
+              attachLabel={t("Attach files")}
+              attachDisabled={disabled}
+              busy={busy}
+              sendDisabled={disabled || (!draft.trim() && attachments.length === 0)}
+              sendLabel={t("Send message")}
+              onAttach={openFilePicker}
+              onSend={handleSend}
+            />
           </div>
         </div>
       </Resizable>

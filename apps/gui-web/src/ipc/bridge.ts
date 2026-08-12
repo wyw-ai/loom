@@ -1,5 +1,6 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen as tauriListen, type UnlistenFn } from "@tauri-apps/api/event";
+import * as webBridge from "./webBridge";
 
 import type {
   AgentFileListResult,
@@ -13,7 +14,11 @@ import type {
   Artifact,
   ArtifactReadResult,
   Channel,
+  ChannelLayoutResult,
+  ChannelLayoutSection,
   ChannelMemberConfig,
+  ChannelVisibility,
+  ConnectionEvent,
   DesktopConfig,
   DeliveryPolicy,
   DeliveryState,
@@ -40,7 +45,7 @@ import type {
   TaskAssignmentType,
   Thread,
   WakeSpec,
-  Workspace,
+  WorkspaceConnectResult,
 } from "./types";
 
 export type LoginProvider = "google" | "github";
@@ -59,7 +64,7 @@ export type AccountLocalDefaults = {
   actorId: string;
 };
 
-function hasTauriRuntime() {
+export function hasTauriRuntime() {
   return (
     typeof window !== "undefined" &&
     Boolean(
@@ -69,12 +74,164 @@ function hasTauriRuntime() {
   );
 }
 
+export function isWebMode() {
+  return !hasTauriRuntime();
+}
+
+export function hasWebConnectionConfig() {
+  return webBridge.hasWebConnectionConfig();
+}
+
+export function configureWebConnection(args: webBridge.WebConnectionInput) {
+  return webBridge.configureWebConnection(args);
+}
+
+const commandToRpcMethod: Record<string, string> = {
+  channel_list: "channel/list",
+  channel_create: "channel/create",
+  channel_update: "channel/update",
+  channel_layout_get: "channel.layout.get",
+  channel_layout_set: "channel.layout.set",
+  channel_delete: "channel/delete",
+  channel_invite: "channel/invite",
+  channel_member_config_list: "channel/member_config.list",
+  channel_member_config_set: "channel/member_config.set",
+  channel_member_config_clear: "channel/member_config.clear",
+  channel_revoke: "channel/revoke",
+  channel_members: "channel/members",
+  thread_list: "thread/list",
+  thread_create: "thread/create",
+  thread_archive: "thread/archive",
+  scope_subscribe: "scope/subscribe",
+  scope_unsubscribe: "scope/unsubscribe",
+  message_list: "message.list",
+  message_search: "message.search",
+  message_context: "message.context",
+  message_send: "message.send",
+  message_read: "message.read",
+  message_reaction_toggle: "message.reaction.toggle",
+  run_cancel: "run.cancel",
+  run_list: "run.list",
+  run_get: "run.get",
+  inbox_list: "inbox.list",
+  delivery_ack: "delivery.ack",
+  inbox_status: "inbox.status",
+  delivery_cancel: "delivery.cancel",
+  delivery_expedite: "delivery.expedite",
+  connection_list: "connection/list",
+  artifact_get: "artifact/get",
+  artifact_read: "artifact/read",
+  artifact_publish: "artifact/publish",
+  task_list: "task.list",
+  task_create: "task.create",
+  task_assignment_create: "task/assignment.create",
+  actor_list: "actor/list",
+  channel_get_instruction: "channel/get_instruction",
+  channel_set_instruction: "channel/set_instruction",
+  channel_clear_instruction: "channel/clear_instruction",
+  thread_get_instruction: "thread/get_instruction",
+  thread_set_instruction: "thread/set_instruction",
+  thread_clear_instruction: "thread/clear_instruction",
+};
+
+function extractRpcParams(args?: Record<string, unknown>) {
+  if (!args) return undefined;
+  if ("params" in args) return args.params;
+  if ("args" in args) return args.args;
+  return args;
+}
+
+function desktopOnly(command: string): never {
+  throw new Error(`${command} is desktop only in Web mode`);
+}
+
+async function webInvoke<T>(
+  command: string,
+  args?: Record<string, unknown>,
+): Promise<T> {
+  switch (command) {
+    case "workspaces_list":
+      return webBridge.webConfig() as T;
+    case "workspace_add":
+      return webBridge.setWebWorkspace((args?.args ?? {}) as {
+        name: string;
+        serverUrl: string;
+        activate?: boolean;
+      }) as T;
+    case "workspace_remove":
+      return webBridge.removeWebWorkspace(String((args?.args as { id?: unknown } | undefined)?.id ?? "")) as T;
+    case "set_active_workspace":
+      return webBridge.setActiveWebWorkspace(String((args?.args as { id?: unknown } | undefined)?.id ?? "")) as T;
+    case "account_get":
+      return webBridge.webConfig().account as T;
+    case "account_auth_status":
+      return { providers: [] } as T;
+    case "account_local_defaults":
+      return webBridge.accountLocalDefaults() as T;
+    case "account_login":
+      desktopOnly(command);
+    case "account_set_local":
+      return webBridge.setWebAccount((args?.args ?? {}) as {
+        userId: string;
+        nickname: string;
+        actorId: string;
+      }) as T;
+    case "account_logout":
+      return webBridge.clearWebConnection() as T;
+    case "account_update_avatar":
+      return webBridge.updateWebAvatar(
+        String((args?.args as { avatarUrl?: unknown } | undefined)?.avatarUrl ?? ""),
+      ) as T;
+    case "avatar_cached_url":
+      return String((args?.args as { url?: unknown } | undefined)?.url ?? "") as T;
+    case "connect":
+      return webBridge.connect(
+        String((args?.args as { workspaceId?: unknown } | undefined)?.workspaceId ?? ""),
+        typeof (args?.args as { password?: unknown } | undefined)?.password === "string"
+          ? String((args?.args as { password?: unknown }).password)
+          : undefined,
+      ) as T;
+    case "disconnect":
+      webBridge.disconnect();
+      return undefined as T;
+    case "machine_list":
+    case "machine_check":
+      return { machines: [] } as T;
+    case "local_provider_check":
+      return { providers: [] } as T;
+    case "artifact_exists":
+      try {
+        await webBridge.callRpc("artifact/get", extractRpcParams(args));
+        return true as T;
+      } catch {
+        return false as T;
+      }
+    case "path_exists":
+      return false as T;
+    case "clear_attachment_cache":
+    case "clear_attachment_cache_by_type":
+      return { freedBytes: 0, clearedIds: [] } as T;
+    case "get_attachment_cache_breakdown":
+      return {
+        images: { size: 0, count: 0 },
+        other: { size: 0, count: 0 },
+        total: { size: 0, count: 0 },
+        cachedIds: [],
+      } as T;
+  }
+
+  const method = commandToRpcMethod[command];
+  if (method) return webBridge.callRpc<T>(method, extractRpcParams(args));
+
+  desktopOnly(command);
+}
+
 function invoke<T>(
   command: string,
   args?: Record<string, unknown>,
 ): Promise<T> {
   if (!hasTauriRuntime()) {
-    return Promise.reject(new Error(`Tauri runtime unavailable for ${command}`));
+    return webInvoke<T>(command, args);
   }
   return tauriInvoke<T>(command, args);
 }
@@ -83,7 +240,15 @@ function listen<T>(
   event: string,
   handler: (event: { payload: T }) => void,
 ): Promise<UnlistenFn> {
-  if (!hasTauriRuntime()) return Promise.resolve(() => {});
+  if (!hasTauriRuntime()) {
+    if (event === "loom://stream") {
+      return Promise.resolve(webBridge.onStream((payload) => handler({ payload: payload as T })));
+    }
+    if (event === "loom://connection") {
+      return Promise.resolve(webBridge.onConnection((payload) => handler({ payload: payload as T })));
+    }
+    return Promise.resolve(() => {});
+  }
   return tauriListen<T>(event, handler);
 }
 
@@ -149,11 +314,8 @@ export async function avatarCachedUrl(url: string): Promise<string> {
   return invoke("avatar_cached_url", { args: { url } });
 }
 
-export async function connect(workspaceId: string): Promise<{
-  workspace: Workspace;
-  open: unknown;
-}> {
-  return invoke("connect", { args: { workspaceId } });
+export async function connect(workspaceId: string, password?: string): Promise<WorkspaceConnectResult> {
+  return invoke("connect", { args: { workspaceId, ...(password ? { password } : {}) } });
 }
 
 export async function disconnect(): Promise<void> {
@@ -174,10 +336,27 @@ export async function channelCreate(params: {
 
 export async function channelUpdate(params: {
   channelId: string;
-  title: string;
+  title?: string;
   topic?: string;
+  visibility?: ChannelVisibility;
 }): Promise<{ channel: Channel }> {
   return invoke("channel_update", { params });
+}
+
+export async function channelLayoutGet(): Promise<ChannelLayoutResult> {
+  return invoke("channel_layout_get", { params: {} });
+}
+
+export async function channelLayoutSet(params: {
+  sections: ChannelLayoutSection[];
+  merge?: boolean;
+}): Promise<ChannelLayoutResult> {
+  return invoke("channel_layout_set", {
+    params: {
+      sections: params.sections,
+      ...(params.merge === undefined ? {} : { merge: params.merge }),
+    },
+  });
 }
 
 export async function channelDelete(params: {
@@ -373,6 +552,35 @@ export async function deliveryAck(params: {
   sourceId: string;
 }): Promise<unknown> {
   return invoke("delivery_ack", { params });
+}
+
+export async function inboxStatus(params: {
+  actorIds: string[];
+  includeEntries?: boolean;
+  entryLimit?: number;
+}): Promise<import("./types").InboxStatusResult> {
+  return invoke("inbox_status", { params });
+}
+
+export async function deliveryCancel(params: {
+  actorId: string;
+  sourceIds?: string[];
+  allPending?: boolean;
+}): Promise<{ cancelled: import("./types").Delivery[] }> {
+  return invoke("delivery_cancel", { params });
+}
+
+export async function deliveryExpedite(params: {
+  actorId: string;
+  sourceId: string;
+}): Promise<{ delivery: import("./types").Delivery }> {
+  return invoke("delivery_expedite", { params });
+}
+
+export async function connectionList(params?: {
+  actorIds?: string[];
+}): Promise<{ actorIds: string[] }> {
+  return invoke("connection_list", { params: params ?? {} });
 }
 
 export async function artifactGet(params: {
@@ -841,9 +1049,9 @@ export function onStream(cb: (u: StreamUpdate) => void): Promise<UnlistenFn> {
 }
 
 export function onConnection(
-  cb: (u: { state: "open" } | { state: "closed"; reason?: string }) => void,
+  cb: (u: ConnectionEvent) => void,
 ): Promise<UnlistenFn> {
-  return listen<{ state: "open" | "closed"; reason?: string }>(
+  return listen<ConnectionEvent>(
     "loom://connection",
     (e) => cb(e.payload),
   );

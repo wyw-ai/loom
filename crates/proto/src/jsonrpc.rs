@@ -97,6 +97,8 @@ pub mod ErrorCode {
     pub const APP_CONFLICT: i32 = -32001;
     pub const APP_INVALID_STATE: i32 = -32002;
     pub const APP_RUNTIME_ERROR: i32 = -32003;
+    pub const APP_AUTH_REQUIRED: i32 = -32010;
+    pub const APP_AUTH_FAILED: i32 = -32011;
 }
 
 impl ErrorObject {

@@ -18,6 +18,78 @@ struct ProviderUsageConfig {
     paths: Vec<String>,
     #[serde(default)]
     fields: FieldAliases,
+    #[serde(default)]
+    semantics: Option<UsageSemanticsConfig>,
+}
+
+/// Raw manifest form of the per-provider accounting semantics.
+#[derive(Debug, Clone, Deserialize)]
+struct UsageSemanticsConfig {
+    #[serde(default)]
+    report: Option<UsageReportKind>,
+    #[serde(default)]
+    input_includes_cache_read: Option<bool>,
+    #[serde(default)]
+    output_includes_reasoning: Option<bool>,
+}
+
+/// How a provider reports usage across turns of a resumed session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageReportKind {
+    /// Each usage object describes just the finished turn.
+    #[default]
+    Delta,
+    /// The provider reports running totals for the whole session; consecutive
+    /// snapshots must be diffed to recover the per-turn increment.
+    SessionCumulative,
+}
+
+/// Resolved accounting semantics for a provider (manifest `[*.semantics]`).
+#[derive(Debug, Clone, Copy)]
+pub struct UsageSemantics {
+    pub report: UsageReportKind,
+    pub input_includes_cache_read: bool,
+    pub output_includes_reasoning: bool,
+}
+
+impl Default for UsageSemantics {
+    fn default() -> Self {
+        Self {
+            report: UsageReportKind::Delta,
+            input_includes_cache_read: false,
+            output_includes_reasoning: true,
+        }
+    }
+}
+
+/// Resolve the accounting semantics for `provider`, falling back to the
+/// manifest `[default.semantics]` (and hard-coded defaults) per field.
+pub fn usage_semantics(provider: Option<&str>) -> UsageSemantics {
+    let mft = manifest();
+    let base = UsageSemantics::default();
+    let apply = |sem: &mut UsageSemantics, cfg: &UsageSemanticsConfig| {
+        if let Some(report) = cfg.report {
+            sem.report = report;
+        }
+        if let Some(v) = cfg.input_includes_cache_read {
+            sem.input_includes_cache_read = v;
+        }
+        if let Some(v) = cfg.output_includes_reasoning {
+            sem.output_includes_reasoning = v;
+        }
+    };
+    let mut sem = base;
+    if let Some(cfg) = mft.default.semantics.as_ref() {
+        apply(&mut sem, cfg);
+    }
+    if let Some(cfg) = provider
+        .and_then(|p| mft.providers.get(p))
+        .and_then(|c| c.semantics.as_ref())
+    {
+        apply(&mut sem, cfg);
+    }
+    sem
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -109,37 +181,99 @@ pub fn normalized_usage(mut usage: TokenUsage) -> TokenUsage {
     usage
 }
 
-pub fn normalized_total(usage: &TokenUsage) -> Option<u64> {
-    usage.total_tokens.or_else(|| {
-        let mut total = 0u64;
-        let mut seen = false;
-        for value in [
-            usage.input_tokens,
-            usage.output_tokens,
-            usage.cache_creation_input_tokens,
-            usage.cache_read_input_tokens,
-            usage.reasoning_tokens,
-        ] {
-            if let Some(value) = value {
-                total += value;
-                seen = true;
-            }
+/// Normalize `usage` using provider-specific accounting semantics: when the
+/// provider did not report an explicit total, derive one that avoids double
+/// counting cache/reasoning tokens for providers whose input/output slots
+/// already include them.
+pub fn normalized_usage_with_semantics(
+    mut usage: TokenUsage,
+    semantics: &UsageSemantics,
+) -> TokenUsage {
+    if usage.total_tokens.is_none() {
+        usage.total_tokens = derived_total(&usage, semantics);
+    }
+    usage
+}
+
+fn derived_total(usage: &TokenUsage, semantics: &UsageSemantics) -> Option<u64> {
+    let mut total = 0u64;
+    let mut seen = false;
+    let mut slots = vec![usage.input_tokens, usage.output_tokens];
+    if !semantics.input_includes_cache_read {
+        slots.push(usage.cache_creation_input_tokens);
+        slots.push(usage.cache_read_input_tokens);
+    }
+    if !semantics.output_includes_reasoning {
+        slots.push(usage.reasoning_tokens);
+    }
+    for value in slots {
+        if let Some(value) = value {
+            total = total.saturating_add(value);
+            seen = true;
         }
-        seen.then_some(total)
-    })
+    }
+    seen.then_some(total)
+}
+
+pub fn normalized_total(usage: &TokenUsage) -> Option<u64> {
+    usage
+        .total_tokens
+        .or_else(|| derived_total(usage, &UsageSemantics::default()))
+}
+
+/// Convert a session-cumulative snapshot into a per-turn increment by
+/// subtracting the previous snapshot field-wise (saturating so a provider
+/// session reset yields the new snapshot rather than a negative value).
+pub fn diff_usage(current: &TokenUsage, previous: &TokenUsage) -> TokenUsage {
+    fn sub_opt(current: Option<u64>, previous: Option<u64>) -> Option<u64> {
+        match (current, previous) {
+            (Some(c), Some(p)) => Some(c.saturating_sub(p)),
+            (current, None) => current,
+            (None, Some(_)) => None,
+        }
+    }
+    TokenUsage {
+        input_tokens: sub_opt(current.input_tokens, previous.input_tokens),
+        output_tokens: sub_opt(current.output_tokens, previous.output_tokens),
+        total_tokens: sub_opt(current.total_tokens, previous.total_tokens),
+        cache_creation_input_tokens: sub_opt(
+            current.cache_creation_input_tokens,
+            previous.cache_creation_input_tokens,
+        ),
+        cache_read_input_tokens: sub_opt(
+            current.cache_read_input_tokens,
+            previous.cache_read_input_tokens,
+        ),
+        reasoning_tokens: sub_opt(current.reasoning_tokens, previous.reasoning_tokens),
+        total_cost_usd: match (current.total_cost_usd, previous.total_cost_usd) {
+            (Some(c), Some(p)) => Some((c - p).max(0.0)),
+            (current, None) => current,
+            (None, Some(_)) => None,
+        },
+        estimated: current.estimated,
+    }
 }
 
 pub fn extract_token_usage_from_text(text: &str) -> Option<TokenUsage> {
+    extract_token_usage_from_text_for_provider(text, None)
+}
+
+/// Like [`extract_token_usage_from_text`] but resolves paths, field aliases
+/// and accounting semantics for `provider` first.
+pub fn extract_token_usage_from_text_for_provider(
+    text: &str,
+    provider: Option<&str>,
+) -> Option<TokenUsage> {
     let mut last = None;
     for line in text.lines() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        if let Some(usage) = extract_token_usage(&value) {
+        if let Some(usage) = extract_token_usage_for_provider(&value, provider) {
             last = Some(usage);
         }
     }
-    last.map(normalized_usage)
+    last
 }
 
 /// Observe a single ndjson-style stdout line and return a normalized usage
@@ -148,12 +282,21 @@ pub fn extract_token_usage_from_text(text: &str) -> Option<TokenUsage> {
 /// returned. On a hit the helper also updates `last` in place. Callers
 /// should treat the returned snapshot as a streaming UsageUpdate payload.
 pub fn observe_usage_line(line: &str, last: &mut Option<TokenUsage>) -> Option<TokenUsage> {
+    observe_usage_line_for_provider(line, None, last)
+}
+
+/// Provider-aware variant of [`observe_usage_line`].
+pub fn observe_usage_line_for_provider(
+    line: &str,
+    provider: Option<&str>,
+    last: &mut Option<TokenUsage>,
+) -> Option<TokenUsage> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return None;
     }
     let value: Value = serde_json::from_str(trimmed).ok()?;
-    let usage = normalized_usage(extract_token_usage(&value)?);
+    let usage = extract_token_usage_for_provider(&value, provider)?;
     if last.as_ref() == Some(&usage) {
         return None;
     }
@@ -227,7 +370,10 @@ pub fn extract_token_usage_for_provider(
             }
         };
         if let Some(usage) = token_usage_from_object_with_fields(candidate, &fields) {
-            return Some(normalized_usage(usage));
+            return Some(normalized_usage_with_semantics(
+                usage,
+                &usage_semantics(provider),
+            ));
         }
     }
     None
@@ -426,6 +572,92 @@ mod tests {
         assert_eq!(usage.input_tokens, Some(200));
         assert_eq!(usage.output_tokens, Some(50));
         assert_eq!(usage.cache_read_input_tokens, Some(30));
+    }
+
+    /// Codex-style accounting: cached input is a subset of input and there is
+    /// no explicit total → the derived total must NOT add cache tokens again.
+    #[test]
+    fn codex_derived_total_does_not_double_count_cache() {
+        let value = json!({
+            "msg": {
+                "info": {
+                    "last_token_usage": {
+                        "input_tokens": 300,
+                        "cached_input_tokens": 250,
+                        "output_tokens": 40
+                    }
+                }
+            }
+        });
+        let usage = extract_token_usage_for_provider(&value, Some("codex"))
+            .expect("codex usage should extract");
+        assert_eq!(usage.total_tokens, Some(340));
+    }
+
+    /// Reasoning tokens are included in output for every current provider
+    /// family, so the default derived total must not add them again.
+    #[test]
+    fn derived_total_does_not_double_count_reasoning() {
+        let value = json!({
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 60,
+                "reasoning_tokens": 40
+            }
+        });
+        let usage = extract_token_usage(&value).expect("usage should extract");
+        assert_eq!(usage.total_tokens, Some(160));
+    }
+
+    #[test]
+    fn usage_semantics_resolution_defaults_and_overrides() {
+        let default_sem = usage_semantics(None);
+        assert_eq!(default_sem.report, UsageReportKind::Delta);
+        assert!(!default_sem.input_includes_cache_read);
+        assert!(default_sem.output_includes_reasoning);
+
+        let codex = usage_semantics(Some("codex"));
+        assert!(codex.input_includes_cache_read);
+
+        let claude = usage_semantics(Some("claude"));
+        assert!(!claude.input_includes_cache_read);
+    }
+
+    #[test]
+    fn diff_usage_recovers_increment_from_cumulative_snapshots() {
+        let previous = TokenUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(50),
+            total_tokens: Some(150),
+            ..TokenUsage::default()
+        };
+        let current = TokenUsage {
+            input_tokens: Some(180),
+            output_tokens: Some(90),
+            total_tokens: Some(270),
+            ..TokenUsage::default()
+        };
+        let inc = diff_usage(&current, &previous);
+        assert_eq!(inc.input_tokens, Some(80));
+        assert_eq!(inc.output_tokens, Some(40));
+        assert_eq!(inc.total_tokens, Some(120));
+    }
+
+    #[test]
+    fn diff_usage_saturates_on_provider_session_reset() {
+        let previous = TokenUsage {
+            input_tokens: Some(500),
+            total_tokens: Some(500),
+            ..TokenUsage::default()
+        };
+        let current = TokenUsage {
+            input_tokens: Some(30),
+            total_tokens: Some(30),
+            ..TokenUsage::default()
+        };
+        let inc = diff_usage(&current, &previous);
+        assert_eq!(inc.input_tokens, Some(0));
+        assert_eq!(inc.total_tokens, Some(0));
     }
 
     /// Non-existent provider falls through to default paths.

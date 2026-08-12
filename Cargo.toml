@@ -7,7 +7,7 @@ members = ["crates/proto", "crates/agent-runtime", "crates/server", "crates/cli"
 default-members = ["crates/proto", "crates/agent-runtime", "crates/server", "crates/cli"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.8"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["The Loom Authors"]

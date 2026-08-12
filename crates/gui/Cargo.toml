@@ -38,6 +38,9 @@ chrono = { workspace = true }
 rfd = "0.15"
 
 [features]
+# Enabled by the Tauri production build so the bundled frontend is loaded via
+# the embedded asset protocol instead of the Vite development server URL.
+custom-protocol = ["tauri/custom-protocol"]
 # Tauri 2 capability to open devtools, opt-in in dev builds.
 devtools = ["tauri/devtools"]
 

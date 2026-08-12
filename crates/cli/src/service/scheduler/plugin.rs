@@ -120,6 +120,13 @@ impl ServicePlugin for SchedulerPlugin {
             }
         }
 
+        // The host has already established the WS connection and upserted the
+        // service actor. Reaching this point additionally proves that the
+        // scheduler config parsed and validated, so it is now safe to expose
+        // this runtime as running. Membership setup above is best-effort and
+        // intentionally does not gate readiness.
+        ctx.readiness.mark_running();
+
         if config.jobs.is_empty() {
             tracing::info!(
                 service = %runtime.service_id(),
@@ -1226,6 +1233,7 @@ mod tests {
             runtime: runtime_a.clone(),
             shutdown: shutdown_rx.clone(),
             instance: Some(request_a),
+            readiness: Default::default(),
         };
         let ctx_b = ServiceContext {
             spec,
@@ -1233,6 +1241,7 @@ mod tests {
             runtime: runtime_b.clone(),
             shutdown: shutdown_rx,
             instance: Some(request_b),
+            readiness: Default::default(),
         };
 
         let subs_a = build_substitutions(&ctx_a);

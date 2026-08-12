@@ -25,13 +25,13 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{Local, SecondsFormat, Utc};
 use proto::methods::{
-    method, stream_kind, AgentConfigActivateResult, AgentConfigPublishResult, AgentModelChoice,
-    AgentPromptAssemblySpec, AgentPromptOutputSpec, AgentPromptRoleHint, AgentSpec, AgentTransport,
-    BundleInstallMode, ChannelListResult, ChannelMemberConfigGetResult, ChannelMembersResult,
-    InboxListResult, MessageListResult, MessageSendResult, OnHumanMessageWhileBusy,
-    PromptTemplateSpec, ReplyReminderMode, RunAppendResult, RunCloseResult, RunOpenResult,
-    RuntimeAwareness, TaskAssignmentContextResult, TaskAssignmentUpdateResult, ThreadGetResult,
-    TriggerPrefixApplyOn, TurnInputStyle,
+    method, stream_kind, AgentConfigActivateResult, AgentConfigPublishResult, AgentContextSpec,
+    AgentModelChoice, AgentPromptAssemblySpec, AgentPromptOutputSpec, AgentPromptRoleHint, AgentSpec,
+    AgentTransport, BundleInstallMode, ChannelListResult, ChannelMemberConfigGetResult,
+    ChannelMembersResult, InboxListResult, MessageListResult,
+    MessageSendResult, OnHumanMessageWhileBusy, PromptTemplateSpec, ReplyReminderMode,
+    RunAppendResult, RunCloseResult, RunOpenResult, RuntimeAwareness, TaskAssignmentContextResult,
+    TaskAssignmentUpdateResult, ThreadGetResult, TriggerPrefixApplyOn, TurnInputStyle,
 };
 use proto::types::trace::TraceKind;
 use proto::types::{
@@ -52,8 +52,9 @@ use agent_runtime::interactive::{InteractiveCommandAdapter, InteractiveCommandCo
 use agent_runtime::usage;
 use agent_runtime::{
     agent_child_server_url, prepare_bundle_install, resolved_bundle_version,
-    validate_bundle_current, Adapter, AdapterEvent, AdapterModelOptions, AdapterPrompt, PromptPart,
-    PromptRoleHint, TokenUsage,
+    validate_bundle_current, Adapter, AdapterEvent, AdapterModelOptions, AdapterPrompt,
+    AssemblyContext, ContextResource, ContextResourceRegistry, FileSystemProvider, MemoryProvider,
+    MessageListProvider, PromptPart, PromptRoleHint, TokenUsage,
 };
 
 use crate::client::Client;
@@ -3423,7 +3424,10 @@ impl WorkerState {
     /// Read the cumulative token usage for a scope without modifying it.
     fn scope_total_tokens(&self, scope_id: &str) -> u64 {
         let totals = self.usage_totals.lock().unwrap_or_else(|e| e.into_inner());
-        totals.get(scope_id).map(|u| u.total_tokens).unwrap_or(0)
+        totals
+            .get(scope_id)
+            .and_then(|u| u.total_tokens)
+            .unwrap_or(0)
     }
 
     /// Read the completed-turn count for a scope.
@@ -8619,6 +8623,189 @@ fn compose_summary_generation_prompt(
 ///
 /// `batch` is the trigger batch for this turn; the last entry is the primary
 /// trigger used for scope resolution, template vars, and prefixes.
+
+// ---------------------------------------------------------------------------
+// D2: Context Layer — agentcontext.yml loading + ContextResource chain
+// ---------------------------------------------------------------------------
+
+/// Default agentcontext config filename. Uses JSON (not YAML) because
+/// loom does not depend on a YAML parser — all existing config files
+/// (spec.json, etc.) use JSON. The ARCH design references agentcontext.yml
+/// conceptually; the runtime uses agentcontext.json for the same purpose.
+const AGENTCONTEXT_FILENAME: &str = "agentcontext.json";
+
+/// Load agentcontext config from the agent profile directory.
+/// Returns None if the file doesn't exist or fails to parse.
+fn load_agentcontext_from_profile(profile_dir: &Path) -> Option<AgentContextSpec> {
+    let path = profile_dir.join(AGENTCONTEXT_FILENAME);
+    load_agentcontext_file(&path)
+}
+
+/// Load agentcontext config from a scope workspace directory.
+/// Returns None if the file doesn't exist or fails to parse.
+fn load_agentcontext_from_workspace(workspace_dir: &Path) -> Option<AgentContextSpec> {
+    let path = workspace_dir.join(AGENTCONTEXT_FILENAME);
+    load_agentcontext_file(&path)
+}
+
+/// Parse an agentcontext.json file into AgentContextSpec.
+fn load_agentcontext_file(path: &Path) -> Option<AgentContextSpec> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(err) => {
+            tracing::warn!(path = %path.display(), %err, "failed to read agentcontext config");
+            return None;
+        }
+    };
+    match serde_json::from_str::<AgentContextSpec>(&text) {
+        Ok(spec) => Some(spec),
+        Err(err) => {
+            tracing::warn!(path = %path.display(), %err, "failed to parse agentcontext config");
+            None
+        }
+    }
+}
+
+/// Merge two AgentContextSpecs: later entries override earlier ones for
+/// the same scheme. Resources from `base` that don't appear in `overlay`
+/// are preserved.
+fn merge_agentcontext(base: AgentContextSpec, overlay: AgentContextSpec) -> AgentContextSpec {
+    let mut resources = base.resources;
+    for new_res in overlay.resources {
+        if let Some(pos) = resources.iter().position(|r| r.scheme == new_res.scheme) {
+            resources[pos] = new_res;
+        } else {
+            resources.push(new_res);
+        }
+    }
+    AgentContextSpec {
+        version: overlay.version.max(base.version),
+        effective_scope: if overlay.effective_scope.is_empty() {
+            base.effective_scope
+        } else {
+            overlay.effective_scope
+        },
+        resources,
+    }
+}
+
+/// Build the ContextResourceRegistry from an AgentContextSpec.
+/// Maps each declared resource scheme to its provider implementation.
+fn build_context_resource_chain(
+    spec: &AgentContextSpec,
+    bootstrap_memory: &str,
+    turn_memory: &str,
+) -> ContextResourceRegistry {
+    let mut registry = ContextResourceRegistry::new();
+
+    for resource_spec in &spec.resources {
+        match resource_spec.scheme.as_str() {
+            "memory" => {
+                let provider = MemoryProvider::new()
+                    .with_rendered(bootstrap_memory, turn_memory);
+                registry.register(Box::new(provider));
+            }
+            "message-list" => {
+                registry.register(Box::new(MessageListProvider::new()));
+            }
+            "file" => {
+                let path = resource_spec
+                    .config
+                    .as_ref()
+                    .and_then(|c| c.get("path"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("${workspace.dir}");
+                let max_files = resource_spec
+                    .config
+                    .as_ref()
+                    .and_then(|c| c.get("max_files"))
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .unwrap_or(10);
+                // Expand ${workspace.dir} template variable.
+                let expanded = expand_workspace_dir(path);
+                let provider = FileSystemProvider::new(expanded, max_files);
+                registry.register(Box::new(FileContextResource::new(provider)));
+            }
+            "warm-summary" => {
+                // Warm summary is handled separately by the D1 mechanism.
+                // It's declared in agentcontext.yml but the actual injection
+                // goes through the existing warm_summary_section path.
+            }
+            other => {
+                tracing::warn!(scheme = other, "unknown context resource scheme; skipping");
+            }
+        }
+    }
+
+    registry
+}
+
+/// Expand `${workspace.dir}` template variable in a path string.
+fn expand_workspace_dir(path: &str) -> String {
+    // In D2, workspace.dir is resolved at assembly time from the
+    // AssemblyContext.profile_dir. For now, replace the template with "."
+    // since FileSystemProvider resolves relative to workspace_dir.
+    path.replace("${workspace.dir}", ".")
+}
+
+/// Adapter that wraps a [`FileSystemProvider`] (ResourceProvider) as a
+/// [`ContextResource`] for the D2 chain. It lists files in the mount path
+/// and assembles their contents as PromptSections.
+struct FileContextResource {
+    provider: FileSystemProvider,
+    effective_scopes: Vec<ScopeKind>,
+}
+
+impl FileContextResource {
+    fn new(provider: FileSystemProvider) -> Self {
+        Self {
+            provider,
+            effective_scopes: vec![ScopeKind::Thread, ScopeKind::Channel],
+        }
+    }
+}
+
+impl ContextResource for FileContextResource {
+    fn scheme(&self) -> &str {
+        "file"
+    }
+
+    fn priority(&self) -> i32 {
+        20
+    }
+
+    fn effective_scope(&self) -> &[ScopeKind] {
+        &self.effective_scopes
+    }
+
+    fn assemble(&self, ctx: &AssemblyContext<'_>) -> Result<Vec<agent_runtime::PromptSection>> {
+        let handles = self.provider.list(ctx.scope, ctx.profile_dir)?;
+        let mut sections = Vec::new();
+        for handle in handles {
+            match self.provider.read(&handle.uri, ctx.scope, ctx.profile_dir) {
+                Ok(content) => {
+                    if !content.text.trim().is_empty() {
+                        sections.push(agent_runtime::PromptSection {
+                            name: "file_resource",
+                            content: format!("--- {} ---\n{}", handle.name, content.text),
+                        });
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        uri = %handle.uri,
+                        %err,
+                        "failed to read file resource; skipping"
+                    );
+                }
+            }
+        }
+        Ok(sections)
+    }
+}
+
 async fn compose_envelope_prompt(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
@@ -8650,6 +8837,29 @@ async fn compose_envelope_prompt(
     let budget = wake_context_token_budget(&state.spec);
     let warm_summary = warm_summary_section(&state.profile_dir, &scope.id, budget);
 
+    // ── D2: ContextResource chain path ──────────────────────────────
+    // When AgentSpec.context_layer is Some, use the ContextResource chain.
+    // When None, fall through to D1 behavior (zero change).
+    if let Some(context_layer_spec) = &state.spec.context_layer {
+        return compose_with_context_chain(
+            state,
+            &scope,
+            &channel_id,
+            &conversation_context,
+            &runtime_context,
+            &profile_prompt_files,
+            memory_spec,
+            context_layer_spec,
+            &warm_summary,
+            &turn_input,
+            trigger_prompt,
+            trigger,
+            first_turn,
+            budget,
+        );
+    }
+
+    // ── D1 fallback path (unchanged) ────────────────────────────────
     if memory_spec.is_none() {
         let mut sections = Vec::new();
         push_profile_prompt_files_section(&mut sections, profile_prompt_files.clone());
@@ -8709,6 +8919,141 @@ async fn compose_envelope_prompt(
         trigger_prompt_prefix_from_trigger(trigger),
     );
     add_turn_input_prompt_parts(&mut prompt, trigger_prompt, &turn_input);
+    state.attach_prompt_repetition_telemetry(&scope.id, &mut prompt);
+    prompt
+}
+
+/// Compose prompt using the D2 ContextResource chain.
+///
+/// This path is used when `AgentSpec.context_layer` is `Some`. It:
+/// 1. Loads agentcontext config (scope inheritance: Agent → Channel → Thread)
+/// 2. Pre-renders memory (if MemorySpec is present) for MemoryProvider
+/// 3. Builds the ContextResourceRegistry from the config
+/// 4. Assembles sections in priority order with token budget waterfall
+/// 5. Injects Warm summary (D1 compatibility)
+/// 6. Appends user_message last
+#[allow(clippy::too_many_arguments)]
+fn compose_with_context_chain(
+    state: &Arc<WorkerState>,
+    scope: &ScopeRef,
+    channel_id: &Option<String>,
+    conversation_context: &str,
+    runtime_context: &str,
+    profile_prompt_files: &str,
+    memory_spec: Option<&proto::methods::MemorySpec>,
+    context_layer_spec: &AgentContextSpec,
+    warm_summary: &Option<agent_runtime::PromptSection>,
+    turn_input: &str,
+    trigger_prompt: &TriggerPromptText,
+    trigger: &AgentTrigger,
+    first_turn: bool,
+    budget: u64,
+) -> PromptTelemetry {
+    // 1. Load agentcontext config with scope inheritance.
+    let mut effective_spec = context_layer_spec.clone();
+
+    // Agent-level: already have it from spec.json context_layer field.
+    // Try loading from profile_dir agentcontext.json (overrides spec.json).
+    if let Some(profile_ctx) = load_agentcontext_from_profile(&state.profile_dir) {
+        effective_spec = merge_agentcontext(effective_spec, profile_ctx);
+    }
+
+    // Scope-level: load from workspace agentcontext.json.
+    let workspace_dir = &state.profile_dir.join("workspace");
+    if let Some(workspace_ctx) = load_agentcontext_from_workspace(workspace_dir) {
+        effective_spec = merge_agentcontext(effective_spec, workspace_ctx);
+    }
+
+    // 2. Pre-render memory if MemorySpec is present (for MemoryProvider).
+    let (bootstrap_rendered, turn_rendered) = if let Some(mem) = memory_spec {
+        if mem.delivery.prompt {
+            let store = agent_runtime::envelope::open_memory_store(&state.profile_dir, mem);
+            let selector = agent_runtime::memory::MemorySelector::new(
+                mem.clone(),
+                channel_id.as_deref().map(String::from),
+            );
+            match agent_runtime::memory::load_bootstrap_and_turn(
+                &selector,
+                &store,
+                turn_input,
+                conversation_context,
+            ) {
+                Ok((boot, turn)) => (
+                    agent_runtime::memory::MemoryRenderer::render_bootstrap(&boot),
+                    agent_runtime::memory::MemoryRenderer::render_turn(&turn),
+                ),
+                Err(err) => {
+                    tracing::warn!(%err, "memory selection failed; skipping memory section");
+                    (String::new(), String::new())
+                }
+            }
+        } else {
+            (String::new(), String::new())
+        }
+    } else {
+        (String::new(), String::new())
+    };
+
+    // 3. Build the ContextResource chain.
+    let registry =
+        build_context_resource_chain(&effective_spec, &bootstrap_rendered, &turn_rendered);
+
+    // 4. Fixed sections (always present, priority 0 equivalent).
+    let mut sections: Vec<agent_runtime::PromptSection> = Vec::new();
+    push_profile_prompt_files_section(&mut sections, profile_prompt_files.to_string());
+    sections.push(agent_runtime::PromptSection {
+        name: "runtime_context",
+        content: runtime_context.to_string(),
+    });
+
+    // 5. ContextResource chain assembly with budget waterfall.
+    let budget_used: u64 = sections
+        .iter()
+        .map(|s| usage::estimate_tokens(&s.content))
+        .sum();
+    let budget_remaining = budget.saturating_sub(budget_used);
+
+    let assembly_ctx = AssemblyContext {
+        scope,
+        channel_id: channel_id.as_deref(),
+        actor_id: &state.actor_id,
+        profile_dir: &state.profile_dir,
+        budget_remaining,
+        budget_total: budget,
+        delivery_context: conversation_context,
+        first_turn,
+    };
+
+    let (chain_sections, _remaining) = registry.assemble_chain(&assembly_ctx, budget_remaining);
+    sections.extend(chain_sections);
+
+    // 6. Warm summary injection (D1 compatibility).
+    // When the chain doesn't have a message-list provider, inject warm
+    // summary directly (same as D1). When it does, the warm summary is
+    // still injected directly for consistency.
+    if let Some(summary) = warm_summary {
+        insert_warm_summary_section(&mut sections, summary.clone());
+    }
+
+    // 7. User message (always last).
+    sections.push(agent_runtime::PromptSection {
+        name: "user_message",
+        content: format!("=== User message ===\n{turn_input}"),
+    });
+
+    let content = sections
+        .iter()
+        .map(|section| section.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let mut prompt = apply_trigger_prefix_to_prompt(
+        &state.spec,
+        prompt_telemetry(content, &sections),
+        first_turn,
+        trigger_prompt_prefix_from_trigger(trigger),
+    );
+    add_turn_input_prompt_parts(&mut prompt, trigger_prompt, turn_input);
     state.attach_prompt_repetition_telemetry(&scope.id, &mut prompt);
     prompt
 }
@@ -9026,7 +9371,7 @@ fn prompt_part_from_section(section: &agent_runtime::PromptSection) -> PromptPar
             | "bootstrap_memory"
             | "scope_bootstrap"
             | "profile_prompt_files"
-            | "warm_summary" => PromptRoleHint::System,
+            |             "warm_summary" | "delivery_context" | "file_resource" => PromptRoleHint::System,
             _ => PromptRoleHint::User,
         },
     }
@@ -9073,6 +9418,8 @@ fn prompt_section_title(name: &str) -> &str {
         "scope_bootstrap" => "System: Loom multi-actor context",
         "profile_prompt_files" => "System: Profile prompt files",
         "warm_summary" => "Context: Warm summary",
+        "delivery_context" => "Context: Delivery context",
+        "file_resource" => "Context: File resource",
         "trigger_prefix" => "Trigger prefix",
         "latest_message" => "Loom turn input",
         "assignment_context" => "Loom assignment context",
@@ -9111,6 +9458,8 @@ fn prompt_section_label(name: &str) -> &str {
         "scope_bootstrap" => "Scope Bootstrap",
         "profile_prompt_files" => "Profile Prompt Files",
         "warm_summary" => "Warm Summary",
+        "delivery_context" => "Delivery Context",
+        "file_resource" => "File Resource",
         "trigger_prefix" => "Trigger Prefix",
         "latest_message" => "Turn Input",
         "assignment_context" => "Assignment Context",

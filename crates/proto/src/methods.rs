@@ -3320,6 +3320,14 @@ pub struct AgentSpec {
         rename = "promptTemplate"
     )]
     pub prompt_template: Option<PromptTemplateSpec>,
+    /// Optional per-actor context layer configuration. When present,
+    /// the runtime loads agentcontext.yml from the agent profile and/or
+    /// scope workspace, and assembles context resources through the
+    /// ContextResource chain instead of hardcoded section assembly.
+    /// When absent, the runtime uses D1 behavior (direct Warm summary
+    /// injection + standard envelope composition).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_layer: Option<AgentContextSpec>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -3336,6 +3344,50 @@ pub struct AgentProviderRef {
     /// Keys here override same-named keys from the provider manifest's mode.env.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub env: std::collections::BTreeMap<String, String>,
+}
+
+// ---------------------------------------------------------------------------
+// Context Layer types (D2)
+// ---------------------------------------------------------------------------
+
+/// Per-actor context layer configuration. When present on AgentSpec,
+/// the runtime assembles context through the ContextResource chain
+/// instead of hardcoded section assembly.
+///
+/// C-4 constraint: no `skills` field in D2.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentContextSpec {
+    #[serde(default = "default_context_version")]
+    pub version: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effective_scope: Vec<ContextScopeKind>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<ContextResourceSpec>,
+}
+
+fn default_context_version() -> u32 {
+    1
+}
+
+/// A single resource declaration in agentcontext.yml.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextResourceSpec {
+    pub scheme: String,
+    pub mount: String,
+    #[serde(default)]
+    pub priority: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<serde_json::Value>,
+}
+
+/// Scope kinds for context layer effective_scope filtering.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ContextScopeKind {
+    Thread,
+    Channel,
 }
 
 /// Callee-described trigger metadata. See `AgentSpec.trigger`.

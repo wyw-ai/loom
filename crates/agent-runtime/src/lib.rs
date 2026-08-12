@@ -14,6 +14,7 @@ pub mod adapter;
 pub mod agents_md;
 pub mod bundle;
 pub mod command;
+pub mod context_layer;
 pub mod discovery;
 pub mod envelope;
 pub mod interactive;
@@ -37,6 +38,10 @@ pub use bundle::{
     prepare_bundle_install, resolved_bundle_version, validate_bundle_current, PreparedBundleInstall,
 };
 pub use envelope::{compose_prompt, EnvelopeInput, PromptSection};
+pub use context_layer::{
+    AssemblyContext, ContextResource, ContextResourceRegistry, FileSystemProvider, MemoryProvider,
+    MessageListProvider, ResourceContent, ResourceHandle, ResourceProvider,
+};
 pub use interactive::{InteractiveCommandAdapter, InteractiveCommandConfig};
 pub use mcp_servers::build_mcp_servers;
 pub use profile::{ensure_profile_scaffold, ProfileScaffold};

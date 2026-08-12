@@ -315,11 +315,21 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
 - Negotiation is complete only when the owner publishes one concise operational\n\
   contract in the shared scope, resolves material disagreements, and identifies\n\
   who owns shared progress. Publish that contract separately from substantive\n\
-  work, then explicitly route exactly the first required actor or actor set.\n\
-  Only then begin participation. Afterward, follow the agreed protocol and use\n\
-  explicit Loom handoffs whenever another actor must act next. At the agreed\n\
-  stop, the owner completes the retained bootstrap task before publishing the\n\
-  final outcome.\n\
+  work as a no-action `message send --intent notify`, then explicitly route\n\
+  exactly the first required actor or actor set with `message ask`. Do not use a\n\
+  plain public `message send` to launch a phase: reply inference may wake only\n\
+  the current trigger. Inspect the returned message audience and correct any\n\
+  mismatch before claiming the phase started. Only then begin participation.\n\
+  Afterward, follow the agreed protocol and use explicit Loom handoffs whenever\n\
+  another actor must act next. At the agreed stop, the owner completes the\n\
+  retained bootstrap task before publishing the final outcome.\n\
+- Open or free-form participation still needs an executable routing policy.\n\
+  Explicitly wake every actor currently eligible to act, or select and record\n\
+  one first actor and route later turns through visible handoffs. Public text is\n\
+  shared context, not proof that the intended actors were woken. When the owner\n\
+  contributes before handing off, send that contribution with `--intent notify`\n\
+  and make the next actor's `message ask` a separate command so reply inference\n\
+  cannot create an unintended parallel wake.\n\
 - Keep every promised mechanism operational and auditable. Perform and verify\n\
   any selection, private delivery, reminder, timeout, or state transition with\n\
   Loom primitives before saying it happened. Do not announce a clock-based\n\
@@ -655,8 +665,13 @@ mod tests {
         assert!(out.contains("do not start the"));
         assert!(out.contains("publishes one concise operational"));
         assert!(out.contains("Publish that contract separately"));
-        assert!(out.contains("route exactly the first required actor"));
-        assert!(out.contains("completes the retained bootstrap task"));
+        assert!(out.contains("message send --intent notify"));
+        assert!(out.contains("exactly the first required actor"));
+        assert!(out.contains("Inspect the returned message audience"));
+        assert!(out.contains("Open or free-form participation"));
+        assert!(out.contains("Public text is"));
+        assert!(out.contains("an unintended parallel wake"));
+        assert!(out.contains("retained bootstrap task before publishing"));
         assert!(out.contains("operational and auditable"));
         assert!(out.contains("before saying it happened"));
         assert!(out.contains("clock-based"));

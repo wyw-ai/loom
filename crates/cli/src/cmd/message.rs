@@ -108,6 +108,21 @@ pub async fn send(
         delivery_policy = Some(DeliveryPolicy::WakeAgent);
         params["deliveryPolicy"] = serde_json::to_value(DeliveryPolicy::WakeAgent)?;
     }
+    if let Some(inferred_actor) = inferred_reply.as_deref() {
+        if should_reject_inferred_single_recipient_collective_call(
+            agent_turn_is_active(),
+            explicit_notify_intent,
+            explicit_silent_policy,
+            &body,
+        ) {
+            bail!(
+                "this public call for multiple actors to act would infer only `@{inferred_actor}` \
+                 from the current trigger. This is blocked inside an agent run. Publish any \
+                 no-action context separately with `message send --intent notify`, then use \
+                 `loom message ask` with the exact actor(s) or group that must act."
+            );
+        }
+    }
     if let Some(if_latest) = if_latest.filter(|value| !value.trim().is_empty()) {
         params["ifLatestMessageId"] = json!(if_latest);
     }
@@ -205,6 +220,7 @@ fn looks_like_call_for_action(body: &str) -> bool {
         "please respond",
         "please answer",
         "please reply",
+        "please submit",
         "please choose",
         "please decide",
         "please share",
@@ -213,6 +229,13 @@ fn looks_like_call_for_action(body: &str) -> bool {
         "cast your vote",
         "start the discussion",
         "open the floor",
+        "please ask",
+        "please continue",
+        "please begin",
+        "please start",
+        "begin now",
+        "start now",
+        "who wants to",
         "请发言",
         "开始发言",
         "请讨论",
@@ -227,8 +250,50 @@ fn looks_like_call_for_action(body: &str) -> bool {
         "各位发言",
         "投票开始",
         "开始投票",
+        "请提问",
+        "开始提问",
+        "请继续",
+        "请开始",
+        "谁先",
     ];
     CUES.iter().any(|cue| lower.contains(cue))
+}
+
+/// Detect a call whose natural-language addressee is broader than the single
+/// actor inferred from the current trigger. This intentionally combines an
+/// action cue with a collective cue so informational summaries remain valid.
+fn looks_like_collective_call_for_action(body: &str) -> bool {
+    if !looks_like_call_for_action(body) {
+        return false;
+    }
+    let lower = body.to_lowercase();
+    const COLLECTIVE_CUES: &[&str] = &[
+        "everyone",
+        "everybody",
+        "all of you",
+        "all reviewers",
+        "all actors",
+        "all agents",
+        "all contributors",
+        "all participants",
+        "all members",
+        "anyone",
+        "whoever",
+        "each of you",
+        "next person",
+        "next participant",
+        "大家",
+        "各位",
+        "所有人",
+        "所有参与者",
+        "每个人",
+        "每位",
+        "任意一位",
+        "下一位",
+        "谁有",
+        "谁先",
+    ];
+    COLLECTIVE_CUES.iter().any(|cue| lower.contains(cue))
 }
 
 fn notify_only_call_for_action_warning() -> &'static str {
@@ -359,6 +424,18 @@ fn should_reject_notify_only_call_for_action(
     explicit_silent_policy: bool,
 ) -> bool {
     agent_turn_active && !explicit_notify_intent && !explicit_silent_policy
+}
+
+fn should_reject_inferred_single_recipient_collective_call(
+    agent_turn_active: bool,
+    explicit_notify_intent: bool,
+    explicit_silent_policy: bool,
+    body: &str,
+) -> bool {
+    agent_turn_active
+        && !explicit_notify_intent
+        && !explicit_silent_policy
+        && looks_like_collective_call_for_action(body)
 }
 
 /// Best-effort, non-blocking nudge: warn when a non-private message is being
@@ -696,6 +773,45 @@ mod tests {
             "天亮了，昨晚是平安夜，无人死亡。"
         ));
         assert!(!looks_like_call_for_action("Game over. Villagers win."));
+    }
+
+    #[test]
+    fn collective_call_heuristic_requires_action_and_multiple_addressees() {
+        assert!(looks_like_collective_call_for_action(
+            "All reviewers, please submit feedback now."
+        ));
+        assert!(looks_like_collective_call_for_action("下一位请继续处理。"));
+        assert!(looks_like_collective_call_for_action(
+            "阶段开始，谁有想法谁先发言。"
+        ));
+        assert!(!looks_like_collective_call_for_action(
+            "Reviewer A, please continue."
+        ));
+        assert!(!looks_like_collective_call_for_action(
+            "Everyone has submitted feedback."
+        ));
+    }
+
+    #[test]
+    fn agent_turn_rejects_collective_call_with_inferred_single_recipient() {
+        assert!(should_reject_inferred_single_recipient_collective_call(
+            true,
+            false,
+            false,
+            "Everyone, please continue."
+        ));
+        assert!(!should_reject_inferred_single_recipient_collective_call(
+            false,
+            false,
+            false,
+            "Everyone, please continue."
+        ));
+        assert!(!should_reject_inferred_single_recipient_collective_call(
+            true,
+            true,
+            false,
+            "Everyone, please continue."
+        ));
     }
 
     #[test]

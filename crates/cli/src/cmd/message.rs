@@ -58,6 +58,11 @@ pub async fn send(
     )?;
     check_artifact_attachment_claim(&body, &attachment_ids, agent_turn_is_active())?;
     let is_private = !private_to.is_empty();
+    check_public_sensitive_payload_claim(
+        &body,
+        agent_turn_is_active(),
+        !is_private && target.starts_with('#'),
+    )?;
     let mut intent = parse_message_intent(intent)?;
     let mut delivery_policy = parse_delivery_policy(delivery_policy)?;
     let explicit_notify_intent = matches!(intent, Some(MessageIntent::Notify));
@@ -193,6 +198,7 @@ pub async fn ask(
         agent_turn_is_active(),
     )?;
     check_artifact_attachment_claim(&body, &attachment_ids, agent_turn_is_active())?;
+    check_public_sensitive_payload_claim(&body, agent_turn_is_active(), target.starts_with('#'))?;
     let params = build_ask_params(
         target.clone(),
         recipients,
@@ -211,6 +217,64 @@ pub async fn ask(
         println!("message {}", res.message.id);
     }
     Ok(())
+}
+
+fn check_public_sensitive_payload_claim(
+    body: &str,
+    agent_turn_active: bool,
+    public_scope: bool,
+) -> Result<()> {
+    if !agent_turn_active || !public_scope || !looks_like_sensitive_payload(body) {
+        return Ok(());
+    }
+    bail!(
+        "this public message appears to contain a secret, hidden allocation, or actor-specific private instruction. An `audience` controls delivery, not visibility. This is blocked inside an agent run; use same-scope `message send --private-to @actor_id ...` addressed once to the complete intended private group."
+    )
+}
+
+fn looks_like_sensitive_payload(body: &str) -> bool {
+    let lower = body.to_lowercase();
+    const STRONG_CUES: &[&str] = &[
+        "this is secret",
+        "keep this secret",
+        "keep this private",
+        "confidential assignment",
+        "hidden assignment",
+        "secret assignment",
+        "这是秘密",
+        "请保密",
+        "务必保密",
+        "私密分配",
+        "秘密分配",
+        "隐藏分配",
+        "仅你可见",
+    ];
+    if STRONG_CUES.iter().any(|cue| lower.contains(cue)) {
+        return true;
+    }
+
+    const PRIVATE_ROUTE_CUES: &[&str] = &[
+        "privately",
+        "private message",
+        "direct message",
+        " dm ",
+        "私信",
+        "私聊",
+    ];
+    const DIRECT_ASSIGNMENT_CUES: &[&str] = &[
+        "you are the ",
+        "you are assigned",
+        "your role is",
+        "your identity is",
+        "assigned to you",
+        "你是",
+        "你的角色是",
+        "你的身份是",
+        "你被分配",
+        "分配给你",
+    ];
+    PRIVATE_ROUTE_CUES.iter().any(|cue| lower.contains(cue))
+        && DIRECT_ASSIGNMENT_CUES.iter().any(|cue| lower.contains(cue))
 }
 
 /// Best-effort, non-blocking heuristic: does this body read like a request for
@@ -1022,6 +1086,42 @@ mod tests {
         ));
         assert!(should_reject_notify_only_call_for_action(
             true, false, true, body
+        ));
+    }
+
+    #[test]
+    fn agent_turn_blocks_sensitive_payloads_on_public_messages() {
+        let leaked = "请保密：你的身份是审阅者，请私信提交选择。";
+        let error = check_public_sensitive_payload_claim(leaked, true, true)
+            .expect_err("public sensitive payload must be rejected in an agent turn");
+        assert!(error.to_string().contains("audience"));
+        assert!(error.to_string().contains("--private-to"));
+
+        check_public_sensitive_payload_claim(leaked, true, false)
+            .expect("same-scope private delivery is allowed");
+        check_public_sensitive_payload_claim(leaked, false, true)
+            .expect("manual CLI usage is not heuristically blocked");
+        check_public_sensitive_payload_claim(
+            "The public workflow has one reviewer and two contributors.",
+            true,
+            true,
+        )
+        .expect("public role descriptions without private allocation are allowed");
+    }
+
+    #[test]
+    fn sensitive_payload_heuristic_requires_privacy_or_private_assignment() {
+        assert!(looks_like_sensitive_payload(
+            "私信通知：你的角色是最终审阅者，请保密。"
+        ));
+        assert!(looks_like_sensitive_payload(
+            "Keep this private: you are assigned the hidden work item."
+        ));
+        assert!(!looks_like_sensitive_payload(
+            "You are the next public speaker; please continue."
+        ));
+        assert!(!looks_like_sensitive_payload(
+            "Publicly assigned roles are listed below."
         ));
     }
 

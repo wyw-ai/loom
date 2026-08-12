@@ -432,6 +432,13 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
   is explicitly intended for the public thread; keep private facts out.\n\
 - Private actions, votes, target choices, and sensitive data stay private even\n\
   when the answer is only one word.\n\
+- An `audience` on a public `message ask` controls delivery and waking; it is not\n\
+  an access-control boundary. Never put a secret, private allocation, hidden\n\
+  state, or actor-specific instruction in public message text merely because its\n\
+  audience names only the intended actors. Use one same-scope `--private-to`\n\
+  send addressed to the complete intended private group, not one overlapping\n\
+  copy per member. Verify the returned message has private metadata and exactly\n\
+  that de-duplicated group before advancing or announcing delivery complete.\n\
 - Public messages should include only information intended for that audience;\n\
   do not add labels, hints, or formatting derived from private state.\n\
 - In ordered workflows, do not take over sequencing unless you own it or were\n\
@@ -729,6 +736,10 @@ mod tests {
         assert!(out.contains("do not rely on inference for handoffs"));
         assert!(out.contains("Do not send the same answer"));
         assert!(out.contains("private wake asks for a public contribution"));
+        assert!(out.contains("an access-control boundary"));
+        assert!(out.contains("complete intended private group"));
+        assert!(out.contains("one overlapping"));
+        assert!(out.contains("returned message has private metadata"));
         assert!(out.contains("actually send it this"));
         assert!(out.contains("latest effective decision"));
         assert!(out.contains("loom guide show <topic>"));

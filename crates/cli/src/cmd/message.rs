@@ -259,13 +259,11 @@ fn looks_like_call_for_action(body: &str) -> bool {
     CUES.iter().any(|cue| lower.contains(cue))
 }
 
-/// Detect a call whose natural-language addressee is broader than the single
-/// actor inferred from the current trigger. This intentionally combines an
-/// action cue with a collective cue so informational summaries remain valid.
+/// Detect collective operational text whose natural-language audience is
+/// broader than the single actor inferred from the current trigger. This is
+/// intentionally conservative: informational collective progress must opt in
+/// to `notify`, while collective action must use explicit `ask` recipients.
 fn looks_like_collective_call_for_action(body: &str) -> bool {
-    if !looks_like_call_for_action(body) {
-        return false;
-    }
     let lower = body.to_lowercase();
     const COLLECTIVE_CUES: &[&str] = &[
         "everyone",
@@ -293,7 +291,50 @@ fn looks_like_collective_call_for_action(body: &str) -> bool {
         "谁有",
         "谁先",
     ];
-    COLLECTIVE_CUES.iter().any(|cue| lower.contains(cue))
+    const OPERATION_CUES: &[&str] = &[
+        "please act",
+        "must act",
+        "to act",
+        "take action",
+        "action",
+        "execute",
+        "proceed",
+        "participate",
+        "respond",
+        "reply",
+        "answer",
+        "submit",
+        "review",
+        "discuss",
+        "vote",
+        "choose",
+        "decide",
+        "continue",
+        "start",
+        "begin",
+        "行动",
+        "执行",
+        "推进",
+        "处理",
+        "参与",
+        "查收",
+        "回复",
+        "回答",
+        "提交",
+        "评审",
+        "讨论",
+        "投票",
+        "选择",
+        "决定",
+        "发言",
+        "提问",
+        "继续",
+        "开始",
+    ];
+    let has_collective_addressee = COLLECTIVE_CUES.iter().any(|cue| lower.contains(cue));
+    let has_operation =
+        looks_like_call_for_action(body) || OPERATION_CUES.iter().any(|cue| lower.contains(cue));
+    has_collective_addressee && has_operation
 }
 
 fn notify_only_call_for_action_warning() -> &'static str {
@@ -784,10 +825,16 @@ mod tests {
         assert!(looks_like_collective_call_for_action(
             "阶段开始，谁有想法谁先发言。"
         ));
+        assert!(looks_like_collective_call_for_action(
+            "请各位根据各自收到的说明行动。"
+        ));
+        assert!(looks_like_collective_call_for_action(
+            "所有参与者现在开始执行各自的步骤。"
+        ));
         assert!(!looks_like_collective_call_for_action(
             "Reviewer A, please continue."
         ));
-        assert!(!looks_like_collective_call_for_action(
+        assert!(looks_like_collective_call_for_action(
             "Everyone has submitted feedback."
         ));
     }

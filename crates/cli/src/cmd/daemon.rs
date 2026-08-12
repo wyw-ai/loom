@@ -742,6 +742,7 @@ fn agent_spec_from_command(
         wake,
         prompt_assembly,
         prompt_template: None,
+        context_layer: None,
     })
 }
 
@@ -3008,6 +3009,7 @@ mod tests {
             wake: None,
             prompt_assembly: None,
             prompt_template: None,
+            context_layer: None,
         }];
         let machine = machine("machine_2eabfd47", Some("actor_human_test"));
 
@@ -3114,6 +3116,7 @@ mod tests {
             wake: None,
             prompt_assembly: None,
             prompt_template: None,
+            context_layer: None,
         };
         assert!(write_config_agent_spec(&spec).is_err());
     }
@@ -3343,6 +3346,7 @@ mod tests {
             wake: None,
             prompt_assembly: None,
             prompt_template: None,
+            context_layer: None,
         };
         annotate_machine_agent_specs(std::slice::from_mut(&mut spec), &machine);
         let runtime_state = ServiceRuntimeState {

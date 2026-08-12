@@ -54,7 +54,7 @@ use agent_runtime::{
     agent_child_server_url, prepare_bundle_install, resolved_bundle_version,
     validate_bundle_current, Adapter, AdapterEvent, AdapterModelOptions, AdapterPrompt,
     AssemblyContext, ContextResource, ContextResourceRegistry, FileSystemProvider, MemoryProvider,
-    MessageListProvider, PromptPart, PromptRoleHint, TokenUsage,
+    MessageListProvider, PromptPart, PromptRoleHint, ResourceProvider, TokenUsage,
 };
 
 use crate::client::Client;
@@ -11037,6 +11037,7 @@ mod tests {
             wake: None,
             prompt_assembly: None,
             prompt_template: None,
+            context_layer: None,
         }
     }
 

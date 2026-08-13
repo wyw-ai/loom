@@ -170,8 +170,9 @@ mod tests {
 
     #[test]
     fn estimate_tokens_ascii_text() {
-        // "hello world" = 11 non-whitespace ASCII chars → ceil(11/4) = 3 tokens
-        assert_eq!(estimate_tokens("hello world"), 3);
+        // Space breaks the ascii_run: "hello" (5 chars → ceil(5/4) = 2)
+        // + "world" (5 chars → ceil(5/4) = 2) = 4 tokens.
+        assert_eq!(estimate_tokens("hello world"), 4);
     }
 
     #[test]

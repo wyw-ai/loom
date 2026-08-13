@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::Result;
-use proto::types::{ScopeKind, ScopeRef};
+use proto::types::ScopeRef;
 
 // Re-export core types from context-layer-core so existing consumers
 // (agent_serve.rs, tests) can keep using `agent_runtime::ContextResource`
@@ -207,6 +207,7 @@ pub use memory::MemoryProvider;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proto::types::ScopeKind;
 
     /// Helper: create a simple test resource with given priority and token size.
     fn make_resource(scheme: &str, priority: i32, token_estimate: usize) -> Box<dyn ContextResource> {

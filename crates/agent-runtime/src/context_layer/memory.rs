@@ -11,7 +11,7 @@
 //! ensuring output parity with D1's build_envelope memory sections.
 
 use anyhow::Result;
-use proto::types::{ScopeKind, ScopeRef};
+use proto::types::ScopeKind;
 
 use crate::envelope::PromptSection;
 

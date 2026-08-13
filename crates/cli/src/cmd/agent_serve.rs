@@ -8597,7 +8597,7 @@ fn build_summary_generation_prompt(delivery_context: &str) -> String {
 /// instruction + delivery context as the user message. The provider's
 /// response text will be persisted as the Warm summary.
 fn compose_summary_generation_prompt(
-    state: &Arc<WorkerState>,
+    _state: &Arc<WorkerState>,
     trigger_prompt: &TriggerPromptText,
 ) -> PromptTelemetry {
     let summary_text = build_summary_generation_prompt(&trigger_prompt.delivery_context);
@@ -9752,7 +9752,7 @@ async fn translate_one_with_gate(
                     }
 
                     // Reset the adapter session so the next turn starts fresh.
-                    adapter.reset_session(&scope_id).await;
+                    let _ = adapter.reset_session(&scope_id).await;
                     // Clear per-scope usage/turn tracking so session-reset
                     // detection starts fresh for the new session.
                     state.reset_scope_tracking(&scope_id);

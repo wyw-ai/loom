@@ -123,7 +123,7 @@ pub struct ContextResourcePlugin {
     pub factory: fn() -> Box<dyn ContextResource>,
 }
 
-/// Enable inventory collection of ContextResourcePlugin entries.
+// Enable inventory collection of ContextResourcePlugin entries.
 inventory::collect!(ContextResourcePlugin);
 
 // ---------------------------------------------------------------------------

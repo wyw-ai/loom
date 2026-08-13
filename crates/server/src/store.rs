@@ -3821,6 +3821,7 @@ impl Store {
 
     /// Durable cumulative token usage for `(actor, scope)`, if any closed run
     /// has reported usage there.
+    #[allow(dead_code)]
     pub fn run_usage_total(
         &self,
         actor_id: &str,

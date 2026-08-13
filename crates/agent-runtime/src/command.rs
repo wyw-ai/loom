@@ -714,6 +714,7 @@ fn run_prompt_with_slot(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn run_prompt(
     cfg: CommandConfig,
     prompt: AdapterPrompt,
@@ -1534,6 +1535,7 @@ fn spawn_and_collect_for_generation(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn spawn_and_collect(
     cfg: &CommandConfig,
     prompt: &AdapterPrompt,

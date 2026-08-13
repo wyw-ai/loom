@@ -52,6 +52,8 @@ type SidebarContextMenu =
   | { kind: "section"; sectionId: string; x: number; y: number };
 
 const sidebarContextMenuMaxHeightPx = 248;
+const sectionChannelMenuWidthPx = 240;
+const sectionChannelMenuMaxHeightPx = 224;
 
 const sidebarMoreExpandedStorageKey = "loom.sidebar.moreExpanded";
 
@@ -148,6 +150,10 @@ export function Sidebar({
     "copied" | "missing" | "copy_failed" | null
   >(null);
   const [sectionChannelMenuId, setSectionChannelMenuId] = useState<string | null>(null);
+  const [sectionChannelMenuPosition, setSectionChannelMenuPosition] = useState<{
+    right: number;
+    top: number;
+  } | null>(null);
   const [channelMoveMenuOpen, setChannelMoveMenuOpen] = useState(false);
   const [moreExpanded, setMoreExpanded] = useState(loadSidebarMoreExpanded);
   const [sidebarContextMenu, setSidebarContextMenu] =
@@ -233,6 +239,7 @@ export function Sidebar({
     closeRenameChannel();
     setSidebarContextMenu(null);
     setSectionChannelMenuId(null);
+    setSectionChannelMenuPosition(null);
   };
 
   const submitRenameSection = (
@@ -306,6 +313,7 @@ export function Sidebar({
     const position = contextMenuPosition(event);
     setChannelMoveMenuOpen(false);
     setSectionChannelMenuId(null);
+    setSectionChannelMenuPosition(null);
     setSidebarContextMenu({
       kind: "channel",
       channelId: channel.id,
@@ -328,6 +336,7 @@ export function Sidebar({
     setSectionTitleDraft("");
     setChannelMoveMenuOpen(false);
     setSectionChannelMenuId(null);
+    setSectionChannelMenuPosition(null);
     setSidebarContextMenu({
       kind: "section",
       sectionId: section.id,
@@ -347,6 +356,7 @@ export function Sidebar({
     setSectionTitleDraft("");
     setChannelMoveMenuOpen(false);
     setSectionChannelMenuId(null);
+    setSectionChannelMenuPosition(null);
     setSidebarContextMenu({ kind: "blank", ...contextMenuPosition(event) });
   };
 
@@ -354,6 +364,29 @@ export function Sidebar({
     setSidebarContextMenu(null);
     setCreateMenuOpen(true);
     handleOpenCreate(kind);
+  };
+
+  const openSectionChannelMenu = (
+    sectionId: string,
+    anchor: Pick<DOMRect, "left" | "bottom">,
+  ) => {
+    setSidebarContextMenu(null);
+    setSectionChannelMenuPosition({
+      right: Math.max(
+        channelContextMenuViewportPaddingPx,
+        window.innerWidth - anchor.left - sectionChannelMenuWidthPx,
+      ),
+      top: Math.max(
+        channelContextMenuViewportPaddingPx,
+        Math.min(
+          anchor.bottom + 4,
+          window.innerHeight -
+            sectionChannelMenuMaxHeightPx -
+            channelContextMenuViewportPaddingPx,
+        ),
+      ),
+    });
+    setSectionChannelMenuId(sectionId);
   };
 
   const handleInvitePeople = async () => {
@@ -564,7 +597,10 @@ export function Sidebar({
 
   useEffect(() => {
     if (!sectionChannelMenuId) return;
-    const close = () => setSectionChannelMenuId(null);
+    const close = () => {
+      setSectionChannelMenuId(null);
+      setSectionChannelMenuPosition(null);
+    };
     const closeOnEscape = (event: globalThis.KeyboardEvent) => {
       if (event.key === "Escape") close();
     };
@@ -878,10 +914,17 @@ export function Sidebar({
                         aria-label={t("Add channel to {{section}}", { section: section.title })}
                         aria-haspopup="menu"
                         aria-expanded={sectionChannelMenuId === section.id}
-                        onClick={() => {
+                        onClick={(event) => {
+                          event.stopPropagation();
                           setSidebarContextMenu(null);
-                          setSectionChannelMenuId((current) =>
-                            current === section.id ? null : section.id,
+                          if (sectionChannelMenuId === section.id) {
+                            setSectionChannelMenuId(null);
+                            setSectionChannelMenuPosition(null);
+                            return;
+                          }
+                          openSectionChannelMenu(
+                            section.id,
+                            event.currentTarget.getBoundingClientRect(),
                           );
                         }}
                       >
@@ -893,6 +936,7 @@ export function Sidebar({
                         title={t("Rename section")}
                         onClick={() => {
                           setSectionChannelMenuId(null);
+                          setSectionChannelMenuPosition(null);
                           startRenameSection(section);
                         }}
                       >
@@ -904,6 +948,7 @@ export function Sidebar({
                         title={t("Delete section")}
                         onClick={() => {
                           setSectionChannelMenuId(null);
+                          setSectionChannelMenuPosition(null);
                           setDeleteSectionId(section.id);
                           setEditingSectionId(null);
                           setSectionTitleDraft("");
@@ -912,47 +957,6 @@ export function Sidebar({
                       >
                         <Trash2 size={12} />
                       </button>
-                      {sectionChannelMenuId === section.id && (
-                        <div
-                          className="absolute right-0 top-7 z-30 max-h-56 w-60 overflow-y-auto rounded-lg border border-[#dfe3ec] bg-white p-1 text-left text-sm normal-case tracking-normal shadow-soft soft-scrollbar"
-                          role="menu"
-                          aria-label={t("Channels available for {{section}}", {
-                            section: section.title,
-                          })}
-                          onClick={(event) => event.stopPropagation()}
-                          onContextMenu={(event) => event.preventDefault()}
-                        >
-                          {channels.filter(
-                            (channel) => !section.channels.some((item) => item.id === channel.id),
-                          ).length === 0 ? (
-                            <div className="px-3 py-2 text-xs font-medium text-[#8a93a5]">
-                              {t("All channels are already in this section.")}
-                            </div>
-                          ) : (
-                            channels
-                              .filter(
-                                (channel) => !section.channels.some((item) => item.id === channel.id),
-                              )
-                              .map((channel) => (
-                                <button
-                                  key={channel.id}
-                                  type="button"
-                                  className="flex min-h-9 w-full items-center gap-2 rounded-md px-3 py-2 text-left font-semibold text-[#303849] hover:bg-[#f5f3ff] hover:text-[#503ed4]"
-                                  role="menuitem"
-                                  onClick={() => {
-                                    onMoveChannelToGroup(channel.id, section.id);
-                                    setSectionChannelMenuId(null);
-                                  }}
-                                >
-                                  <ArrowRight size={14} />
-                                  <span className="min-w-0 flex-1 truncate">
-                                    {t("Move #{{channel}} here", { channel: channel.title })}
-                                  </span>
-                                </button>
-                              ))
-                          )}
-                        </div>
-                      )}
                     </div>
                   )}
                 </div>
@@ -1342,8 +1346,10 @@ export function Sidebar({
                   className="flex h-9 w-full items-center gap-2 rounded-md px-3 text-left font-semibold text-[#303849] hover:bg-[#f5f3ff] hover:text-[#503ed4]"
                   role="menuitem"
                   onClick={() => {
-                    setSidebarContextMenu(null);
-                    setSectionChannelMenuId(contextMenuSection.id);
+                    openSectionChannelMenu(contextMenuSection.id, {
+                      left: sidebarContextMenu.x,
+                      bottom: sidebarContextMenu.y,
+                    });
                   }}
                 >
                   <Plus size={14} />
@@ -1375,6 +1381,55 @@ export function Sidebar({
                 </button>
               </>
             )}
+          </div>,
+          document.body,
+        )}
+      {sectionChannelMenuId && sectionChannelMenuPosition &&
+        createPortal(
+          <div
+            className="fixed z-50 max-h-56 w-60 overflow-y-auto rounded-lg border border-[#dfe3ec] bg-white p-1 text-left text-sm normal-case tracking-normal shadow-soft soft-scrollbar"
+            style={{
+              right: sectionChannelMenuPosition.right,
+              top: sectionChannelMenuPosition.top,
+            }}
+            role="menu"
+            aria-label={t("Channels available for {{section}}", {
+              section: sections.find((item) => item.id === sectionChannelMenuId)?.title ?? "",
+            })}
+            onClick={(event) => event.stopPropagation()}
+            onContextMenu={(event) => event.preventDefault()}
+          >
+            {(() => {
+              const section = sections.find((item) => item.id === sectionChannelMenuId);
+              if (!section) return null;
+              const availableChannels = channels.filter(
+                (channel) => !section.channels.some((item) => item.id === channel.id),
+              );
+              return availableChannels.length === 0 ? (
+                <div className="px-3 py-2 text-xs font-medium text-[#8a93a5]">
+                  {t("All channels are already in this section.")}
+                </div>
+              ) : (
+                availableChannels.map((channel) => (
+                  <button
+                    key={channel.id}
+                    type="button"
+                    className="flex min-h-9 w-full items-center gap-2 rounded-md px-3 py-2 text-left font-semibold text-[#303849] hover:bg-[#f5f3ff] hover:text-[#503ed4]"
+                    role="menuitem"
+                    onClick={() => {
+                      onMoveChannelToGroup(channel.id, section.id);
+                      setSectionChannelMenuId(null);
+                      setSectionChannelMenuPosition(null);
+                    }}
+                  >
+                    <ArrowRight size={14} />
+                    <span className="min-w-0 flex-1 truncate">
+                      {t("Move #{{channel}} here", { channel: channel.title })}
+                    </span>
+                  </button>
+                ))
+              );
+            })()}
           </div>,
           document.body,
         )}

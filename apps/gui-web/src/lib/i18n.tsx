@@ -211,6 +211,8 @@ const zhCN: Record<string, string> = {
   "Send message": "发送消息",
   "Thread": "讨论串",
   "Close thread": "关闭讨论串",
+  "Back to channel": "返回频道",
+  "Restore default size": "恢复默认大小",
   "Reply": "回复",
   "No replies yet.": "暂无回复。",
   "Reply in thread": "在线程中回复",

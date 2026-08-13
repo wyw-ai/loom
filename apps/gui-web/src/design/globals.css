@@ -1400,6 +1400,29 @@
   background: #ffffff;
 }
 
+.detail-panel-shell.detail-panel-shell-thread-maximized {
+  position: fixed;
+  inset: 0 0 0 calc(72px + var(--sidebar-width) + 8px);
+  z-index: 40;
+  width: auto;
+  height: 100dvh;
+  border: 0;
+  box-shadow: none;
+  animation: thread-panel-snap-in 160ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+@keyframes thread-panel-snap-in {
+  from {
+    opacity: 0.92;
+    transform: translateX(20px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
 @media (min-width: 768px) and (max-width: 1279px) {
   .detail-panel-shell {
     position: fixed;
@@ -1523,6 +1546,12 @@
     width: 100vw;
     border-left: 0;
     box-shadow: 0 -16px 48px rgb(16 24 40 / 0.16);
+  }
+
+  .detail-panel-shell.detail-panel-shell-thread-maximized {
+    inset: calc(52px + env(safe-area-inset-top)) 0 0 0;
+    width: 100vw;
+    height: auto;
   }
 
   .app-shell header {

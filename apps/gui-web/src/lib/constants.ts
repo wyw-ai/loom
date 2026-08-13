@@ -125,6 +125,8 @@ export const sidebarMaxWidth = 420;
 export const detailMinWidth = 280;
 export const detailMaxWidth = 560;
 export const mainMinWidth = 360;
+export const threadPanelDragMainMinWidth = 160;
+export const threadPanelMaximizeSnapMainWidth = 200;
 export const defaultPanelSizes: PanelSizes = {
   sidebar: 286,
   detail: 340,

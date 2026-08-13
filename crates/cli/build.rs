@@ -25,7 +25,7 @@ struct OfficialPluginSource {
 
 /// Unified plugin entry list. Pure skill repos (loom-skills, actor-circuit)
 /// have no `plugin.json` and fall back to global-scope skill loading.
-/// Full plugin repos (context-tier-skill) carry `plugin.json` for
+/// Full plugin repos (loom-plugin-context-tier) carry `plugin.json` for
 /// multi-dimensional dispatch.
 const OFFICIAL_PLUGINS: &[OfficialPluginSource] = &[
     OfficialPluginSource {
@@ -44,10 +44,10 @@ const OFFICIAL_PLUGINS: &[OfficialPluginSource] = &[
     },
     OfficialPluginSource {
         dir_env: &["LOOM_CONTEXT_TIER_DIR"],
-        repo_dir_name: "context-tier-skill",
+        repo_dir_name: "loom-plugin-context-tier",
         required_rel: "skills/context-tier/SKILL.md",
         repo_env: "LOOM_CONTEXT_TIER_REPO",
-        default_repo_url: "https://github.com/wyw-ai/context-tier-skill.git",
+        default_repo_url: "https://github.com/wyw-ai/loom-plugin-context-tier.git",
     },
 ];
 

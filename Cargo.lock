@@ -16,12 +16,12 @@ dependencies = [
  "async-trait",
  "chrono",
  "context-layer-core",
- "context-tier",
  "dirs 5.0.1",
  "hex",
  "inventory",
  "libc",
  "loom-platform",
+ "loom-plugin-context-tier",
  "parking_lot",
  "proto",
  "serde",
@@ -764,18 +764,6 @@ dependencies = [
  "anyhow",
  "inventory",
  "proto",
-]
-
-[[package]]
-name = "context-tier"
-version = "1.0.0"
-dependencies = [
- "anyhow",
- "context-layer-core",
- "inventory",
- "loom-platform",
- "proto",
- "tracing",
 ]
 
 [[package]]
@@ -2584,7 +2572,6 @@ dependencies = [
  "chrono",
  "clap",
  "context-layer-core",
- "context-tier",
  "crossterm",
  "dirs 5.0.1",
  "fs2",
@@ -2592,6 +2579,7 @@ dependencies = [
  "futures-util",
  "hex",
  "loom-platform",
+ "loom-plugin-context-tier",
  "parking_lot",
  "proto",
  "pulldown-cmark",
@@ -2652,6 +2640,18 @@ dependencies = [
  "tokio",
  "widestring",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "loom-plugin-context-tier"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "context-layer-core",
+ "inventory",
+ "loom-platform",
+ "proto",
+ "tracing",
 ]
 
 [[package]]

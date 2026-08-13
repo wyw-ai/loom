@@ -16,7 +16,7 @@ authors = ["The Loom Authors"]
 proto = { path = "crates/proto" }
 agent-runtime = { path = "crates/agent-runtime" }
 context-layer-core = { path = "crates/context-layer-core" }
-context-tier = { path = "../context-tier-skill" }
+loom-plugin-context-tier = { path = "../loom-plugin-context-tier" }
 loom-platform = { path = "crates/loom-platform" }
 dunce = "1"
 inventory = "0.3"

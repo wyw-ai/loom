@@ -8796,91 +8796,38 @@ async fn compose_envelope_prompt(
 
     let budget = wake_context_token_budget(&state.spec);
 
-    // ── D2: ContextResource chain path ──────────────────────────────
-    // When AgentSpec.context_layer is Some, use the ContextResource chain.
-    // Warm summary is handled by WarmSummaryContextResource (priority 7)
-    // within the chain — no manual injection needed.
-    // When None, fall through to D1 behavior (zero change).
-    if let Some(context_layer_spec) = &state.spec.context_layer {
-        return compose_with_context_chain(
-            state,
-            &scope,
-            &channel_id,
-            &conversation_context,
-            &runtime_context,
-            &profile_prompt_files,
-            memory_spec,
-            context_layer_spec,
-            &turn_input,
-            trigger_prompt,
-            trigger,
-            first_turn,
-            budget,
-        );
-    }
+    // ── D2 ContextResource chain (always active) ───────────────────
+    // When AgentSpec.context_layer is Some, use it directly.
+    // When None, fall back to default_agent_context_spec() so all agents
+    // get the D2 chain (including WarmSummaryContextResource).
+    // This eliminates the D1 fallback path where context_layer: None
+    // caused warm summary to be silently dropped.
+    let context_layer_spec = state
+        .spec
+        .context_layer
+        .clone()
+        .unwrap_or_else(proto::methods::default_agent_context_spec);
 
-    // ── D1 fallback path ───────────────────────────────────────────
-    // Used when AgentSpec.context_layer is None.
-    // Warm summary is now exclusively a D2 ContextResource
-    // (WarmSummaryContextResource, priority 7). When context_layer is
-    // None, no warm summary is injected.
-
-    if memory_spec.is_none() {
-        let mut sections = Vec::new();
-        push_profile_prompt_files_section(&mut sections, profile_prompt_files.clone());
-        sections.push(agent_runtime::PromptSection {
-            name: "runtime_context",
-            content: runtime_context.clone(),
-        });
-        sections.push(agent_runtime::PromptSection {
-            name: "user_message",
-            content: format!("=== User message ===\n{turn_input}"),
-        });
-        let content = sections
-            .iter()
-            .map(|section| section.content.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        let mut prompt = apply_trigger_prefix_to_prompt(
-            &state.spec,
-            prompt_telemetry(content, &sections),
-            first_turn,
-            trigger_prompt_prefix_from_trigger(trigger),
-        );
-        add_turn_input_prompt_parts(&mut prompt, trigger_prompt, &turn_input);
-        state.attach_prompt_repetition_telemetry(&scope.id, &mut prompt);
-        return prompt;
-    }
-
-    let (_prompt, mut sections) =
-        agent_runtime::envelope::build_envelope(&agent_runtime::envelope::BuildContext {
-            profile_dir: &state.profile_dir,
-            memory_spec,
-            channel_id: channel_id.as_deref(),
-            thread_context: &conversation_context,
-            runtime_context: &runtime_context,
-            user_message: &turn_input,
-        });
-    push_profile_prompt_files_section(&mut sections, profile_prompt_files);
-    let prompt = sections
-        .iter()
-        .map(|section| section.content.as_str())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    let mut prompt = apply_trigger_prefix_to_prompt(
-        &state.spec,
-        prompt_telemetry(prompt, &sections),
+    return compose_with_context_chain(
+        state,
+        &scope,
+        &channel_id,
+        &conversation_context,
+        &runtime_context,
+        &profile_prompt_files,
+        memory_spec,
+        &context_layer_spec,
+        &turn_input,
+        trigger_prompt,
+        trigger,
         first_turn,
-        trigger_prompt_prefix_from_trigger(trigger),
+        budget,
     );
-    add_turn_input_prompt_parts(&mut prompt, trigger_prompt, &turn_input);
-    state.attach_prompt_repetition_telemetry(&scope.id, &mut prompt);
-    prompt
 }
 
 /// Compose prompt using the D2 ContextResource chain.
 ///
-/// This path is used when `AgentSpec.context_layer` is `Some`. It:
+/// This is now the only prompt composition path (D2 default). It:
 /// 1. Loads agentcontext config (scope inheritance: Agent → Channel → Thread)
 /// 2. Pre-renders memory (if MemorySpec is present) for MemoryProvider
 /// 3. Builds the ContextResourceRegistry from the config

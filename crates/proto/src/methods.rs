@@ -3390,6 +3390,43 @@ pub enum ContextScopeKind {
     Channel,
 }
 
+/// Default context layer spec used when `AgentSpec.context_layer` is `None`.
+///
+/// Ensures all agents get the D2 ContextResource chain by default, including
+/// the Warm summary layer (priority 7). This eliminates the D1 fallback path
+/// where `context_layer: None` caused warm summary to be silently dropped.
+///
+/// Default resources (priority order):
+/// - `memory` (priority 5) — agent memory bootstrap + turn context
+/// - `warm-summary` (priority 7) — persisted session summary
+/// - `message-list` (priority 10) — delivery cursor / message history
+pub fn default_agent_context_spec() -> AgentContextSpec {
+    AgentContextSpec {
+        version: 1,
+        effective_scope: vec![],
+        resources: vec![
+            ContextResourceSpec {
+                scheme: "memory".into(),
+                mount: "agent-memory".into(),
+                priority: 5,
+                config: None,
+            },
+            ContextResourceSpec {
+                scheme: "warm-summary".into(),
+                mount: "warm".into(),
+                priority: 7,
+                config: None,
+            },
+            ContextResourceSpec {
+                scheme: "message-list".into(),
+                mount: "delivery".into(),
+                priority: 10,
+                config: None,
+            },
+        ],
+    }
+}
+
 /// Callee-described trigger metadata. See `AgentSpec.trigger`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

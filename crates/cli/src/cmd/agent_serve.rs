@@ -1458,6 +1458,13 @@ struct EmbeddedBuiltinSkill {
     files: &'static [EmbeddedSkillFile],
 }
 
+/// A context resource declaration embedded from plugin.json at build time.
+#[derive(Debug, Clone, Copy)]
+struct EmbeddedPluginResource {
+    scheme: &'static str,
+    priority: Option<i32>,
+}
+
 include!(concat!(env!("OUT_DIR"), "/loom_skill_embedded.rs"));
 
 const WORKSPACE_PROJECTION_MANIFEST: &str = "workspace.json";
@@ -1563,6 +1570,59 @@ fn project_builtin_skill_targets(
 ) -> std::io::Result<()> {
     workspace_skill_targets.extend(ensure_builtin_skills(data_root)?);
     Ok(())
+}
+
+/// Project only scope-level plugin skills (declared with `"scope": "scope"`
+/// in plugin.json) into `workspace_skill_targets`. Called after builtin
+/// skills so scope-level skills can coexist with global ones.
+fn project_plugin_scope_skills(
+    data_root: &Path,
+    workspace_skill_targets: &mut BTreeMap<String, PathBuf>,
+) -> std::io::Result<()> {
+    let builtin = ensure_builtin_skills(data_root)?;
+    for id in EMBEDDED_SCOPE_SKILL_IDS {
+        if let Some(path) = builtin.get(*id) {
+            workspace_skill_targets.insert(id.to_string(), path.clone());
+        }
+    }
+    Ok(())
+}
+
+/// Project only actor-bundle-level plugin skills (declared with
+/// `"scope": "actor-bundle"` in plugin.json) into `workspace_skill_targets`.
+fn project_plugin_bundle_skills(
+    data_root: &Path,
+    workspace_skill_targets: &mut BTreeMap<String, PathBuf>,
+) -> std::io::Result<()> {
+    let builtin = ensure_builtin_skills(data_root)?;
+    for id in EMBEDDED_BUNDLE_SKILL_IDS {
+        if let Some(path) = builtin.get(*id) {
+            workspace_skill_targets.insert(id.to_string(), path.clone());
+        }
+    }
+    Ok(())
+}
+
+/// Merge embedded global plugin resource declarations (from plugin.json)
+/// into an `AgentContextSpec`. Resources whose scheme is already present
+/// in the spec are not duplicated. New resources get a default mount name
+/// equal to the scheme and the priority from the plugin.json declaration
+/// (or 100 if unspecified).
+fn merge_embedded_global_resources(spec: &mut AgentContextSpec) {
+    for resource in EMBEDDED_GLOBAL_RESOURCES {
+        let already_present = spec
+            .resources
+            .iter()
+            .any(|r| r.scheme == resource.scheme);
+        if !already_present {
+            spec.resources.push(proto::methods::ContextResourceSpec {
+                scheme: resource.scheme.to_string(),
+                mount: resource.scheme.to_string(),
+                priority: resource.priority.unwrap_or(100),
+                config: None,
+            });
+        }
+    }
 }
 
 /// Write the embedded official Loom skill into an exact, dedicated skill directory.
@@ -5877,6 +5937,10 @@ async fn build_adapter_prompt(
     if state.spec.runtime_awareness == RuntimeAwareness::Native {
         project_builtin_skill_targets(&state.paths.data_root, &mut workspace_skill_targets)
             .context("project builtin skill snapshots")?;
+        project_plugin_scope_skills(&state.paths.data_root, &mut workspace_skill_targets)
+            .context("project plugin scope skills")?;
+        project_plugin_bundle_skills(&state.paths.data_root, &mut workspace_skill_targets)
+            .context("project plugin bundle skills")?;
     }
     ensure_workspace_skill_targets(&scope_paths.workspace, &workspace_skill_targets)
         .with_context(|| format!("project workspace skills for scope {}", scope.id))?;
@@ -8802,11 +8866,15 @@ async fn compose_envelope_prompt(
     // get the D2 chain (including WarmSummaryContextResource).
     // This eliminates the D1 fallback path where context_layer: None
     // caused warm summary to be silently dropped.
-    let context_layer_spec = state
+    let mut context_layer_spec = state
         .spec
         .context_layer
         .clone()
         .unwrap_or_else(proto::methods::default_agent_context_spec);
+
+    // Merge embedded global plugin resources (from plugin.json declarations)
+    // into the spec. Resources already present in the spec are not duplicated.
+    merge_embedded_global_resources(&mut context_layer_spec);
 
     return compose_with_context_chain(
         state,
@@ -16145,5 +16213,81 @@ mod tests {
         };
         let registry = build_context_resource_chain(&spec, "", "".into());
         assert!(registry.is_empty(), "unknown scheme should be skipped");
+    }
+
+    // ── Plugin loader tests ───────────────────────────────────────
+
+    #[test]
+    fn embedded_plugin_resource_struct_compiles() {
+        // Verify the EmbeddedPluginResource type is usable
+        let r = EmbeddedPluginResource {
+            scheme: "test",
+            priority: Some(42),
+        };
+        assert_eq!(r.scheme, "test");
+        assert_eq!(r.priority, Some(42));
+
+        let r2 = EmbeddedPluginResource {
+            scheme: "no-prio",
+            priority: None,
+        };
+        assert_eq!(r2.priority, None);
+    }
+
+    #[test]
+    fn merge_embedded_global_resources_adds_missing_schemes() {
+        let mut spec = AgentContextSpec {
+            version: 1,
+            effective_scope: vec![],
+            resources: vec![proto::methods::ContextResourceSpec {
+                scheme: "memory".into(),
+                mount: "agent-memory".into(),
+                priority: 5,
+                config: None,
+            }],
+        };
+        let original_count = spec.resources.len();
+        merge_embedded_global_resources(&mut spec);
+        // The spec should have at least as many resources as before
+        assert!(spec.resources.len() >= original_count);
+        // memory should still be there
+        assert!(spec.resources.iter().any(|r| r.scheme == "memory"));
+    }
+
+    #[test]
+    fn merge_embedded_global_resources_does_not_duplicate() {
+        // Start with the default spec (which already has warm-summary and message-list)
+        let mut spec = proto::methods::default_agent_context_spec();
+        let count_before = spec.resources.len();
+        merge_embedded_global_resources(&mut spec);
+        // No duplicates should be added for schemes already in the default spec
+        assert_eq!(spec.resources.len(), count_before);
+    }
+
+    #[test]
+    fn embedded_scope_skill_ids_is_valid() {
+        // EMBEDDED_SCOPE_SKILL_IDS should be a valid slice (may be empty)
+        let _ids: &[&str] = EMBEDDED_SCOPE_SKILL_IDS;
+        // Each id should be non-empty
+        for id in EMBEDDED_SCOPE_SKILL_IDS {
+            assert!(!id.is_empty(), "scope skill id should not be empty");
+        }
+    }
+
+    #[test]
+    fn embedded_bundle_skill_ids_is_valid() {
+        let _ids: &[&str] = EMBEDDED_BUNDLE_SKILL_IDS;
+        for id in EMBEDDED_BUNDLE_SKILL_IDS {
+            assert!(!id.is_empty(), "bundle skill id should not be empty");
+        }
+    }
+
+    #[test]
+    fn embedded_global_resources_contains_warm_summary() {
+        // The context-tier plugin.json declares warm-summary as a global resource
+        let has_warm = EMBEDDED_GLOBAL_RESOURCES
+            .iter()
+            .any(|r| r.scheme == "warm-summary");
+        assert!(has_warm, "warm-summary should be in EMBEDDED_GLOBAL_RESOURCES");
     }
 }

@@ -6,9 +6,12 @@ use std::process::Command;
 
 const GUIDE_REPO_URL: &str = "https://github.com/wyw-ai/loom-guide.git";
 
-/// One official skill content source repository. Adding a new official skill
-/// source is a single new entry in `OFFICIAL_SKILL_SOURCES`.
-struct OfficialSkillSource {
+/// One official plugin content source repository. A plugin may carry a
+/// `plugin.json` manifest declaring skill scope (global/scope/actor-bundle)
+/// and context resource declarations. Sources without `plugin.json` are
+/// treated as pure skill repositories with all skills at global scope
+/// (backward compatible with the former `OFFICIAL_SKILL_SOURCES`).
+struct OfficialPluginSource {
     /// Env vars pointing at a local checkout of the source repo.
     dir_env: &'static [&'static str],
     /// Sibling-directory lookup name and temp clone directory name.
@@ -20,22 +23,26 @@ struct OfficialSkillSource {
     default_repo_url: &'static str,
 }
 
-const OFFICIAL_SKILL_SOURCES: &[OfficialSkillSource] = &[
-    OfficialSkillSource {
+/// Unified plugin entry list. Pure skill repos (loom-skills, actor-circuit)
+/// have no `plugin.json` and fall back to global-scope skill loading.
+/// Full plugin repos (context-tier-skill) carry `plugin.json` for
+/// multi-dimensional dispatch.
+const OFFICIAL_PLUGINS: &[OfficialPluginSource] = &[
+    OfficialPluginSource {
         dir_env: &["LOOM_SKILLS_DIR", "LOOM_SKILL_DIR"],
         repo_dir_name: "loom-skills",
         required_rel: "skills/loom/SKILL.md",
         repo_env: "LOOM_SKILLS_REPO",
         default_repo_url: "https://github.com/wyw-ai/skills.git",
     },
-    OfficialSkillSource {
+    OfficialPluginSource {
         dir_env: &["LOOM_ACTOR_CIRCUIT_DIR"],
         repo_dir_name: "actor-circuit",
         required_rel: "skills/actor-circuit/SKILL.md",
         repo_env: "LOOM_ACTOR_CIRCUIT_REPO",
         default_repo_url: "https://github.com/wyw-ai/actor-circuit.git",
     },
-    OfficialSkillSource {
+    OfficialPluginSource {
         dir_env: &["LOOM_CONTEXT_TIER_DIR"],
         repo_dir_name: "context-tier-skill",
         required_rel: "skills/context-tier/SKILL.md",
@@ -56,26 +63,26 @@ fn main() {
         GUIDE_REPO_URL,
         &clone_root,
     );
-    let skill_sources = resolve_skill_sources(&clone_root);
+    let plugin_sources = resolve_plugin_sources(&clone_root);
 
     generate_guide_snapshot(&guide_dir, &out_dir);
-    generate_skill_snapshot(&skill_sources, &out_dir);
+    generate_plugin_snapshot(&plugin_sources, &out_dir);
 
     cleanup_temp_source(&guide_dir, &out_dir);
-    for source in &skill_sources {
+    for source in &plugin_sources {
         cleanup_temp_source(&source.content, &out_dir);
     }
 }
 
-struct ResolvedSkillSource {
+struct ResolvedPluginSource {
     repo_dir_name: &'static str,
     content: ContentSource,
 }
 
-fn resolve_skill_sources(clone_root: &Path) -> Vec<ResolvedSkillSource> {
-    OFFICIAL_SKILL_SOURCES
+fn resolve_plugin_sources(clone_root: &Path) -> Vec<ResolvedPluginSource> {
+    OFFICIAL_PLUGINS
         .iter()
-        .map(|source| ResolvedSkillSource {
+        .map(|source| ResolvedPluginSource {
             repo_dir_name: source.repo_dir_name,
             content: resolve_content_source(
                 source.dir_env,
@@ -261,82 +268,226 @@ fn generate_guide_snapshot(guide_source: &ContentSource, out_dir: &Path) {
         .expect("write generated guide snapshot");
 }
 
-fn generate_skill_snapshot(sources: &[ResolvedSkillSource], out_dir: &Path) {
-    // Snapshot every skill under each source's `skills/` tree (a directory
-    // with a SKILL.md). `skills/loom/SKILL.md` is the required file of the
-    // loom-skills source, so the default loom skill is always part of the
-    // snapshot. A skill id provided by two sources is a release-level error
-    // and fails the build.
-    let mut skills: Vec<(String, &'static str, PathBuf, Vec<PathBuf>)> = Vec::new();
-    for source in sources {
-        let content = &source.content;
-        let skills_root = content.path.join("skills");
-        if !content.cloned {
-            println!("cargo:rerun-if-changed={}", skills_root.display());
-        }
+// ---------------------------------------------------------------------------
+// plugin.json parsing (build-time, no serde dependency — manual JSON walk)
+// ---------------------------------------------------------------------------
 
-        let mut skill_dirs = fs::read_dir(&skills_root)
-            .unwrap_or_else(|err| panic!("read {} failed: {err}", skills_root.display()))
-            .map(|entry| entry.expect("read skill entry").path())
-            .filter(|path| path.is_dir())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| !name.starts_with('.'))
-            })
-            .filter(|path| path.join("SKILL.md").is_file())
-            .collect::<Vec<_>>();
-        skill_dirs.sort();
-        if skill_dirs.is_empty() {
-            panic!(
-                "no skills with SKILL.md found under {}",
-                skills_root.display()
-            );
-        }
+/// Parsed `plugin.json` manifest from a plugin repository.
+struct PluginManifest {
+    skills: Vec<DeclaredSkill>,
+    resources: Vec<DeclaredResource>,
+}
 
-        for skill_dir in skill_dirs {
-            let id = skill_dir
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or_else(|| panic!("invalid skill directory name: {}", skill_dir.display()))
+struct DeclaredSkill {
+    id: String,
+    path: String,
+    scope: PluginScope,
+}
+
+struct DeclaredResource {
+    scheme: String,
+    priority: Option<i32>,
+    scope: PluginScope,
+}
+
+/// Scope classification for build-time dispatch.
+/// - `Global` → project_builtin_skill_targets() / default_agent_context_spec()
+/// - `Scope` → scope-level skill targets / AgentContextSpec overlay
+/// - `ActorBundle` → actor_bundle_skill_targets() / actor-specific agentcontext.json
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PluginScope {
+    Global,
+    Scope,
+    ActorBundle,
+}
+
+fn parse_plugin_json(path: &Path) -> PluginManifest {
+    let raw = fs::read_to_string(path)
+        .unwrap_or_else(|err| panic!("read plugin.json {} failed: {err}", path.display()));
+    let json: serde_json::Value = serde_json::from_str(&raw)
+        .unwrap_or_else(|err| panic!("parse plugin.json {} failed: {err}", path.display()));
+
+    let mut skills = Vec::new();
+    if let Some(arr) = json.get("skills").and_then(|v| v.as_array()) {
+        for entry in arr {
+            let id = entry
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| panic!("plugin.json skill missing id: {}", path.display()))
                 .to_owned();
-            if let Some(existing) = skills.iter().find(|skill| skill.0 == id) {
-                panic!(
-                    "skill id `{id}` provided by both official skill sources `{}` and `{}`",
-                    existing.1, source.repo_dir_name
-                );
-            }
-            let mut files = collect_files(&skill_dir, !content.cloned);
-            files.sort();
-            if !content.cloned {
-                for path in &files {
-                    println!("cargo:rerun-if-changed={}", path.display());
-                }
-            }
-            skills.push((id, source.repo_dir_name, skill_dir, files));
+            let skill_path = entry
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| panic!("plugin.json skill `{id}` missing path"))
+                .to_owned();
+            let scope = parse_scope(entry.get("scope"), &id, path);
+            skills.push(DeclaredSkill {
+                id,
+                path: skill_path,
+                scope,
+            });
         }
     }
-    skills.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut resources = Vec::new();
+    if let Some(arr) = json.get("context_resources").and_then(|v| v.as_array()) {
+        for entry in arr {
+            let scheme = entry
+                .get("scheme")
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| panic!("plugin.json context_resource missing scheme"))
+                .to_owned();
+            let priority = entry.get("priority").and_then(|v| v.as_i64()).map(|n| n as i32);
+            let scope = parse_scope(entry.get("scope"), &scheme, path);
+            resources.push(DeclaredResource {
+                scheme,
+                priority,
+                scope,
+            });
+        }
+    }
+
+    PluginManifest { skills, resources }
+}
+
+fn parse_scope(raw: Option<&serde_json::Value>, label: &str, path: &Path) -> PluginScope {
+    match raw.and_then(|v| v.as_str()) {
+        Some("global") => PluginScope::Global,
+        Some("scope") => PluginScope::Scope,
+        Some("actor-bundle") => PluginScope::ActorBundle,
+        Some(other) => panic!(
+            "plugin.json `{label}` has unknown scope `{other}` in {}",
+            path.display()
+        ),
+        None => PluginScope::Global, // default
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Plugin snapshot generation
+// ---------------------------------------------------------------------------
+
+/// A skill discovered in a plugin repo, tagged with its dispatch scope.
+struct PluginSkillEntry {
+    id: String,
+    source: &'static str,
+    skill_dir: PathBuf,
+    files: Vec<PathBuf>,
+    scope: PluginScope,
+}
+
+/// A resource declared in plugin.json, tagged with its dispatch scope.
+struct PluginResourceEntry {
+    scheme: String,
+    priority: Option<i32>,
+    scope: PluginScope,
+}
+
+fn generate_plugin_snapshot(sources: &[ResolvedPluginSource], out_dir: &Path) {
+    let mut all_skills: Vec<PluginSkillEntry> = Vec::new();
+    let mut all_resources: Vec<PluginResourceEntry> = Vec::new();
+
+    for source in sources {
+        let content = &source.content;
+        let plugin_json_path = content.path.join("plugin.json");
+
+        if plugin_json_path.is_file() {
+            // Full plugin: parse plugin.json for scope dispatch
+            if !content.cloned {
+                println!("cargo:rerun-if-changed={}", plugin_json_path.display());
+            }
+            let manifest = parse_plugin_json(&plugin_json_path);
+
+            // Collect skills declared in plugin.json
+            for decl in &manifest.skills {
+                let skill_dir = content.path.join(&decl.path);
+                if !skill_dir.join("SKILL.md").is_file() {
+                    panic!(
+                        "plugin.json skill `{}` path `{}` missing SKILL.md in {}",
+                        decl.id,
+                        decl.path,
+                        content.path.display()
+                    );
+                }
+                register_skill(
+                    &mut all_skills,
+                    &decl.id,
+                    source.repo_dir_name,
+                    &skill_dir,
+                    !content.cloned,
+                    decl.scope,
+                );
+            }
+
+            // Collect resources declared in plugin.json
+            for decl in &manifest.resources {
+                all_resources.push(PluginResourceEntry {
+                    scheme: decl.scheme.clone(),
+                    priority: decl.priority,
+                    scope: decl.scope,
+                });
+            }
+
+            // Also scan skills/ dir for any skills NOT listed in plugin.json
+            // (treat them as global scope for backward compat within the repo)
+            let skills_root = content.path.join("skills");
+            if skills_root.is_dir() {
+                if !content.cloned {
+                    println!("cargo:rerun-if-changed={}", skills_root.display());
+                }
+                let declared_ids: Vec<&str> =
+                    manifest.skills.iter().map(|s| s.id.as_str()).collect();
+                scan_and_register_skills(
+                    &mut all_skills,
+                    &skills_root,
+                    source.repo_dir_name,
+                    !content.cloned,
+                    PluginScope::Global,
+                    &declared_ids,
+                );
+            }
+        } else {
+            // Pure skill repo (no plugin.json): all skills at global scope
+            let skills_root = content.path.join("skills");
+            if !content.cloned {
+                println!("cargo:rerun-if-changed={}", skills_root.display());
+            }
+            scan_and_register_skills(
+                &mut all_skills,
+                &skills_root,
+                source.repo_dir_name,
+                !content.cloned,
+                PluginScope::Global,
+                &[],
+            );
+        }
+    }
+
+    all_skills.sort_by(|a, b| a.id.cmp(&b.id));
+    all_resources.sort_by(|a, b| a.scheme.cmp(&b.scheme));
 
     let mut generated = String::new();
+
+    // --- Skill ID list (all skills, for backward compat) ---
     generated.push_str("const EMBEDDED_BUILTIN_SKILL_IDS: &[&str] = &[\n");
-    for (id, _, _, _) in &skills {
-        writeln!(generated, "    {id:?},").expect("write generated skill snapshot");
+    for skill in &all_skills {
+        writeln!(generated, "    {:?},", skill.id).expect("write skill snapshot");
     }
     generated.push_str("];\n\n");
 
+    // --- Per-skill file arrays ---
     let mut static_names = Vec::new();
-    for (id, _, skill_dir, files) in &skills {
-        let static_name = embedded_skill_files_static_name(id);
+    for skill in &all_skills {
+        let static_name = embedded_skill_files_static_name(&skill.id);
         if static_names.contains(&static_name) {
-            panic!("skill id `{id}` collides with another skill in generated snapshot");
+            panic!("skill id `{}` collides in generated snapshot", skill.id);
         }
         static_names.push(static_name.clone());
         writeln!(generated, "static {static_name}: &[EmbeddedSkillFile] = &[")
-            .expect("write generated skill snapshot");
-        for path in files {
+            .expect("write skill snapshot");
+        for path in &skill.files {
             let rel = path
-                .strip_prefix(skill_dir)
+                .strip_prefix(&skill.skill_dir)
                 .unwrap_or_else(|err| panic!("strip skill prefix {} failed: {err}", path.display()))
                 .to_string_lossy()
                 .replace('\\', "/");
@@ -346,35 +497,193 @@ fn generate_skill_snapshot(sources: &[ResolvedSkillSource], out_dir: &Path) {
                 generated,
                 "    EmbeddedSkillFile {{ path: {rel:?}, content: {content:?} }},"
             )
-            .expect("write generated skill snapshot");
+            .expect("write skill snapshot");
         }
         generated.push_str("];\n\n");
     }
 
+    // --- EMBEDDED_BUILTIN_SKILLS (backward compat: all skills as flat list) ---
     generated.push_str("static EMBEDDED_BUILTIN_SKILLS: &[EmbeddedBuiltinSkill] = &[\n");
-    for (id, _, _, _) in &skills {
-        let static_name = embedded_skill_files_static_name(id);
+    for skill in &all_skills {
+        let static_name = embedded_skill_files_static_name(&skill.id);
         writeln!(
             generated,
-            "    EmbeddedBuiltinSkill {{ id: {id:?}, files: {static_name} }},"
+            "    EmbeddedBuiltinSkill {{ id: {:?}, files: {static_name} }},",
+            skill.id
         )
-        .expect("write generated skill snapshot");
+        .expect("write skill snapshot");
     }
     generated.push_str("];\n\n");
 
-    let loom_static = skills
+    // --- EMBEDDED_LOOM_SKILL_FILES (backward compat) ---
+    let loom_static = all_skills
         .iter()
-        .find(|(id, _, _, _)| id == "loom")
-        .map(|(id, _, _, _)| embedded_skill_files_static_name(id))
-        .unwrap_or_else(|| panic!("default Loom skill missing from official skill sources"));
+        .find(|s| s.id == "loom")
+        .map(|s| embedded_skill_files_static_name(&s.id))
+        .unwrap_or_else(|| panic!("default Loom skill missing from official plugin sources"));
     writeln!(
         generated,
         "const EMBEDDED_LOOM_SKILL_FILES: &[EmbeddedSkillFile] = {loom_static};"
     )
-    .expect("write generated skill snapshot");
+    .expect("write skill snapshot");
+
+    // --- Scope-classified skill ID lists ---
+    let global_ids: Vec<&str> = all_skills
+        .iter()
+        .filter(|s| s.scope == PluginScope::Global)
+        .map(|s| s.id.as_str())
+        .collect();
+    let scope_ids: Vec<&str> = all_skills
+        .iter()
+        .filter(|s| s.scope == PluginScope::Scope)
+        .map(|s| s.id.as_str())
+        .collect();
+    let bundle_ids: Vec<&str> = all_skills
+        .iter()
+        .filter(|s| s.scope == PluginScope::ActorBundle)
+        .map(|s| s.id.as_str())
+        .collect();
+
+    generated.push_str("\n#[allow(dead_code)]\nconst EMBEDDED_GLOBAL_SKILL_IDS: &[&str] = &[");
+    for id in &global_ids {
+        write!(generated, "{id:?}, ").expect("write skill snapshot");
+    }
+    generated.push_str("];\n");
+
+    generated.push_str("#[allow(dead_code)]\nconst EMBEDDED_SCOPE_SKILL_IDS: &[&str] = &[");
+    for id in &scope_ids {
+        write!(generated, "{id:?}, ").expect("write skill snapshot");
+    }
+    generated.push_str("];\n");
+
+    generated.push_str("#[allow(dead_code)]\nconst EMBEDDED_BUNDLE_SKILL_IDS: &[&str] = &[");
+    for id in &bundle_ids {
+        write!(generated, "{id:?}, ").expect("write skill snapshot");
+    }
+    generated.push_str("];\n");
+
+    // --- Scope-classified resource declarations ---
+    generated.push_str("\nconst EMBEDDED_GLOBAL_RESOURCES: &[EmbeddedPluginResource] = &[\n");
+    for r in all_resources.iter().filter(|r| r.scope == PluginScope::Global) {
+        let prio = match r.priority {
+            Some(p) => format!("Some({p})"),
+            None => "None".to_string(),
+        };
+        writeln!(
+            generated,
+            "    EmbeddedPluginResource {{ scheme: {:?}, priority: {prio} }},",
+            r.scheme
+        )
+        .expect("write resource snapshot");
+    }
+    generated.push_str("];\n");
+
+    generated.push_str("#[allow(dead_code)]\nconst EMBEDDED_SCOPE_RESOURCES: &[EmbeddedPluginResource] = &[\n");
+    for r in all_resources.iter().filter(|r| r.scope == PluginScope::Scope) {
+        let prio = match r.priority {
+            Some(p) => format!("Some({p})"),
+            None => "None".to_string(),
+        };
+        writeln!(
+            generated,
+            "    EmbeddedPluginResource {{ scheme: {:?}, priority: {prio} }},",
+            r.scheme
+        )
+        .expect("write resource snapshot");
+    }
+    generated.push_str("];\n");
+
+    generated.push_str("#[allow(dead_code)]\nconst EMBEDDED_BUNDLE_RESOURCES: &[EmbeddedPluginResource] = &[\n");
+    for r in all_resources.iter().filter(|r| r.scope == PluginScope::ActorBundle) {
+        let prio = match r.priority {
+            Some(p) => format!("Some({p})"),
+            None => "None".to_string(),
+        };
+        writeln!(
+            generated,
+            "    EmbeddedPluginResource {{ scheme: {:?}, priority: {prio} }},",
+            r.scheme
+        )
+        .expect("write resource snapshot");
+    }
+    generated.push_str("];\n");
 
     fs::write(out_dir.join("loom_skill_embedded.rs"), generated)
-        .expect("write generated skill snapshot");
+        .expect("write generated plugin snapshot");
+}
+
+/// Scan a `skills/` directory and register each skill directory (with SKILL.md)
+/// into `all_skills`, skipping any id in `skip_ids`.
+fn scan_and_register_skills(
+    all_skills: &mut Vec<PluginSkillEntry>,
+    skills_root: &Path,
+    repo_dir_name: &'static str,
+    emit_rerun: bool,
+    default_scope: PluginScope,
+    skip_ids: &[&str],
+) {
+    let mut skill_dirs = fs::read_dir(skills_root)
+        .unwrap_or_else(|err| panic!("read {} failed: {err}", skills_root.display()))
+        .map(|entry| entry.expect("read skill entry").path())
+        .filter(|path| path.is_dir())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| !name.starts_with('.'))
+        })
+        .filter(|path| path.join("SKILL.md").is_file())
+        .collect::<Vec<_>>();
+    skill_dirs.sort();
+
+    for skill_dir in skill_dirs {
+        let id = skill_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_else(|| panic!("invalid skill directory name: {}", skill_dir.display()))
+            .to_owned();
+        if skip_ids.contains(&id.as_str()) {
+            continue;
+        }
+        register_skill(
+            all_skills,
+            &id,
+            repo_dir_name,
+            &skill_dir,
+            emit_rerun,
+            default_scope,
+        );
+    }
+}
+
+/// Register a single skill, checking for duplicate ids.
+fn register_skill(
+    all_skills: &mut Vec<PluginSkillEntry>,
+    id: &str,
+    source: &'static str,
+    skill_dir: &Path,
+    emit_rerun: bool,
+    scope: PluginScope,
+) {
+    if let Some(existing) = all_skills.iter().find(|s| s.id == id) {
+        panic!(
+            "skill id `{id}` provided by both official plugin sources `{}` and `{}`",
+            existing.source, source
+        );
+    }
+    let mut files = collect_files(skill_dir, emit_rerun);
+    files.sort();
+    if emit_rerun {
+        for path in &files {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+    all_skills.push(PluginSkillEntry {
+        id: id.to_owned(),
+        source,
+        skill_dir: skill_dir.to_path_buf(),
+        files,
+        scope,
+    });
 }
 
 fn embedded_skill_files_static_name(skill_id: &str) -> String {

@@ -184,4 +184,90 @@ mod tests {
         let result = r.assemble(&ctx).unwrap();
         assert!(result.is_empty());
     }
+
+    // (a) assemble with summary present — output format verification
+    #[test]
+    fn assemble_with_summary_produces_formatted_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let scope_id = "test_scope_format";
+        let summary_text = "SESSION INTENT: test session\nKEY DECISIONS: none";
+        WarmSummaryContextResource::persist(dir.path(), scope_id, summary_text).unwrap();
+
+        let scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: scope_id.into(),
+        };
+        let r = WarmSummaryContextResource::new();
+        let ctx = AssemblyContext {
+            scope: &scope,
+            channel_id: None,
+            actor_id: "test_actor",
+            profile_dir: dir.path(),
+            budget_remaining: 10000,
+            budget_total: 10000,
+            delivery_context: "",
+            first_turn: false,
+        };
+        let result = r.assemble(&ctx).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "warm_summary");
+        assert!(result[0].content.contains("=== Context: Warm summary ==="));
+        assert!(result[0].content.contains(summary_text));
+    }
+
+    // (b) assemble over-budget skip behavior verification
+    #[test]
+    fn assemble_skips_when_summary_exceeds_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let scope_id = "test_scope_budget";
+        // Create a large summary that will exceed 20% of a small budget.
+        // 20% of 100 = 20 tokens. A ~200-char string is well over 20 tokens.
+        let summary_text = "x".repeat(200);
+        WarmSummaryContextResource::persist(dir.path(), scope_id, &summary_text).unwrap();
+
+        let scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: scope_id.into(),
+        };
+        let r = WarmSummaryContextResource::new();
+        let ctx = AssemblyContext {
+            scope: &scope,
+            channel_id: None,
+            actor_id: "test_actor",
+            profile_dir: dir.path(),
+            budget_remaining: 100, // 20% = 20 tokens; summary is ~50 tokens
+            budget_total: 100,
+            delivery_context: "",
+            first_turn: false,
+        };
+        let result = r.assemble(&ctx).unwrap();
+        // C-3: skip (not truncate) when over budget.
+        assert!(result.is_empty(), "over-budget summary should be skipped, not truncated");
+    }
+
+    // (c) persist + clear file I/O verification
+    #[test]
+    fn persist_and_clear_file_io() {
+        let dir = tempfile::tempdir().unwrap();
+        let scope_id = "test_scope_io";
+
+        // Initially no file exists.
+        let path = WarmSummaryContextResource::summary_path(dir.path(), scope_id);
+        assert!(!path.exists());
+
+        // Persist creates the file.
+        WarmSummaryContextResource::persist(dir.path(), scope_id, "test summary").unwrap();
+        assert!(path.exists());
+
+        // Load reads it back.
+        let loaded = WarmSummaryContextResource::load(dir.path(), scope_id);
+        assert_eq!(loaded.as_deref(), Some("test summary"));
+
+        // Clear removes it.
+        WarmSummaryContextResource::clear(dir.path(), scope_id);
+        assert!(!path.exists());
+
+        // Clear on non-existent file is a no-op (no panic).
+        WarmSummaryContextResource::clear(dir.path(), scope_id);
+    }
 }

@@ -16088,4 +16088,62 @@ mod tests {
             "legit symlink should have been removed (not in desired set)"
         );
     }
+
+    // (e) builtin_resource_factories factory lookup verification
+    #[test]
+    fn builtin_resource_factories_registers_all_schemes() {
+        let factories = builtin_resource_factories("", String::new());
+        assert!(factories.contains_key("memory"), "memory factory must be registered");
+        assert!(factories.contains_key("message-list"), "message-list factory must be registered");
+        assert!(factories.contains_key("file"), "file factory must be registered");
+        assert!(factories.contains_key("warm-summary"), "warm-summary factory must be registered");
+    }
+
+    #[test]
+    fn builtin_resource_factories_produces_correct_schemes() {
+        let factories = builtin_resource_factories("", String::new());
+        // memory factory
+        let mem = factories.get("memory").unwrap()(&None);
+        assert_eq!(mem.scheme(), "memory");
+        assert_eq!(mem.priority(), 5);
+        // message-list factory
+        let ml = factories.get("message-list").unwrap()(&None);
+        assert_eq!(ml.scheme(), "message-list");
+        assert_eq!(ml.priority(), 10);
+        // warm-summary factory
+        let ws = factories.get("warm-summary").unwrap()(&None);
+        assert_eq!(ws.scheme(), "warm-summary");
+        assert_eq!(ws.priority(), 7);
+        // file factory
+        let file = factories.get("file").unwrap()(&None);
+        assert_eq!(file.scheme(), "file");
+        assert_eq!(file.priority(), 20);
+    }
+
+    // (f) build_context_resource_chain end-to-end verification
+    #[test]
+    fn build_context_resource_chain_assembles_default_spec() {
+        let spec = proto::methods::default_agent_context_spec();
+        let registry = build_context_resource_chain(&spec, "boot memory", "turn memory".into());
+        assert!(!registry.is_empty(), "default spec should produce a non-empty registry");
+        assert!(registry.has_scheme("memory"));
+        assert!(registry.has_scheme("warm-summary"));
+        assert!(registry.has_scheme("message-list"));
+    }
+
+    #[test]
+    fn build_context_resource_chain_skips_unknown_scheme() {
+        let spec = AgentContextSpec {
+            version: 1,
+            effective_scope: vec![],
+            resources: vec![proto::methods::ContextResourceSpec {
+                scheme: "nonexistent-scheme".into(),
+                mount: "test".into(),
+                priority: 10,
+                config: None,
+            }],
+        };
+        let registry = build_context_resource_chain(&spec, "", "".into());
+        assert!(registry.is_empty(), "unknown scheme should be skipped");
+    }
 }

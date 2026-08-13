@@ -242,3 +242,112 @@ pub use filesystem::FileSystemProvider;
 pub use memory::MemoryProvider;
 pub use message_list::MessageListProvider;
 pub use warm_summary::WarmSummaryContextResource;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: create a simple test resource with given priority and token size.
+    fn make_resource(scheme: &str, priority: i32, token_estimate: usize) -> Box<dyn ContextResource> {
+        let content = "a".repeat(token_estimate * 4); // ~4 chars per token
+        ContextResourceBuilder::new(scheme)
+            .priority(priority)
+            .assemble(move |_| {
+                Ok(vec![PromptSection {
+                    name: "test",
+                    content: content.clone(),
+                }])
+            })
+            .build()
+    }
+
+    fn make_ctx<'a>(scope: &'a ScopeRef, budget_remaining: u64) -> AssemblyContext<'a> {
+        AssemblyContext {
+            scope,
+            channel_id: None,
+            actor_id: "test",
+            profile_dir: Path::new("/tmp"),
+            budget_remaining,
+            budget_total: budget_remaining,
+            delivery_context: "",
+            first_turn: false,
+        }
+    }
+
+    // (d) assemble_chain budget waterfall verification
+    #[test]
+    fn assemble_chain_budget_waterfall_includes_within_budget() {
+        let scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: "test".into(),
+        };
+        let mut registry = ContextResourceRegistry::new();
+        // Two resources: priority 1 (10 tokens) and priority 2 (10 tokens).
+        registry.register(make_resource("low-priority", 1, 10));
+        registry.register(make_resource("high-priority", 2, 10));
+
+        let ctx = make_ctx(&scope, 100);
+        let (sections, remaining) = registry.assemble_chain(&ctx, 100);
+        // Both fit within budget.
+        assert_eq!(sections.len(), 2);
+        assert!(remaining < 100);
+    }
+
+    #[test]
+    fn assemble_chain_budget_waterfall_skips_over_budget() {
+        let scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: "test".into(),
+        };
+        let mut registry = ContextResourceRegistry::new();
+        // priority 1: 10 tokens (fits), priority 2: 1000 tokens (exceeds remaining).
+        registry.register(make_resource("fits", 1, 10));
+        registry.register(make_resource("too-big", 2, 1000));
+
+        let ctx = make_ctx(&scope, 100);
+        let (sections, _remaining) = registry.assemble_chain(&ctx, 100);
+        // Only the first resource fits; the second is skipped (not truncated).
+        assert_eq!(sections.len(), 1);
+    }
+
+    #[test]
+    fn assemble_chain_priority_zero_always_included() {
+        let scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: "test".into(),
+        };
+        let mut registry = ContextResourceRegistry::new();
+        // priority 0: always included even if over budget.
+        registry.register(make_resource("critical", 0, 1000));
+
+        let ctx = make_ctx(&scope, 10);
+        let (sections, _remaining) = registry.assemble_chain(&ctx, 10);
+        assert_eq!(sections.len(), 1, "priority 0 resource must always be included");
+    }
+
+    #[test]
+    fn assemble_chain_respects_scope_filtering() {
+        let scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: "test".into(),
+        };
+        let mut registry = ContextResourceRegistry::new();
+        // Thread-only resource should be skipped in Channel scope.
+        registry.register(
+            ContextResourceBuilder::new("thread-only")
+                .priority(1)
+                .scopes(vec![ScopeKind::Thread])
+                .assemble(|_| {
+                    Ok(vec![PromptSection {
+                        name: "should-not-appear",
+                        content: "data".into(),
+                    }])
+                })
+                .build(),
+        );
+
+        let ctx = make_ctx(&scope, 100);
+        let (sections, _) = registry.assemble_chain(&ctx, 100);
+        assert!(sections.is_empty(), "thread-only resource should be skipped in channel scope");
+    }
+}

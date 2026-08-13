@@ -15,9 +15,11 @@
 //!   insufficient.
 //! - C-4: agentcontext.yml has no `skills` field in D2.
 
+pub mod builder;
 pub mod filesystem;
 pub mod memory;
 pub mod message_list;
+pub mod warm_summary;
 
 use std::path::Path;
 
@@ -235,6 +237,8 @@ impl Default for ContextResourceRegistry {
 // Re-exports
 // ---------------------------------------------------------------------------
 
+pub use builder::ContextResourceBuilder;
 pub use filesystem::FileSystemProvider;
 pub use memory::MemoryProvider;
 pub use message_list::MessageListProvider;
+pub use warm_summary::WarmSummaryContextResource;

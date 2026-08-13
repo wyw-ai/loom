@@ -55,6 +55,7 @@ use agent_runtime::{
     validate_bundle_current, Adapter, AdapterEvent, AdapterModelOptions, AdapterPrompt,
     AssemblyContext, ContextResource, ContextResourceRegistry, FileSystemProvider, MemoryProvider,
     MessageListProvider, PromptPart, PromptRoleHint, ResourceProvider, TokenUsage,
+    WarmSummaryContextResource,
 };
 
 use crate::client::Client;
@@ -4347,9 +4348,9 @@ async fn notification_loop(
             };
             let scopes = state.cancel_channel_work(channel_id);
             // Clean up persisted Warm summaries for the deleted channel and
-            // all its known thread scopes (Bug 1: clear_warm_summary dead code).
+            // all its known thread scopes (cleanup on channel deletion).
             for scope_id in state.scope_ids_for_channel(channel_id) {
-                clear_warm_summary(&state.profile_dir, &scope_id);
+                WarmSummaryContextResource::clear(&state.profile_dir, &scope_id);
             }
             if !scopes.is_empty() {
                 tracing::info!(
@@ -8449,103 +8450,10 @@ fn normalize_timezone_value(value: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 // Context Layer MVP — Warm summary persistence + injection
 //
-// ARCH v2 design §B1-B5, §C. The Warm layer stores a provider-generated
-// structured summary on the local filesystem (keyed by scope id) and injects
-// it into compose_envelope_prompt between delivery_context and user_message.
-//
-// Constraints satisfied:
-//   C-1: Summary is provider-generated (Loom never writes summary content)
-//   C-2: Summary persists to disk, survives restart/crash
-//   C-3: Loom does no keyword extraction / truncation / semantic compression
-//   C-5: Summary is produced via a dedicated provider call (summary prompt)
+// Migrated to WarmSummaryContextResource (context_layer/warm_summary.rs).
+// The session-reset trigger logic below remains in agent_serve.rs because
+// it is a turn-level decision, not a ContextResource (ARCH D3).
 // ---------------------------------------------------------------------------
-
-/// Directory under the actor profile where Warm summaries are stored.
-fn warm_summary_dir(profile_dir: &Path) -> PathBuf {
-    profile_dir.join("summaries")
-}
-
-/// File path for a given scope's Warm summary.
-fn warm_summary_path(profile_dir: &Path, scope_id: &str) -> PathBuf {
-    warm_summary_dir(profile_dir).join(format!("{scope_id}.md"))
-}
-
-/// Load a persisted Warm summary for the given scope. Returns `None` if no
-/// summary exists or the file cannot be read (treated as "no summary
-/// available" — the turn proceeds without Warm context).
-fn load_warm_summary(profile_dir: &Path, scope_id: &str) -> Option<String> {
-    let path = warm_summary_path(profile_dir, scope_id);
-    let text = std::fs::read_to_string(&path).ok()?;
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
-
-/// Persist a provider-generated Warm summary for the given scope. The summary
-/// is written atomically (write to temp + rename) so a crash mid-write does
-/// not corrupt an existing summary.
-fn persist_warm_summary(profile_dir: &Path, scope_id: &str, summary: &str) -> Result<()> {
-    let dir = warm_summary_dir(profile_dir);
-    create_dir_all_unc(&dir)
-        .with_context(|| format!("create warm summary dir {}", dir.display()))?;
-    let final_path = warm_summary_path(profile_dir, scope_id);
-    let temp_path = final_path.with_extension("md.tmp");
-    std::fs::write(&temp_path, summary)
-        .with_context(|| format!("write warm summary tmp {}", temp_path.display()))?;
-    std::fs::rename(&temp_path, &final_path)
-        .with_context(|| format!("rename warm summary {}", final_path.display()))?;
-    Ok(())
-}
-
-/// Remove a persisted Warm summary (e.g. when the scope is deleted). Errors
-/// are logged but not propagated — a stale summary file is harmless.
-fn clear_warm_summary(profile_dir: &Path, scope_id: &str) {
-    let path = warm_summary_path(profile_dir, scope_id);
-    if path.exists() {
-        if let Err(err) = std::fs::remove_file(&path) {
-            tracing::debug!(path = %path.display(), %err, "failed to remove warm summary");
-        }
-    }
-}
-
-/// Maximum fraction of the wake-context token budget that the Warm summary
-/// section may occupy (ARCH §B5: 20%).
-const WARM_SUMMARY_BUDGET_FRACTION: f64 = 0.2;
-
-/// Build the Warm summary prompt section for the current scope. Returns
-/// `None` when no summary is persisted or the summary exceeds its token
-/// budget allocation.
-///
-/// This function only **reads** persisted summaries — it never generates,
-/// truncates, or modifies summary content (C-1, C-3).
-fn warm_summary_section(
-    profile_dir: &Path,
-    scope_id: &str,
-    total_budget: u64,
-) -> Option<agent_runtime::PromptSection> {
-    let raw = load_warm_summary(profile_dir, scope_id)?;
-    let summary_budget = ((total_budget as f64) * WARM_SUMMARY_BUDGET_FRACTION) as u64;
-    let summary_tokens = usage::estimate_tokens(&raw);
-    if summary_tokens > summary_budget && summary_budget > 0 {
-        tracing::debug!(
-            scope = scope_id,
-            summary_tokens,
-            budget = summary_budget,
-            "warm summary exceeds budget; skipping injection (not truncating per C-3)"
-        );
-        return None;
-    }
-    Some(agent_runtime::PromptSection {
-        name: "warm_summary",
-        content: format!("=== Context: Warm summary ===\n\
-            The following structured summary was generated by the provider to \
-            preserve context from earlier in this session. Use it as background \
-            for the current turn.\n\n{raw}"),
-    })
-}
 
 /// Threshold multiplier: session reset triggers when estimated token usage
 /// exceeds budget × this factor (ARCH §B2, §C Step 1).
@@ -8713,52 +8621,81 @@ fn merge_agentcontext(base: AgentContextSpec, overlay: AgentContextSpec) -> Agen
     }
 }
 
+/// Type alias for a factory function that creates a ContextResource from
+/// optional JSON config. Pre-rendered memory strings are captured via the
+/// outer closure when the factory map is built.
+type ResourceFactory = Box<dyn Fn(&Option<Value>) -> Box<dyn ContextResource>>;
+
+/// Build the builtin resource factory map. Each entry maps a scheme name
+/// to a factory closure that produces a ContextResource.
+///
+/// Adding a new builtin resource is a one-line change here — no match arm
+/// modifications needed in `build_context_resource_chain`.
+fn builtin_resource_factories(
+    bootstrap_memory: &str,
+    turn_memory: String,
+) -> std::collections::HashMap<String, ResourceFactory> {
+    let mut factories: std::collections::HashMap<String, ResourceFactory> =
+        std::collections::HashMap::new();
+
+    // memory — needs pre-rendered bootstrap + turn text (special case).
+    let boot = bootstrap_memory.to_string();
+    factories.insert("memory".into(), Box::new(move |_config| {
+        Box::new(
+            MemoryProvider::new()
+                .with_rendered(boot.clone(), turn_memory.clone()),
+        ) as Box<dyn ContextResource>
+    }));
+
+    // message-list — no config needed.
+    factories.insert("message-list".into(), Box::new(|_config| {
+        Box::new(MessageListProvider::new()) as Box<dyn ContextResource>
+    }));
+
+    // file — reads path + max_files from config.
+    factories.insert("file".into(), Box::new(|config| {
+        let path = config
+            .as_ref()
+            .and_then(|c| c.get("path"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("${workspace.dir}");
+        let max_files = config
+            .as_ref()
+            .and_then(|c| c.get("max_files"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(10);
+        let expanded = expand_workspace_dir(path);
+        let provider = FileSystemProvider::new(expanded, max_files);
+        Box::new(FileContextResource::new(provider)) as Box<dyn ContextResource>
+    }));
+
+    // warm-summary — no config needed.
+    factories.insert("warm-summary".into(), Box::new(|_config| {
+        Box::new(WarmSummaryContextResource::new()) as Box<dyn ContextResource>
+    }));
+
+    factories
+}
+
 /// Build the ContextResourceRegistry from an AgentContextSpec.
-/// Maps each declared resource scheme to its provider implementation.
+/// Uses the factory registry to look up each declared resource scheme.
 fn build_context_resource_chain(
     spec: &AgentContextSpec,
     bootstrap_memory: &str,
     turn_memory: &str,
 ) -> ContextResourceRegistry {
     let mut registry = ContextResourceRegistry::new();
+    let factories = builtin_resource_factories(bootstrap_memory, turn_memory.to_string());
 
     for resource_spec in &spec.resources {
-        match resource_spec.scheme.as_str() {
-            "memory" => {
-                let provider = MemoryProvider::new()
-                    .with_rendered(bootstrap_memory, turn_memory);
-                registry.register(Box::new(provider));
-            }
-            "message-list" => {
-                registry.register(Box::new(MessageListProvider::new()));
-            }
-            "file" => {
-                let path = resource_spec
-                    .config
-                    .as_ref()
-                    .and_then(|c| c.get("path"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("${workspace.dir}");
-                let max_files = resource_spec
-                    .config
-                    .as_ref()
-                    .and_then(|c| c.get("max_files"))
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as usize)
-                    .unwrap_or(10);
-                // Expand ${workspace.dir} template variable.
-                let expanded = expand_workspace_dir(path);
-                let provider = FileSystemProvider::new(expanded, max_files);
-                registry.register(Box::new(FileContextResource::new(provider)));
-            }
-            "warm-summary" => {
-                // Warm summary is handled separately by the D1 mechanism.
-                // It's declared in agentcontext.yml but the actual injection
-                // goes through the existing warm_summary_section path.
-            }
-            other => {
-                tracing::warn!(scheme = other, "unknown context resource scheme; skipping");
-            }
+        if let Some(factory) = factories.get(resource_spec.scheme.as_str()) {
+            registry.register(factory(&resource_spec.config));
+        } else {
+            tracing::warn!(
+                scheme = %resource_spec.scheme,
+                "unknown context resource scheme; skipping"
+            );
         }
     }
 
@@ -8858,10 +8795,11 @@ async fn compose_envelope_prompt(
     let memory_spec = state.spec.memory.as_ref();
 
     let budget = wake_context_token_budget(&state.spec);
-    let warm_summary = warm_summary_section(&state.profile_dir, &scope.id, budget);
 
     // ── D2: ContextResource chain path ──────────────────────────────
     // When AgentSpec.context_layer is Some, use the ContextResource chain.
+    // Warm summary is handled by WarmSummaryContextResource (priority 7)
+    // within the chain — no manual injection needed.
     // When None, fall through to D1 behavior (zero change).
     if let Some(context_layer_spec) = &state.spec.context_layer {
         return compose_with_context_chain(
@@ -8873,7 +8811,6 @@ async fn compose_envelope_prompt(
             &profile_prompt_files,
             memory_spec,
             context_layer_spec,
-            &warm_summary,
             &turn_input,
             trigger_prompt,
             trigger,
@@ -8882,7 +8819,12 @@ async fn compose_envelope_prompt(
         );
     }
 
-    // ── D1 fallback path (unchanged) ────────────────────────────────
+    // ── D1 fallback path ───────────────────────────────────────────
+    // Used when AgentSpec.context_layer is None.
+    // Warm summary is now exclusively a D2 ContextResource
+    // (WarmSummaryContextResource, priority 7). When context_layer is
+    // None, no warm summary is injected.
+
     if memory_spec.is_none() {
         let mut sections = Vec::new();
         push_profile_prompt_files_section(&mut sections, profile_prompt_files.clone());
@@ -8890,11 +8832,6 @@ async fn compose_envelope_prompt(
             name: "runtime_context",
             content: runtime_context.clone(),
         });
-        // Warm summary injected after runtime_context, before user_message
-        // (ARCH §A4, §B5).
-        if let Some(summary) = &warm_summary {
-            sections.push(summary.clone());
-        }
         sections.push(agent_runtime::PromptSection {
             name: "user_message",
             content: format!("=== User message ===\n{turn_input}"),
@@ -8925,11 +8862,6 @@ async fn compose_envelope_prompt(
             user_message: &turn_input,
         });
     push_profile_prompt_files_section(&mut sections, profile_prompt_files);
-    // Warm summary injected after profile_prompt_files / runtime_context,
-    // before user_message (ARCH §A4, §B5).
-    if let Some(summary) = &warm_summary {
-        insert_warm_summary_section(&mut sections, summary.clone());
-    }
     let prompt = sections
         .iter()
         .map(|section| section.content.as_str())
@@ -8953,8 +8885,10 @@ async fn compose_envelope_prompt(
 /// 2. Pre-renders memory (if MemorySpec is present) for MemoryProvider
 /// 3. Builds the ContextResourceRegistry from the config
 /// 4. Assembles sections in priority order with token budget waterfall
-/// 5. Injects Warm summary (D1 compatibility)
-/// 6. Appends user_message last
+/// 5. Appends user_message last
+///
+/// Warm summary is now handled by WarmSummaryContextResource (priority 7)
+/// within the chain itself — no manual injection needed.
 #[allow(clippy::too_many_arguments)]
 fn compose_with_context_chain(
     state: &Arc<WorkerState>,
@@ -8965,7 +8899,6 @@ fn compose_with_context_chain(
     profile_prompt_files: &str,
     memory_spec: Option<&proto::methods::MemorySpec>,
     context_layer_spec: &AgentContextSpec,
-    warm_summary: &Option<agent_runtime::PromptSection>,
     turn_input: &str,
     trigger_prompt: &TriggerPromptText,
     trigger: &AgentTrigger,
@@ -9047,32 +8980,11 @@ fn compose_with_context_chain(
         first_turn,
     };
 
-    let (chain_sections, remaining_after_chain) =
+    let (chain_sections, _remaining_after_chain) =
         registry.assemble_chain(&assembly_ctx, budget_remaining);
     sections.extend(chain_sections);
 
-    // 6. Warm summary injection (D1 compatibility).
-    // Re-check the warm summary against the budget remaining after chain
-    // assembly (Bug 2: D2 budget precision). The initial check at the call
-    // site used the total budget; here we verify it still fits within the
-    // remaining space. If it doesn't, skip injection (no truncation per C-3).
-    if let Some(summary) = warm_summary {
-        let summary_tokens = usage::estimate_tokens(&summary.content);
-        let warm_budget = ((remaining_after_chain as f64) * WARM_SUMMARY_BUDGET_FRACTION) as u64;
-        if summary_tokens <= warm_budget || warm_budget == 0 {
-            insert_warm_summary_section(&mut sections, summary.clone());
-        } else {
-            tracing::debug!(
-                scope = %scope.id,
-                summary_tokens,
-                remaining_after_chain,
-                warm_budget,
-                "warm summary skipped: exceeds remaining budget after chain assembly (C-3)"
-            );
-        }
-    }
-
-    // 7. User message (always last).
+    // 6. User message (always last).
     sections.push(agent_runtime::PromptSection {
         name: "user_message",
         content: format!("=== User message ===\n{turn_input}"),
@@ -9118,19 +9030,6 @@ fn push_profile_prompt_files_section(
             content,
         },
     );
-}
-
-/// Insert the Warm summary section just before `user_message`, preserving
-/// the ARCH §A4 ordering: ... → runtime_context → warm_summary → user_message.
-fn insert_warm_summary_section(
-    sections: &mut Vec<agent_runtime::PromptSection>,
-    summary: agent_runtime::PromptSection,
-) {
-    let insert_at = sections
-        .iter()
-        .position(|section| section.name == "user_message")
-        .unwrap_or(sections.len());
-    sections.insert(insert_at, summary);
 }
 
 fn add_turn_input_prompt_parts(
@@ -9823,7 +9722,7 @@ async fn translate_one_with_gate(
 
                 if success && !summary_text.trim().is_empty() {
                     // Persist the provider-generated summary (C-1, C-2, C-5).
-                    if let Err(err) = persist_warm_summary(
+                    if let Err(err) = WarmSummaryContextResource::persist(
                         &state.profile_dir,
                         &scope_id,
                         &summary_text,

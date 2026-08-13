@@ -39,8 +39,9 @@ pub use bundle::{
 };
 pub use envelope::{compose_prompt, EnvelopeInput, PromptSection};
 pub use context_layer::{
-    AssemblyContext, ContextResource, ContextResourceRegistry, FileSystemProvider, MemoryProvider,
-    MessageListProvider, ResourceContent, ResourceHandle, ResourceProvider,
+    AssemblyContext, ContextResource, ContextResourceBuilder, ContextResourceRegistry,
+    FileSystemProvider, MemoryProvider, MessageListProvider, ResourceContent, ResourceHandle,
+    ResourceProvider, WarmSummaryContextResource,
 };
 pub use interactive::{InteractiveCommandAdapter, InteractiveCommandConfig};
 pub use mcp_servers::build_mcp_servers;

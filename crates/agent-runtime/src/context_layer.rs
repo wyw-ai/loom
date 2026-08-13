@@ -207,6 +207,7 @@ pub use memory::MemoryProvider;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use proto::types::ScopeKind;
 
     /// Helper: create a simple test resource with given priority and token size.

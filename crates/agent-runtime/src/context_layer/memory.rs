@@ -95,6 +95,7 @@ impl ContextResource for MemoryProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proto::types::ScopeRef;
     use std::path::Path;
 
     #[test]

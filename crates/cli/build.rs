@@ -35,6 +35,13 @@ const OFFICIAL_SKILL_SOURCES: &[OfficialSkillSource] = &[
         repo_env: "LOOM_ACTOR_CIRCUIT_REPO",
         default_repo_url: "https://github.com/wyw-ai/actor-circuit.git",
     },
+    OfficialSkillSource {
+        dir_env: &["LOOM_CONTEXT_TIER_DIR"],
+        repo_dir_name: "context-tier-skill",
+        required_rel: "skills/context-tier/SKILL.md",
+        repo_env: "LOOM_CONTEXT_TIER_REPO",
+        default_repo_url: "https://github.com/wyw-ai/context-tier-skill.git",
+    },
 ];
 
 fn main() {

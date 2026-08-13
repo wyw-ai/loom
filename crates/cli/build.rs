@@ -21,6 +21,8 @@ struct OfficialPluginSource {
     /// Env var overriding the repo URL to clone.
     repo_env: &'static str,
     default_repo_url: &'static str,
+    /// Env var for an optional git ref (tag/branch) to clone.
+    ref_env: &'static str,
 }
 
 /// Unified plugin entry list. Pure skill repos (loom-skills, actor-circuit)
@@ -34,6 +36,7 @@ const OFFICIAL_PLUGINS: &[OfficialPluginSource] = &[
         required_rel: "skills/loom/SKILL.md",
         repo_env: "LOOM_SKILLS_REPO",
         default_repo_url: "https://github.com/wyw-ai/skills.git",
+        ref_env: "LOOM_SKILLS_REF",
     },
     OfficialPluginSource {
         dir_env: &["LOOM_ACTOR_CIRCUIT_DIR"],
@@ -41,6 +44,7 @@ const OFFICIAL_PLUGINS: &[OfficialPluginSource] = &[
         required_rel: "skills/actor-circuit/SKILL.md",
         repo_env: "LOOM_ACTOR_CIRCUIT_REPO",
         default_repo_url: "https://github.com/wyw-ai/actor-circuit.git",
+        ref_env: "LOOM_ACTOR_CIRCUIT_REF",
     },
     OfficialPluginSource {
         dir_env: &["LOOM_CONTEXT_TIER_DIR"],
@@ -48,6 +52,7 @@ const OFFICIAL_PLUGINS: &[OfficialPluginSource] = &[
         required_rel: "skills/context-tier/SKILL.md",
         repo_env: "LOOM_CONTEXT_TIER_REPO",
         default_repo_url: "https://github.com/wyw-ai/loom-plugin-context-tier.git",
+        ref_env: "LOOM_CONTEXT_TIER_REF",
     },
 ];
 
@@ -61,6 +66,7 @@ fn main() {
         "guides",
         "LOOM_GUIDE_REPO",
         GUIDE_REPO_URL,
+        "LOOM_GUIDE_REF",
         &clone_root,
     );
     let plugin_sources = resolve_plugin_sources(&clone_root);
@@ -90,6 +96,7 @@ fn resolve_plugin_sources(clone_root: &Path) -> Vec<ResolvedPluginSource> {
                 source.required_rel,
                 source.repo_env,
                 source.default_repo_url,
+                source.ref_env,
                 clone_root,
             ),
         })
@@ -108,12 +115,14 @@ fn resolve_content_source(
     required_rel: &str,
     repo_env_name: &str,
     default_repo_url: &str,
+    ref_env_name: &str,
     clone_root: &Path,
 ) -> ContentSource {
     for env_name in env_names {
         println!("cargo:rerun-if-env-changed={env_name}");
     }
     println!("cargo:rerun-if-env-changed={repo_env_name}");
+    println!("cargo:rerun-if-env-changed={ref_env_name}");
 
     for env_name in env_names {
         if let Some(raw) = env::var_os(env_name).filter(|value| !value.is_empty()) {
@@ -144,8 +153,9 @@ fn resolve_content_source(
     }
 
     let repo_url = env::var(repo_env_name).unwrap_or_else(|_| default_repo_url.to_string());
+    let git_ref = env::var(ref_env_name).ok().filter(|r| !r.is_empty());
     let target = clone_root.join(repo_name);
-    clone_repo(&repo_url, &target);
+    clone_repo(&repo_url, &target, git_ref.as_deref());
     if !target.join(required_rel).exists() {
         panic!(
             "cloned {repo_url} into {}, but {} is missing",
@@ -176,7 +186,7 @@ fn content_candidates(repo_name: &str) -> Vec<PathBuf> {
     candidates
 }
 
-fn clone_repo(repo_url: &str, target: &Path) {
+fn clone_repo(repo_url: &str, target: &Path, git_ref: Option<&str>) {
     if target.exists() {
         fs::remove_dir_all(target)
             .unwrap_or_else(|err| panic!("remove stale clone {} failed: {err}", target.display()));
@@ -186,9 +196,13 @@ fn clone_repo(repo_url: &str, target: &Path) {
             .unwrap_or_else(|err| panic!("create clone dir {} failed: {err}", parent.display()));
     }
 
-    let status = Command::new("git")
-        .args(["clone", "--depth", "1", repo_url])
-        .arg(target)
+    let mut cmd = Command::new("git");
+    cmd.args(["clone", "--depth", "1"]);
+    if let Some(r) = git_ref {
+        cmd.args(["--branch", r]);
+    }
+    cmd.arg(repo_url).arg(target);
+    let status = cmd
         .status()
         .unwrap_or_else(|err| panic!("run git clone for {repo_url} failed: {err}"));
     if !status.success() {

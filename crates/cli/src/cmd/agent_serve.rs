@@ -3349,6 +3349,24 @@ impl WorkerState {
         scopes
     }
 
+    /// Collect all known scope ids that belong to `channel_id`: the channel
+    /// scope itself plus every thread scope in the cache. Used to clean up
+    /// per-scope artifacts (e.g. Warm summaries) when a channel is deleted.
+    fn scope_ids_for_channel(&self, channel_id: &str) -> Vec<String> {
+        let mut ids = vec![channel_id.to_string()];
+        let cache = self
+            .scope_channel_cache
+            .lock()
+            .map(|c| c.clone())
+            .unwrap_or_default();
+        for (thread_id, ch) in &cache {
+            if ch == channel_id {
+                ids.push(thread_id.clone());
+            }
+        }
+        ids
+    }
+
     fn has_pending_source(&self, source_id: &str) -> bool {
         self.pending_triggers
             .lock()
@@ -4328,6 +4346,11 @@ async fn notification_loop(
                 continue;
             };
             let scopes = state.cancel_channel_work(channel_id);
+            // Clean up persisted Warm summaries for the deleted channel and
+            // all its known thread scopes (Bug 1: clear_warm_summary dead code).
+            for scope_id in state.scope_ids_for_channel(channel_id) {
+                clear_warm_summary(&state.profile_dir, &scope_id);
+            }
             if !scopes.is_empty() {
                 tracing::info!(
                     "[{actor_id}] channel {channel_id} deleted — canceling {} active turn(s)",
@@ -9024,15 +9047,29 @@ fn compose_with_context_chain(
         first_turn,
     };
 
-    let (chain_sections, _remaining) = registry.assemble_chain(&assembly_ctx, budget_remaining);
+    let (chain_sections, remaining_after_chain) =
+        registry.assemble_chain(&assembly_ctx, budget_remaining);
     sections.extend(chain_sections);
 
     // 6. Warm summary injection (D1 compatibility).
-    // When the chain doesn't have a message-list provider, inject warm
-    // summary directly (same as D1). When it does, the warm summary is
-    // still injected directly for consistency.
+    // Re-check the warm summary against the budget remaining after chain
+    // assembly (Bug 2: D2 budget precision). The initial check at the call
+    // site used the total budget; here we verify it still fits within the
+    // remaining space. If it doesn't, skip injection (no truncation per C-3).
     if let Some(summary) = warm_summary {
-        insert_warm_summary_section(&mut sections, summary.clone());
+        let summary_tokens = usage::estimate_tokens(&summary.content);
+        let warm_budget = ((remaining_after_chain as f64) * WARM_SUMMARY_BUDGET_FRACTION) as u64;
+        if summary_tokens <= warm_budget || warm_budget == 0 {
+            insert_warm_summary_section(&mut sections, summary.clone());
+        } else {
+            tracing::debug!(
+                scope = %scope.id,
+                summary_tokens,
+                remaining_after_chain,
+                warm_budget,
+                "warm summary skipped: exceeds remaining budget after chain assembly (C-3)"
+            );
+        }
     }
 
     // 7. User message (always last).

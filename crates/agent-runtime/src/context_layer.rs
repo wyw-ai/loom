@@ -1,11 +1,12 @@
-//! Context Layer — pluggable context resource system.
+//! Context Layer — pluggable context resource system (runtime container).
 //!
-//! Defines the AOP interface (the "agentcontext" concept) that lets agents
-//! declare how per-turn prompt context is assembled from multiple sources.
+//! This module re-exports the core trait and data types from
+//! `context-layer-core` and provides the runtime registry, built-in
+//! providers (memory, filesystem), and plugin discovery.
 //!
-//! Design basis: ARCH v2 §A1, MCP Resource primitive, LlamaIndex
-//! BaseMemoryBlock.priority. Loom core defines the traits; concrete
-//! providers are optional (feature flag or runtime registration).
+//! Plugin providers (warm-summary, message-list) live in the `context-tier`
+//! crate and self-register via `inventory::submit!`. Loom discovers them
+//! at runtime via [`discover_plugins`] without knowing their concrete types.
 //!
 //! # Constraints
 //!
@@ -18,83 +19,25 @@
 pub mod builder;
 pub mod filesystem;
 pub mod memory;
-pub mod message_list;
-pub mod warm_summary;
 
+// Force-link the context-tier crate so its `inventory::submit!`
+// registrations are not stripped by the linker. Without this, the
+// plugin registrations would be dead-code eliminated because
+// agent-runtime never references context-tier's types directly.
+extern crate context_tier;
+
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::Result;
 use proto::types::{ScopeKind, ScopeRef};
 
-use crate::envelope::PromptSection;
-
-// ---------------------------------------------------------------------------
-// ContextResource trait
-// ---------------------------------------------------------------------------
-
-/// A pluggable context resource that contributes PromptSections to the
-/// per-turn prompt envelope. Resources are assembled in priority order
-/// within the remaining token budget.
-///
-/// This trait is the AOP interface Founder described as "agentcontext" —
-/// loom core defines the trait; concrete providers are optional.
-pub trait ContextResource: Send + Sync {
-    /// URI scheme this resource handles (e.g. "message-list", "file",
-    /// "memory"). Used by the registry to route agentcontext.yml
-    /// declarations to the correct provider.
-    fn scheme(&self) -> &str;
-
-    /// Assembly priority. Lower = assembled first (higher importance).
-    /// Resources exceeding budget are skipped in reverse priority order.
-    /// 0 = never skipped (reserved for critical resources).
-    fn priority(&self) -> i32;
-
-    /// Which scope kinds this resource is effective in.
-    /// A channel-only resource is skipped in thread scopes, and vice versa.
-    fn effective_scope(&self) -> &[ScopeKind];
-
-    /// Assemble this resource's contribution to the prompt.
-    ///
-    /// `ctx` provides scope metadata, remaining token budget, and
-    /// thread context. Returns zero or more PromptSections.
-    ///
-    /// This method MUST NOT perform semantic compression, keyword
-    /// extraction, or content truncation (C-3, C-6). It may only:
-    ///   - Read already-persisted data (files, summaries, memory)
-    ///   - Format it into PromptSections
-    ///   - Skip itself if budget is insufficient
-    fn assemble(&self, ctx: &AssemblyContext<'_>) -> Result<Vec<PromptSection>>;
-}
-
-// ---------------------------------------------------------------------------
-// AssemblyContext
-// ---------------------------------------------------------------------------
-
-/// Read-only context passed to [`ContextResource::assemble`].
-/// Provides everything a resource needs without exposing mutable state.
-pub struct AssemblyContext<'a> {
-    /// The scope this turn runs in (thread or channel).
-    pub scope: &'a ScopeRef,
-    /// Channel id if available (None for channel-level scopes without a
-    /// parent channel context).
-    pub channel_id: Option<&'a str>,
-    /// The actor id of the agent whose turn is being composed.
-    pub actor_id: &'a str,
-    /// Absolute path to this actor's profile directory.
-    pub profile_dir: &'a Path,
-    /// Remaining token budget after higher-priority resources consumed
-    /// their share. Resources should check this before assembling large
-    /// content.
-    pub budget_remaining: u64,
-    /// Total token budget for this turn (for fraction calculations).
-    pub budget_total: u64,
-    /// The delivery cursor context string (thread messages, inbox items).
-    /// Available so resources like MessageListProvider can reference it
-    /// without re-querying.
-    pub delivery_context: &'a str,
-    /// Whether this is the first turn in this scope.
-    pub first_turn: bool,
-}
+// Re-export core types from context-layer-core so existing consumers
+// (agent_serve.rs, tests) can keep using `agent_runtime::ContextResource`
+// etc. without change.
+pub use context_layer_core::{
+    estimate_tokens, AssemblyContext, ContextResource, ContextResourcePlugin, PromptSection,
+};
 
 // ---------------------------------------------------------------------------
 // ResourceProvider trait
@@ -205,7 +148,7 @@ impl ContextResourceRegistry {
             };
 
             for section in resource_sections {
-                let section_tokens = crate::usage::estimate_tokens(&section.content);
+                let section_tokens = context_layer_core::estimate_tokens(&section.content);
 
                 // Priority 0 resources are always included regardless of budget.
                 if resource.priority() != 0 && section_tokens > budget_remaining {
@@ -234,14 +177,31 @@ impl Default for ContextResourceRegistry {
 }
 
 // ---------------------------------------------------------------------------
+// Plugin Discovery (inventory)
+// ---------------------------------------------------------------------------
+
+/// Discover all plugins registered via `inventory::submit!`.
+///
+/// Returns a map of scheme → factory function. Loom uses this to populate
+/// the resource factory map without knowing any plugin's concrete types.
+///
+/// Plugin crates (e.g. `context-tier`) self-register at compile time;
+/// this function traverses those registrations at runtime.
+pub fn discover_plugins() -> HashMap<String, fn() -> Box<dyn ContextResource>> {
+    let mut map = HashMap::new();
+    for plugin in inventory::iter::<ContextResourcePlugin> {
+        map.insert(plugin.scheme.to_string(), plugin.factory);
+    }
+    map
+}
+
+// ---------------------------------------------------------------------------
 // Re-exports
 // ---------------------------------------------------------------------------
 
 pub use builder::ContextResourceBuilder;
 pub use filesystem::FileSystemProvider;
 pub use memory::MemoryProvider;
-pub use message_list::MessageListProvider;
-pub use warm_summary::WarmSummaryContextResource;
 
 #[cfg(test)]
 mod tests {
@@ -349,5 +309,19 @@ mod tests {
         let ctx = make_ctx(&scope, 100);
         let (sections, _) = registry.assemble_chain(&ctx, 100);
         assert!(sections.is_empty(), "thread-only resource should be skipped in channel scope");
+    }
+
+    #[test]
+    fn discover_plugins_finds_registered_plugins() {
+        let plugins = discover_plugins();
+        // context-tier crate registers warm-summary and message-list.
+        assert!(
+            plugins.contains_key("warm-summary"),
+            "warm-summary plugin should be discovered via inventory"
+        );
+        assert!(
+            plugins.contains_key("message-list"),
+            "message-list plugin should be discovered via inventory"
+        );
     }
 }

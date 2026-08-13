@@ -120,30 +120,8 @@ fn manifest() -> &'static UsageManifest {
 }
 
 pub fn estimate_tokens(text: &str) -> u64 {
-    let mut total = 0u64;
-    let mut ascii_run = 0u64;
-
-    for ch in text.chars() {
-        if ch.is_ascii() && !ch.is_ascii_whitespace() {
-            ascii_run += 1;
-            continue;
-        }
-
-        if ascii_run > 0 {
-            total += ascii_run.div_ceil(4);
-            ascii_run = 0;
-        }
-
-        if !ch.is_whitespace() {
-            total += 1;
-        }
-    }
-
-    if ascii_run > 0 {
-        total += ascii_run.div_ceil(4);
-    }
-
-    total
+    // Delegate to context-layer-core's canonical implementation.
+    context_layer_core::estimate_tokens(text)
 }
 
 pub fn estimated_usage(input_tokens: u64, output_text: &str) -> TokenUsage {

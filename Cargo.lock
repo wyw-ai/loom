@@ -15,8 +15,11 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "context-layer-core",
+ "context-tier",
  "dirs 5.0.1",
  "hex",
+ "inventory",
  "libc",
  "loom-platform",
  "parking_lot",
@@ -752,6 +755,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ca0197aee26d1ae37445ee532fefce43251d24cc7c166799f4d46817f1d3973"
 dependencies = [
  "crossbeam-utils",
+]
+
+[[package]]
+name = "context-layer-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "inventory",
+ "proto",
+]
+
+[[package]]
+name = "context-tier"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "context-layer-core",
+ "inventory",
+ "loom-platform",
+ "proto",
+ "tracing",
 ]
 
 [[package]]
@@ -2270,6 +2294,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "inventory"
+version = "0.3.24"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4f0c30c76f2f4ccee3fe55a2435f691ca00c0e4bd87abe4f4a851b1d4dac39b"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2550,6 +2583,8 @@ dependencies = [
  "async-trait",
  "chrono",
  "clap",
+ "context-layer-core",
+ "context-tier",
  "crossterm",
  "dirs 5.0.1",
  "fs2",

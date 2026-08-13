@@ -53,9 +53,9 @@ use agent_runtime::usage;
 use agent_runtime::{
     agent_child_server_url, prepare_bundle_install, resolved_bundle_version,
     validate_bundle_current, Adapter, AdapterEvent, AdapterModelOptions, AdapterPrompt,
-    AssemblyContext, ContextResource, ContextResourceRegistry, FileSystemProvider, MemoryProvider,
-    MessageListProvider, PromptPart, PromptRoleHint, ResourceProvider, TokenUsage,
-    WarmSummaryContextResource,
+    AssemblyContext, ContextResource, ContextResourceRegistry, discover_plugins,
+    FileSystemProvider, MemoryProvider,
+    PromptPart, PromptRoleHint, ResourceProvider, TokenUsage,
 };
 
 use crate::client::Client;
@@ -4410,7 +4410,7 @@ async fn notification_loop(
             // Clean up persisted Warm summaries for the deleted channel and
             // all its known thread scopes (cleanup on channel deletion).
             for scope_id in state.scope_ids_for_channel(channel_id) {
-                WarmSummaryContextResource::clear(&state.profile_dir, &scope_id);
+                context_tier::WarmSummaryContextResource::clear(&state.profile_dir, &scope_id);
             }
             if !scopes.is_empty() {
                 tracing::info!(
@@ -8514,9 +8514,10 @@ fn normalize_timezone_value(value: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 // Context Layer MVP — Warm summary persistence + injection
 //
-// Migrated to WarmSummaryContextResource (context_layer/warm_summary.rs).
-// The session-reset trigger logic below remains in agent_serve.rs because
-// it is a turn-level decision, not a ContextResource (ARCH D3).
+// Migrated to context_tier::WarmSummaryContextResource (context-tier crate,
+// self-registered via inventory). The session-reset trigger logic below
+// remains in agent_serve.rs because it is a turn-level decision, not a
+// ContextResource (ARCH D3).
 // ---------------------------------------------------------------------------
 
 /// Threshold multiplier: session reset triggers when estimated token usage
@@ -8693,8 +8694,10 @@ type ResourceFactory = Box<dyn Fn(&Option<Value>) -> Box<dyn ContextResource>>;
 /// Build the builtin resource factory map. Each entry maps a scheme name
 /// to a factory closure that produces a ContextResource.
 ///
-/// Adding a new builtin resource is a one-line change here — no match arm
-/// modifications needed in `build_context_resource_chain`.
+/// Built-in providers (memory, file) are registered directly here.
+/// Plugin providers (warm-summary, message-list, etc.) are discovered via
+/// `inventory::submit!` self-registration — loom does not know their
+/// concrete types (Founder principle: plugin decoupling).
 fn builtin_resource_factories(
     bootstrap_memory: &str,
     turn_memory: String,
@@ -8709,11 +8712,6 @@ fn builtin_resource_factories(
             MemoryProvider::new()
                 .with_rendered(boot.clone(), turn_memory.clone()),
         ) as Box<dyn ContextResource>
-    }));
-
-    // message-list — no config needed.
-    factories.insert("message-list".into(), Box::new(|_config| {
-        Box::new(MessageListProvider::new()) as Box<dyn ContextResource>
     }));
 
     // file — reads path + max_files from config.
@@ -8734,10 +8732,13 @@ fn builtin_resource_factories(
         Box::new(FileContextResource::new(provider)) as Box<dyn ContextResource>
     }));
 
-    // warm-summary — no config needed.
-    factories.insert("warm-summary".into(), Box::new(|_config| {
-        Box::new(WarmSummaryContextResource::new()) as Box<dyn ContextResource>
-    }));
+    // ── External plugins (via inventory self-registration) ─────────────
+    // Plugins like warm-summary and message-list register themselves at
+    // compile time via `inventory::submit!`. Loom discovers them here
+    // without knowing their concrete types.
+    for (scheme, factory_fn) in discover_plugins() {
+        factories.insert(scheme, Box::new(move |_config| factory_fn()));
+    }
 
     factories
 }
@@ -9737,7 +9738,7 @@ async fn translate_one_with_gate(
 
                 if success && !summary_text.trim().is_empty() {
                     // Persist the provider-generated summary (C-1, C-2, C-5).
-                    if let Err(err) = WarmSummaryContextResource::persist(
+                    if let Err(err) = context_tier::WarmSummaryContextResource::persist(
                         &state.profile_dir,
                         &scope_id,
                         &summary_text,

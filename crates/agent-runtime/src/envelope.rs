@@ -18,11 +18,10 @@
 
 /// A named, titled, rendered section. Exposed so callers (and tests) can
 /// inspect individual pieces, not just the final glued prompt.
-#[derive(Debug, Clone)]
-pub struct PromptSection {
-    pub name: &'static str,
-    pub content: String,
-}
+///
+/// The canonical definition lives in `context-layer-core`; this re-export
+/// preserves backward compatibility for `agent_runtime::envelope::PromptSection`.
+pub use context_layer_core::PromptSection;
 
 /// Input to [`compose_prompt`]. All string fields may be empty — the
 /// composer drops empty sections. Pre-rendered memory strings (already

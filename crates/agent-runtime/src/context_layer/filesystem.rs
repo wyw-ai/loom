@@ -165,7 +165,6 @@ impl ResourceProvider for FileSystemProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proto::types::ScopeKind;
 
     #[test]
     fn scheme_is_file() {

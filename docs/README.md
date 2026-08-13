@@ -46,7 +46,7 @@ runtime/provider behavior, GUI product flows, or local verification steps.
 - [context-layer/api-reference.md](./context-layer/api-reference.md) - trait method signatures, struct fields, built-in provider APIs, and custom provider example.
 - [context-layer/source-navigation.md](./context-layer/source-navigation.md) - key source file paths and line numbers across the codebase.
 - [context-layer/message-list-warm-cold.md](./context-layer/message-list-warm-cold.md) - Hot/Warm/Cold context layering, session reset triggers, Warm summary generation and persistence.
-- [context-layer/skill-mounting-guide.md](./context-layer/skill-mounting-guide.md) - Skill two dimensions, installation projection, prompt injection, progressive disclosure.
+- [context-layer/skill-mounting-guide.md](./context-layer/skill-mounting-guide.md) - Skill installation projection, progressive disclosure, MCP mapping.
 - [context-layer/data-source-best-practices.md](./context-layer/data-source-best-practices.md) - per-data-source configuration examples, priority allocation, security constraints.
 - [context-layer/custom-provider-guide.md](./context-layer/custom-provider-guide.md) - ContextResource/ResourceProvider implementation, inventory self-registration, security constraints.
 

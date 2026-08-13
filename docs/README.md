@@ -37,6 +37,19 @@ runtime/provider behavior, GUI product flows, or local verification steps.
 - [gui-desktop-design.md](./gui-desktop-design.md) - Loom Desktop goals, technical stack, information architecture, design tokens, component slots, state model, Tauri bridge, UI update mapping, shortcuts, slash commands, and milestones.
 - [gui-actor-provider-management-design.md](./gui-actor-provider-management-design.md) - Actors workspace product logic, host registration, provider availability, agent/service management, profile files, prompt studio, runtime configuration, backend changes, UI principles, rollout, and acceptance criteria.
 
+## Context Layer
+
+- [context-layer/README.md](./context-layer/README.md) - index for ContextLayer documentation (pluggable context-assembly system).
+- [context-layer/getting-started.md](./context-layer/getting-started.md) - what ContextLayer is, when to enable it, minimal configuration, and scope inheritance.
+- [context-layer/architecture.md](./context-layer/architecture.md) - core concepts (ContextResource trait, AssemblyContext, ResourceProvider, Registry), design constraints, token budget waterfall, and Hot/Warm/Cold layering.
+- [context-layer/configuration.md](./context-layer/configuration.md) - complete agentcontext.json schema, per-scheme configuration, merge semantics, and template variables.
+- [context-layer/api-reference.md](./context-layer/api-reference.md) - trait method signatures, struct fields, built-in provider APIs, and custom provider example.
+- [context-layer/source-navigation.md](./context-layer/source-navigation.md) - key source file paths and line numbers across the codebase.
+- [context-layer/message-list-warm-cold.md](./context-layer/message-list-warm-cold.md) - Hot/Warm/Cold context layering, session reset triggers, Warm summary generation and persistence.
+- [context-layer/skill-mounting-guide.md](./context-layer/skill-mounting-guide.md) - Skill two dimensions, installation projection, prompt injection, progressive disclosure.
+- [context-layer/data-source-best-practices.md](./context-layer/data-source-best-practices.md) - per-data-source configuration examples, priority allocation, security constraints.
+- [context-layer/custom-provider-guide.md](./context-layer/custom-provider-guide.md) - ContextResource/ResourceProvider implementation, inventory self-registration, security constraints.
+
 ## Contracts And Runbooks
 
 - [artifact-contracts.md](./artifact-contracts.md) - artifact shape conventions, generic contract structures, and versioning rules.

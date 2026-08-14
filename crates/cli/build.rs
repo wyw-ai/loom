@@ -11,17 +11,38 @@ const GUIDE_REPO_URL: &str = "https://github.com/wyw-ai/loom-guide.git";
 /// and context resource declarations. Sources without `plugin.json` are
 /// treated as pure skill repositories with all skills at global scope
 /// (backward compatible with the former `OFFICIAL_SKILL_SOURCES`).
+///
+/// Source resolution lifecycle (see `resolve_content_source`):
+/// 1. env override — first non-empty `dir_env` var wins (anchor-checked)
+/// 2. sibling lookup — `<workspace-parent>/<repo_dir_name>`, then
+///    `<workspace>/<repo_dir_name>` (anchor-checked)
+/// 3. clone — `repo_env` or `default_repo_url` (+ optional `ref_env`)
+///    into OUT_DIR (anchor-checked after clone)
+/// Every stage validates the same `repo_anchor_rel`; a non-empty env var
+/// or fresh clone failing the check panics the build.
 struct OfficialPluginSource {
-    /// Env vars pointing at a local checkout of the source repo.
+    /// Env vars (in priority order) that may point at a local checkout
+    /// of the source repo. The first non-empty value that passes the
+    /// anchor check wins; a non-empty value failing it panics.
     dir_env: &'static [&'static str],
-    /// Sibling-directory lookup name and temp clone directory name.
+    /// Repository directory name, used both for sibling-directory lookup
+    /// and as the temp clone directory name under OUT_DIR.
     repo_dir_name: &'static str,
-    /// File that must exist for the source to be considered valid.
-    required_rel: &'static str,
-    /// Env var overriding the repo URL to clone.
+    /// Repo-relative path that must exist for a candidate directory to be
+    /// accepted as a valid checkout of this source repo (identity anchor).
+    ///
+    /// This is a validity check only — it never filters which skills or
+    /// resources are loaded; content discovery scans the whole repo (see
+    /// `scan_and_register_skills`). A missing anchor panics the build
+    /// (fail-loud by design, guarding against wrong-dir or drifted
+    /// repo layouts).
+    repo_anchor_rel: &'static str,
+    /// Env var overriding the repo URL used when cloning is required.
     repo_env: &'static str,
+    /// Repo URL cloned when no `repo_env` override is set and no local
+    /// checkout is found by env or sibling lookup.
     default_repo_url: &'static str,
-    /// Env var for an optional git ref (tag/branch) to clone.
+    /// Env var for an optional git ref (branch/tag) used when cloning.
     ref_env: &'static str,
 }
 
@@ -33,7 +54,7 @@ const OFFICIAL_PLUGINS: &[OfficialPluginSource] = &[
     OfficialPluginSource {
         dir_env: &["LOOM_SKILLS_DIR", "LOOM_SKILL_DIR"],
         repo_dir_name: "loom-skills",
-        required_rel: "skills/loom/SKILL.md",
+        repo_anchor_rel: "skills/loom/SKILL.md",
         repo_env: "LOOM_SKILLS_REPO",
         default_repo_url: "https://github.com/wyw-ai/skills.git",
         ref_env: "LOOM_SKILLS_REF",
@@ -41,7 +62,7 @@ const OFFICIAL_PLUGINS: &[OfficialPluginSource] = &[
     OfficialPluginSource {
         dir_env: &["LOOM_ACTOR_CIRCUIT_DIR"],
         repo_dir_name: "actor-circuit",
-        required_rel: "skills/actor-circuit/SKILL.md",
+        repo_anchor_rel: "skills/actor-circuit/SKILL.md",
         repo_env: "LOOM_ACTOR_CIRCUIT_REPO",
         default_repo_url: "https://github.com/wyw-ai/actor-circuit.git",
         ref_env: "LOOM_ACTOR_CIRCUIT_REF",
@@ -49,7 +70,7 @@ const OFFICIAL_PLUGINS: &[OfficialPluginSource] = &[
     OfficialPluginSource {
         dir_env: &["LOOM_CONTEXT_TIER_DIR"],
         repo_dir_name: "loom-plugin-context-tier",
-        required_rel: "skills/context-tier/SKILL.md",
+        repo_anchor_rel: "skills/context-tier/SKILL.md",
         repo_env: "LOOM_CONTEXT_TIER_REPO",
         default_repo_url: "https://github.com/wyw-ai/loom-plugin-context-tier.git",
         ref_env: "LOOM_CONTEXT_TIER_REF",
@@ -93,7 +114,7 @@ fn resolve_plugin_sources(clone_root: &Path) -> Vec<ResolvedPluginSource> {
             content: resolve_content_source(
                 source.dir_env,
                 source.repo_dir_name,
-                source.required_rel,
+                source.repo_anchor_rel,
                 source.repo_env,
                 source.default_repo_url,
                 source.ref_env,
@@ -112,7 +133,7 @@ struct ContentSource {
 fn resolve_content_source(
     env_names: &[&str],
     repo_name: &str,
-    required_rel: &str,
+    repo_anchor_rel: &str,
     repo_env_name: &str,
     default_repo_url: &str,
     ref_env_name: &str,
@@ -127,7 +148,7 @@ fn resolve_content_source(
     for env_name in env_names {
         if let Some(raw) = env::var_os(env_name).filter(|value| !value.is_empty()) {
             let path = PathBuf::from(raw);
-            if path.join(required_rel).exists() {
+            if path.join(repo_anchor_rel).exists() {
                 println!("cargo:rerun-if-changed={}", path.display());
                 return ContentSource {
                     path,
@@ -137,13 +158,13 @@ fn resolve_content_source(
             panic!(
                 "{env_name} points at {}, but {} is missing",
                 path.display(),
-                required_rel
+                repo_anchor_rel
             );
         }
     }
 
     for candidate in content_candidates(repo_name) {
-        if candidate.join(required_rel).exists() {
+        if candidate.join(repo_anchor_rel).exists() {
             println!("cargo:rerun-if-changed={}", candidate.display());
             return ContentSource {
                 path: candidate,
@@ -156,11 +177,11 @@ fn resolve_content_source(
     let git_ref = env::var(ref_env_name).ok().filter(|r| !r.is_empty());
     let target = clone_root.join(repo_name);
     clone_repo(&repo_url, &target, git_ref.as_deref());
-    if !target.join(required_rel).exists() {
+    if !target.join(repo_anchor_rel).exists() {
         panic!(
             "cloned {repo_url} into {}, but {} is missing",
             target.display(),
-            required_rel
+            repo_anchor_rel
         );
     }
     ContentSource {

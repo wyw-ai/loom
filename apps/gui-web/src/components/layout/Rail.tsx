@@ -5,6 +5,7 @@ import type { ConnectionState } from "@/lib/types";
 import { accountName, workspaceInitials } from "@/lib/format-utils";
 import { cn } from "@/lib/utils";
 import { Avatar } from "@/components/layout/Avatar";
+import { usePresence } from "@/hooks/usePresence";
 import { useI18n } from "@/lib/i18n";
 
 export function Rail({
@@ -36,6 +37,7 @@ export function Rail({
 }) {
   const { t } = useI18n();
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
+  const accountMenuMounted = usePresence(accountMenuOpen);
   const accountMenuId = useId();
   const accountMenuRootRef = useRef<HTMLDivElement>(null);
   const accountMenuRef = useRef<HTMLDivElement>(null);
@@ -43,7 +45,7 @@ export function Rail({
   const accountDestinationActive = accountActive || systemSettingsActive;
 
   useEffect(() => {
-    if (!accountMenuOpen) return;
+    if (!accountMenuOpen || !accountMenuMounted) return;
 
     accountMenuRef.current
       ?.querySelector<HTMLButtonElement>('[role="menuitem"]')
@@ -67,7 +69,11 @@ export function Rail({
       document.removeEventListener("pointerdown", closeFromOutside);
       document.removeEventListener("keydown", closeOnEscape);
     };
-  }, [accountMenuOpen]);
+  }, [accountMenuMounted, accountMenuOpen]);
+
+  useEffect(() => {
+    setAccountMenuOpen(false);
+  }, [workspace?.id]);
 
   const selectAccountDestination = (destination: "account" | "system") => {
     setAccountMenuOpen(false);
@@ -160,13 +166,17 @@ export function Rail({
             </span>
           )}
         </button>
-        {accountMenuOpen ? (
+        {accountMenuMounted ? (
           <div
             ref={accountMenuRef}
             id={accountMenuId}
-            role="menu"
+            role={accountMenuOpen ? "menu" : undefined}
             aria-label={t("Account menu")}
-            className="absolute bottom-0 left-[calc(100%+12px)] z-[70] w-52 rounded-xl border border-[#dfe3ec] bg-white p-1.5 shadow-[0_18px_48px_rgb(16_24_40_/_0.18)]"
+            aria-hidden={!accountMenuOpen}
+            className={cn(
+              "surface-menu surface-menu-origin-bottom-left absolute bottom-0 left-[calc(100%+12px)] z-[70] w-52 rounded-xl border border-[#dfe3ec] bg-white p-1.5 shadow-[0_18px_48px_rgb(16_24_40_/_0.16)]",
+              !accountMenuOpen && "motion-menu-closing pointer-events-none",
+            )}
             onKeyDown={handleMenuKeyDown}
           >
             <AccountMenuItem

@@ -8,7 +8,10 @@ import {
   hasMigratedChannelGroups,
   markChannelGroupsDirty,
   markChannelGroupsMigrated,
+  channelGroupSections,
+  moveChannelInGroups,
   normalizeChannelLayout,
+  reorderChannelGroups,
   sortChannels,
 } from "@/lib/channel-utils";
 
@@ -55,6 +58,101 @@ describe("channel layout normalization", () => {
         updatedAt: "2026-08-10T00:00:00Z",
       }),
     ).toBeNull();
+  });
+});
+
+describe("channel layout drag placement", () => {
+  const groups = [
+    {
+      id: "section-one",
+      title: "One",
+      channelIds: ["channel-a", "channel-b"],
+      collapsed: false,
+    },
+    {
+      id: "section-two",
+      title: "Two",
+      channelIds: ["channel-c"],
+      collapsed: true,
+    },
+  ];
+
+  it("reorders channels at the inferred insertion point and expands the target", () => {
+    const moved = moveChannelInGroups(
+      groups,
+      "channel-a",
+      "section-two",
+      "channel-c",
+    );
+
+    expect(moved[0]?.channelIds).toEqual(["channel-b"]);
+    expect(moved[1]?.channelIds).toEqual(["channel-a", "channel-c"]);
+    expect(moved[1]?.collapsed).toBe(false);
+  });
+
+  it("persists the visible ungrouped order in a reserved section", () => {
+    const moved = moveChannelInGroups(
+      groups,
+      "channel-a",
+      "__ungrouped",
+      "channel-d",
+      ["channel-d", "channel-e"],
+    );
+
+    expect(moved.at(-1)).toEqual({
+      id: "__ungrouped",
+      title: "Ungrouped",
+      channelIds: ["channel-a", "channel-d", "channel-e"],
+      collapsed: false,
+    });
+  });
+
+  it("reorders sections without exposing the reserved ungrouped section as a group", () => {
+    const reordered = reorderChannelGroups(
+      [
+        ...groups,
+        {
+          id: "__ungrouped",
+          title: "Ungrouped",
+          channelIds: ["channel-d"],
+          collapsed: false,
+        },
+      ],
+      "section-two",
+      "section-one",
+    );
+
+    expect(reordered.map((group) => group.id)).toEqual([
+      "section-two",
+      "section-one",
+      "__ungrouped",
+    ]);
+  });
+
+  it("renders newly discovered channels after an explicit ungrouped order", () => {
+    const channels: Channel[] = ["channel-a", "channel-b", "channel-c"].map(
+      (id) => ({ id, title: id, visibility: "public", members: [] }),
+    );
+    const sections = channelGroupSections(
+      [
+        {
+          id: "__ungrouped",
+          title: "Ungrouped",
+          channelIds: ["channel-b", "channel-a"],
+          collapsed: false,
+        },
+      ],
+      channels,
+    );
+
+    expect(sections).toHaveLength(1);
+    expect(sections[0]?.local).toBe(false);
+    expect(sections[0]?.title).toBe("Channels");
+    expect(sections[0]?.channels.map((channel) => channel.id)).toEqual([
+      "channel-b",
+      "channel-a",
+      "channel-c",
+    ]);
   });
 });
 

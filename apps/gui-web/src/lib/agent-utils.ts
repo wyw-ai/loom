@@ -326,11 +326,10 @@ export function runStatusDotClass(ctx: ActorRunContext | null): string {
 
 export function runStatusAnimationName(ctx: ActorRunContext | null): string | undefined {
   if (!ctx) return undefined;
-  if (ctx.isTerminal) {
-    return ctx.status === "failed" ? "agent-status-failed" : "agent-status-canceled";
-  }
-  if (ctx.isStale) return "agent-status-stale-warning";
-  return `agent-status-${ctx.status.replace(/_/g, "-")}`;
+  if (ctx.isTerminal || ctx.isStale) return undefined;
+  if (ctx.status === "preparing_context") return "agent-status-preparing-context";
+  if (ctx.status === "running") return "agent-status-running";
+  return undefined;
 }
 
 // ---------------------------------------------------------------------------

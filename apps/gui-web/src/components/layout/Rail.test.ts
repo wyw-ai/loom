@@ -87,6 +87,7 @@ describe("Rail account menu", () => {
     expect(onOpenAccount).toHaveBeenCalledOnce();
     expect(onOpenSystemSettings).not.toHaveBeenCalled();
     expect(container.querySelector('[role="menu"]')).toBeNull();
+    expect(container.querySelector('[aria-hidden="true"]')).not.toBeNull();
   });
 
   it("closes from an outside pointer or Escape and exposes Chinese labels", () => {

@@ -1,5 +1,5 @@
 import { useMemo, useState, type ReactNode } from "react";
-import { ChevronDown, ChevronRight } from "lucide-react";
+import { ChevronDown } from "lucide-react";
 import type {
   Actor,
   MachineInfo,
@@ -111,7 +111,7 @@ export function scopedServiceActivity(
 function dotClass(status: AgentActivityStatus) {
   switch (status) {
     case "running":
-      return "bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.45)] animate-pulse";
+      return "motion-status-active bg-emerald-500 shadow-[0_0_6px_rgba(16,185,129,0.35)]";
     case "queued":
       return "bg-amber-400";
     case "offline":
@@ -159,9 +159,9 @@ function statusText(agent: AgentActivityAgent, t: I18nContextValue["t"]) {
 function serviceDotClass(phase: ServiceRuntimePhase) {
   switch (phase) {
     case "running":
-      return "bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.45)] animate-pulse";
+      return "motion-status-active bg-emerald-500 shadow-[0_0_6px_rgba(16,185,129,0.35)]";
     case "starting":
-      return "bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.35)] animate-pulse";
+      return "bg-amber-400 shadow-[0_0_6px_rgba(251,191,36,0.28)]";
     case "failed":
       return "bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.35)]";
   }
@@ -279,7 +279,7 @@ export function ActorActivityBanner({
             aria-expanded={false}
             onClick={() => setOpen(true)}
           >
-            <ChevronRight size={14} className="shrink-0 text-[#667085]" />
+            <ChevronDown size={14} className="motion-chevron shrink-0 -rotate-90 text-[#667085]" />
             {compactAgent && (
               <span
                 className={cn("h-2.5 w-2.5 shrink-0 rounded-full", dotClass(compactAgent.status))}
@@ -356,14 +356,14 @@ export function ActorActivityBanner({
 
   return (
     <div className="actor-activity-banner shrink-0 border-t border-[#e2e6ef] bg-white px-5 py-2">
-      <div className="mx-auto max-w-4xl rounded-xl border border-[#e2e6ef] bg-[#fbfcff] shadow-sm">
+      <div className="mx-auto max-w-4xl animate-[loom-activity-expand_180ms_var(--motion-emphasized)_both] rounded-xl border border-[#e2e6ef] bg-[#fbfcff] shadow-sm">
         <button
           type="button"
           className="flex min-h-9 w-full items-center gap-2 border-b border-[#edf0f5] px-3 py-2 text-left text-xs font-bold text-[#303849]"
           aria-expanded
           onClick={() => setOpen(false)}
         >
-          <ChevronDown size={14} className="shrink-0 text-[#667085]" />
+          <ChevronDown size={14} className="motion-chevron shrink-0 text-[#667085]" />
           <span className="min-w-0 flex-1 truncate">{t("Actor activity")}</span>
           <span className="shrink-0 font-semibold text-[#667085]">{summary}</span>
         </button>

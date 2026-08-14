@@ -81,6 +81,8 @@ export function App() {
   const [messageAnchorId, setMessageAnchorId] = useState<string | null>(null);
   const [serverPasswordPrompt, setServerPasswordPrompt] = useState<ServerPasswordPrompt | null>(null);
   const [threadPanelMaximized, setThreadPanelMaximized] = useState(false);
+  const [threadPanelRestoring, setThreadPanelRestoring] = useState(false);
+  const threadRestoreTimerRef = useRef<number | null>(null);
 
   const activeScopeRef = useRef<ScopeRef | null>(null);
   const activeThreadScopeRef = useRef<ScopeRef | null>(null);
@@ -211,6 +213,7 @@ export function App() {
     removeChannelGroup,
     toggleChannelGroup,
     moveChannelToGroup,
+    reorderChannelGroup,
   } = useChannelGroups({
     channelGroups,
     setChannelGroups,
@@ -483,18 +486,40 @@ export function App() {
 
   const restoreThreadPanel = useCallback(() => {
     setThreadPanelMaximized(false);
+    setThreadPanelRestoring(true);
+    if (threadRestoreTimerRef.current !== null) {
+      window.clearTimeout(threadRestoreTimerRef.current);
+    }
+    threadRestoreTimerRef.current = window.setTimeout(() => {
+      setThreadPanelRestoring(false);
+      threadRestoreTimerRef.current = null;
+    }, 220);
     setPanelSizes((current) => ({
       ...current,
       detail: defaultPanelSizes.detail,
     }));
   }, [setPanelSizes]);
-  const maximizeThreadPanel = useCallback(() => setThreadPanelMaximized(true), []);
+  const maximizeThreadPanel = useCallback(() => {
+    if (threadRestoreTimerRef.current !== null) {
+      window.clearTimeout(threadRestoreTimerRef.current);
+      threadRestoreTimerRef.current = null;
+    }
+    setThreadPanelRestoring(false);
+    setThreadPanelMaximized(true);
+  }, []);
 
   useEffect(() => {
     if (!activeThread || searchPanelOpen || view !== "chat") {
       setThreadPanelMaximized(false);
+      setThreadPanelRestoring(false);
     }
   }, [activeThread, searchPanelOpen, view]);
+
+  useEffect(() => () => {
+    if (threadRestoreTimerRef.current !== null) {
+      window.clearTimeout(threadRestoreTimerRef.current);
+    }
+  }, []);
 
   const {
     shellStyle,
@@ -583,7 +608,7 @@ export function App() {
   }
 
   const shellProps = {
-    shellStyle, showWorkspaceChrome, showChatDetail, threadPanelMaximized,
+    shellStyle, showWorkspaceChrome, showChatDetail, threadPanelMaximized, threadPanelRestoring,
     restoreThreadPanel, resizingPanel, notice,
     account, busy, connection, workspace, workspaces, selectWorkspace, setView,
     view, visibleChannels, channelGroups, activeChannelId, activeDirectActorId,
@@ -591,7 +616,7 @@ export function App() {
     cancelRun, openScope, openMessageContext, messageAnchorId,
     searchPanelOpen, setSearchPanelOpen, machines, threadsByChannel,
     runsLoading, runsError, refreshRuns,
-    createChannelWithTitle, addChannelGroup, moveChannelToGroup, deleteChannel,
+    createChannelWithTitle, addChannelGroup, moveChannelToGroup, reorderChannelGroup, deleteChannel,
     renameChannel, updateChannelVisibility, removeChannelGroup, renameChannelGroup, toggleChannelGroup,
     setActiveChannelId, setActiveThreadId, setActiveDirectActorId, setChannelPanelTab,
     resizePanelByKeyboard, startPanelResize, error, target, channelPanelTab,

@@ -75,6 +75,7 @@ function defaultProps(): SidebarProps {
     onAddChannel: vi.fn(),
     onAddChannelGroup: vi.fn(),
     onMoveChannelToGroup: vi.fn(),
+    onReorderChannelGroup: vi.fn(),
     onDeleteChannel: vi.fn(),
     onRenameChannel: vi.fn(),
     onRemoveChannelGroup: vi.fn(),
@@ -205,6 +206,23 @@ describe("Sidebar server navigation", () => {
 
     expect(buttonWithText(container, "Leave server")?.disabled).toBe(true);
   });
+
+  it("keeps a closed server menu visual-only during its exit transition", () => {
+    const { container } = renderSidebar();
+    const trigger = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Server menu"]',
+    );
+
+    React.act(() => trigger!.click());
+    expect(container.querySelector('[role="menu"]')).not.toBeNull();
+    React.act(() => trigger!.click());
+
+    expect(container.querySelector('[role="menu"]')).toBeNull();
+    const exiting = container.querySelector<HTMLElement>('.motion-menu-closing[aria-hidden="true"]');
+    expect(exiting).not.toBeNull();
+    expect(exiting?.className).toContain("motion-menu-closing");
+    expect(exiting?.className).toContain("pointer-events-none");
+  });
 });
 
 describe("Sidebar section and context menus", () => {
@@ -235,6 +253,111 @@ describe("Sidebar section and context menus", () => {
       "channel-beta",
       "section-work",
     );
+  });
+
+  it("lets a channel follow the pointer and infers its exact drop position", () => {
+    const onMoveChannelToGroup = vi.fn();
+    const { container } = renderSidebar({ onMoveChannelToGroup });
+    const workSection = container.querySelector<HTMLElement>(
+      '[data-channel-section-id="section-work"]',
+    )!;
+    const channelArea = container.querySelector<HTMLElement>(
+      '[aria-label="Channel sections"]',
+    )!;
+    const ungroupedSection = container.querySelector<HTMLElement>(
+      '[data-channel-section-id="__ungrouped"]',
+    )!;
+    const alphaRow = container.querySelector<HTMLElement>(
+      '[data-channel-row-id="channel-alpha"]',
+    )!;
+    const betaRow = container.querySelector<HTMLElement>(
+      '[data-channel-row-id="channel-beta"]',
+    )!;
+    vi.spyOn(channelArea, "getBoundingClientRect").mockReturnValue({
+      left: 12, top: 50, right: 272, bottom: 300, width: 260, height: 250,
+      x: 12, y: 50, toJSON: () => ({}),
+    });
+    vi.spyOn(workSection, "getBoundingClientRect").mockReturnValue({
+      left: 20, top: 80, right: 260, bottom: 160, width: 240, height: 80,
+      x: 20, y: 80, toJSON: () => ({}),
+    });
+    vi.spyOn(ungroupedSection, "getBoundingClientRect").mockReturnValue({
+      left: 20, top: 170, right: 260, bottom: 250, width: 240, height: 80,
+      x: 20, y: 170, toJSON: () => ({}),
+    });
+    vi.spyOn(alphaRow, "getBoundingClientRect").mockReturnValue({
+      left: 24, top: 112, right: 256, bottom: 140, width: 232, height: 28,
+      x: 24, y: 112, toJSON: () => ({}),
+    });
+    vi.spyOn(betaRow, "getBoundingClientRect").mockReturnValue({
+      left: 24, top: 204, right: 256, bottom: 232, width: 232, height: 28,
+      x: 24, y: 204, toJSON: () => ({}),
+    });
+
+    const alphaButton = alphaRow.querySelector<HTMLButtonElement>("button")!;
+    React.act(() => {
+      alphaButton.dispatchEvent(pointerEvent("pointerdown", 1, 40, 120));
+      window.dispatchEvent(pointerEvent("pointermove", 1, 42, 210));
+    });
+    expect(document.body.querySelector(".sidebar-drag-overlay")?.textContent).toContain(
+      "alpha",
+    );
+
+    React.act(() => {
+      window.dispatchEvent(pointerEvent("pointerup", 1, 42, 210));
+    });
+    expect(onMoveChannelToGroup).toHaveBeenCalledWith(
+      "channel-alpha",
+      "__ungrouped",
+      "channel-beta",
+      ["channel-beta"],
+    );
+  });
+
+  it("reorders whole sections using the same free vertical drag interaction", () => {
+    const onReorderChannelGroup = vi.fn();
+    const { container } = renderSidebar({
+      channelGroups: [
+        {
+          id: "section-work",
+          title: "Work",
+          channelIds: ["channel-alpha"],
+          collapsed: false,
+        },
+        {
+          id: "section-play",
+          title: "Play",
+          channelIds: ["channel-beta"],
+          collapsed: false,
+        },
+      ],
+      onReorderChannelGroup,
+    });
+    const workSection = container.querySelector<HTMLElement>(
+      '[data-channel-section-id="section-work"]',
+    )!;
+    const playSection = container.querySelector<HTMLElement>(
+      '[data-channel-section-id="section-play"]',
+    )!;
+    vi.spyOn(workSection, "getBoundingClientRect").mockReturnValue({
+      left: 20, top: 80, right: 260, bottom: 160, width: 240, height: 80,
+      x: 20, y: 80, toJSON: () => ({}),
+    });
+    vi.spyOn(playSection, "getBoundingClientRect").mockReturnValue({
+      left: 20, top: 170, right: 260, bottom: 250, width: 240, height: 80,
+      x: 20, y: 170, toJSON: () => ({}),
+    });
+    const workHeaderButton = workSection.querySelector<HTMLButtonElement>(
+      ".channel-group-header > button",
+    )!;
+
+    React.act(() => {
+      workHeaderButton.dispatchEvent(pointerEvent("pointerdown", 7, 44, 96));
+      window.dispatchEvent(pointerEvent("pointermove", 7, 44, 240));
+      window.dispatchEvent(pointerEvent("pointerup", 7, 44, 240));
+    });
+
+    expect(onReorderChannelGroup).toHaveBeenCalledWith("section-work", null);
   });
 
   it("provides focused context menus for blank space, channels, and sections", () => {
@@ -290,3 +413,19 @@ describe("Sidebar section and context menus", () => {
     expect(buttonWithText(menu!, "Delete")).toBeDefined();
   });
 });
+
+function pointerEvent(
+  type: "pointerdown" | "pointermove" | "pointerup",
+  pointerId: number,
+  clientX: number,
+  clientY: number,
+) {
+  const event = new Event(type, { bubbles: true, cancelable: true });
+  Object.defineProperties(event, {
+    pointerId: { value: pointerId },
+    button: { value: 0 },
+    clientX: { value: clientX },
+    clientY: { value: clientY },
+  });
+  return event;
+}

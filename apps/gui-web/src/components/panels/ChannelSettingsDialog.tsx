@@ -12,6 +12,7 @@ import {
 import type { Channel, ChannelVisibility } from "@/ipc/types";
 import { ChannelConfigurePanel } from "@/components/panels/ChannelConfigurePanel";
 import { Button } from "@/components/ui/button";
+import { useAnimatedDismiss } from "@/hooks/usePresence";
 import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 
@@ -36,6 +37,7 @@ export function ChannelSettingsDialog({
     channel.visibility,
   );
   const [savingVisibility, setSavingVisibility] = useState(false);
+  const { closing, dismiss } = useAnimatedDismiss(onClose);
   const dialogRef = useRef<HTMLDivElement>(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const canManageVisibility = Boolean(
@@ -52,7 +54,7 @@ export function ChannelSettingsDialog({
     const handleDialogKeys = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
-        onClose();
+        dismiss();
         return;
       }
       if (event.key !== "Tab") return;
@@ -81,7 +83,7 @@ export function ChannelSettingsDialog({
       document.removeEventListener("keydown", handleDialogKeys);
       if (previouslyFocused?.isConnected) previouslyFocused.focus();
     };
-  }, [onClose]);
+  }, [dismiss]);
 
   const saveVisibility = async () => {
     if (
@@ -102,12 +104,15 @@ export function ChannelSettingsDialog({
 
   return createPortal(
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-[#111827]/35 px-4 py-6 backdrop-blur-sm"
+      className={cn(
+        "fixed inset-0 z-50 flex items-center justify-center bg-[#111827]/35 px-4 py-6 backdrop-blur-sm",
+        closing && "motion-dialog-closing pointer-events-none",
+      )}
       role="dialog"
       aria-modal="true"
       aria-labelledby="channel-settings-title"
       onMouseDown={(event) => {
-        if (event.target === event.currentTarget) onClose();
+        if (event.target === event.currentTarget) dismiss();
       }}
     >
       <div
@@ -135,7 +140,7 @@ export function ChannelSettingsDialog({
             className="composer-icon h-8 min-w-8"
             title={t("Close")}
             aria-label={t("Close channel settings")}
-            onClick={onClose}
+            onClick={dismiss}
           >
             <X size={16} />
           </button>

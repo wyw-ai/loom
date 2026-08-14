@@ -44,6 +44,7 @@ export interface WorkspaceShellProps {
   showWorkspaceChrome: boolean;
   showChatDetail: boolean;
   threadPanelMaximized: boolean;
+  threadPanelRestoring: boolean;
   restoreThreadPanel: () => void;
   resizingPanel: "sidebar" | "detail" | null;
   notice: string | null;
@@ -80,7 +81,13 @@ export interface WorkspaceShellProps {
   threadsByChannel: Record<string, Thread[]>;
   createChannelWithTitle: (title: string) => Promise<void>;
   addChannelGroup: (title: string) => void;
-  moveChannelToGroup: (channelId: string, groupId: string) => void;
+  moveChannelToGroup: (
+    channelId: string,
+    groupId: string,
+    beforeChannelId?: string | null,
+    targetChannelIds?: readonly string[],
+  ) => void;
+  reorderChannelGroup: (groupId: string, beforeGroupId: string | null) => void;
   deleteChannel: (channel: Channel) => Promise<void>;
   renameChannel: (channel: Channel, title: string) => Promise<void>;
   updateChannelVisibility: (channel: Channel, visibility: ChannelVisibility) => Promise<boolean>;
@@ -351,6 +358,7 @@ export function WorkspaceShell(props: WorkspaceShellProps) {
           }}
           onAddChannelGroup={p.addChannelGroup}
           onMoveChannelToGroup={p.moveChannelToGroup}
+          onReorderChannelGroup={p.reorderChannelGroup}
           onDeleteChannel={p.deleteChannel}
           onRenameChannel={p.renameChannel}
           onRemoveChannelGroup={p.removeChannelGroup}
@@ -496,6 +504,7 @@ export function WorkspaceShell(props: WorkspaceShellProps) {
           className={cn(
             "detail-panel-shell",
             p.threadPanelMaximized && "detail-panel-shell-thread-maximized",
+            p.threadPanelRestoring && "detail-panel-shell-thread-restoring",
           )}
         >
           {detailContent}

@@ -29,13 +29,15 @@ struct OfficialPluginSource {
     /// and as the temp clone directory name under OUT_DIR.
     repo_dir_name: &'static str,
     /// Repo-relative path that must exist for a candidate directory to be
-    /// accepted as a valid checkout of this source repo (identity anchor).
+    /// accepted as a valid checkout of this source repo (structural anchor).
     ///
-    /// This is a validity check only — it never filters which skills or
-    /// resources are loaded; content discovery scans the whole repo (see
-    /// `scan_and_register_skills`). A missing anchor panics the build
-    /// (fail-loud by design, guarding against wrong-dir or drifted
-    /// repo layouts).
+    /// (a) The anchor points at the repo's defining layout (e.g. `skills`),
+    /// (b) never at an individual content file, and
+    /// (c) serves as a validity check only — it never filters which skills
+    ///     or resources are loaded; content discovery scans the whole repo
+    ///     (see `scan_and_register_skills`).
+    /// (d) A missing anchor panics the build (fail-loud by design, guarding
+    ///     against wrong-dir or drifted repo layouts).
     repo_anchor_rel: &'static str,
     /// Env var overriding the repo URL used when cloning is required.
     repo_env: &'static str,
@@ -49,12 +51,13 @@ struct OfficialPluginSource {
 /// Unified plugin entry list. Pure skill repos (loom-skills, actor-circuit)
 /// have no `plugin.json` and fall back to global-scope skill loading.
 /// Full plugin repos (loom-plugin-context-tier) carry `plugin.json` for
-/// multi-dimensional dispatch.
+/// multi-dimensional dispatch. Each source is validated against its
+/// structural `repo_anchor_rel` before content discovery.
 const OFFICIAL_PLUGINS: &[OfficialPluginSource] = &[
     OfficialPluginSource {
         dir_env: &["LOOM_SKILLS_DIR", "LOOM_SKILL_DIR"],
         repo_dir_name: "loom-skills",
-        repo_anchor_rel: "skills/loom/SKILL.md",
+        repo_anchor_rel: "skills",
         repo_env: "LOOM_SKILLS_REPO",
         default_repo_url: "https://github.com/wyw-ai/skills.git",
         ref_env: "LOOM_SKILLS_REF",
@@ -62,7 +65,7 @@ const OFFICIAL_PLUGINS: &[OfficialPluginSource] = &[
     OfficialPluginSource {
         dir_env: &["LOOM_ACTOR_CIRCUIT_DIR"],
         repo_dir_name: "actor-circuit",
-        repo_anchor_rel: "skills/actor-circuit/SKILL.md",
+        repo_anchor_rel: "skills",
         repo_env: "LOOM_ACTOR_CIRCUIT_REPO",
         default_repo_url: "https://github.com/wyw-ai/actor-circuit.git",
         ref_env: "LOOM_ACTOR_CIRCUIT_REF",
@@ -70,7 +73,7 @@ const OFFICIAL_PLUGINS: &[OfficialPluginSource] = &[
     OfficialPluginSource {
         dir_env: &["LOOM_CONTEXT_TIER_DIR"],
         repo_dir_name: "loom-plugin-context-tier",
-        repo_anchor_rel: "skills/context-tier/SKILL.md",
+        repo_anchor_rel: "skills",
         repo_env: "LOOM_CONTEXT_TIER_REPO",
         default_repo_url: "https://github.com/wyw-ai/loom-plugin-context-tier.git",
         ref_env: "LOOM_CONTEXT_TIER_REF",
@@ -494,6 +497,22 @@ fn generate_plugin_snapshot(sources: &[ResolvedPluginSource], out_dir: &Path) {
                 !content.cloned,
                 PluginScope::Global,
                 &[],
+            );
+        }
+    }
+
+    // Zero-skill guard: every official source must contribute at least one
+    // skill. A source contributing none indicates a drifted repo layout or
+    // a misconfigured anchor; fail loud instead of silently embedding less.
+    for source in sources {
+        let contributed = all_skills
+            .iter()
+            .filter(|skill| skill.source == source.repo_dir_name)
+            .count();
+        if contributed == 0 {
+            panic!(
+                "official plugin source `{}` contributed no skills",
+                source.repo_dir_name
             );
         }
     }

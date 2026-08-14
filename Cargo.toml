@@ -39,7 +39,7 @@ tokio-tungstenite = { version = "0.21", features = ["connect", "rustls-tls-nativ
 url = "2"
 dirs = "5"
 toml = "1.1"
-ratatui = { version = "0.28", default-features = false, features = ["crossterm"] }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures = "0.3"
 unicode-width = "0.1"

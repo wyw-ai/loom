@@ -11,5 +11,7 @@ describe("WorkspaceShell maximized thread layout", () => {
       /\.detail-panel-shell\.detail-panel-shell-thread-maximized\s*\{[^}]*position:\s*fixed[^}]*inset:\s*0 0 0 calc\(72px \+ var\(--sidebar-width\) \+ 8px\)[^}]*width:\s*auto/s,
     );
     expect(css).not.toContain("app-shell-thread-underlay");
+    expect(css).toMatch(/detail-panel-shell\.detail-panel-shell-thread-restoring/);
+    expect(css).toMatch(/@media \(prefers-reduced-motion: reduce\)/);
   });
 });

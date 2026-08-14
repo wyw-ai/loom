@@ -2,15 +2,16 @@ import { useCallback, useEffect, useRef } from "react";
 import * as ipc from "@/ipc/bridge";
 import type { ChannelLayout } from "@/ipc/types";
 import type { ChannelGroup, ConnectionState } from "@/lib/types";
-import { ungroupedChannelGroupId } from "@/lib/constants";
 import {
   hasDirtyChannelGroups,
   hasMigratedChannelGroups,
   loadChannelGroups,
   markChannelGroupsDirty,
   markChannelGroupsMigrated,
+  moveChannelInGroups,
   normalizeChannelGroups,
   normalizeChannelLayout,
+  reorderChannelGroups,
   saveChannelGroups,
 } from "@/lib/channel-utils";
 
@@ -507,16 +508,29 @@ export function useChannelGroups({
   );
 
   const moveChannelToGroup = useCallback(
-    (channelId: string, groupId: string) => {
+    (
+      channelId: string,
+      groupId: string,
+      beforeChannelId: string | null = null,
+      targetChannelIds?: readonly string[],
+    ) => {
       updateChannelGroups((current) =>
-        current.map((group) => {
-          const channelIds = group.channelIds.filter((id) => id !== channelId);
-          if (group.id === groupId && groupId !== ungroupedChannelGroupId) {
-            channelIds.push(channelId);
-            return { ...group, channelIds, collapsed: false };
-          }
-          return { ...group, channelIds };
-        }),
+        moveChannelInGroups(
+          current,
+          channelId,
+          groupId,
+          beforeChannelId,
+          targetChannelIds,
+        ),
+      );
+    },
+    [updateChannelGroups],
+  );
+
+  const reorderChannelGroup = useCallback(
+    (groupId: string, beforeGroupId: string | null) => {
+      updateChannelGroups((current) =>
+        reorderChannelGroups(current, groupId, beforeGroupId),
       );
     },
     [updateChannelGroups],
@@ -531,5 +545,6 @@ export function useChannelGroups({
     removeChannelGroup,
     toggleChannelGroup,
     moveChannelToGroup,
+    reorderChannelGroup,
   };
 }

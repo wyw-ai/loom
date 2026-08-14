@@ -2996,10 +2996,16 @@ fn fallback_command_dirs() -> Vec<PathBuf> {
     if let Some(home) = std::env::var_os("HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+        .or_else(dirs::home_dir)
     {
         dirs.push(home.join(".local").join("bin"));
         dirs.push(home.join(".cargo").join("bin"));
         dirs.push(home.join(".bun").join("bin"));
+        // Kimi Code installs its launcher here by default. User services
+        // (systemd/launchd) commonly start with a minimal PATH, so relying on
+        // the interactive shell to contribute this directory makes provider
+        // discovery silently differ between a terminal and loom-daemon.
+        dirs.push(home.join(".kimi-code").join("bin"));
         let nvm_node_root = home.join(".nvm").join("versions").join("node");
         if let Ok(entries) = std::fs::read_dir(nvm_node_root) {
             dirs.extend(
@@ -3059,6 +3065,19 @@ fn is_executable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallback_command_dirs_include_the_default_kimi_install_location() {
+        let Some(home) = std::env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(dirs::home_dir)
+        else {
+            return;
+        };
+
+        assert!(fallback_command_dirs().contains(&home.join(".kimi-code").join("bin")));
+    }
     use proto::methods::ProviderDecoderEventSpec;
 
     fn temp_dir(name: &str) -> PathBuf {

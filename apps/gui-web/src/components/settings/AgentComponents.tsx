@@ -69,7 +69,7 @@ export function MemberListItem({
                 ? runStatusDotClass(ctx)
                 : statusDotClass(entry.agent.status),
             )}
-            style={animationName ? { animation: `${animationName} 1.5s ease-in-out infinite` } : undefined}
+            style={animationName ? { animation: `${animationName} 2.2s ease-in-out infinite` } : undefined}
           />
         </span>
         <span className="mt-0.5 block truncate text-xs text-[#667085]">

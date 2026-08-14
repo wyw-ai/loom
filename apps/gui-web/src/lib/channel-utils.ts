@@ -133,12 +133,126 @@ export function normalizeChannelLayout(value: unknown): ChannelLayout | null {
   };
 }
 
+function insertChannelBefore(
+  channelIds: readonly string[],
+  channelId: string,
+  beforeChannelId: string | null,
+) {
+  const next = Array.from(
+    new Set(channelIds.filter((candidate) => candidate !== channelId)),
+  );
+  const beforeIndex = beforeChannelId
+    ? next.indexOf(beforeChannelId)
+    : -1;
+  next.splice(beforeIndex >= 0 ? beforeIndex : next.length, 0, channelId);
+  return next;
+}
+
+/**
+ * Move a channel between sections or reorder it inside its current section.
+ *
+ * The server layout only stores ordered section membership. When the target is
+ * the otherwise implicit "Ungrouped" area, materialize its current visible
+ * order as a reserved section so a pure channel reorder is durable and syncs
+ * to other clients too.
+ */
+export function moveChannelInGroups(
+  groups: ChannelGroup[],
+  channelId: string,
+  targetGroupId: string,
+  beforeChannelId: string | null = null,
+  targetChannelIds?: readonly string[],
+) {
+  const current = normalizeChannelGroups(groups);
+  const targetsUngrouped = targetGroupId === ungroupedChannelGroupId;
+  if (
+    !targetsUngrouped &&
+    !current.some((group) => group.id === targetGroupId)
+  ) {
+    return current;
+  }
+
+  const withoutChannel = current.map((group) => ({
+    ...group,
+    channelIds: group.channelIds.filter((candidate) => candidate !== channelId),
+  }));
+
+  if (targetsUngrouped) {
+    const reservedIndex = withoutChannel.findIndex(
+      (group) => group.id === ungroupedChannelGroupId,
+    );
+    const reserved = reservedIndex >= 0 ? withoutChannel[reservedIndex] : null;
+
+    // A context-menu move does not need to materialize an implicit section.
+    // A drag supplies the visible target order (including an empty array), so
+    // that order must be persisted explicitly.
+    if (targetChannelIds === undefined && !reserved) return withoutChannel;
+
+    const channelIds = insertChannelBefore(
+      targetChannelIds ?? reserved?.channelIds ?? [],
+      channelId,
+      beforeChannelId,
+    );
+    const nextReserved: ChannelGroup = {
+      id: ungroupedChannelGroupId,
+      title: "Ungrouped",
+      channelIds,
+      collapsed: false,
+    };
+    if (reservedIndex >= 0) withoutChannel.splice(reservedIndex, 1);
+    withoutChannel.push(nextReserved);
+    return withoutChannel;
+  }
+
+  return withoutChannel.map((group) =>
+    group.id === targetGroupId
+      ? {
+          ...group,
+          channelIds: insertChannelBefore(
+            group.channelIds,
+            channelId,
+            beforeChannelId,
+          ),
+          collapsed: false,
+        }
+      : group,
+  );
+}
+
+/** Reorder user-created sections while keeping the reserved ungrouped area last. */
+export function reorderChannelGroups(
+  groups: ChannelGroup[],
+  groupId: string,
+  beforeGroupId: string | null,
+) {
+  const current = normalizeChannelGroups(groups);
+  const ungrouped = current.find(
+    (group) => group.id === ungroupedChannelGroupId,
+  );
+  const localGroups = current.filter(
+    (group) => group.id !== ungroupedChannelGroupId,
+  );
+  const sourceIndex = localGroups.findIndex((group) => group.id === groupId);
+  if (sourceIndex < 0) return current;
+
+  const [moving] = localGroups.splice(sourceIndex, 1);
+  const beforeIndex = beforeGroupId
+    ? localGroups.findIndex((group) => group.id === beforeGroupId)
+    : -1;
+  localGroups.splice(beforeIndex >= 0 ? beforeIndex : localGroups.length, 0, moving!);
+  if (ungrouped) localGroups.push(ungrouped);
+  return localGroups;
+}
+
 export function channelGroupSections(
   groups: ChannelGroup[],
   channels: Channel[],
 ): ChannelGroupSection[] {
   const channelsById = new Map(channels.map((channel) => [channel.id, channel]));
   const assigned = new Set<string>();
+  const hasLocalGroups = groups.some(
+    (group) => group.id !== ungroupedChannelGroupId,
+  );
   const sections: ChannelGroupSection[] = groups.map((group) => {
     const groupChannels = group.channelIds.flatMap((channelId) => {
       const channel = channelsById.get(channelId);
@@ -146,16 +260,24 @@ export function channelGroupSections(
       assigned.add(channel.id);
       return [channel];
     });
-    return {
+    const section = {
       id: group.id,
-      title: group.title,
+      title: group.id === ungroupedChannelGroupId
+        ? hasLocalGroups ? "Ungrouped" : "Channels"
+        : group.title,
       channels: groupChannels,
-      collapsed: group.collapsed,
-      local: true,
+      collapsed: group.id === ungroupedChannelGroupId ? false : group.collapsed,
+      local: group.id !== ungroupedChannelGroupId,
     };
+    return section;
   });
+  const explicitUngrouped = sections.find(
+    (section) => section.id === ungroupedChannelGroupId,
+  ) ?? null;
   const ungroupedChannels = channels.filter((channel) => !assigned.has(channel.id));
-  if (groups.length === 0 || ungroupedChannels.length > 0) {
+  if (explicitUngrouped) {
+    explicitUngrouped.channels.push(...ungroupedChannels);
+  } else if (groups.length === 0 || ungroupedChannels.length > 0) {
     sections.push({
       id: ungroupedChannelGroupId,
       title: groups.length === 0 ? "Channels" : "Ungrouped",

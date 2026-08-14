@@ -25,6 +25,11 @@
     --input: 225 20% 88%;
     --ring: 248 66% 55%;
     --radius: 0.5rem;
+    --motion-fast: 120ms;
+    --motion-base: 160ms;
+    --motion-panel: 200ms;
+    --motion-standard: cubic-bezier(0.2, 0.72, 0.2, 1);
+    --motion-emphasized: cubic-bezier(0.16, 1, 0.3, 1);
   }
 
   html,
@@ -146,8 +151,9 @@
     font-weight: 500;
     text-align: left;
     transition:
-      background-color 160ms ease,
-      color 160ms ease;
+      background-color var(--motion-base) ease,
+      color var(--motion-base) ease,
+      transform var(--motion-fast) ease;
   }
 
   .nav-row:hover {
@@ -158,6 +164,17 @@
   .nav-row-active:hover {
     background: linear-gradient(90deg, #efecff 0%, #f5f3ff 100%);
     color: #4f3fd7;
+  }
+
+  .nav-row:active {
+    transform: scale(0.988);
+  }
+
+  .nav-row:focus-visible,
+  .channel-row:focus-visible,
+  .channel-group-header button:focus-visible {
+    outline: 2px solid #8f82ff;
+    outline-offset: 1px;
   }
 
   .channel-row {
@@ -174,8 +191,10 @@
     font-weight: 500;
     text-align: left;
     transition:
-      background-color 160ms ease,
-      color 160ms ease;
+      background-color var(--motion-base) ease,
+      color var(--motion-base) ease,
+      box-shadow var(--motion-base) ease,
+      transform var(--motion-fast) ease;
   }
 
   .channel-row:hover {
@@ -184,9 +203,15 @@
 
   .channel-row-active,
   .channel-row-active:hover {
-    background: linear-gradient(135deg, #614ced 0%, #4c36ce 100%);
+    background: linear-gradient(135deg, #604ce8 0%, #523dd5 100%);
     color: #ffffff;
-    box-shadow: 0 8px 16px rgb(79 63 215 / 0.2);
+    box-shadow:
+      inset 0 0 0 1px rgb(255 255 255 / 0.1),
+      0 3px 8px rgb(79 63 215 / 0.16);
+  }
+
+  .channel-row:active {
+    transform: scale(0.992);
   }
 
   .channel-group-header {
@@ -211,6 +236,76 @@
   .channel-drop-target {
     background: #f5f3ff;
     box-shadow: inset 0 0 0 1px #c8c1ff;
+  }
+
+  .sidebar-drag-placeholder {
+    opacity: 0.2;
+    filter: saturate(0.65);
+  }
+
+  .sidebar-drop-indicator {
+    position: relative;
+    height: 2px;
+    margin: 3px 8px;
+    border-radius: 999px;
+    background: linear-gradient(90deg, #8c7cf2, #5d49dc);
+    box-shadow: 0 1px 5px rgb(91 70 217 / 0.28);
+    pointer-events: none;
+  }
+
+  .sidebar-drop-indicator::before {
+    position: absolute;
+    top: 50%;
+    left: -2px;
+    width: 6px;
+    height: 6px;
+    border: 2px solid #6652dd;
+    border-radius: 999px;
+    background: #fbfbfd;
+    content: "";
+    transform: translateY(-50%);
+  }
+
+  .sidebar-drop-indicator-section {
+    margin: 5px 4px 7px;
+  }
+
+  .sidebar-drag-overlay {
+    position: fixed;
+    z-index: 80;
+    display: flex;
+    height: 32px;
+    max-width: min(320px, calc(100vw - 24px));
+    align-items: center;
+    gap: 8px;
+    border: 1px solid rgb(111 91 220 / 0.34);
+    border-radius: 8px;
+    background: rgb(255 255 255 / 0.96);
+    padding: 0 10px;
+    color: #343849;
+    font-size: 13px;
+    font-weight: 650;
+    box-shadow:
+      0 12px 30px rgb(35 29 76 / 0.18),
+      0 2px 8px rgb(77 60 173 / 0.12);
+    pointer-events: none;
+    transform: scale(1.018) rotate(-0.25deg);
+    transform-origin: 24px center;
+    will-change: left, top;
+  }
+
+  .sidebar-drag-overlay-section {
+    height: 34px;
+    background: rgb(250 249 255 / 0.98);
+    font-size: 12px;
+    letter-spacing: 0.025em;
+    text-transform: uppercase;
+  }
+
+  body.sidebar-dragging,
+  body.sidebar-dragging * {
+    cursor: grabbing !important;
+    user-select: none !important;
   }
 
   .channel-section-editor {
@@ -982,6 +1077,16 @@
     color: #4f3fd7;
   }
 
+  .composer-icon:focus-visible,
+  .surface-menu button:focus-visible {
+    outline: 2px solid #8f82ff;
+    outline-offset: 1px;
+  }
+
+  .composer-icon:active {
+    transform: scale(0.94);
+  }
+
   .detail-action {
     display: flex;
     min-height: 38px;
@@ -1387,6 +1492,160 @@
   animation: paste-highlight 1.5s ease-out forwards;
 }
 
+/* Shared interaction motion -------------------------------------------------
+   Keep motion short and spatially small. These classes intentionally cover
+   the high-frequency surfaces so menus, disclosures and dialogs feel like one
+   system rather than a collection of unrelated effects. */
+
+.surface-menu,
+[role="menu"] {
+  transform-origin: var(--motion-origin, top right);
+  animation: loom-menu-in var(--motion-base) var(--motion-emphasized) both;
+}
+
+.surface-menu-origin-top-left {
+  --motion-origin: top left;
+}
+
+.surface-menu-origin-bottom-left {
+  --motion-origin: bottom left;
+}
+
+.motion-menu-closing {
+  animation: loom-menu-out var(--motion-fast) ease-in both !important;
+}
+
+.motion-chevron {
+  transition: transform var(--motion-base) var(--motion-standard);
+}
+
+.collapsible-region {
+  display: grid;
+  grid-template-rows: 1fr;
+  opacity: 1;
+  transform: translateY(0);
+  visibility: visible;
+  transition:
+    grid-template-rows var(--motion-base) var(--motion-standard),
+    opacity var(--motion-fast) ease,
+    transform var(--motion-base) var(--motion-standard),
+    visibility 0s linear 0s;
+}
+
+.collapsible-region > .collapsible-region-inner {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.collapsible-region-collapsed {
+  grid-template-rows: 0fr;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-4px);
+  visibility: hidden;
+  transition:
+    grid-template-rows var(--motion-base) var(--motion-standard),
+    opacity var(--motion-fast) ease,
+    transform var(--motion-base) var(--motion-standard),
+    visibility 0s linear var(--motion-base);
+}
+
+[role="dialog"].fixed.inset-0 {
+  animation: loom-dialog-backdrop-in var(--motion-panel) ease-out both;
+}
+
+[role="dialog"].fixed.inset-0 > :first-child {
+  animation: loom-dialog-panel-in var(--motion-panel) var(--motion-emphasized) both;
+}
+
+.motion-dialog-closing {
+  animation: loom-dialog-backdrop-out var(--motion-base) ease-in both !important;
+}
+
+.motion-dialog-closing > :first-child {
+  animation: loom-dialog-panel-out var(--motion-base) ease-in both !important;
+}
+
+.motion-status-active {
+  animation: loom-status-breathe 2.2s ease-in-out infinite;
+}
+
+@keyframes loom-menu-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes loom-menu-out {
+  from {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(-3px) scale(0.985);
+  }
+}
+
+@keyframes loom-dialog-backdrop-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes loom-dialog-backdrop-out {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+
+@keyframes loom-dialog-panel-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes loom-dialog-panel-out {
+  from {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(6px) scale(0.99);
+  }
+}
+
+@keyframes loom-status-breathe {
+  0%, 100% {
+    opacity: 0.82;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.08);
+  }
+}
+
+@keyframes loom-activity-expand {
+  from {
+    opacity: 0.7;
+    transform: translateY(4px) scaleY(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scaleY(1);
+  }
+}
+
 .mobile-topbar,
 .mobile-sidebar-overlay {
   display: none;
@@ -1408,18 +1667,47 @@
   height: 100dvh;
   border: 0;
   box-shadow: none;
-  animation: thread-panel-snap-in 160ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  animation: thread-panel-snap-in var(--motion-panel) var(--motion-emphasized);
 }
 
 @keyframes thread-panel-snap-in {
   from {
-    opacity: 0.92;
-    transform: translateX(20px);
+    opacity: 0.94;
+    transform: translateX(14px);
   }
 
   to {
     opacity: 1;
     transform: translateX(0);
+  }
+}
+
+.detail-panel-shell.detail-panel-shell-thread-restoring {
+  animation: thread-panel-restore-in var(--motion-panel) var(--motion-emphasized);
+}
+
+@keyframes thread-panel-restore-in {
+  from {
+    opacity: 0.9;
+    transform: translateX(-10px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 1ms !important;
+    animation-delay: 0ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+    transition-delay: 0ms !important;
   }
 }
 

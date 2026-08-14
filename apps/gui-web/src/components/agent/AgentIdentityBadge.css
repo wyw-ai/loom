@@ -68,12 +68,10 @@
 .agent-identity-badge__status--queued {
   background: #f3f4f6;
   box-shadow: 0 0 0 1px rgb(255 255 255 / 0.82);
-  animation: agent-status-pulse 1.8s ease-in-out infinite;
 }
 
 .agent-identity-badge__status--queued::after {
   background: #9ca3af;
-  animation: agent-status-blink 1.8s ease-in-out infinite;
 }
 
 /* ---- PreparingContext - blue spin ---- */
@@ -91,12 +89,12 @@
 .agent-identity-badge__status--running {
   background: #f3e8ff;
   box-shadow: 0 0 0 1px rgb(255 255 255 / 0.82);
-  animation: agent-status-pulse 1.2s ease-in-out infinite;
+  animation: agent-status-pulse 2.2s ease-in-out infinite;
 }
 
 .agent-identity-badge__status--running::after {
   background: #a855f7;
-  animation: agent-status-blink 1.2s ease-in-out infinite;
+  animation: agent-status-blink 2.2s ease-in-out infinite;
 }
 
 /* ---- WaitingTool - orange blink ---- */
@@ -107,7 +105,6 @@
 
 .agent-identity-badge__status--waiting-tool::after {
   background: #f97316;
-  animation: agent-status-blink-fast 0.6s ease-in-out infinite;
 }
 
 /* ---- Failed - red static ---- */
@@ -134,12 +131,10 @@
 .agent-identity-badge__status--stale-warning {
   background: #fef9c3;
   box-shadow: 0 0 0 1px rgb(255 255 255 / 0.82);
-  animation: agent-status-pulse 1.5s ease-in-out infinite;
 }
 
 .agent-identity-badge__status--stale-warning::after {
   background: #eab308;
-  animation: agent-status-blink 1.5s ease-in-out infinite;
 }
 
 @keyframes agent-status-pulse {
@@ -521,7 +516,6 @@
 
 .agent-detail-card__active--working span {
   background: #f59e0b;
-  animation: agent-status-blink 1.2s ease-in-out infinite;
 }
 
 /* ---- Detail card: Queued ---- */
@@ -533,7 +527,6 @@
 
 .agent-detail-card__active--queued span {
   background: #9ca3af;
-  animation: agent-status-blink 1.8s ease-in-out infinite;
 }
 
 /* ---- Detail card: PreparingContext ---- */
@@ -557,7 +550,7 @@
 
 .agent-detail-card__active--running span {
   background: #a855f7;
-  animation: agent-status-blink 1.2s ease-in-out infinite;
+  animation: agent-status-blink 2.2s ease-in-out infinite;
 }
 
 /* ---- Detail card: WaitingTool ---- */
@@ -569,7 +562,6 @@
 
 .agent-detail-card__active--waiting-tool span {
   background: #f97316;
-  animation: agent-status-blink-fast 0.6s ease-in-out infinite;
 }
 
 /* ---- Detail card: Failed ---- */
@@ -603,7 +595,6 @@
 
 .agent-detail-card__active--stale-warning span {
   background: #eab308;
-  animation: agent-status-blink 1.5s ease-in-out infinite;
 }
 
 .agent-detail-section {

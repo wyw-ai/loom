@@ -147,6 +147,18 @@ impl ContextResourceRegistry {
                 }
             };
 
+            // B5 zero-content guard: a registered plugin returning no
+            // sections is almost always a config or registration problem
+            // (wrong envelope key, unreadable source, silent skip inside
+            // the plugin). Empty output is legal but invisible in the
+            // assembled prompt, so surface it at warn level.
+            if resource_sections.is_empty() {
+                tracing::warn!(
+                    scheme = resource.scheme(),
+                    "context layer plugin supplied no sections (check config/registration)"
+                );
+            }
+
             for section in resource_sections {
                 let section_tokens = context_layer_core::estimate_tokens(&section.content);
 
@@ -330,6 +342,40 @@ mod tests {
         assert!(
             plugins.contains_key("message-list"),
             "message-list plugin should be discovered via inventory"
+        );
+    }
+
+    // (e) B5 zero-content guard: a plugin returning Ok(vec![]) is legal
+    // but suspicious — the chain must keep flowing (no error, no phantom
+    // section) while the guard makes the situation visible in logs.
+    #[test]
+    fn assemble_chain_empty_plugin_output_does_not_break_the_chain() {
+        let scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: "test".into(),
+        };
+        let mut registry = ContextResourceRegistry::new();
+        registry.register(
+            ContextResourceBuilder::new("empty-plugin")
+                .priority(1)
+                .assemble(|_| Ok(vec![]))
+                .build(),
+        );
+        registry.register(make_resource("healthy", 2, 10));
+
+        let ctx = make_ctx(&scope, 100);
+        let (sections, _) = registry.assemble_chain(&ctx, 100);
+        assert_eq!(
+            sections.len(),
+            1,
+            "empty plugin output yields no section; later resources still assemble"
+        );
+        // make_resource names its section "test" and carries the scheme
+        // in the source; only the healthy resource's section survives.
+        assert_eq!(sections[0].name, "test");
+        assert_eq!(
+            sections[0].source,
+            context_layer_core::SectionSource::Resource { scheme: "healthy", uri: None }
         );
     }
 }

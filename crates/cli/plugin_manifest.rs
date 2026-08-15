@@ -23,6 +23,9 @@ pub struct PluginManifest {
     pub id: String,
     pub name: String,
     pub version: String,
+    /// Schema-completeness snapshot: parsed and validated, consumed by
+    /// the build-time embedding path (not read again in lib tests).
+    #[allow(dead_code)]
     pub loom_version: String,
     pub layer: String,
     /// `executable` is a reserved (M5) field: schema-validated here but
@@ -33,8 +36,13 @@ pub struct PluginManifest {
 }
 
 pub struct DeclaredSkill {
+    /// Schema-completeness snapshot: parsed and validated, consumed by
+    /// the build-time embedding path (not read again in lib tests).
+    #[allow(dead_code)]
     pub id: String,
+    #[allow(dead_code)]
     pub path: String,
+    #[allow(dead_code)]
     pub scope: PluginScope,
 }
 

@@ -17586,4 +17586,158 @@ mod tests {
             "materialized skill set must match the embedded manifest"
         );
     }
+
+    // ── R1 rectification — pre-rectification baseline (Task #14 R1a) ───
+    //
+    // Captures the memory plugin's assembly behavior across BOTH config
+    // dialects before the registration-path rectification (builtin table
+    // entry → inventory + plugin.json v2 manifest):
+    //   * old dialect — actor spec `MemorySpec` injected at chain-build
+    //     time (inject_memory_envelope), agentcontext config absent
+    //   * new dialect — agentcontext.json `resources[].config` envelope
+    //     key "memory", actor spec absent
+    //   * merged — both present; per-field merge with actor-spec values
+    //     winning (D-D3 conflict visibility)
+    //
+    // AC-U-5: this baseline MUST land before any R1 implementation code
+    // (first commit of the rectification branch); the post-rectification
+    // chain must reproduce it byte-for-byte.
+    //
+    // Regenerate (ARCH 10 号 §1 dump-baseline entry point; unit-test
+    // placement because the assembly internals are crate-private):
+    //   cargo test -p loom-cli --lib dump_pre_r1_baseline -- --ignored
+    // or via the env var used by the sibling golden:
+    //   LOOM_UPDATE_GOLDEN=1 cargo test -p loom-cli matches_pre_rectification
+
+    fn pre_r1_spec(memory_config: Option<serde_json::Value>) -> AgentContextSpec {
+        let mut spec = proto::methods::default_agent_context_spec();
+        spec.resources.push(proto::methods::ContextResourceSpec {
+            scheme: "file".into(),
+            mount: Some("notes".into()),
+            priority: Some(20),
+            config: Some(serde_json::json!({
+                "path": "notes",
+                "max_files": 5
+            })),
+        });
+        merge_embedded_global_resources(&mut spec);
+        for resource in &mut spec.resources {
+            if resource.scheme == "memory" {
+                resource.config = memory_config.clone();
+            }
+        }
+        spec
+    }
+
+    fn pre_r1_baseline_document(dir: &Path) -> serde_json::Value {
+        let scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: GOLDEN_SCOPE_ID.into(),
+        };
+        let ctx = golden_assembly_ctx(dir, &scope);
+        let memory_spec = golden_memory_spec();
+
+        let old_dialect = chain_section_projection(
+            &pre_r1_spec(None),
+            Some(&memory_spec),
+            &ctx,
+        );
+        let new_dialect = chain_section_projection(
+            &pre_r1_spec(Some(serde_json::json!({
+                "memory": { "delivery": { "prompt": true } }
+            }))),
+            None,
+            &ctx,
+        );
+        let merged_dialects = chain_section_projection(
+            &pre_r1_spec(Some(serde_json::json!({
+                "memory": {
+                    "delivery": { "prompt": false },
+                    "query": { "turnTopK": 2 }
+                }
+            }))),
+            Some(&memory_spec),
+            &ctx,
+        );
+
+        // Dialect equivalence: the same effective MemorySpec supplied via
+        // either channel must assemble identically.
+        assert_eq!(
+            old_dialect, new_dialect,
+            "old (actor spec) and new (resources[].config) memory dialects diverged"
+        );
+        // Actor-spec precedence: with both channels present and the actor
+        // spec fully populated, the merged envelope equals the actor spec.
+        assert_eq!(
+            old_dialect, merged_dialects,
+            "merged dialects must reduce to the actor-spec projection"
+        );
+
+        serde_json::json!({
+            "scenario": "pre-R1 rectification memory baseline",
+            "fixture": {
+                "records": 6,
+                "actor_id": GOLDEN_ACTOR_ID,
+                "channel_id": GOLDEN_CHANNEL_ID,
+                "scope_id": GOLDEN_SCOPE_ID,
+            },
+            "old_dialect": old_dialect,
+            "new_dialect": new_dialect,
+            "merged_dialects": merged_dialects,
+        })
+    }
+
+    fn pre_r1_baseline_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("golden")
+            .join("baseline-pre-r1.json")
+    }
+
+    #[test]
+    fn matches_pre_rectification_pipeline() {
+        let dir = tempfile::tempdir().expect("tempdir for R1 baseline fixture");
+        golden_fixture_profile(dir.path());
+        let document = pre_r1_baseline_document(dir.path());
+        let mut snapshot = serde_json::to_string_pretty(&document)
+            .expect("serialize R1 baseline document");
+        snapshot.push('\n');
+
+        let baseline_path = pre_r1_baseline_path();
+        if std::env::var("LOOM_UPDATE_GOLDEN").ok().as_deref() == Some("1") {
+            std::fs::create_dir_all(baseline_path.parent().expect("baseline parent dir"))
+                .expect("create golden dir");
+            std::fs::write(&baseline_path, &snapshot).expect("write R1 baseline");
+            return;
+        }
+        let expected = std::fs::read_to_string(&baseline_path).unwrap_or_else(|err| {
+            panic!(
+                "R1 baseline missing or unreadable ({err}); regenerate with \
+                 LOOM_UPDATE_GOLDEN=1 cargo test -p loom-cli matches_pre_rectification"
+            )
+        });
+        let expected = expected.replace("\r\n", "\n");
+        assert_eq!(
+            snapshot, expected,
+            "pre-R1 memory baseline drifted; if intentional, regenerate the golden"
+        );
+    }
+
+    /// Explicit dump-baseline entry point (ARCH 10 号 §1). Ignored by
+    /// default so normal test runs only verify; run with --ignored to
+    /// regenerate the baseline file.
+    #[test]
+    #[ignore = "baseline regeneration only: cargo test -p loom-cli --lib dump_pre_r1_baseline -- --ignored"]
+    fn dump_pre_r1_baseline() {
+        let dir = tempfile::tempdir().expect("tempdir for R1 baseline dump");
+        golden_fixture_profile(dir.path());
+        let document = pre_r1_baseline_document(dir.path());
+        let mut snapshot =
+            serde_json::to_string_pretty(&document).expect("serialize R1 baseline document");
+        snapshot.push('\n');
+        let baseline_path = pre_r1_baseline_path();
+        std::fs::create_dir_all(baseline_path.parent().expect("baseline parent dir"))
+            .expect("create golden dir");
+        std::fs::write(&baseline_path, &snapshot).expect("write R1 baseline");
+    }
 }

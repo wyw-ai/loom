@@ -226,7 +226,7 @@ workspace/skills/
 
 每轮 `compose_with_context_chain()` 执行时：
 
-1. MemoryProvider 注入记忆段落（priority=5）
+1. MemoryResource（plugin-memory）注入记忆段落（priority=5）
 2. MessageListProvider 注入投递上下文（priority=10）
 3. Provider（Claude/GPT）原生读取 `workspace/skills/` 目录中的
    `loom/SKILL.md` 和 `writing/SKILL.md`，作为 skill 指令加载
@@ -236,7 +236,7 @@ workspace/skills/
 ```
 [profile_prompt_files]
 [runtime_context]
-[bootstrap_memory]          ← MemoryProvider
+[bootstrap_memory]          ← MemoryResource（plugin-memory）
 [delivery_context]          ← MessageListProvider
 [warm_summary]（如果存在）
 [user_message]

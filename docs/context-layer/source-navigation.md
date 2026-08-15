@@ -10,10 +10,11 @@
 | 文件 | 行数 | 职责 |
 |---|---|---|
 | `crates/context-layer-core/src/lib.rs` | 200 | **共享接口 crate** — ContextResource trait, AssemblyContext, PromptSection, ContextResourcePlugin, estimate_tokens |
+| `crates/plugin-memory/src/lib.rs` | — | **官方 memory 插件 crate**（迭代 2）— MemoryResource, open_memory_store |
 | `crates/agent-runtime/src/context_layer.rs` | 320 | 核心 Trait + Registry + 预算瀑布 + discover_plugins() |
 | `crates/agent-runtime/src/context_layer/warm_summary.rs` | 163 | WarmSummaryContextResource |
 | `crates/agent-runtime/src/context_layer/builder.rs` | 173 | ContextResourceBuilder + ClosureContextResource |
-| `crates/agent-runtime/src/memory.rs` | 151 | MemoryProvider |
+| `crates/agent-runtime/src/memory/mod.rs` | 14 | 重导出 shim（迭代 2 起业务在 plugin-memory） |
 | `crates/agent-runtime/src/message_list.rs` | 124 | MessageListProvider |
 | `crates/agent-runtime/src/filesystem.rs` | 191 | FileSystemProvider |
 | `crates/agent-runtime/src/envelope.rs` | — | PromptSection 定义 |
@@ -79,16 +80,16 @@
 
 ---
 
-## memory.rs — MemoryProvider
+## plugin-memory — MemoryResource（迭代 2 官方插件）
 
-| 行号 | 符号 | 说明 |
-|---|---|---|
-| L20-30 | `MemoryProvider` struct | 持有预渲染的 bootstrap/turn 记忆字符串 |
-| L32-40 | `new()` | 创建空 Provider |
-| L42-50 | `with_rendered(bootstrap, turn)` | 设置预渲染记忆（由运行时在执行记忆选择后调用） |
-| L52-60 | `scheme()` → `"memory"` | URI scheme 标识 |
-| L62-70 | `priority()` → `5` | 组装优先级 |
-| L80-100 | `assemble()` | 生成 `bootstrap_memory` 和 `turn_memory` 段落 |
+memory 业务已迁入独立 crate `crates/plugin-memory`（仅依赖 `context-layer-core` + `loom-proto`，无 agent-runtime 特权）。`crates/agent-runtime/src/memory/mod.rs` 仅保留重导出 shim，`agent_runtime::memory::*` import 路径不变。
+
+| 符号 | 说明 |
+|---|---|
+| `MemoryResource::new(spec: Option<MemorySpec>)` | 捕获 per-agent spec；`None` = 不贡献段落 |
+| `MemoryResource` (impl ContextResource) | scheme `"memory"` / priority 5 / Thread + Channel |
+| `assemble()` | 链装配阶段检索 + 渲染 `bootstrap_memory` / `turn_memory`；读取 `ctx.turn_input` / `ctx.delivery_context`；错误 warn + 空输出降级 |
+| `open_memory_store(profile_dir, spec)` | 打开 JSONL 存储（公开供 MCP bridge 复用） |
 
 ---
 

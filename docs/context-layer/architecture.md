@@ -162,14 +162,15 @@ Loom 内置四个 Provider，通过工厂注册表（`builtin_resource_factories
 memory(5) → warm-summary(7) → message-list(10) → file(20)
 ```
 
-### 1. MemoryProvider（优先级 = 5）
+### 1. MemoryResource（plugin-memory，优先级 = 5）
 
 - **Scheme**：`"memory"`
 - **作用域**：Thread + Channel
-- **行为**：包装现有记忆机制。从调用方接收预渲染的 bootstrap 和 turn
-  记忆字符串（通过 `with_rendered()`）。不替换 `MemorySpec` —
-  它包装现有的 `build_envelope` 记忆段落，使其在 `agentcontext.json`
-  存在时参与链式组装。
+- **行为**：迭代 2 起以官方插件形态存在于独立 crate `plugin-memory`（仅依赖
+  `context-layer-core` + `loom-proto`，无 agent-runtime 特权）。工厂捕获
+  per-agent 的 `MemorySpec`，检索与渲染在 `assemble()` 内部执行（读取
+  `ctx.turn_input` / `ctx.delivery_context`）。错误时 warn + 空输出降级，
+  预算不足时整段跳过（skip-not-truncate）。
 - **产出段落**：`bootstrap_memory`、`turn_memory`（仅在非空时）
 
 ### 2. WarmSummaryContextResource（优先级 = 7）

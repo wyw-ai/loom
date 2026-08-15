@@ -19,15 +19,12 @@ drafts and may change between releases.
   (previously a declared priority differing from the built-in value was
   silently ignored). Default specs are unaffected — their declared
   priorities match the built-in values.
-
-### Internal
-
-- Memory context resource extracted into a standalone `plugin-memory`
-  crate and wired through the same ContextResource factory chain as every
-  other resource (compose no longer special-cases memory). Zero
-  user-visible behavior change: section content, ordering, degradation
-  and budget waterfall are golden-test equivalent to the previous
-  pre-rendered pipeline. `plugin-memory` depends only on
+- Internal: memory context resource extracted into a standalone
+  `plugin-memory` crate and wired through the same ContextResource
+  factory chain as every other resource (compose no longer special-cases
+  memory). Zero user-visible behavior change: section content, ordering,
+  degradation and budget waterfall are golden-test equivalent to the
+  previous pre-rendered pipeline. `plugin-memory` depends only on
   `context-layer-core`/`loom-proto` (no `agent-runtime` dependency),
   proving the third-party plugin path is privilege-free.
 

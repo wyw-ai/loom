@@ -142,12 +142,11 @@ ContextLayer 配置在三个层级间合并，上层对相同 `scheme` 的声明
 
 1. 运行时加载 `context_layer`（如为 None 则使用 `default_agent_context_spec()`）
 2. 加载并合并三层 `agentcontext.json`
-3. 预渲染记忆（如果存在 `MemorySpec`），供 `MemoryProvider` 使用
-4. 从合并后的配置构建 `ContextResourceRegistry`
-5. 组装固定段落（profile 提示词文件、运行时上下文）
-6. 运行链：按优先级顺序调用每个资源的 `assemble()`
-7. 应用 Token 预算瀑布：超出剩余预算的段落被 **跳过**（不截断）
-8. 最后追加用户消息
+3. 从合并后的配置构建 `ContextResourceRegistry`（memory 工厂捕获 `MemorySpec`，交由 `plugin-memory` 的 `MemoryResource`）
+4. 组装固定段落（profile 提示词文件、运行时上下文）
+5. 运行链：按优先级顺序调用每个资源的 `assemble()`
+6. 应用 Token 预算瀑布：超出剩余预算的段落被 **跳过**（不截断）
+7. 最后追加用户消息
 
 参见 [架构 Wiki](./architecture.md) 了解完整设计，或
 [配置参考](./configuration.md) 了解完整 schema 详情。

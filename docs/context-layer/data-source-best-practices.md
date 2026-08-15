@@ -33,12 +33,12 @@ ContextLayer 通过 `ContextResource` Trait 统一管理各类数据源的提示
 }
 ```
 
-**无需 `config`** — 运行时从 `MemorySpec` 预渲染记忆并传递给 `MemoryProvider`。
+**无需 `config`** — 工厂捕获 per-agent 的 `MemorySpec`，检索与渲染由 `plugin-memory` 的 `MemoryResource::assemble()` 在链装配阶段执行（迭代 2 插件化）。
 
 **最佳实践**：
 - 优先级保持 5（高优先级，记忆是 Agent 身份的核心）
 - 如果 Agent 未配置 `MemorySpec`，此 Provider 不贡献任何内容
-- 记忆内容由现有 `build_envelope` 逻辑生成，不受 ContextLayer 控制
+- 记忆检索输入为 `ctx.turn_input` / `ctx.delivery_context`；错误时空输出降级，不中断回合
 
 ### MessageList 挂载
 

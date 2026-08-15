@@ -309,14 +309,15 @@ loom 通过 `extern crate loom_plugin_my_feature;` 强制链接，
 ```rust
 // agent_serve.rs — builtin_resource_factories()
 fn builtin_resource_factories(
-    bootstrap_memory: &str,
-    turn_memory: String,
+    memory_spec: Option<&proto::methods::MemorySpec>,
 ) -> std::collections::HashMap<String, ResourceFactory> {
     let mut factories = std::collections::HashMap::new();
 
-    // 内置 scheme...
+    // memory — 捕获 actor 的 MemorySpec；检索在 MemoryResource::assemble
+    // 内部执行（迭代 2 插件化，skip-not-truncate，warn-on-error）。
+    let mem_spec = memory_spec.cloned();
     factories.insert("memory".into(), Box::new(move |_config| {
-        Box::new(MemoryProvider::new().with_rendered(/* ... */)) as Box<dyn ContextResource>
+        Box::new(MemoryResource::new(mem_spec.clone())) as Box<dyn ContextResource>
     }));
 
     // ↓↓↓ 新增你的自定义 scheme ↓↓↓
@@ -331,6 +332,8 @@ fn builtin_resource_factories(
     factories
 }
 ```
+
+> 迭代 2 变更: memory 工厂不再接收预渲染字符串（`MemoryProvider::with_rendered` 已随插件化删除），改为捕获 `MemorySpec` 交给 `plugin-memory` 的 `MemoryResource`。需要 per-agent 状态的官方资源走此工厂捕获路径；无状态第三方资源走方式 A 的 inventory 路径。
 
 `build_context_resource_chain()` 会自动遍历 `agentcontext.json` 声明的 resources，
 通过 scheme 名称从工厂注册表或 discover_plugins() 查找对应闭包并生成实例。
@@ -359,10 +362,13 @@ factories.insert("my-simple".into(), Box::new(|_config| {
             if content.is_empty() {
                 Ok(vec![])
             } else {
-                Ok(vec![PromptSection {
-                    name: "my_context".into(),
+                // 溯源必填（AC-R1-2）: 用 from_resource 构造带
+                // SectionSource::Resource 标记的段落
+                Ok(vec![PromptSection::from_resource(
+                    "my_context",
+                    "my-simple",
                     content,
-                }])
+                )])
             }
         })
         .build()
@@ -403,7 +409,7 @@ factories.insert("my-simple".into(), Box::new(|_config| {
 ```
 assemble_chain(ctx, budget_remaining=10000)
 
-1. MemoryProvider (priority=5)
+1. MemoryResource (priority=5)
    assemble() → 2 sections, 800 tokens
    budget_remaining: 10000 - 800 = 9200
 

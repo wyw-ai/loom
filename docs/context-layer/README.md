@@ -15,12 +15,16 @@ Loom 的可插拔上下文组装系统，用于 Agent 提示词构建。
 | [Skill 挂载指南](./skill-mounting-guide.md) | 所有用户 | Skill 安装投影、渐进式披露、MCP 映射 |
 | [数据源最佳实践](./data-source-best-practices.md) | 运维人员、架构师 | 各数据源配置示例、优先级分配、安全约束 |
 | [自定义 Provider 指南](./custom-provider-guide.md) | 开发者 | ContextResource/ResourceProvider 实现、注册、安全约束 |
+| [Memory 插件指南](./memory-plugin-guide.md) | 运维人员、维护者 | 迭代 2 插件化架构、禁用/覆盖/定制三态、行为语义、迁移 |
+| [第三方资源扩展指南](./third-party-resource-guide.md) | 第三方开发者 | 无特权接缝契约、inventory 注册、EchoInputResource 范例 |
 
 ## 快速链接
 
 - **启用 ContextLayer**：参见 [快速入门 → 最小配置](./getting-started.md#最小配置)
 - **理解预算瀑布**：参见 [架构 Wiki → Token 预算瀑布](./architecture.md#token-预算瀑布)
 - **编写自定义 Provider**：参见 [自定义 Provider 指南](./custom-provider-guide.md)
+- **替换/禁用官方 memory 插件**：参见 [Memory 插件指南](./memory-plugin-guide.md)
+- **编写第三方替身资源**：参见 [第三方资源扩展指南](./third-party-resource-guide.md)
 - **挂载 Skill**：参见 [Skill 挂载指南](./skill-mounting-guide.md)
 - **配置数据源**：参见 [数据源最佳实践](./data-source-best-practices.md)
 - **查找源码位置**：参见 [源码导航](./source-navigation.md)

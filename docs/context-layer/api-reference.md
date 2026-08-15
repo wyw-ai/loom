@@ -55,7 +55,7 @@ pub trait ContextResource: Send + Sync {
 
 | Provider | 优先级 |
 |---|---|
-| MemoryProvider | 5 |
+| MemoryResource（plugin-memory） | 5 |
 | WarmSummaryContextResource | 7 |
 | MessageListProvider | 10 |
 | FileSystemProvider（通过 FileContextResource） | 20 |
@@ -96,6 +96,7 @@ pub struct AssemblyContext<'a> {
     pub budget_remaining: u64,
     pub budget_total: u64,
     pub delivery_context: &'a str,
+    pub turn_input: &'a str,
     pub first_turn: bool,
 }
 ```
@@ -111,6 +112,7 @@ pub struct AssemblyContext<'a> {
 | `budget_remaining` | `u64` | 高优先级资源消耗后剩余的 Token 预算 |
 | `budget_total` | `u64` | 本轮的总 Token 预算 |
 | `delivery_context` | `&str` | Thread 消息/收件箱条目的字符串形式 |
+| `turn_input` | `&str` | 当前回合的用户输入（迭代 2 新增）。环境数据通道——官方 memory 插件用它做记忆检索，第三方替身资源读取同一字段（参见[第三方资源扩展指南](./third-party-resource-guide.md)） |
 | `first_turn` | `bool` | 是否为该作用域的第一轮 |
 
 所有字段都是零拷贝引用（`&'a`）。生命周期绑定到轮的作用域。
@@ -201,8 +203,9 @@ pub struct ContextResourceRegistry {
 
 ```rust
 pub struct PromptSection {
-    pub name: String,
+    pub name: &'static str,
     pub content: String,
+    pub source: SectionSource,
 }
 ```
 
@@ -210,29 +213,58 @@ pub struct PromptSection {
 |---|---|
 | `name` | 段落标识符（如 `"bootstrap_memory"`、`"delivery_context"`、`"warm_summary"`、`"user_message"`） |
 | `content` | 注入到提示词中的文本内容 |
+| `source` | 溯源标记（迭代 1 起，AC-R1-2）。声明该段落从哪个持久来源产生，用于调试与审计 |
 
 段落最终以 `"\n\n"` 分隔符拼接。
+
+### SectionSource
+
+```rust
+pub enum SectionSource {
+    Resource { scheme: &'static str, uri: Option<String> },
+    Runtime { origin: &'static str },
+    Exempted { reason: &'static str },
+}
+```
+
+| 变体 | 说明 |
+|---|---|
+| `Resource` | 由注册在该 scheme 下的 ContextResource 产出。`uri` 为单一持久来源定位符（如 `"summaries/{scope_id}.md"`）；`None` 表示聚合/投影内容无单一 uri（豁免记录于 ARCH 设计 §1.3） |
+| `Runtime` | 由运行时在资源链外组装（固定段落与旁路路径，如 summary 生成提示词） |
+| `Exempted` | 显式豁免溯源；`reason` 记录原因。保留给自起源输入（用户回合输入）与仅为编译保留的遗留路径 |
+
+便捷构造: `PromptSection::from_resource(name, scheme, content)`（uri=None）与 `from_resource_uri(name, scheme, uri, content)`（uri=Some）。
 
 ---
 
 ## 内置 Provider API
 
-### MemoryProvider
+### MemoryResource（plugin-memory）
+
+迭代 2 起，memory 以官方插件形态存在于独立 crate `plugin-memory`（无特权依赖: 仅 `context-layer-core` + `loom-proto`，编译期禁止依赖 `agent-runtime`）。compose 路径的预渲染特判已删除，`MemoryResource` 在链装配阶段自行检索 + 渲染。详见[Memory 插件指南](./memory-plugin-guide.md)。
 
 ```rust
-pub struct MemoryProvider { ... }
+pub struct MemoryResource { /* 捕获的 Option<MemorySpec> */ }
 
-impl MemoryProvider {
-    pub fn new() -> Self;
-    pub fn with_rendered(self, bootstrap: impl Into<String>, turn: impl Into<String>) -> Self;
+impl MemoryResource {
+    pub fn new(spec: Option<MemorySpec>) -> Self;
 }
+
+pub fn open_memory_store(profile_dir: &Path, spec: &MemorySpec) -> JsonlMemoryStore;
+pub fn open_memory_store_dyn(profile_dir: &Path, spec: &MemorySpec) -> Arc<dyn MemoryStore>;
 ```
 
-- `new()` — 创建具有空渲染字符串的 Provider
-- `with_rendered(bootstrap, turn)` — 设置预渲染记忆字符串。
-  由运行时在执行现有记忆选择逻辑后调用。
+- `new(spec)` — 捕获 per-agent 的 `MemorySpec`（`None` = 未配置，assemble 返回空）。不经 inventory 注册——零参工厂拿不到 per-agent 状态，注册会遮蔽内置工厂（ARCH 迭代 2 裁决）
+- `open_memory_store` / `open_memory_store_dyn` — 打开 JSONL 存储（相对路径基于 `profile_dir`），公开供 MCP bridge 复用
+- 重导出 shim: `agent_runtime::memory::*` import 路径不变；新代码建议直接依赖 `plugin-memory`
 
-**Scheme**：`"memory"` | **优先级**：5 | **作用域**：Thread + Channel
+**Scheme**：`"memory"` | **优先级**：5 | **作用域**：Thread + Channel | **段落**：`bootstrap_memory` / `turn_memory`
+
+行为语义: `MemorySpec` 缺失或 `delivery.prompt=false` → 不贡献段落; 检索/渲染错误 → `tracing::warn` + 空输出降级（回合不中断）; 预算不足 → 整段跳过（skip-not-truncate）。检索输入为 `ctx.turn_input` + `ctx.delivery_context`。
+
+### 第三方替身资源（replacement contract）
+
+第三方 crate 经 `inventory::submit!` 注册 `ContextResourcePlugin { scheme, factory }`（零参工厂 + 自含配置），读取与官方插件相同的环境数据通道（`ctx.turn_input` / `ctx.delivery_context`），参与同一 priority 排序与预算瀑布。完整范例参见[第三方资源扩展指南](./third-party-resource-guide.md)。
 
 ### WarmSummaryContextResource
 

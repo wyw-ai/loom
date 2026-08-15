@@ -49,6 +49,8 @@ runtime/provider behavior, GUI product flows, or local verification steps.
 - [context-layer/skill-mounting-guide.md](./context-layer/skill-mounting-guide.md) - Skill installation projection, progressive disclosure, MCP mapping.
 - [context-layer/data-source-best-practices.md](./context-layer/data-source-best-practices.md) - per-data-source configuration examples, priority allocation, security constraints.
 - [context-layer/custom-provider-guide.md](./context-layer/custom-provider-guide.md) - ContextResource/ResourceProvider implementation, inventory self-registration, security constraints.
+- [context-layer/memory-plugin-guide.md](./context-layer/memory-plugin-guide.md) - memory plugin architecture (iter2 pluginization), disable/override/customize states, behavior semantics, migration, and troubleshooting.
+- [context-layer/third-party-resource-guide.md](./context-layer/third-party-resource-guide.md) - privilege-free third-party resource contract: inventory registration, embedded config, ambient data channels, and the EchoInputResource worked example.
 
 ## Contracts And Runbooks
 

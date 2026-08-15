@@ -1,4 +1,4 @@
-﻿# ContextLayer — 架构 Wiki
+# ContextLayer — 架构 Wiki
 
 > 本文档解释 ContextLayer 系统的设计概念、数据流和约束。
 > 配置语法参见 [配置参考](./configuration.md)。Trait 方法签名
@@ -167,7 +167,7 @@ memory(5) → warm-summary(7) → message-list(10) → file(20)
 - **Scheme**：`"memory"`
 - **作用域**：Thread + Channel
 - **行为**：迭代 2 起以官方插件形态存在于独立 crate `plugin-memory`（仅依赖
-  `context-layer-core` + `loom-proto`，无 agent-runtime 特权）。工厂捕获
+  `context-layer-core` + `proto`，无 agent-runtime 特权）。工厂捕获
   per-agent 的 `MemorySpec`，检索与渲染在 `assemble()` 内部执行（读取
   `ctx.turn_input` / `ctx.delivery_context`）。错误时 warn + 空输出降级，
   预算不足时整段跳过（skip-not-truncate）。

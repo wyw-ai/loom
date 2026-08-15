@@ -1,4 +1,4 @@
-﻿# ContextLayer — 源码导航
+# ContextLayer — 源码导航
 
 > ContextLayer 实现的文件级和行级索引。
 > 源码位置：`F:\pj\loom`，分支：`feat/context-layer-message-list-mvp`
@@ -82,7 +82,7 @@
 
 ## plugin-memory — MemoryResource（迭代 2 官方插件）
 
-memory 业务已迁入独立 crate `crates/plugin-memory`（仅依赖 `context-layer-core` + `loom-proto`，无 agent-runtime 特权）。`crates/agent-runtime/src/memory/mod.rs` 仅保留重导出 shim，`agent_runtime::memory::*` import 路径不变。
+memory 业务已迁入独立 crate `crates/plugin-memory`（仅依赖 `context-layer-core` + `proto`，无 agent-runtime 特权）。`crates/agent-runtime/src/memory/mod.rs` 仅保留重导出 shim，`agent_runtime::memory::*` import 路径不变。
 
 | 符号 | 说明 |
 |---|---|

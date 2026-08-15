@@ -27,7 +27,7 @@ compose 路径的预渲染特判已删除，memory 与 file / warm-summary / mes
 `plugin-memory` 的 Cargo.toml 仅依赖:
 
 - `context-layer-core`（公共契约: ContextResource / AssemblyContext / PromptSection）
-- `loom-proto`（MemorySpec 类型）
+- `proto`（MemorySpec 类型）
 - 基础库（anyhow / serde / chrono / tracing）
 
 **编译期禁止依赖 `agent-runtime`**——这正是「无特权接缝」的实证: 官方插件与第三方插件使用同一契约面，没有隐藏后门。第三方可以写出与官方 memory 完全同权的替身插件（参见[第三方资源扩展指南](./third-party-resource-guide.md)）。

@@ -1,4 +1,4 @@
-﻿# ContextLayer — API 参考
+# ContextLayer — API 参考
 
 > ContextLayer 系统的 Trait 定义、方法签名和使用示例。
 > 配置语法参见 [配置参考](./configuration.md)。
@@ -241,7 +241,7 @@ pub enum SectionSource {
 
 ### MemoryResource（plugin-memory）
 
-迭代 2 起，memory 以官方插件形态存在于独立 crate `plugin-memory`（无特权依赖: 仅 `context-layer-core` + `loom-proto`，编译期禁止依赖 `agent-runtime`）。compose 路径的预渲染特判已删除，`MemoryResource` 在链装配阶段自行检索 + 渲染。详见[Memory 插件指南](./memory-plugin-guide.md)。
+迭代 2 起，memory 以官方插件形态存在于独立 crate `plugin-memory`（无特权依赖: 仅 `context-layer-core` + `proto`，编译期禁止依赖 `agent-runtime`）。compose 路径的预渲染特判已删除，`MemoryResource` 在链装配阶段自行检索 + 渲染。详见[Memory 插件指南](./memory-plugin-guide.md)。
 
 ```rust
 pub struct MemoryResource { /* 捕获的 Option<MemorySpec> */ }

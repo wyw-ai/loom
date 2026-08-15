@@ -2,7 +2,7 @@
 
 > 迭代 2 建立了**无特权接缝**: 任何第三方 crate 都能以与官方插件完全相同的契约接入 ContextResource 链——没有隐藏后门，没有 agent-runtime 特权依赖。本文以 `crates/cli/tests/context_replacement.rs` 的 `EchoInputResource` 为范例，讲解替身资源（replacement resource）的完整写法。
 >
-> 相关文档: [自定义 Provider 指南](./custom-provider-guide.md)（新增 scheme 的通用路径）| [Memory 插件指南](./memory-plugin-guide.md)（官方插件参考实现）
+> 相关文档: [自定义 Provider 指南](./custom-provider-guide.md)（新增 scheme 的通用路径）| [Memory 插件指南](./memory-plugin-guide.md)（官方插件参考实现）| [plugin.json 清单指南](./plugin-guide.md)（清单声明格式与官方源数据化）
 
 ---
 

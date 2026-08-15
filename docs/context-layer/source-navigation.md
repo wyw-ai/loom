@@ -20,7 +20,10 @@
 | `crates/agent-runtime/src/envelope.rs` | — | PromptSection 定义 |
 | `crates/agent-runtime/src/proto/types.rs` | — | AgentContextSpec, ContextResourceSpec, ScopeKind |
 | `crates/cli/src/cmd/agent_serve.rs` | — | 集成层：工厂注册表 + 链构建 + 信封组装 |
-| `crates/cli/build.rs` | — | build.rs 双路径处理（plugin.json / pure skill） |
+| `crates/cli/build.rs` | — | 官方源清单处理器 + 预装缓存加速器（读 official-plugins.json → 解析 plugin.json → 嵌入快照；双路径 plugin.json / pure skill） |
+| `crates/cli/official-plugins.json` | — | 官方插件源清单（数据文件；加官方插件 = 编辑此 JSON，零核心代码） |
+| `crates/cli/plugin_manifest.rs` | — | plugin.json v2 schema 契约（解析/归一化，同时编译进 build.rs 与 CLI 测试） |
+| `crates/cli/src/cmd/plugin.rs` | — | `loom plugin list` 实现（表格 / --verbose / --json、幽灵检测） |
 | `crates/cli/src/adapter.rs` | — | reset_session Trait 默认实现 |
 | `crates/cli/src/acp.rs` | — | reset_session 运行时实现 |
 | `crates/cli/src/interactive.rs` | — | reset_session CLI 入口 |

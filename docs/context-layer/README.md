@@ -1,6 +1,8 @@
 # ContextLayer 文档
 
-Loom 的可插拔上下文组装系统，用于 Agent 提示词构建。
+Loom 的 context layer（上下文层）文档族。context layer 是唯一顶层概念——Agent
+提示词组装的 AOP 中间层：scope resource 接入、actor 侧解析、agent context 产出、
+横切关注点处理。plugin（资源插件）是角色词，指层的供给单元，不是独立系统。
 
 ## 文档列表
 
@@ -17,6 +19,8 @@ Loom 的可插拔上下文组装系统，用于 Agent 提示词构建。
 | [自定义 Provider 指南](./custom-provider-guide.md) | 开发者 | ContextResource/ResourceProvider 实现、注册、安全约束 |
 | [Memory 插件指南](./memory-plugin-guide.md) | 运维人员、维护者 | 迭代 2 插件化架构、禁用/覆盖/定制三态、行为语义、迁移 |
 | [第三方资源扩展指南](./third-party-resource-guide.md) | 第三方开发者 | 无特权接缝契约、inventory 注册、EchoInputResource 范例 |
+| [plugin.json 清单指南](./plugin-guide.md) | 插件作者、维护者 | v2 schema 字段表、v1 归一化、executable 预留、官方源数据化 |
+| [plugin list 自省](./plugin-list.md) | 所有用户 | `loom plugin list` 语义、--verbose 排查、--json 对账 |
 
 ## 快速链接
 
@@ -36,4 +40,4 @@ Loom 的可插拔上下文组装系统，用于 Agent 提示词构建。
 - Phase 3 文档：`phase3-plugin-independence/`（Plugin Independence 阶段归档）
 - Proto 类型：`crates/proto/src/methods.rs`（`AgentContextSpec`、`ContextResourceSpec`）
 - 共享接口 crate：`crates/context-layer-core/`（ContextResource trait, inventory 注册）
-- Plugin 仓库：`loom-plugin-context-tier`（warm-summary + message-list 自注册）
+- Plugin 仓库：`loom-plugin-context-tier`（warm-summary + message-list 自注册；仓名沿袭迭代 1 历史，指「context layer 的 tier 资源插件」，非独立插件系统）

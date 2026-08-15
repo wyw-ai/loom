@@ -226,6 +226,9 @@ factories.insert("my-scheme".into(), Box::new(|config| {
 
 ## Plugin 挂载架构（Phase 3）
 
+术语锚定：本节及全文的 plugin（资源插件）是**角色词**——context layer 的供给单元，
+不是独立系统名。context layer 是唯一顶层概念（AOP 中间层）。
+
 Phase 3 引入了 `context-layer-core` crate 和 inventory 自注册机制，
 实现了 loom 与 plugin 的完全解耦。
 
@@ -294,11 +297,17 @@ pub fn discover_plugins() -> HashMap<String, fn() -> Box<dyn ContextResource>> {
 
 ### build.rs 双路径处理
 
-`crates/cli/build.rs` 根据 plugin.json 存在与否区分两种路径：
+`crates/cli/build.rs` 是**官方源清单处理器 + 预装缓存加速器**：读取
+`crates/cli/official-plugins.json`（官方源清单，数据文件非代码）→ clone/复用本地
+目录 → 解析各源 `plugin.json` → 生成嵌入快照。**注册的事实源是 plugin.json 清单，
+不是 build.rs**；加官方插件 = 编辑 JSON + 提供仓，零核心代码改动。字段契约见
+[plugin.json 清单指南](./plugin-guide.md)。
+
+根据 plugin.json 存在与否区分两种路径：
 
 | 条件 | 路径 | 行为 |
 |---|---|---|
-| 有 plugin.json | Full plugin 路径 | 解析 scope/priority/resources，支持多维调度 |
+| 有 plugin.json | Full plugin 路径 | 解析清单（id/version/loom_version/skills/context_resources），生成嵌入快照 |
 | 无 plugin.json | Pure skill 路径 | 扫描 skills/ 目录，所有 skill 为 global scope（向后兼容） |
 
 ---

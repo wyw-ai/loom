@@ -8,8 +8,39 @@ drafts and may change between releases.
 
 ## [Unreleased]
 
+### Added
+
+- CLI: `loom plugin list` — unified entry point listing context layer
+  plugins across official, external and builtin sources, with ghost
+  detection (embedded manifests vs runtime factory table, both
+  directions). Supports `--verbose` (source/version/registration
+  detail) and `--json` (experimental) output forms.
+- Plugin manifest schema v2 (`plugin.json`): rejects fields removed by
+  the single-concept model (`registration`, `crate`, `scope`) and
+  reserves the `executable` field for the future process-boundary
+  form. v1 manifests remain accepted and are normalized to v2 at
+  build time.
+
 ### Changed
 
+- Context layer: official plugin sources are now data-driven from
+  `crates/cli/official-plugins.json` (embedded at build time) instead
+  of a hardcoded list; official plugin additions or removals no
+  longer require code changes.
+- Context layer: resource factories now receive the merged resource
+  config envelope. The memory resource reads its spec from the
+  `"memory"` config key, merged per-field with the actor-side spec
+  (actor values win on conflict, conflicts logged at error level with
+  both values). Malformed config degrades to defaults with a warning
+  instead of skipping the resource.
+- Context layer: a plugin resource returning an empty section list now
+  logs a warning (scheme plus a config/registration hint) instead of
+  silently contributing nothing; assembly order and behavior are
+  otherwise unchanged.
+- Docs: repository documentation aligned to the single-concept model —
+  context layer is the sole top-level concept (AOP middle layer) and
+  "plugin" is the role word for supply units; new `plugin-guide.md`
+  and `plugin-list.md` under `docs/context-layer/`.
 - Context layer: `agentcontext.json` resources that omit `priority` now
   inherit the base-layer value (new resources default to 100) instead of
   silently deserializing to 0. Configs relying on the implicit 0

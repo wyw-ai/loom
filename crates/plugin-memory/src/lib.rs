@@ -8,10 +8,11 @@
 //! Boundary rules (compile-time enforced by Cargo):
 //! * depends only on `context-layer-core` (the public contract) plus
 //!   `proto` (MemorySpec) and basic libs — never on `agent-runtime`;
-//! * NOT registered via `inventory` — the builtin factory in the CLI
-//!   captures the actor's `MemorySpec` at construction time (a
-//!   zero-arg inventory factory cannot access that spec and would
-//!   shadow the builtin; ARCH iter2 裁决二).
+//! * registered via `inventory::submit!` like every other context
+//!   plugin (R1 rectification: the former CLI builtin-table entry was
+//!   the last registration privilege; the factory reads its MemorySpec
+//!   from the config envelope key "memory", injected from the actor
+//!   spec at chain-build time or supplied by agentcontext.json).
 //!
 //! `MemoryResource` replaces the old `MemoryProvider` wrapper: instead
 //! of receiving pre-rendered strings from the compose path, it runs
@@ -38,6 +39,37 @@ pub use record::{confidence_rank, MemoryQuery, MemoryRecord, MemorySource};
 pub use renderer::MemoryRenderer;
 pub use selector::{load_bootstrap_and_turn, MemorySelector};
 pub use store::MemoryStore;
+
+/// Inventory-registered factory for the `memory` scheme (R1
+/// rectification): reads the effective `MemorySpec` from the config
+/// envelope key "memory" — injected from the actor spec at chain-build
+/// time (`inject_memory_envelope`) or supplied by agentcontext.json
+/// `resources[].config`. A missing or malformed envelope falls back to
+/// defaults with a warn (skip-not-truncate).
+pub fn memory_resource_factory(
+    config: &Option<serde_json::Value>,
+) -> Box<dyn ContextResource> {
+    let spec = config.as_ref().and_then(|c| c.get("memory")).and_then(|v| {
+        match serde_json::from_value::<MemorySpec>(v.clone()) {
+            Ok(spec) => Some(spec),
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "invalid memory config envelope; falling back to defaults"
+                );
+                None
+            }
+        }
+    });
+    Box::new(MemoryResource::new(spec))
+}
+
+inventory::submit! {
+    context_layer_core::ContextResourcePlugin {
+        scheme: "memory",
+        factory: memory_resource_factory,
+    }
+}
 
 /// Memory ContextResource — loads and renders actor memory during
 /// assembly.

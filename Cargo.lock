@@ -3464,6 +3464,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "context-layer-core",
+ "inventory",
  "proto",
  "serde",
  "serde_json",

@@ -58,7 +58,6 @@ use agent_runtime::{
     PromptPart, PromptRoleHint, ResourceProvider, TokenUsage,
 };
 use context_layer_core::SectionSource;
-use plugin_memory::MemoryResource;
 
 use crate::client::Client;
 use crate::config;
@@ -8760,34 +8759,15 @@ type ResourceFactory = Box<dyn Fn(&Option<Value>) -> Box<dyn ContextResource>>;
 /// Build the builtin resource factory map. Each entry maps a scheme name
 /// to a factory closure that produces a ContextResource.
 ///
-/// Built-in providers (memory, file) are registered directly here; both
-/// read their config from the single config channel (B4 flattening).
-/// Plugin providers (warm-summary, message-list, etc.) are discovered via
-/// `inventory::submit!` self-registration — loom does not know their
-/// concrete types (Founder principle: plugin decoupling).
+/// Host infrastructure (file) is registered directly here; it reads its
+/// config from the single config channel (B4 flattening). Every plugin
+/// provider — including the official memory plugin — is discovered via
+/// `inventory::submit!` self-registration: loom does not know their
+/// concrete types (Founder principle: plugin decoupling; R1
+/// rectification removed the last builtin-table plugin entry).
 fn builtin_resource_factories() -> std::collections::HashMap<String, ResourceFactory> {
     let mut factories: std::collections::HashMap<String, ResourceFactory> =
         std::collections::HashMap::new();
-
-    // memory — reads its MemorySpec from the config envelope (key
-    // "memory"), injected from the actor spec at chain-build time or
-    // supplied by agentcontext.json. Selection runs inside
-    // MemoryResource::assemble (skip-not-truncate, warn-on-error).
-    factories.insert("memory".into(), Box::new(|config| {
-        let spec = config.as_ref().and_then(|c| c.get("memory")).and_then(|v| {
-            match serde_json::from_value::<proto::methods::MemorySpec>(v.clone()) {
-                Ok(spec) => Some(spec),
-                Err(err) => {
-                    tracing::warn!(
-                        %err,
-                        "invalid memory config envelope; falling back to defaults"
-                    );
-                    None
-                }
-            }
-        });
-        Box::new(MemoryResource::new(spec)) as Box<dyn ContextResource>
-    }));
 
     // file — reads path + max_files from config.
     factories.insert("file".into(), Box::new(|config| {

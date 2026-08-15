@@ -16821,4 +16821,242 @@ mod tests {
             .any(|r| r.scheme == "warm-summary");
         assert!(has_warm, "warm-summary should be in EMBEDDED_GLOBAL_RESOURCES");
     }
+
+    // ── Iter3 S1 Batch A — pre-unification golden baseline (A1) ─────────
+    //
+    // Locks the CURRENT resource-chain assembly output for a fixed
+    // fixture. Batch B (plugin.json v2, official-plugins.json,
+    // `loom plugin list`, config flattening, empty-content guard) must
+    // keep this snapshot byte-identical — that is the iter3 equivalence
+    // proof (AC-M1-1). Regenerate intentionally with:
+    //   LOOM_UPDATE_GOLDEN=1 cargo test -p loom-cli matches_pre_unification
+
+    const GOLDEN_SCOPE_ID: &str = "thr_iter3_golden";
+    const GOLDEN_ACTOR_ID: &str = "actor_agent_golden";
+    const GOLDEN_CHANNEL_ID: &str = "chan_iter3_golden";
+    const GOLDEN_TURN_INPUT: &str =
+        "golden fixture turn input: deploy rotation tokens and window schedule";
+    const GOLDEN_DELIVERY_CONTEXT: &str = "=== Latest Loom message ===\n\
+         msg_g1 alpha: deploy rotation window\n\
+         msg_g2 beta: token audit";
+
+    fn golden_memory_spec() -> proto::methods::MemorySpec {
+        // Actor-spec driven: delivery.prompt on, defaults elsewhere
+        // (bootstrapTopK=8, turnTopK=4). The fixture store holds 6
+        // accepted records so both selections are observable and
+        // deterministic (distinct ts, no ranking ties).
+        let mut spec = proto::methods::MemorySpec::default();
+        spec.delivery.prompt = true;
+        spec
+    }
+
+    fn golden_memory_record(
+        id: &str,
+        ts: &str,
+        confidence: &str,
+        summary: &str,
+    ) -> plugin_memory::MemoryRecord {
+        plugin_memory::MemoryRecord {
+            schema_version: 1,
+            id: id.into(),
+            actor_id: GOLDEN_ACTOR_ID.into(),
+            ts: ts.into(),
+            record_type: "fact".into(),
+            status: "accepted".into(),
+            summary: summary.into(),
+            detail: String::new(),
+            confidence: confidence.into(),
+            // per_channel defaults true: records must carry the fixture
+            // channel id to be visible to the channel-scoped selector.
+            source: plugin_memory::MemorySource {
+                channel_id: GOLDEN_CHANNEL_ID.into(),
+                thread_id: GOLDEN_SCOPE_ID.into(),
+                message_ids: Vec::new(),
+            },
+            tags: Vec::new(),
+        }
+    }
+
+    fn golden_memory_records() -> Vec<plugin_memory::MemoryRecord> {
+        vec![
+            golden_memory_record(
+                "mem_g1",
+                "2026-08-10T09:00:00Z",
+                "high",
+                "deploy rotation uses thirty day windows",
+            ),
+            golden_memory_record(
+                "mem_g2",
+                "2026-08-11T10:00:00Z",
+                "high",
+                "rotation tokens refresh automatically each window",
+            ),
+            golden_memory_record(
+                "mem_g3",
+                "2026-08-12T11:00:00Z",
+                "medium",
+                "deploy checklist includes a token audit step",
+            ),
+            golden_memory_record(
+                "mem_g4",
+                "2026-08-13T12:00:00Z",
+                "medium",
+                "tokens must stay private to the actor profile",
+            ),
+            golden_memory_record(
+                "mem_g5",
+                "2026-08-14T13:00:00Z",
+                "low",
+                "unrelated gardening note about tomatoes",
+            ),
+            golden_memory_record(
+                "mem_g6",
+                "2026-08-15T14:00:00Z",
+                "high",
+                "alpha channel fixture marker for delivery context",
+            ),
+        ]
+    }
+
+    /// Build a full fixture profile dir: memory records, a warm summary
+    /// for the golden scope, and a single notes file (a single file keeps
+    /// the FileSystemProvider listing order platform-independent).
+    fn golden_fixture_profile(dir: &Path) {
+        use plugin_memory::MemoryStore as _;
+
+        let spec = golden_memory_spec();
+        let store = plugin_memory::open_memory_store(dir, &spec);
+        for record in golden_memory_records() {
+            store.append(&record).expect("append golden memory record");
+        }
+
+        let summaries = dir.join("summaries");
+        std::fs::create_dir_all(&summaries).expect("create summaries dir");
+        std::fs::write(
+            summaries.join(format!("{GOLDEN_SCOPE_ID}.md")),
+            "SESSION INTENT: iter3 golden baseline fixture\n\
+             KEY DECISIONS: deploy rotation uses thirty-day windows",
+        )
+        .expect("write warm summary fixture");
+
+        let notes = dir.join("workspace").join("notes");
+        std::fs::create_dir_all(&notes).expect("create notes dir");
+        std::fs::write(
+            notes.join("deploy-notes.md"),
+            "# Deploy notes\n\nrotation tokens refresh every window\n",
+        )
+        .expect("write notes fixture");
+    }
+
+    fn golden_assembly_ctx<'a>(
+        profile_dir: &'a Path,
+        scope: &'a ScopeRef,
+    ) -> AssemblyContext<'a> {
+        AssemblyContext {
+            scope,
+            channel_id: Some(GOLDEN_CHANNEL_ID),
+            actor_id: GOLDEN_ACTOR_ID,
+            profile_dir,
+            budget_remaining: 100_000,
+            budget_total: 100_000,
+            delivery_context: GOLDEN_DELIVERY_CONTEXT,
+            turn_input: GOLDEN_TURN_INPUT,
+            first_turn: false,
+        }
+    }
+
+    fn render_section_source(source: &SectionSource) -> String {
+        match source {
+            SectionSource::Resource { scheme, uri } => match uri {
+                Some(uri) => format!("resource:{scheme} uri={uri}"),
+                None => format!("resource:{scheme} uri=-"),
+            },
+            SectionSource::Runtime { origin } => format!("runtime:{origin}"),
+            SectionSource::Exempted { reason } => format!("exempted:{reason}"),
+        }
+    }
+
+    /// Assemble a chain for the spec and project each section to a stable
+    /// `name [source] content` string — the comparison unit for both the
+    /// A1 golden snapshot and the A2 three-path matrix.
+    fn chain_section_projection(
+        spec: &AgentContextSpec,
+        memory_spec: Option<&proto::methods::MemorySpec>,
+        ctx: &AssemblyContext<'_>,
+    ) -> Vec<String> {
+        let registry = build_context_resource_chain(spec, memory_spec);
+        let (sections, _) = registry.assemble_chain(ctx, 100_000);
+        sections
+            .iter()
+            .map(|section| {
+                format!(
+                    "## {} [{}]\n{}",
+                    section.name,
+                    render_section_source(&section.source),
+                    section.content
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn matches_pre_unification_pipeline() {
+        let dir = tempfile::tempdir().expect("tempdir for golden fixture");
+        golden_fixture_profile(dir.path());
+
+        let scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: GOLDEN_SCOPE_ID.into(),
+        };
+        let ctx = golden_assembly_ctx(dir.path(), &scope);
+
+        // Real pipeline shape: default spec + a user file resource +
+        // embedded global merge (the same order compose uses).
+        let mut spec = proto::methods::default_agent_context_spec();
+        spec.resources.push(proto::methods::ContextResourceSpec {
+            scheme: "file".into(),
+            mount: Some("notes".into()),
+            priority: Some(20),
+            config: Some(serde_json::json!({
+                "path": "notes",
+                "max_files": 5
+            })),
+        });
+        merge_embedded_global_resources(&mut spec);
+
+        let memory_spec = golden_memory_spec();
+        let projection = chain_section_projection(&spec, Some(&memory_spec), &ctx);
+        let mut snapshot = String::from(
+            "# Pre-unification context chain golden (iter3 S1 A1)\n\
+             # Fixture: 6 accepted memory records, 1 warm summary, 1 notes file.\n\
+             # Regenerate: LOOM_UPDATE_GOLDEN=1 cargo test -p loom-cli matches_pre_unification\n\n",
+        );
+        snapshot.push_str(&projection.join("\n\n"));
+
+        let golden_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("golden")
+            .join("pre_unification_chain.md");
+        if std::env::var("LOOM_UPDATE_GOLDEN").ok().as_deref() == Some("1") {
+            std::fs::create_dir_all(golden_path.parent().expect("golden parent dir"))
+                .expect("create golden dir");
+            std::fs::write(&golden_path, &snapshot).expect("write golden snapshot");
+            return;
+        }
+        let expected = std::fs::read_to_string(&golden_path).unwrap_or_else(|err| {
+            panic!(
+                "golden file missing or unreadable ({err}); regenerate with \
+                 LOOM_UPDATE_GOLDEN=1 cargo test -p loom-cli matches_pre_unification"
+            )
+        });
+        // Defensive CRLF normalization: the snapshot uses LF and
+        // .gitattributes pins the golden to LF, but an editor rewrite
+        // must not fail the comparison on Windows.
+        let expected = expected.replace("\r\n", "\n");
+        assert_eq!(
+            snapshot, expected,
+            "pre-unification chain output drifted; if intentional, regenerate the golden"
+        );
+    }
+
 }

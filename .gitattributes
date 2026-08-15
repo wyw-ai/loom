@@ -4,3 +4,6 @@
 docker/** text eol=lf
 docker-compose.yml text eol=lf
 .env.example text eol=lf
+# Golden snapshots are compared byte-wise by tests; keep line endings
+# stable across Windows/macOS/Linux checkouts (iter3 S1 A1).
+crates/cli/tests/golden/** text eol=lf

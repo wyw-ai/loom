@@ -1,0 +1,29 @@
+[
+  {
+    "id": "loom-skills",
+    "dir_env": ["LOOM_SKILLS_DIR", "LOOM_SKILL_DIR"],
+    "repo_dir_name": "loom-skills",
+    "repo_anchor_rel": "skills",
+    "repo_env": "LOOM_SKILLS_REPO",
+    "default_repo_url": "https://github.com/wyw-ai/skills.git",
+    "ref_env": "LOOM_SKILLS_REF"
+  },
+  {
+    "id": "actor-circuit",
+    "dir_env": ["LOOM_ACTOR_CIRCUIT_DIR"],
+    "repo_dir_name": "actor-circuit",
+    "repo_anchor_rel": "skills",
+    "repo_env": "LOOM_ACTOR_CIRCUIT_REPO",
+    "default_repo_url": "https://github.com/wyw-ai/actor-circuit.git",
+    "ref_env": "LOOM_ACTOR_CIRCUIT_REF"
+  },
+  {
+    "id": "loom-plugin-context-tier",
+    "dir_env": ["LOOM_CONTEXT_TIER_DIR"],
+    "repo_dir_name": "loom-plugin-context-tier",
+    "repo_anchor_rel": "skills",
+    "repo_env": "LOOM_CONTEXT_TIER_REPO",
+    "default_repo_url": "https://github.com/wyw-ai/loom-plugin-context-tier.git",
+    "ref_env": "LOOM_CONTEXT_TIER_REF"
+  }
+]

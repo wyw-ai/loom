@@ -9,7 +9,7 @@ use std::process::Command;
 #[path = "plugin_manifest.rs"]
 mod plugin_manifest;
 
-use plugin_manifest::{check_loom_version, parse_plugin_json, PluginManifest, PluginScope};
+use plugin_manifest::{check_loom_version, parse_plugin_json, PluginScope};
 
 const GUIDE_REPO_URL: &str = "https://github.com/wyw-ai/loom-guide.git";
 
@@ -28,6 +28,9 @@ const GUIDE_REPO_URL: &str = "https://github.com/wyw-ai/loom-guide.git";
 /// Every stage validates the same `repo_anchor_rel`; a non-empty env var
 /// or fresh clone failing the check panics the build.
 struct OfficialPluginSource {
+    /// Stable identity of this source (used in diagnostics and by
+    /// `loom plugin list`); must be unique across the data file.
+    id: &'static str,
     /// Env vars (in priority order) that may point at a local checkout
     /// of the source repo. The first non-empty value that passes the
     /// anchor check wins; a non-empty value failing it panics.
@@ -55,37 +58,148 @@ struct OfficialPluginSource {
     ref_env: &'static str,
 }
 
-/// Unified plugin entry list. Pure skill repos (loom-skills, actor-circuit)
-/// have no `plugin.json` and fall back to global-scope skill loading.
-/// Full plugin repos (loom-plugin-context-tier) carry `plugin.json` for
-/// multi-dimensional dispatch. Each source is validated against its
-/// structural `repo_anchor_rel` before content discovery.
-const OFFICIAL_PLUGINS: &[OfficialPluginSource] = &[
-    OfficialPluginSource {
-        dir_env: &["LOOM_SKILLS_DIR", "LOOM_SKILL_DIR"],
-        repo_dir_name: "loom-skills",
-        repo_anchor_rel: "skills",
-        repo_env: "LOOM_SKILLS_REPO",
-        default_repo_url: "https://github.com/wyw-ai/skills.git",
-        ref_env: "LOOM_SKILLS_REF",
-    },
-    OfficialPluginSource {
-        dir_env: &["LOOM_ACTOR_CIRCUIT_DIR"],
-        repo_dir_name: "actor-circuit",
-        repo_anchor_rel: "skills",
-        repo_env: "LOOM_ACTOR_CIRCUIT_REPO",
-        default_repo_url: "https://github.com/wyw-ai/actor-circuit.git",
-        ref_env: "LOOM_ACTOR_CIRCUIT_REF",
-    },
-    OfficialPluginSource {
-        dir_env: &["LOOM_CONTEXT_TIER_DIR"],
-        repo_dir_name: "loom-plugin-context-tier",
-        repo_anchor_rel: "skills",
-        repo_env: "LOOM_CONTEXT_TIER_REPO",
-        default_repo_url: "https://github.com/wyw-ai/loom-plugin-context-tier.git",
-        ref_env: "LOOM_CONTEXT_TIER_REF",
-    },
-];
+/// Unified plugin entry list, data-driven from `official-plugins.json`
+/// (next to this build script). Pure skill repos (loom-skills,
+/// actor-circuit) have no `plugin.json` and fall back to global-scope
+/// skill loading. Full plugin repos (loom-plugin-context-tier) carry
+/// `plugin.json` for multi-dimensional dispatch. Each source is
+/// validated against its structural `repo_anchor_rel` before content
+/// discovery. Adding an official plugin = editing the JSON + providing
+/// the repo; no build.rs change.
+///
+/// Loaded by `load_official_plugins`; any missing/invalid field, empty
+/// list, or duplicate id fails the build.
+fn load_official_plugins() -> &'static [OfficialPluginSource] {
+    let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("official-plugins.json");
+    println!("cargo:rerun-if-changed={}", manifest_path.display());
+    let raw = fs::read_to_string(&manifest_path)
+        .unwrap_or_else(|err| panic!("read {} failed: {err}", manifest_path.display()));
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .unwrap_or_else(|err| panic!("parse {} failed: {err}", manifest_path.display()));
+    let array = value.as_array().unwrap_or_else(|| {
+        panic!(
+            "{} must be a JSON array of plugin source objects",
+            manifest_path.display()
+        )
+    });
+    if array.is_empty() {
+        panic!(
+            "{} must declare at least one plugin source",
+            manifest_path.display()
+        );
+    }
+
+    let mut sources = Vec::with_capacity(array.len());
+    let mut seen_ids: Vec<&str> = Vec::with_capacity(array.len());
+    for (index, entry) in array.iter().enumerate() {
+        let object = entry.as_object().unwrap_or_else(|| {
+            panic!(
+                "{} entry [{index}] must be an object",
+                manifest_path.display()
+            )
+        });
+        let id = required_str(&manifest_path, index, object, "id");
+        if seen_ids.contains(&id) {
+            panic!(
+                "{} entry [{index}] duplicates plugin source id `{id}`",
+                manifest_path.display()
+            );
+        }
+        seen_ids.push(id);
+
+        let dir_env_raw = required_str_array(&manifest_path, index, object, "dir_env");
+        if dir_env_raw.is_empty() {
+            panic!(
+                "{} entry [{index}] (`{id}`) must list at least one dir_env",
+                manifest_path.display()
+            );
+        }
+
+        sources.push(OfficialPluginSource {
+            id: Box::leak(id.to_owned().into_boxed_str()),
+            dir_env: Box::leak(
+                dir_env_raw
+                    .into_iter()
+                    .map(|s| Box::leak(s.to_owned().into_boxed_str()) as &'static str)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            ),
+            repo_dir_name: Box::leak(
+                required_str(&manifest_path, index, object, "repo_dir_name")
+                    .to_owned()
+                    .into_boxed_str(),
+            ),
+            repo_anchor_rel: Box::leak(
+                required_str(&manifest_path, index, object, "repo_anchor_rel")
+                    .to_owned()
+                    .into_boxed_str(),
+            ),
+            repo_env: Box::leak(
+                required_str(&manifest_path, index, object, "repo_env")
+                    .to_owned()
+                    .into_boxed_str(),
+            ),
+            default_repo_url: Box::leak(
+                required_str(&manifest_path, index, object, "default_repo_url")
+                    .to_owned()
+                    .into_boxed_str(),
+            ),
+            ref_env: Box::leak(
+                required_str(&manifest_path, index, object, "ref_env")
+                    .to_owned()
+                    .into_boxed_str(),
+            ),
+        });
+    }
+    Box::leak(sources.into_boxed_slice())
+}
+
+fn required_str<'a>(
+    manifest_path: &Path,
+    index: usize,
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> &'a str {
+    object.get(field).and_then(|v| v.as_str()).unwrap_or_else(|| {
+        panic!(
+            "{} entry [{index}] is missing required string field `{field}`",
+            manifest_path.display()
+        )
+    })
+}
+
+fn required_str_array(
+    manifest_path: &Path,
+    index: usize,
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Vec<String> {
+    let invalid_array = || {
+        panic!(
+            "{} entry [{index}] field `{field}` must be an array of non-empty strings",
+            manifest_path.display()
+        )
+    };
+    let array = object
+        .get(field)
+        .and_then(|v| v.as_array())
+        .unwrap_or_else(invalid_array);
+    let mut values = Vec::with_capacity(array.len());
+    for item in array {
+        let invalid_item = || {
+            panic!(
+                "{} entry [{index}] field `{field}` must be an array of non-empty strings",
+                manifest_path.display()
+            )
+        };
+        let s = item.as_str().unwrap_or_else(invalid_item);
+        if s.is_empty() {
+            invalid_item();
+        }
+        values.push(s.to_owned());
+    }
+    values
+}
 
 fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by cargo"));
@@ -100,7 +214,8 @@ fn main() {
         "LOOM_GUIDE_REF",
         &clone_root,
     );
-    let plugin_sources = resolve_plugin_sources(&clone_root);
+    let official_plugins = load_official_plugins();
+    let plugin_sources = resolve_plugin_sources(official_plugins, &clone_root);
 
     generate_guide_snapshot(&guide_dir, &out_dir);
     generate_plugin_snapshot(&plugin_sources, &out_dir);
@@ -116,8 +231,11 @@ struct ResolvedPluginSource {
     content: ContentSource,
 }
 
-fn resolve_plugin_sources(clone_root: &Path) -> Vec<ResolvedPluginSource> {
-    OFFICIAL_PLUGINS
+fn resolve_plugin_sources(
+    sources: &'static [OfficialPluginSource],
+    clone_root: &Path,
+) -> Vec<ResolvedPluginSource> {
+    sources
         .iter()
         .map(|source| ResolvedPluginSource {
             repo_dir_name: source.repo_dir_name,

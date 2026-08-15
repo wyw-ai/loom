@@ -17059,4 +17059,83 @@ mod tests {
         );
     }
 
+    // ── Iter3 S1 Batch A — unification matrix skeleton (A2) ────────────
+    //
+    // Three supply paths for the same plugin content must yield an
+    // identical assembly projection:
+    //   P1 official-manifest — default spec + merge_embedded_global_resources
+    //      (build-time embedded official plugin data)
+    //   P2 external-repo — the same schemes declared explicitly in an
+    //      agentcontext spec, resolved through inventory discovery
+    //   P3 materialized — builtin skill sync (ensure_builtin_skills)
+    // Post-B, P1 is fed by official-plugins.json and P2 by plugin.json v2;
+    // this skeleton keeps the assertion framework stable across the swap.
+
+    #[test]
+    fn unification_matrix_three_paths_agree() {
+        let dir = tempfile::tempdir().expect("tempdir for matrix fixture");
+        golden_fixture_profile(dir.path());
+
+        let scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: GOLDEN_SCOPE_ID.into(),
+        };
+        let ctx = golden_assembly_ctx(dir.path(), &scope);
+
+        // P1 official: default spec + embedded global merge.
+        let mut official = proto::methods::default_agent_context_spec();
+        merge_embedded_global_resources(&mut official);
+
+        // P2 external: explicit declarations of the same schemes, the way
+        // an external plugin's agentcontext.json would declare them.
+        let external = AgentContextSpec {
+            version: 1,
+            effective_scope: vec![],
+            resources: [
+                ("memory", 5),
+                ("warm-summary", 7),
+                ("message-list", 10),
+            ]
+            .into_iter()
+            .map(|(scheme, priority)| proto::methods::ContextResourceSpec {
+                scheme: scheme.into(),
+                mount: None,
+                priority: Some(priority),
+                config: None,
+            })
+            .collect(),
+        };
+
+        let memory_spec = golden_memory_spec();
+        let p1 = chain_section_projection(&official, Some(&memory_spec), &ctx);
+        let p2 = chain_section_projection(&external, Some(&memory_spec), &ctx);
+        assert_eq!(
+            p1, p2,
+            "official-manifest and external-repo paths must agree pre- and post-unification"
+        );
+
+        // The matrix must actually exercise the plugins (non-trivial chain).
+        assert!(
+            p1.iter().any(|s| s.contains("bootstrap_memory")),
+            "matrix fixture must include the memory section"
+        );
+        assert!(
+            p1.iter().any(|s| s.contains("warm_summary")),
+            "matrix fixture must include the warm-summary section"
+        );
+        assert!(
+            p1.iter().any(|s| s.contains("delivery_context")),
+            "matrix fixture must include the message-list section"
+        );
+
+        // P3 materialized: the skill dimension of the same plugins.
+        let data_root = dir.path().join("data-root");
+        let targets = ensure_builtin_skills(&data_root).expect("materialize builtin skills");
+        let materialized_ids: BTreeSet<&str> = targets.keys().map(|s| s.as_str()).collect();
+        let embedded_ids: BTreeSet<&str> = EMBEDDED_BUILTIN_SKILL_IDS.iter().copied().collect();
+        assert_eq!(
+            materialized_ids, embedded_ids,
+            "materialized skill set must match the embedded manifest"
+        );
+    }
 }

@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::adapter::{PromptPart, PromptRoleHint};
+use context_layer_core::SectionSource;
 
 const DEFAULT_COMMAND_TIMEOUT_MS: i64 = -1;
 const DEFAULT_COMMAND_IDLE_TIMEOUT_MS: i64 = -1;
@@ -559,6 +560,9 @@ pub fn workspace_prompt_parts(
             rendered_content: format!("=== {title} ===\n{content}"),
             content,
             role_hint: provider_role_hint(file.role_hint),
+            source: SectionSource::Runtime {
+                origin: "provider:workspace_files",
+            },
         });
     }
     Ok(parts)
@@ -3102,6 +3106,9 @@ mod tests {
             content: content.into(),
             rendered_content: content.into(),
             role_hint: crate::adapter::PromptRoleHint::User,
+            source: SectionSource::Runtime {
+                origin: "test:prompt_part",
+            },
         }
     }
 
@@ -3227,6 +3234,9 @@ mod tests {
             content: "You are @demo.".into(),
             rendered_content: "=== System: Loom actor context ===\nYou are @demo.".into(),
             role_hint: crate::adapter::PromptRoleHint::System,
+            source: SectionSource::Runtime {
+                origin: "test:render_title",
+            },
         }];
         let outputs = render_prompt_outputs(
             Some(&ProviderPromptSpec {
@@ -3273,6 +3283,9 @@ mod tests {
             content: "You are @demo.".into(),
             rendered_content: "=== System: Loom actor context ===\nYou are @demo.".into(),
             role_hint: crate::adapter::PromptRoleHint::System,
+            source: SectionSource::Runtime {
+                origin: "test:render_title",
+            },
         }];
         let outputs = render_prompt_outputs(
             Some(&ProviderPromptSpec {

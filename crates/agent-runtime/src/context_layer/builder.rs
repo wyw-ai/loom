@@ -12,10 +12,11 @@
 //! let resource = ContextResourceBuilder::new("my-scheme")
 //!     .priority(10)
 //!     .assemble(|ctx| {
-//!         Ok(vec![PromptSection {
-//!             name: "my_section",
-//!             content: "Hello world".into(),
-//!         }])
+//!         Ok(vec![PromptSection::from_resource(
+//!             "my_section",
+//!             "my-scheme",
+//!             "Hello world".into(),
+//!         )])
 //!     })
 //!     .build();
 //! ```
@@ -158,10 +159,11 @@ mod tests {
 
         let resource = ContextResourceBuilder::new("test")
             .assemble(|_| {
-                Ok(vec![PromptSection {
-                    name: "hello",
-                    content: "world".into(),
-                }])
+                Ok(vec![PromptSection::from_resource(
+                    "hello",
+                    "test",
+                    "world".into(),
+                )])
             })
             .build();
 

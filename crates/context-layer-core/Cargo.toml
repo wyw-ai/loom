@@ -8,6 +8,15 @@ license.workspace = true
 proto = { workspace = true }
 anyhow = { workspace = true }
 inventory = { workspace = true }
+serde = { workspace = true }
+
+[features]
+# Test-only helpers (e.g. `assert_skip_not_truncate`). Enabled via
+# dev-dependencies; never enabled in production builds.
+test-helpers = []
+
+[dev-dependencies]
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

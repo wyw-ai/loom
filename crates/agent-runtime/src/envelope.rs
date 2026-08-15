@@ -61,10 +61,11 @@ pub fn compose_prompt(input: &EnvelopeInput<'_>) -> (String, Vec<PromptSection>)
     // User message is always last, even if blank — an empty user message is
     // a legitimate wake-up signal (e.g. a bare directed message) and the model still
     // needs to see the delimiter.
-    sections.push(PromptSection {
-        name: "user_message",
-        content: format!("=== User message ===\n{}", input.user_message),
-    });
+    sections.push(PromptSection::exempted(
+        "user_message",
+        "legacy envelope path",
+        format!("=== User message ===\n{}", input.user_message),
+    ));
 
     let body = sections
         .iter()
@@ -78,7 +79,11 @@ fn push_nonempty(sections: &mut Vec<PromptSection>, name: &'static str, content:
     if content.trim().is_empty() {
         return;
     }
-    sections.push(PromptSection { name, content });
+    sections.push(PromptSection::exempted(
+        name,
+        "legacy envelope path",
+        content,
+    ));
 }
 
 // ---- high-level orchestrator ----

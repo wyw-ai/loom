@@ -12,6 +12,7 @@
 //! a process-level failure) may leave it `None`.
 
 use async_trait::async_trait;
+use context_layer_core::SectionSource;
 use proto::types::ScopeRef;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -111,6 +112,11 @@ pub struct PromptPart {
     /// parts to provider prompt rendering.
     pub rendered_content: String,
     pub role_hint: PromptRoleHint,
+    /// Provenance of this part (R1.1, D-D): carried over from the source
+    /// PromptSection when the part mirrors a chain section, or declared
+    /// directly for runtime-composed parts. Additive only — existing
+    /// fields are untouched.
+    pub source: SectionSource,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

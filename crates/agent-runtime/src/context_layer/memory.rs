@@ -74,18 +74,20 @@ impl ContextResource for MemoryProvider {
 
         let bootstrap = self.bootstrap_text.trim();
         if !bootstrap.is_empty() {
-            sections.push(PromptSection {
-                name: "bootstrap_memory",
-                content: bootstrap.to_string(),
-            });
+            sections.push(PromptSection::from_resource(
+                "bootstrap_memory",
+                "memory",
+                bootstrap.to_string(),
+            ));
         }
 
         let turn = self.turn_text.trim();
         if !turn.is_empty() {
-            sections.push(PromptSection {
-                name: "turn_memory",
-                content: turn.to_string(),
-            });
+            sections.push(PromptSection::from_resource(
+                "turn_memory",
+                "memory",
+                turn.to_string(),
+            ));
         }
 
         Ok(sections)
@@ -148,5 +150,74 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].name, "bootstrap_memory");
         assert_eq!(result[1].name, "turn_memory");
+    }
+
+    #[test]
+    fn memory_sections_carry_resource_provenance() {
+        // R1.1: memory sections are Resource-sourced; uri is exempted
+        // (aggregate over the memory store, no single persistent uri —
+        // ARCH design doc §1.3).
+        let scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: "test".into(),
+        };
+        let p = MemoryProvider::new()
+            .with_rendered("Bootstrap memory:\n- fact A", "Relevant memory:\n- note B");
+        let ctx = AssemblyContext {
+            scope: &scope,
+            channel_id: None,
+            actor_id: "test_actor",
+            profile_dir: Path::new("/tmp"),
+            budget_remaining: 1000,
+            budget_total: 1000,
+            delivery_context: "",
+            first_turn: false,
+        };
+        for section in p.assemble(&ctx).unwrap() {
+            assert_eq!(
+                section.source,
+                context_layer_core::SectionSource::Resource {
+                    scheme: "memory",
+                    uri: None,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn memory_resource_honors_skip_not_truncate() {
+        // R1.2 (AC-R1-3): under a tiny budget the memory resource must
+        // skip sections entirely, never truncate them.
+        use context_layer_core::test_support::assert_skip_not_truncate;
+
+        let scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: "test".into(),
+        };
+        let p = MemoryProvider::new().with_rendered(
+            "Bootstrap memory:\n- fact A\n- fact B\n- fact C",
+            "Relevant memory:\n- note B\n- note D",
+        );
+        let full_ctx = AssemblyContext {
+            scope: &scope,
+            channel_id: None,
+            actor_id: "test_actor",
+            profile_dir: Path::new("/tmp"),
+            budget_remaining: 10_000,
+            budget_total: 10_000,
+            delivery_context: "",
+            first_turn: false,
+        };
+        let tiny_ctx = AssemblyContext {
+            scope: &scope,
+            channel_id: None,
+            actor_id: "test_actor",
+            profile_dir: Path::new("/tmp"),
+            budget_remaining: 1,
+            budget_total: 10_000,
+            delivery_context: "",
+            first_turn: false,
+        };
+        assert_skip_not_truncate(&p, &full_ctx, &tiny_ctx);
     }
 }

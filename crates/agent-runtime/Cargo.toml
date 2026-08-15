@@ -35,6 +35,7 @@ libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+context-layer-core = { workspace = true, features = ["test-helpers"] }
 
 [lints]
 workspace = true

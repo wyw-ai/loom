@@ -57,6 +57,7 @@ use agent_runtime::{
     FileSystemProvider, MemoryProvider,
     PromptPart, PromptRoleHint, ResourceProvider, TokenUsage,
 };
+use context_layer_core::SectionSource;
 
 use crate::client::Client;
 use crate::config;
@@ -6150,6 +6151,9 @@ fn load_agent_prompt_file_parts(
                         AgentPromptRoleHint::System => PromptRoleHint::System,
                         AgentPromptRoleHint::User => PromptRoleHint::User,
                     },
+                    source: SectionSource::Runtime {
+                        origin: "spec:prompt_files",
+                    },
                 });
             }
             Err(err) if file.optional => {
@@ -8601,10 +8605,11 @@ fn compose_summary_generation_prompt(
     trigger_prompt: &TriggerPromptText,
 ) -> PromptTelemetry {
     let summary_text = build_summary_generation_prompt(&trigger_prompt.delivery_context);
-    let sections = vec![agent_runtime::PromptSection {
-        name: "user_message",
-        content: format!("=== User message ===\n{summary_text}"),
-    }];
+    let sections = vec![agent_runtime::PromptSection::runtime(
+        "user_message",
+        "fn:build_summary_generation_prompt",
+        format!("=== User message ===\n{summary_text}"),
+    )];
     let content = sections
         .iter()
         .map(|s| s.content.as_str())
@@ -8812,10 +8817,12 @@ impl ContextResource for FileContextResource {
             match self.provider.read(&handle.uri, ctx.scope, ctx.profile_dir) {
                 Ok(content) => {
                     if !content.text.trim().is_empty() {
-                        sections.push(agent_runtime::PromptSection {
-                            name: "file_resource",
-                            content: format!("--- {} ---\n{}", handle.name, content.text),
-                        });
+                        sections.push(agent_runtime::PromptSection::from_resource_uri(
+                            "file_resource",
+                            "file",
+                            handle.uri.clone(),
+                            format!("--- {} ---\n{}", handle.name, content.text),
+                        ));
                     }
                 }
                 Err(err) => {
@@ -8973,10 +8980,11 @@ fn compose_with_context_chain(
     // 4. Fixed sections (always present, priority 0 equivalent).
     let mut sections: Vec<agent_runtime::PromptSection> = Vec::new();
     push_profile_prompt_files_section(&mut sections, profile_prompt_files.to_string());
-    sections.push(agent_runtime::PromptSection {
-        name: "runtime_context",
-        content: runtime_context.to_string(),
-    });
+    sections.push(agent_runtime::PromptSection::runtime(
+        "runtime_context",
+        "fn:local_time_manifest",
+        runtime_context.to_string(),
+    ));
 
     // 5. ContextResource chain assembly with budget waterfall.
     let budget_used: u64 = sections
@@ -9001,10 +9009,11 @@ fn compose_with_context_chain(
     sections.extend(chain_sections);
 
     // 6. User message (always last).
-    sections.push(agent_runtime::PromptSection {
-        name: "user_message",
-        content: format!("=== User message ===\n{turn_input}"),
-    });
+    sections.push(agent_runtime::PromptSection::exempted(
+        "user_message",
+        "user turn input (is its own origin)",
+        format!("=== User message ===\n{turn_input}"),
+    ));
 
     let content = sections
         .iter()
@@ -9041,10 +9050,11 @@ fn push_profile_prompt_files_section(
         .unwrap_or(sections.len());
     sections.insert(
         insert_at,
-        agent_runtime::PromptSection {
-            name: "profile_prompt_files",
+        agent_runtime::PromptSection::runtime(
+            "profile_prompt_files",
+            "profile:prompts/",
             content,
-        },
+        ),
     );
 }
 
@@ -9053,16 +9063,38 @@ fn add_turn_input_prompt_parts(
     trigger_prompt: &TriggerPromptText,
     turn_input: &str,
 ) {
-    push_extra_prompt_part(prompt, "latest_message", &trigger_prompt.latest_message);
+    push_extra_prompt_part(
+        prompt,
+        "latest_message",
+        &trigger_prompt.latest_message,
+        SectionSource::Runtime {
+            origin: "trigger:latest_message",
+        },
+    );
     push_extra_prompt_part(
         prompt,
         "assignment_context",
         &trigger_prompt.assignment_context,
+        SectionSource::Runtime {
+            origin: "trigger:assignment_context",
+        },
     );
-    push_extra_prompt_part(prompt, "turn_input", turn_input);
+    push_extra_prompt_part(
+        prompt,
+        "turn_input",
+        turn_input,
+        SectionSource::Exempted {
+            reason: "user turn input (is its own origin)",
+        },
+    );
 }
 
-fn push_extra_prompt_part(prompt: &mut PromptTelemetry, key: &'static str, content: &str) {
+fn push_extra_prompt_part(
+    prompt: &mut PromptTelemetry,
+    key: &'static str,
+    content: &str,
+    source: SectionSource,
+) {
     if content.trim().is_empty() || prompt.parts.iter().any(|part| part.key == key) {
         return;
     }
@@ -9072,6 +9104,7 @@ fn push_extra_prompt_part(prompt: &mut PromptTelemetry, key: &'static str, conte
         content: content.to_string(),
         rendered_content: content.to_string(),
         role_hint: PromptRoleHint::User,
+        source,
     });
 }
 
@@ -9142,6 +9175,9 @@ fn ensure_trigger_prefix_prompt_part(prompt: &mut PromptTelemetry, prefix: &str)
             content: prefix.to_string(),
             rendered_content: prefix.to_string(),
             role_hint: PromptRoleHint::User,
+            source: SectionSource::Runtime {
+                origin: "trigger:prompt_prefix",
+            },
         },
     );
 }
@@ -9326,6 +9362,8 @@ fn prompt_part_from_section(section: &agent_runtime::PromptSection) -> PromptPar
             |             "warm_summary" | "delivery_context" | "file_resource" => PromptRoleHint::System,
             _ => PromptRoleHint::User,
         },
+        // R1.1 (D-D): provenance is carried over from the chain section.
+        source: section.source.clone(),
     }
 }
 
@@ -13350,6 +13388,7 @@ mod tests {
                 content: "actor raw".into(),
                 rendered_content: "=== Actor ===\nactor raw".into(),
                 role_hint: PromptRoleHint::System,
+                source: SectionSource::Runtime { origin: "test" },
             },
             PromptPart {
                 key: "agent_instructions".into(),
@@ -13357,6 +13396,7 @@ mod tests {
                 content: "be concise".into(),
                 rendered_content: "=== Instructions ===\nbe concise".into(),
                 role_hint: PromptRoleHint::System,
+                source: SectionSource::Runtime { origin: "test" },
             },
             PromptPart {
                 key: "runtime_context".into(),
@@ -13364,6 +13404,7 @@ mod tests {
                 content: "time now".into(),
                 rendered_content: "=== Runtime ===\ntime now".into(),
                 role_hint: PromptRoleHint::User,
+                source: SectionSource::Runtime { origin: "test" },
             },
             PromptPart {
                 key: "user_message".into(),
@@ -13371,6 +13412,7 @@ mod tests {
                 content: "hello".into(),
                 rendered_content: "=== User ===\nhello".into(),
                 role_hint: PromptRoleHint::User,
+                source: SectionSource::Runtime { origin: "test" },
             },
             PromptPart {
                 key: "file.persona".into(),
@@ -13378,6 +13420,7 @@ mod tests {
                 content: "reviewer".into(),
                 rendered_content: "=== Persona ===\nreviewer".into(),
                 role_hint: PromptRoleHint::System,
+                source: SectionSource::Runtime { origin: "test" },
             },
         ];
         let assembly = AgentPromptAssemblySpec {
@@ -13695,10 +13738,11 @@ mod tests {
             trigger_prompt_prefix: "/router\n".into(),
             apply_on: TriggerPrefixApplyOn::EveryTurn,
         });
-        let sections = vec![agent_runtime::PromptSection {
-            name: "user_message",
-            content: "hello".into(),
-        }];
+        let sections = vec![agent_runtime::PromptSection::exempted(
+            "user_message",
+            "user turn input (is its own origin)",
+            "hello".into(),
+        )];
 
         assert_eq!(
             apply_trigger_prefix_to_prompt(
@@ -13762,10 +13806,11 @@ mod tests {
 
     #[test]
     fn turn_input_parts_are_available_without_changing_full_prompt() {
-        let sections = vec![agent_runtime::PromptSection {
-            name: "user_message",
-            content: "=== User message ===\nlatest\n\nassignment".into(),
-        }];
+        let sections = vec![agent_runtime::PromptSection::exempted(
+            "user_message",
+            "user turn input (is its own origin)",
+            "=== User message ===\nlatest\n\nassignment".into(),
+        )];
         let mut prompt = prompt_telemetry(sections[0].content.clone(), &sections);
         let original = prompt.content.clone();
         let trigger_prompt = TriggerPromptText {
@@ -13803,6 +13848,7 @@ mod tests {
                 content: "runtime".into(),
                 rendered_content: "runtime".into(),
                 role_hint: PromptRoleHint::User,
+                source: SectionSource::Runtime { origin: "test" },
             },
             PromptPart {
                 key: "assignment_context".into(),
@@ -13810,6 +13856,7 @@ mod tests {
                 content: assignment.into(),
                 rendered_content: assignment.into(),
                 role_hint: PromptRoleHint::User,
+                source: SectionSource::Runtime { origin: "test" },
             },
             PromptPart {
                 key: "user_message".into(),
@@ -13817,6 +13864,7 @@ mod tests {
                 content: format!("latest\n\n{assignment}"),
                 rendered_content: format!("latest\n\n{assignment}"),
                 role_hint: PromptRoleHint::User,
+                source: SectionSource::Runtime { origin: "test" },
             },
         ];
 
@@ -13869,6 +13917,7 @@ mod tests {
                 content: "Actor: Demo".into(),
                 rendered_content: "Actor: Demo".into(),
                 role_hint: PromptRoleHint::System,
+                source: SectionSource::Runtime { origin: "test" },
             },
             PromptPart {
                 key: "scope_bootstrap".into(),
@@ -13876,6 +13925,7 @@ mod tests {
                 content: "Scope: channel demo".into(),
                 rendered_content: "Scope: channel demo".into(),
                 role_hint: PromptRoleHint::System,
+                source: SectionSource::Runtime { origin: "test" },
             },
             PromptPart {
                 key: "runtime_context".into(),
@@ -13883,6 +13933,7 @@ mod tests {
                 content: "Runtime context".into(),
                 rendered_content: "Runtime context".into(),
                 role_hint: PromptRoleHint::User,
+                source: SectionSource::Runtime { origin: "test" },
             },
             PromptPart {
                 key: "user_message".into(),
@@ -13890,6 +13941,7 @@ mod tests {
                 content: "hello".into(),
                 rendered_content: "hello".into(),
                 role_hint: PromptRoleHint::User,
+                source: SectionSource::Runtime { origin: "test" },
             },
         ];
 
@@ -13909,14 +13961,16 @@ mod tests {
     #[test]
     fn prompt_parts_are_raw_while_full_prompt_stays_rendered() {
         let sections = vec![
-            agent_runtime::PromptSection {
-                name: "runtime_context",
-                content: "=== Runtime context ===\nCurrent time: now".into(),
-            },
-            agent_runtime::PromptSection {
-                name: "user_message",
-                content: "=== User message ===\nhello".into(),
-            },
+            agent_runtime::PromptSection::runtime(
+                "runtime_context",
+                "fn:local_time_manifest",
+                "=== Runtime context ===\nCurrent time: now".into(),
+            ),
+            agent_runtime::PromptSection::exempted(
+                "user_message",
+                "user turn input (is its own origin)",
+                "=== User message ===\nhello".into(),
+            ),
         ];
 
         let prompt = prompt_telemetry(
@@ -13984,10 +14038,11 @@ mod tests {
             trigger_prompt_prefix: "/router\n".into(),
             apply_on: TriggerPrefixApplyOn::EveryTurn,
         });
-        let sections = vec![agent_runtime::PromptSection {
-            name: "user_message",
-            content: "=== User message ===\n[loom envelope]\nhello".into(),
-        }];
+        let sections = vec![agent_runtime::PromptSection::exempted(
+            "user_message",
+            "user turn input (is its own origin)",
+            "=== User message ===\n[loom envelope]\nhello".into(),
+        )];
         let prompt = prompt_telemetry(sections[0].content.clone(), &sections);
 
         let prompt = apply_trigger_prefix_to_prompt(&spec, prompt, false, None);
@@ -14020,10 +14075,11 @@ mod tests {
             trigger_prompt_prefix: "/router\n".into(),
             apply_on: TriggerPrefixApplyOn::EveryTurn,
         });
-        let sections = vec![agent_runtime::PromptSection {
-            name: "user_message",
-            content: "=== User message ===\n[loom envelope]\nhello".into(),
-        }];
+        let sections = vec![agent_runtime::PromptSection::exempted(
+            "user_message",
+            "user turn input (is its own origin)",
+            "=== User message ===\n[loom envelope]\nhello".into(),
+        )];
         let prompt = prompt_telemetry(sections[0].content.clone(), &sections);
 
         let prompt = apply_trigger_prefix_to_prompt(&spec, prompt, false, Some("/review [loom]\n"));
@@ -14050,10 +14106,11 @@ mod tests {
             trigger_prompt_prefix: "/router\n".into(),
             apply_on: TriggerPrefixApplyOn::EveryTurn,
         });
-        let sections = vec![agent_runtime::PromptSection {
-            name: "user_message",
-            content: "=== User message ===\nignored".into(),
-        }];
+        let sections = vec![agent_runtime::PromptSection::exempted(
+            "user_message",
+            "user turn input (is its own origin)",
+            "=== User message ===\nignored".into(),
+        )];
         let prompt = apply_trigger_prefix_to_prompt(
             &spec,
             prompt_telemetry(sections[0].content.clone(), &sections),
@@ -16214,6 +16271,58 @@ mod tests {
         };
         let registry = build_context_resource_chain(&spec, "", "".into());
         assert!(registry.is_empty(), "unknown scheme should be skipped");
+    }
+
+    // ── R1: file resource provenance + skip-not-truncate ─────────────
+
+    #[test]
+    fn file_context_resource_honors_skip_not_truncate() {
+        use context_layer_core::test_support::assert_skip_not_truncate;
+        use proto::types::{ScopeKind, ScopeRef};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let notes = dir.path().join("workspace").join("notes");
+        std::fs::create_dir_all(&notes).expect("create notes dir");
+        std::fs::write(notes.join("a.md"), "alpha notes\n".repeat(50)).expect("write a.md");
+        std::fs::write(notes.join("b.md"), "beta notes\n".repeat(50)).expect("write b.md");
+
+        let scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: "thr_file_test".into(),
+        };
+        let resource = FileContextResource::new(FileSystemProvider::new("notes", 10));
+
+        let mk_ctx = |budget_remaining: u64| AssemblyContext {
+            scope: &scope,
+            channel_id: None,
+            actor_id: "test_actor",
+            profile_dir: dir.path(),
+            budget_remaining,
+            budget_total: 10_000,
+            delivery_context: "",
+            first_turn: false,
+        };
+        let full_ctx = mk_ctx(10_000);
+        let tiny_ctx = mk_ctx(1);
+
+        // R1.2 (AC-R1-3): under a tiny budget the file resource must
+        // never truncate — sections are byte-identical or absent.
+        assert_skip_not_truncate(&resource, &full_ctx, &tiny_ctx);
+
+        // R1.1: file sections carry Resource provenance with a
+        // traceable uri (the file handle uri).
+        let sections = resource.assemble(&full_ctx).expect("assemble");
+        assert!(!sections.is_empty(), "expected file sections");
+        for section in &sections {
+            assert!(
+                matches!(
+                    &section.source,
+                    SectionSource::Resource { scheme: "file", uri: Some(_) }
+                ),
+                "file_resource section must be Resource-sourced with a uri, got {:?}",
+                section.source
+            );
+        }
     }
 
     // ── Plugin loader tests ───────────────────────────────────────

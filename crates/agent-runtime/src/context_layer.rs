@@ -211,15 +211,20 @@ mod tests {
     use proto::types::ScopeKind;
 
     /// Helper: create a simple test resource with given priority and token size.
-    fn make_resource(scheme: &str, priority: i32, token_estimate: usize) -> Box<dyn ContextResource> {
+    fn make_resource(
+        scheme: &'static str,
+        priority: i32,
+        token_estimate: usize,
+    ) -> Box<dyn ContextResource> {
         let content = "a".repeat(token_estimate * 4); // ~4 chars per token
         ContextResourceBuilder::new(scheme)
             .priority(priority)
             .assemble(move |_| {
-                Ok(vec![PromptSection {
-                    name: "test",
-                    content: content.clone(),
-                }])
+                Ok(vec![PromptSection::from_resource(
+                    "test",
+                    scheme,
+                    content.clone(),
+                )])
             })
             .build()
     }
@@ -301,10 +306,11 @@ mod tests {
                 .priority(1)
                 .scopes(vec![ScopeKind::Thread])
                 .assemble(|_| {
-                    Ok(vec![PromptSection {
-                        name: "should-not-appear",
-                        content: "data".into(),
-                    }])
+                    Ok(vec![PromptSection::from_resource(
+                        "should-not-appear",
+                        "thread-only",
+                        "data".into(),
+                    )])
                 })
                 .build(),
         );

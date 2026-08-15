@@ -43,7 +43,7 @@ fn render_section(title: &str, records: &[MemoryRecord]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::record::MemorySource;
+    use crate::record::MemorySource;
 
     fn rec(ty: &str, conf: &str, summary: &str) -> MemoryRecord {
         MemoryRecord {

@@ -246,7 +246,7 @@ pub(crate) fn tokenize(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::record::MemorySource;
+    use crate::record::MemorySource;
 
     fn mk(id: &str, ts: &str, summary: &str, channel: &str, confidence: &str) -> MemoryRecord {
         MemoryRecord {

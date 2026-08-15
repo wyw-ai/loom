@@ -40,7 +40,7 @@ pub use bundle::{
 pub use envelope::{compose_prompt, EnvelopeInput, PromptSection};
 pub use context_layer::{
     AssemblyContext, ContextResource, ContextResourceBuilder, ContextResourceRegistry,
-    discover_plugins, FileSystemProvider, MemoryProvider, ResourceContent, ResourceHandle,
+    discover_plugins, FileSystemProvider, ResourceContent, ResourceHandle,
     ResourceProvider,
 };
 pub use interactive::{InteractiveCommandAdapter, InteractiveCommandConfig};

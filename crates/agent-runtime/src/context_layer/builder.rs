@@ -154,6 +154,7 @@ mod tests {
             budget_remaining: 1000,
             budget_total: 1000,
             delivery_context: "",
+            turn_input: "",
             first_turn: false,
         };
 

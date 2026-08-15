@@ -16,6 +16,7 @@ path = "src/bin/loom_daemon.rs"
 proto = { workspace = true }
 agent-runtime = { workspace = true }
 context-layer-core = { workspace = true }
+plugin-memory = { workspace = true }
 loom-plugin-context-tier = { workspace = true }
 loom-platform = { workspace = true }
 serde = { workspace = true }
@@ -48,6 +49,7 @@ tempfile = { workspace = true }
 
 [dev-dependencies]
 context-layer-core = { workspace = true, features = ["test-helpers"] }
+inventory = { workspace = true }
 [build-dependencies]
 serde_json = { workspace = true }
 

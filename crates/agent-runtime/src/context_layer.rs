@@ -19,7 +19,6 @@
 
 pub mod builder;
 pub mod filesystem;
-pub mod memory;
 
 // Force-link the loom-plugin-context-tier crate so its `inventory::submit!`
 // registrations are not stripped by the linker. Without this, the
@@ -202,7 +201,6 @@ pub fn discover_plugins() -> HashMap<String, fn() -> Box<dyn ContextResource>> {
 
 pub use builder::ContextResourceBuilder;
 pub use filesystem::FileSystemProvider;
-pub use memory::MemoryProvider;
 
 #[cfg(test)]
 mod tests {
@@ -238,6 +236,7 @@ mod tests {
             budget_remaining,
             budget_total: budget_remaining,
             delivery_context: "",
+            turn_input: "",
             first_turn: false,
         }
     }

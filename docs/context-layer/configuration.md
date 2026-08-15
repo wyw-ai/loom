@@ -74,7 +74,7 @@ ContextLayer 配置可放在三个位置，按优先级顺序合并（上层对�
 |---|---|---|---|
 | `scheme` | `String` | 是 | 标识 Provider 的 URI scheme。可选值：`"memory"`、`"message-list"`、`"file"`、`"warm-summary"`（`"skill"` 设计中但未实现）。 |
 | `mount` | `Option<String>` | 否 | 挂载标签（信息性；标识此资源声明）。省略时：覆盖已有资源则继承下层值；新资源则缺省为 `scheme` 本身。 |
-| `priority` | `Option<i32>` | 否 | 组装顺序。值越小 = 越先组装。`0` = 永不跳过（保留值）。省略时：覆盖已有资源则继承下层值；新资源则缺省为 `100`。 |
+| `priority` | `Option<i32>` | 否 | 组装顺序。值越小 = 越先组装。`0` = 永不跳过（保留值）。省略时：覆盖已有资源则继承下层值；新资源则缺省为 `100`。显式声明的 `priority` 会覆盖资源内置优先级并真实作用于装配顺序（迭代 2 起；此前显式值若与内置值不同会被静默忽略）。 |
 | `config` | `Option<serde_json::Value>` | 否 | Provider 专属配置。参见下文各 scheme 说明。 |
 
 > **行为变更（迭代 1 / R2）**：此前 `priority` 省略时按 `0` 处理（即"永不跳过"的
@@ -88,8 +88,10 @@ ContextLayer 配置可放在三个位置，按优先级顺序合并（上层对�
 
 ### `memory` scheme
 
-包装现有记忆机制。无需 `config` — 运行时从 `MemorySpec` 预渲染记忆并传递给
-`MemoryProvider`。
+官方记忆插件（独立 `plugin-memory` crate，迭代 2 起以官方插件形态接入
+ContextResource 链）。无需 `config` — 插件在链构造时捕获 Agent 的
+`MemorySpec`（来自 `spec.json`），在链装配阶段按当前回合输入
+（`AssemblyContext.turn_input`）检索并渲染记忆段落。
 
 ```json
 {
@@ -101,8 +103,34 @@ ContextLayer 配置可放在三个位置，按优先级顺序合并（上层对�
 
 **内置默认优先级**：5
 
-**行为**：从预渲染记忆字符串生成 `bootstrap_memory` 和 `turn_memory` 段落。
-如果 Agent 未配置 `MemorySpec`，两个段落都为空，Provider 不贡献任何内容。
+**行为**：生成 `bootstrap_memory` 和 `turn_memory` 段落。如果 Agent 未配置
+`MemorySpec` 或 `delivery.prompt=false`，两个段落都为空，插件不贡献任何内容；
+检索失败时降级为空输出（跳过而非中断）。
+
+**`config` 字段**：当前被记忆插件忽略（与历史行为一致），为未来覆盖
+`MemorySpec` 子集（如 `top_k`）预留。
+
+**禁用 / 覆盖 / 定制**（迭代 2 语义）：
+
+- **禁用**：从有效 `resources` 列表中移除 `memory` 条目即可（逐字段合并无删除
+  语义，需在最高层用不含 memory 的完整 `resources` 数组覆盖）：
+
+  ```json
+  { "resources": [
+      { "scheme": "warm-summary", "priority": 7 },
+      { "scheme": "message-list", "priority": 10 }
+  ] }
+  ```
+
+- **覆盖**：在更高层级声明同 `scheme` 条目并显式指定 `priority`（或 `mount`）。
+  显式 `priority` 会真实作用于装配顺序（见下文行为变更说明）：
+
+  ```json
+  { "resources": [ { "scheme": "memory", "priority": 25 } ] }
+  ```
+
+- **定制**：`config` 字段会传入资源工厂；记忆插件当前忽略它（业务配置以
+  `spec.json` 的 `MemorySpec` 为准），第三方替身插件可用自身 `config`。
 
 ### `message-list` scheme
 

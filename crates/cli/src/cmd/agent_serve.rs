@@ -54,10 +54,11 @@ use agent_runtime::{
     agent_child_server_url, prepare_bundle_install, resolved_bundle_version,
     validate_bundle_current, Adapter, AdapterEvent, AdapterModelOptions, AdapterPrompt,
     AssemblyContext, ContextResource, ContextResourceRegistry, discover_plugins,
-    FileSystemProvider, MemoryProvider,
+    FileSystemProvider,
     PromptPart, PromptRoleHint, ResourceProvider, TokenUsage,
 };
 use context_layer_core::SectionSource;
+use plugin_memory::MemoryResource;
 
 use crate::client::Client;
 use crate::config;
@@ -8718,8 +8719,9 @@ fn merge_agentcontext(base: AgentContextSpec, overlay: AgentContextSpec) -> Agen
 }
 
 /// Type alias for a factory function that creates a ContextResource from
-/// optional JSON config. Pre-rendered memory strings are captured via the
-/// outer closure when the factory map is built.
+/// optional JSON config. The actor's `MemorySpec` is captured via the
+/// outer closure when the factory map is built (iter2: the memory plugin
+/// runs its own selection during assemble, no pre-rendered strings).
 type ResourceFactory = Box<dyn Fn(&Option<Value>) -> Box<dyn ContextResource>>;
 
 /// Build the builtin resource factory map. Each entry maps a scheme name
@@ -8730,19 +8732,16 @@ type ResourceFactory = Box<dyn Fn(&Option<Value>) -> Box<dyn ContextResource>>;
 /// `inventory::submit!` self-registration — loom does not know their
 /// concrete types (Founder principle: plugin decoupling).
 fn builtin_resource_factories(
-    bootstrap_memory: &str,
-    turn_memory: String,
+    memory_spec: Option<&proto::methods::MemorySpec>,
 ) -> std::collections::HashMap<String, ResourceFactory> {
     let mut factories: std::collections::HashMap<String, ResourceFactory> =
         std::collections::HashMap::new();
 
-    // memory — needs pre-rendered bootstrap + turn text (special case).
-    let boot = bootstrap_memory.to_string();
+    // memory — captures the actor's MemorySpec; selection runs inside
+    // MemoryResource::assemble (skip-not-truncate, warn-on-error).
+    let mem_spec = memory_spec.cloned();
     factories.insert("memory".into(), Box::new(move |_config| {
-        Box::new(
-            MemoryProvider::new()
-                .with_rendered(boot.clone(), turn_memory.clone()),
-        ) as Box<dyn ContextResource>
+        Box::new(MemoryResource::new(mem_spec.clone())) as Box<dyn ContextResource>
     }));
 
     // file — reads path + max_files from config.
@@ -8778,15 +8777,27 @@ fn builtin_resource_factories(
 /// Uses the factory registry to look up each declared resource scheme.
 fn build_context_resource_chain(
     spec: &AgentContextSpec,
-    bootstrap_memory: &str,
-    turn_memory: &str,
+    memory_spec: Option<&proto::methods::MemorySpec>,
 ) -> ContextResourceRegistry {
     let mut registry = ContextResourceRegistry::new();
-    let factories = builtin_resource_factories(bootstrap_memory, turn_memory.to_string());
+    let factories = builtin_resource_factories(memory_spec);
 
     for resource_spec in &spec.resources {
         if let Some(factory) = factories.get(resource_spec.scheme.as_str()) {
-            registry.register(factory(&resource_spec.config));
+            let resource = factory(&resource_spec.config);
+            // An explicit agentcontext priority overrides the resource's
+            // inherent priority (iter1 per-field merge promise; AC-M1-2).
+            // Default spec entries declare priorities matching the
+            // inherent values, so only real overrides change order.
+            match resource_spec.priority {
+                Some(p) if p != resource.priority() => {
+                    registry.register(Box::new(PriorityOverrideResource {
+                        inner: resource,
+                        priority: p,
+                    }));
+                }
+                _ => registry.register(resource),
+            }
         } else {
             tracing::warn!(
                 scheme = %resource_spec.scheme,
@@ -8796,6 +8807,32 @@ fn build_context_resource_chain(
     }
 
     registry
+}
+
+/// Adapter that applies an agentcontext-declared priority on top of a
+/// resource, keeping every other trait behavior (scheme, scope,
+/// assemble) identical to the wrapped resource.
+struct PriorityOverrideResource {
+    inner: Box<dyn ContextResource>,
+    priority: i32,
+}
+
+impl ContextResource for PriorityOverrideResource {
+    fn scheme(&self) -> &str {
+        self.inner.scheme()
+    }
+
+    fn priority(&self) -> i32 {
+        self.priority
+    }
+
+    fn effective_scope(&self) -> &[ScopeKind] {
+        self.inner.effective_scope()
+    }
+
+    fn assemble(&self, ctx: &AssemblyContext<'_>) -> anyhow::Result<Vec<agent_runtime::PromptSection>> {
+        self.inner.assemble(ctx)
+    }
 }
 
 /// Expand `${workspace.dir}` template variable in a path string.
@@ -8931,10 +8968,11 @@ async fn compose_envelope_prompt(
 ///
 /// This is now the only prompt composition path (D2 default). It:
 /// 1. Loads agentcontext config (scope inheritance: Agent → Channel → Thread)
-/// 2. Pre-renders memory (if MemorySpec is present) for MemoryProvider
-/// 3. Builds the ContextResourceRegistry from the config
-/// 4. Assembles sections in priority order with token budget waterfall
-/// 5. Appends user_message last
+/// 2. Builds the ContextResourceRegistry from the config (the memory
+///    plugin captures the actor's MemorySpec and runs selection during
+///    assembly — iter2 pluginization)
+/// 3. Assembles sections in priority order with token budget waterfall
+/// 4. Appends user_message last
 ///
 /// Warm summary is now handled by WarmSummaryContextResource (priority 7)
 /// within the chain itself — no manual injection needed.
@@ -8969,41 +9007,10 @@ fn compose_with_context_chain(
         effective_spec = merge_agentcontext(effective_spec, workspace_ctx);
     }
 
-    // 2. Pre-render memory if MemorySpec is present (for MemoryProvider).
-    let (bootstrap_rendered, turn_rendered) = if let Some(mem) = memory_spec {
-        if mem.delivery.prompt {
-            let store = agent_runtime::envelope::open_memory_store(&state.profile_dir, mem);
-            let selector = agent_runtime::memory::MemorySelector::new(
-                mem.clone(),
-                channel_id.as_deref().map(String::from),
-            );
-            match agent_runtime::memory::load_bootstrap_and_turn(
-                &selector,
-                &store,
-                turn_input,
-                conversation_context,
-            ) {
-                Ok((boot, turn)) => (
-                    agent_runtime::memory::MemoryRenderer::render_bootstrap(&boot),
-                    agent_runtime::memory::MemoryRenderer::render_turn(&turn),
-                ),
-                Err(err) => {
-                    tracing::warn!(%err, "memory selection failed; skipping memory section");
-                    (String::new(), String::new())
-                }
-            }
-        } else {
-            (String::new(), String::new())
-        }
-    } else {
-        (String::new(), String::new())
-    };
+    // 2. Build the ContextResource chain.
+    let registry = build_context_resource_chain(&effective_spec, memory_spec);
 
-    // 3. Build the ContextResource chain.
-    let registry =
-        build_context_resource_chain(&effective_spec, &bootstrap_rendered, &turn_rendered);
-
-    // 4. Fixed sections (always present, priority 0 equivalent).
+    // 3. Fixed sections (always present, priority 0 equivalent).
     let mut sections: Vec<agent_runtime::PromptSection> = Vec::new();
     push_profile_prompt_files_section(&mut sections, profile_prompt_files.to_string());
     sections.push(agent_runtime::PromptSection::runtime(
@@ -9012,7 +9019,7 @@ fn compose_with_context_chain(
         runtime_context.to_string(),
     ));
 
-    // 5. ContextResource chain assembly with budget waterfall.
+    // 4. ContextResource chain assembly with budget waterfall.
     let budget_used: u64 = sections
         .iter()
         .map(|s| usage::estimate_tokens(&s.content))
@@ -9027,6 +9034,7 @@ fn compose_with_context_chain(
         budget_remaining,
         budget_total: budget,
         delivery_context: conversation_context,
+        turn_input,
         first_turn,
     };
 
@@ -9034,7 +9042,7 @@ fn compose_with_context_chain(
         registry.assemble_chain(&assembly_ctx, budget_remaining);
     sections.extend(chain_sections);
 
-    // 6. User message (always last).
+    // 5. User message (always last).
     sections.push(agent_runtime::PromptSection::exempted(
         "user_message",
         "user turn input (is its own origin)",
@@ -16244,7 +16252,7 @@ mod tests {
     // (e) builtin_resource_factories factory lookup verification
     #[test]
     fn builtin_resource_factories_registers_all_schemes() {
-        let factories = builtin_resource_factories("", String::new());
+        let factories = builtin_resource_factories(None);
         assert!(factories.contains_key("memory"), "memory factory must be registered");
         assert!(factories.contains_key("message-list"), "message-list factory must be registered");
         assert!(factories.contains_key("file"), "file factory must be registered");
@@ -16253,7 +16261,7 @@ mod tests {
 
     #[test]
     fn builtin_resource_factories_produces_correct_schemes() {
-        let factories = builtin_resource_factories("", String::new());
+        let factories = builtin_resource_factories(None);
         // memory factory
         let mem = factories.get("memory").unwrap()(&None);
         assert_eq!(mem.scheme(), "memory");
@@ -16276,7 +16284,7 @@ mod tests {
     #[test]
     fn build_context_resource_chain_assembles_default_spec() {
         let spec = proto::methods::default_agent_context_spec();
-        let registry = build_context_resource_chain(&spec, "boot memory", "turn memory".into());
+        let registry = build_context_resource_chain(&spec, None);
         assert!(!registry.is_empty(), "default spec should produce a non-empty registry");
         assert!(registry.has_scheme("memory"));
         assert!(registry.has_scheme("warm-summary"));
@@ -16295,7 +16303,7 @@ mod tests {
                 config: None,
             }],
         };
-        let registry = build_context_resource_chain(&spec, "", "".into());
+        let registry = build_context_resource_chain(&spec, None);
         assert!(registry.is_empty(), "unknown scheme should be skipped");
     }
 
@@ -16326,6 +16334,7 @@ mod tests {
             budget_remaining,
             budget_total: 10_000,
             delivery_context: "",
+            turn_input: "",
             first_turn: false,
         };
         let full_ctx = mk_ctx(10_000);
@@ -16466,6 +16475,174 @@ mod tests {
         let merged = merge_agentcontext(base, overlay);
         assert_eq!(merged.resources[0].priority, Some(100), "new resource defaults to 100 (was 0 before R2)");
         assert_eq!(merged.resources[0].mount.as_deref(), Some("file"));
+    }
+
+    // ── Iter2 AC-M2-1: memory plugin disable / override / customize ──
+
+    fn memory_fixture_spec(root: &std::path::Path) -> proto::methods::MemorySpec {
+        // Fixture store with one accepted record so the memory resource
+        // produces sections when prompted.
+        use agent_runtime::memory::MemoryStore as _;
+        let store = agent_runtime::memory::JsonlMemoryStore::new(root.to_path_buf());
+        store
+            .append(&agent_runtime::memory::MemoryRecord {
+                schema_version: 1,
+                id: "m1".into(),
+                actor_id: "actor_test".into(),
+                ts: "2026-04-05T10:00:00Z".into(),
+                record_type: "fact".into(),
+                status: "accepted".into(),
+                summary: "iter2 fixture memory record".into(),
+                detail: String::new(),
+                confidence: "high".into(),
+                source: Default::default(),
+                tags: vec![],
+            })
+            .expect("append fixture record");
+        let mut spec = proto::methods::MemorySpec::default();
+        spec.store.root = root.display().to_string();
+        spec.delivery.prompt = true;
+        spec
+    }
+
+    fn chain_test_ctx<'a>(scope: &'a proto::types::ScopeRef, profile_dir: &'a std::path::Path) ->
+        AssemblyContext<'a>
+    {
+        AssemblyContext {
+            scope,
+            channel_id: None,
+            actor_id: "actor_test",
+            profile_dir,
+            budget_remaining: 100_000,
+            budget_total: 100_000,
+            delivery_context: "",
+            turn_input: "iter2 fixture",
+            first_turn: false,
+        }
+    }
+
+    #[test]
+    fn ac_m2_1_disable_memory_entry_excludes_plugin_from_chain() {
+        // Disable = the effective agentcontext resources list simply has
+        // no memory entry: the memory plugin never joins the chain even
+        // though the actor has a MemorySpec (delivery stays MCP-only).
+        let root = tempfile::tempdir().expect("tempdir");
+        let mem_spec = memory_fixture_spec(root.path());
+        let spec = ctx_from_json(
+            r#"{"resources":[
+                {"scheme":"warm-summary","mount":"warm","priority":7}]}"#,
+        );
+        let registry = build_context_resource_chain(&spec, Some(&mem_spec));
+        assert!(!registry.has_scheme("memory"), "disabled entry must keep memory out of the chain");
+        assert!(registry.has_scheme("warm-summary"));
+    }
+
+    #[test]
+    fn ac_m2_1_override_priority_reorders_assembly() {
+        // Override = overlay raises memory priority above file (20) —
+        // the assembled section order flips accordingly.
+        let root = tempfile::tempdir().expect("tempdir");
+        let docs = root.path().join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("note.md"), "file fixture content").unwrap();
+        let mem_spec = memory_fixture_spec(root.path());
+
+        let base = ctx_from_json(&format!(
+            r#"{{"resources":[
+                {{"scheme":"memory","mount":"agent-memory","priority":5}},
+                {{"scheme":"file","priority":20,"config":{{"path":"{0}"}}}}]}}"#,
+            docs.display().to_string().replace('\\', "/")
+        ));
+        let scope = proto::types::ScopeRef {
+            kind: proto::types::ScopeKind::Thread,
+            id: "t".into(),
+        };
+        let ctx = chain_test_ctx(&scope, root.path());
+
+        // Default order: memory (5) before file (20).
+        let registry = build_context_resource_chain(&base, Some(&mem_spec));
+        let (sections, _) = registry.assemble_chain(&ctx, 100_000);
+        let memory_pos = sections.iter().position(|s| s.name == "bootstrap_memory")
+            .expect("memory section with default priority");
+        let file_pos = sections.iter().position(|s| s.name == "file_resource")
+            .expect("file section");
+        assert!(memory_pos < file_pos, "priority 5 memory assembles before priority 20 file");
+
+        // Overlay bumps memory to 25 → file first.
+        let overlay = ctx_from_json(r#"{"resources":[{"scheme":"memory","priority":25}]}"#);
+        let merged = merge_agentcontext(base, overlay);
+        assert_eq!(
+            merged.resources.iter().find(|r| r.scheme == "memory").unwrap().priority,
+            Some(25)
+        );
+        let registry = build_context_resource_chain(&merged, Some(&mem_spec));
+        let (sections, _) = registry.assemble_chain(&ctx, 100_000);
+        let memory_pos = sections.iter().position(|s| s.name == "bootstrap_memory")
+            .expect("memory section with overridden priority");
+        let file_pos = sections.iter().position(|s| s.name == "file_resource")
+            .expect("file section");
+        assert!(file_pos < memory_pos, "priority 25 memory assembles after priority 20 file");
+    }
+
+    #[test]
+    fn ac_m2_1_customize_config_reaches_factory() {
+        // Customize = the config field on a resource entry is handed to
+        // the factory: pointing the file entry at different dirs yields
+        // different assembled content. The memory entry accepts a config
+        // without breaking (its spec is captured from MemorySpec; config
+        // is reserved for future use).
+        let root = tempfile::tempdir().expect("tempdir");
+        let docs_a = root.path().join("a");
+        let docs_b = root.path().join("b");
+        std::fs::create_dir_all(&docs_a).unwrap();
+        std::fs::create_dir_all(&docs_b).unwrap();
+        std::fs::write(docs_a.join("alpha.md"), "alpha dir content").unwrap();
+        std::fs::write(docs_b.join("beta.md"), "beta dir content").unwrap();
+        let mem_spec = memory_fixture_spec(root.path());
+
+        let spec_a = ctx_from_json(&format!(
+            r#"{{"resources":[
+                {{"scheme":"memory","priority":5,"config":{{"reserved":true}}}},
+                {{"scheme":"file","priority":20,"config":{{"path":"{0}"}}}}]}}"#,
+            docs_a.display().to_string().replace('\\', "/")
+        ));
+        let spec_b = ctx_from_json(&format!(
+            r#"{{"resources":[
+                {{"scheme":"memory","priority":5}},
+                {{"scheme":"file","priority":20,"config":{{"path":"{0}"}}}}]}}"#,
+            docs_b.display().to_string().replace('\\', "/")
+        ));
+
+        let scope = proto::types::ScopeRef {
+            kind: proto::types::ScopeKind::Thread,
+            id: "t".into(),
+        };
+        let ctx = chain_test_ctx(&scope, root.path());
+
+        let registry = build_context_resource_chain(&spec_a, Some(&mem_spec));
+        let (sections, _) = registry.assemble_chain(&ctx, 100_000);
+        assert!(registry.has_scheme("memory"), "memory entry with config still registers");
+        let file_body: Vec<&str> = sections
+            .iter()
+            .filter(|s| s.name == "file_resource")
+            .map(|s| s.content.as_str())
+            .collect();
+        assert!(
+            file_body.iter().any(|c| c.contains("alpha dir content")),
+            "config path=a must surface alpha content"
+        );
+
+        let registry = build_context_resource_chain(&spec_b, Some(&mem_spec));
+        let (sections, _) = registry.assemble_chain(&ctx, 100_000);
+        let file_body: Vec<&str> = sections
+            .iter()
+            .filter(|s| s.name == "file_resource")
+            .map(|s| s.content.as_str())
+            .collect();
+        assert!(
+            file_body.iter().any(|c| c.contains("beta dir content")),
+            "config path=b must surface beta content"
+        );
     }
 
     #[test]

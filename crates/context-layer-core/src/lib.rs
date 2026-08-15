@@ -193,6 +193,12 @@ pub struct AssemblyContext<'a> {
     /// Available so resources like MessageListProvider can reference it
     /// without re-querying.
     pub delivery_context: &'a str,
+    /// The current turn's user input (templated). Ambient per-turn data
+    /// made available to every resource: retrieval-style resources
+    /// (including third-party memory replacements) may query against it.
+    /// Same value the composer previously passed to the memory
+    /// pre-render step.
+    pub turn_input: &'a str,
     /// Whether this is the first turn in this scope.
     pub first_turn: bool,
 }

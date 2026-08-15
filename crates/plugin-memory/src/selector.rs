@@ -141,8 +141,8 @@ fn build_turn_query(latest_message: &str, thread_context: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::jsonl_store::JsonlMemoryStore;
-    use crate::memory::record::MemorySource;
+    use crate::jsonl_store::JsonlMemoryStore;
+    use crate::record::MemorySource;
     use proto::methods::{MemoryDeliverySpec, MemoryQuerySpec, MemorySpec, MemoryStoreSpec};
 
     fn tmpdir() -> std::path::PathBuf {

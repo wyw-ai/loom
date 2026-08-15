@@ -14,9 +14,13 @@ scheme 背后必须有真实的供给路径:
 
 | 来源 | 供给路径 | 表格显示 |
 |---|---|---|
-| 官方资源插件 | 嵌入清单（plugin.json）声明 + inventory 注册 | `official` |
-| 内置资源（memory/file） | 工厂表 builtin 条目 | `official`（version 列为 `builtin`） |
+| 官方内部资源插件（memory） | 主仓内清单（plugin.json）声明 + inventory 注册 | `official` |
+| 官方外部资源插件（tier） | 外部仓清单（嵌入快照）声明 + inventory 注册 | `official` |
+| 宿主内置资源（file） | 工厂表 builtin 条目（宿主基础设施，非插件） | `official`（version 列为 `builtin`） |
 | 外部资源插件 | 仅 inventory 注册（`discover_plugins()`） | `external` |
+
+> 官方内部与官方外部插件走**同一规范**（见 [plugin.json 清单指南](./plugin-guide.md)
+> 的五面一致判据），出身差异只决定清单住哪。
 
 **零幽灵**: 清单声明了 `context_resources` 但既无 inventory 注册、也不是 builtin
 的 scheme，不会展示为可用——`list` 对账失败，非零退出并给出诊断。这类 scheme 在
@@ -32,7 +36,7 @@ inventory 自注册是外部仓的合法供给线，注册表在 `discover_plugi
 
 ```
 SCHEME        SOURCE    PRIORITY  VERSION
-memory        official         5  builtin
+memory        official         5  1.0.0
 warm-summary  official         7  1.1.0
 message-list  official        10  1.1.0
 file          official        20  builtin
@@ -43,11 +47,12 @@ file          official        20  builtin
 每插件一段，覆盖排查四问中最高频的「**这个插件从哪来 / 为什么没生效**」:
 
 ```
-warm-summary:
+memory:
   source:      official
-  version:     1.1.0
-  priority:    7
-  plugin:      Context Tier — Hot/Warm/Cold Temperature Model (loom-plugin-context-tier)
+  version:     1.0.0
+  priority:    5
+  plugin:      Memory (memory)
+  config keys: memory
   registered:  inventory
   endpoint:    in-process factory
 ```
@@ -55,9 +60,9 @@ warm-summary:
 | 字段 | 说明 |
 |---|---|
 | `source` | 供给路径分类（表格口径: official/external） |
-| `version` | 清单声明的插件版本；builtin 资源为 `builtin` |
+| `version` | 清单声明的插件版本; 宿主内置资源（file）为 `builtin` |
 | `priority` | 装配优先级（越小越先装配） |
-| `plugin` | 所属插件的显示名与 id（仅清单声明的资源有） |
+| `plugin` | 所属插件的显示名与 id（清单声明的资源才有） |
 | `config keys` | 插件声明的接受 config 字段（`config_schema` 的 key 集） |
 | `registered` | 注册路径: `inventory` 或 `builtin factory table` |
 | `endpoint` | 端点形态: 当前均为 `in-process factory`（进程边界端点属后续阶段） |
@@ -73,13 +78,16 @@ warm-summary:
 
 ```json
 [
-  {"scheme":"memory","source":"builtin","priority":5,"version":"builtin",
-   "plugin_id":null,"plugin_name":null,"config_keys":[],
-   "registered_via":"builtin factory table","endpoint":"in-process factory"},
+  {"scheme":"memory","source":"official","priority":5,"version":"1.0.0",
+   "plugin_id":"memory","plugin_name":"Memory","config_keys":["memory"],
+   "registered_via":"inventory","endpoint":"in-process factory"},
   {"scheme":"warm-summary","source":"official","priority":7,"version":"1.1.0",
    "plugin_id":"loom-plugin-context-tier",
    "plugin_name":"Context Tier — Hot/Warm/Cold Temperature Model",
-   "config_keys":[],"registered_via":"inventory","endpoint":"in-process factory"}
+   "config_keys":[],"registered_via":"inventory","endpoint":"in-process factory"},
+  {"scheme":"file","source":"builtin","priority":20,"version":"builtin",
+   "plugin_id":null,"plugin_name":null,"config_keys":[],
+   "registered_via":"builtin factory table","endpoint":"in-process factory"}
 ]
 ```
 

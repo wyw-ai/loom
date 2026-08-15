@@ -44,21 +44,21 @@ pub trait ContextResource: Send + Sync {
 返回此资源处理的 URI scheme。注册表使用它将 `agentcontext.json` 声明
 路由到正确的 Provider。
 
-**内置 scheme**：`"memory"`、`"message-list"`、`"file"`、`"warm-summary"`、`"skill"`
+**发行版可用 scheme**：`"memory"`、`"message-list"`、`"file"`、`"warm-summary"`、`"skill"`（前三者来自官方插件，`file` 为宿主内置资源; `skill` 为设计中形态）
 
 #### `priority(&self) -> i32`
 
 返回组装优先级。值越小 = 越先组装（重要性越高）。超出预算的资源按
 优先级逆序跳过。优先级 `0` = 永不跳过（保留给关键资源）。
 
-**内置优先级**：
+**默认优先级**（插件由 `plugin.json` 清单声明，宿主内置资源由工厂表定义）：
 
 | Provider | 优先级 |
 |---|---|
-| MemoryResource（plugin-memory） | 5 |
-| WarmSummaryContextResource | 7 |
-| MessageListProvider | 10 |
-| FileSystemProvider（通过 FileContextResource） | 20 |
+| MemoryResource（plugin-memory，清单声明） | 5 |
+| WarmSummaryContextResource（清单声明） | 7 |
+| MessageListProvider（清单声明） | 10 |
+| FileSystemProvider（宿主内置） | 20 |
 
 #### `effective_scope(&self) -> &[ScopeKind]`
 
@@ -241,7 +241,7 @@ pub enum SectionSource {
 
 ### MemoryResource（plugin-memory）
 
-迭代 2 起，memory 以官方插件形态存在于独立 crate `plugin-memory`（无特权依赖: 仅 `context-layer-core` + `proto`，编译期禁止依赖 `agent-runtime`）。compose 路径的预渲染特判已删除，`MemoryResource` 在链装配阶段自行检索 + 渲染。详见[Memory 插件指南](./memory-plugin-guide.md)。
+迭代 2 起，memory 以官方插件形态存在于独立 crate `plugin-memory`（无特权依赖: 仅 `context-layer-core` + `proto`，编译期禁止依赖 `agent-runtime`）; 迭代 3 R1 整改起完全规范化——`inventory::submit!` 注册 + `plugin.json` v2 清单（`official`，v1.0.0）。compose 路径的预渲染特判已删除，`MemoryResource` 在链装配阶段自行检索 + 渲染。详见[Memory 插件指南](./memory-plugin-guide.md)。
 
 ```rust
 pub struct MemoryResource { /* 捕获的 Option<MemorySpec> */ }
@@ -254,7 +254,7 @@ pub fn open_memory_store(profile_dir: &Path, spec: &MemorySpec) -> JsonlMemorySt
 pub fn open_memory_store_dyn(profile_dir: &Path, spec: &MemorySpec) -> Arc<dyn MemoryStore>;
 ```
 
-- `new(spec)` — 捕获 per-agent 的 `MemorySpec`（`None` = 未配置，assemble 返回空）。不经 inventory 注册——零参工厂拿不到 per-agent 状态，注册会遮蔽内置工厂（ARCH 迭代 2 裁决）
+- `new(spec)` — 捕获 per-agent 的 `MemorySpec`（`None` = 未配置，assemble 返回空）。注册经 `inventory::submit!`（`memory_resource_factory` 从 config envelope 的 `memory` key 构造; actor spec 由宿主注入 envelope——见 [Memory 插件指南 · 注册路径](./memory-plugin-guide.md#注册路径r1-规范化)）
 - `open_memory_store` / `open_memory_store_dyn` — 打开 JSONL 存储（相对路径基于 `profile_dir`），公开供 MCP bridge 复用
 - 重导出 shim: `agent_runtime::memory::*` import 路径不变；新代码建议直接依赖 `plugin-memory`
 
@@ -264,7 +264,7 @@ pub fn open_memory_store_dyn(profile_dir: &Path, spec: &MemorySpec) -> Arc<dyn M
 
 ### 第三方替身资源（replacement contract）
 
-第三方 crate 经 `inventory::submit!` 注册 `ContextResourcePlugin { scheme, factory }`（零参工厂 + 自含配置），读取与官方插件相同的环境数据通道（`ctx.turn_input` / `ctx.delivery_context`），参与同一 priority 排序与预算瀑布。完整范例参见[第三方资源扩展指南](./third-party-resource-guide.md)。
+第三方 crate 经 `inventory::submit!` 注册 `ContextResourcePlugin { scheme, factory }`（工厂接收 config envelope），读取与官方插件相同的环境数据通道（`ctx.turn_input` / `ctx.delivery_context`），参与同一 priority 排序与预算瀑布。完整范例参见[第三方资源扩展指南](./third-party-resource-guide.md)。
 
 ### WarmSummaryContextResource
 

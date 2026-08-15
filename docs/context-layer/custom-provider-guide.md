@@ -8,14 +8,14 @@
 
 ## 背景
 
-ContextLayer 通过 `ContextResource` Trait 提供可插拔的扩展机制。当内置
-Provider（Memory、MessageList、FileSystem、Skill）无法满足需求时，
+ContextLayer 通过 `ContextResource` Trait 提供可插拔的扩展机制。当发行版自带的
+资源（memory、message-list、file、skill 形态）无法满足需求时，
 可以开发自定义 Provider 来接入新的数据源（数据库、API、Obsidian vault 等）。
 
 本文档覆盖：
 - ContextResource Trait 实现步骤
 - ResourceProvider Trait 实现步骤（可选，用于数据访问层分离）
-- 注册到 `builtin_resource_factories()`
+- 注册路径（inventory 规范路径; 宿主基础设施走工厂表）
 - 预算瀑布参与说明
 - 安全约束清单
 
@@ -301,26 +301,24 @@ inventory::submit! {
 loom 通过 `extern crate loom_plugin_my_feature;` 强制链接，
 确保 inventory 注册不被链接器剥离。
 
-### 方式 B：工厂注册表（内置 Provider）
+### 方式 B：工厂注册表（仅宿主基础设施）
 
-对于 loom 内置 Provider，在 `agent_serve.rs` 的 `builtin_resource_factories()`
+> 迭代 3 R1 整改后，**插件（含官方内部插件如 memory）一律走方式 A 的 inventory
+> 路径**。工厂注册表仅保留给宿主基础设施——装配基线自身依赖、无业务语义的资源
+> （当前只有 `file`）。新增插件不要走此路径。
+
+对于宿主内置资源，在 `agent_serve.rs` 的 `builtin_resource_factories()`
 工厂注册表中添加一行：
 
 ```rust
 // agent_serve.rs — builtin_resource_factories()
-fn builtin_resource_factories(
-    memory_spec: Option<&proto::methods::MemorySpec>,
-) -> std::collections::HashMap<String, ResourceFactory> {
+fn builtin_resource_factories() -> std::collections::HashMap<String, ResourceFactory> {
     let mut factories = std::collections::HashMap::new();
 
-    // memory — 捕获 actor 的 MemorySpec；检索在 MemoryResource::assemble
-    // 内部执行（迭代 2 插件化，skip-not-truncate，warn-on-error）。
-    let mem_spec = memory_spec.cloned();
-    factories.insert("memory".into(), Box::new(move |_config| {
-        Box::new(MemoryResource::new(mem_spec.clone())) as Box<dyn ContextResource>
-    }));
+    // file — 宿主基础设施: 读 config 的 path + max_files。
+    factories.insert("file".into(), Box::new(|config| { /* ... */ }));
 
-    // ↓↓↓ 新增你的自定义 scheme ↓↓↓
+    // ↓↓↓ 宿主基础设施新增 ↓↓↓
     factories.insert("markdown".into(), Box::new(|config| {
         let path = config.as_ref()
             .and_then(|c| c.get("path"))
@@ -329,20 +327,28 @@ fn builtin_resource_factories(
         Box::new(MarkdownContextResource::new(path)) as Box<dyn ContextResource>
     }));
 
+    // inventory 注册的插件（memory / warm-summary / message-list ...）在此汇入
+    for (scheme, factory_fn) in discover_plugins() {
+        factories.insert(scheme, Box::new(factory_fn));
+    }
+
     factories
 }
 ```
 
-> 迭代 2 变更: memory 工厂不再接收预渲染字符串（`MemoryProvider::with_rendered` 已随插件化删除），改为捕获 `MemorySpec` 交给 `plugin-memory` 的 `MemoryResource`。需要 per-agent 状态的官方资源走此工厂捕获路径；无状态第三方资源走方式 A 的 inventory 路径。
+> 历史注记: 迭代 2 时期 memory 曾走此工厂表捕获路径（当时的 inventory 工厂是零参
+> 闭包，拿不到 per-agent 状态）; 迭代 3 B4 拉平工厂签名（config envelope 统一传入）
+> 后，R1 整改将 memory 迁回 inventory 规范路径。per-agent 状态现在经 config envelope
+> 传递（参见 [Memory 插件指南 · 注册路径](./memory-plugin-guide.md#注册路径r1-规范化)）。
 
 `build_context_resource_chain()` 会自动遍历 `agentcontext.json` 声明的 resources，
-通过 scheme 名称从工厂注册表或 discover_plugins() 查找对应闭包并生成实例。
+通过 scheme 名称从合并后的工厂表查找对应闭包并生成实例。
 
 ### 注册要点
 
-1. **外部 Plugin** 使用 `inventory::submit!`（方式 A），零改动 loom
-2. **内置 Provider** 使用工厂注册表（方式 B），在 `builtin_resource_factories()` 添加一行
-3. 工厂闭包签名为 `|config: Option<&Value>| -> Box<dyn ContextResource>`
+1. **插件（官方内部 / 官方外部 / 第三方）** 使用 `inventory::submit!`（方式 A），零改动 loom
+2. **宿主基础设施** 使用工厂注册表（方式 B），在 `builtin_resource_factories()` 添加一行
+3. 工厂闭包签名为 `|config: &Option<Value>| -> Box<dyn ContextResource>`（config envelope 统一传入，B4 拉平）
 4. 对未知 scheme 由 `build_context_resource_chain()` 自动记录警告日志（不 panic）
 
 ### 替代方案：ContextResourceBuilder

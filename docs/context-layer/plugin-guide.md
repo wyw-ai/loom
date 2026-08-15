@@ -1,8 +1,11 @@
-# plugin.json 清单指南（资源插件声明格式）
+# plugin.json 清单指南（资源插件声明格式 · 规范唯一锚点）
 
 > 一个资源插件（plugin）= context layer 的一个供给单元。本文定义它的声明清单
 > `plugin.json`（v2 schema）：字段表、v1 归一化规则、`executable` 预留字段，以及
 > 官方源 `official-plugins.json` 的数据化说明。
+>
+> **本文档是「符合 context layer plugin 规范」的唯一规范锚点**——五面一致判据与
+> 豁免回收条款（见下文）只在此维护; docs 全族其他文档不得出现第二套插件规范表述。
 >
 > 相关文档: [第三方资源扩展指南](./third-party-resource-guide.md)（Rust 侧
 > `ContextResource` 实现与 inventory 注册）| [plugin list 自省](./plugin-list.md)
@@ -19,6 +22,50 @@
 
 > 仓名消歧: 官方插件仓 `loom-plugin-context-tier` 的名字沿袭迭代 1 历史，指
 > 「context layer 的 tier 资源插件」，不是一个独立的插件系统。
+
+---
+
+## 插件规范 — 五面一致判据（唯一锚点）
+
+**核心原则: 「同一规范，三种出身」。** 出身（官方内部 / 官方外部 / 第三方）只决定
+代码住哪、谁维护，**不改变任何用户可见行为面**。出身是溯源元数据，不是行为轴。
+
+「符合 context layer plugin 规范」= 以下五面全部成立:
+
+| 面 | 判据 | 用户可见锚点 |
+|---|---|---|
+| **F1 清单面（声明）** | 每个插件恰有一份 `plugin.json`（v2）七字段全声明。官方内部插件清单住主仓内（如 `crates/plugin-memory/plugin.json`）并纳入官方源数据; 官方外部住其仓并登记官方源; 第三方住己仓。**零无籍插件** | `plugin.json` 存在且可解析 |
+| **F2 注册面（供给）** | 统一注册语义——同一标准 inventory 路径（`ContextResourcePlugin` + `inventory::submit!`）。出身不改变注册方式，无编译期专属接线 | `plugin list --verbose` 的 `registered:` 列 |
+| **F3 config 面（配置）** | 唯一配置方言 `resources[].config` + per-field 合并。无插件专属顶层配置通道; 遗留字段只能是兼容别名（可迁移、有废弃周期），不是并行通道 | `config keys:` 列（源自 `config_schema`） |
+| **F4 枚举面（自省）** | `plugin list` 行**同构**——所有字段可解析（id/name/version/source/priority/config_keys/registered_via/endpoint 无 None 空洞）; 出身差异只体现为 `source` 溯源取值（`official` / `external`） | `plugin list` 表格与 `--json` |
+| **F5 排查面（溯源）** | 同一排查路径——`--verbose` 四问结构一致（谁注册/什么身份/接受什么配置/端点在哪），section 级溯源（`SectionSource`）统一覆盖 | `--verbose` 输出 + section 溯源 |
+
+**出身与 `source` 取值的对应**: 官方内部与官方外部插件在 `plugin list` 中均显示
+`official`（清单在册 + inventory 注册）; 第三方 inventory 注册但无清单的显示
+`external`。宿主内置资源（如 `file`）不是插件——它是装配基线自身依赖的宿主基础设施
+（无业务语义、无版本演进诉求），在表格中 version 列显示 `builtin` 以区分。
+
+## 豁免与临时通道条款
+
+**豁免不是免债，是挂账。** 任何对插件规范的豁免、桥接或临时通道（如遗留配置别名、
+过渡期注册路径）必须同时满足四要素:
+
+1. **临时标注** — 以「临时」显式标注，禁止表述为永久设计;
+2. **回收条件** — 登记触发事件或期限至少其一（如「下一迭代」「S2 落地时」「某版本
+   发布后」）;
+3. **豁免清单登记** — 记入下方豁免清单（exemption ledger，随本锚点维护）;
+4. **回收时 golden 验证** — 回收时以功能守护测试（golden 等价）验证无行为漂移。
+
+**无回收条件的豁免视为规范违例。**
+
+### 豁免清单（exemption ledger）
+
+| 登记项 | 类别 | 临时标注 | 回收条件 | 状态 |
+|---|---|---|---|---|
+| `spec.memory` actor 级字段 + `inject_memory_envelope` 注入桥 | 数据源桥接（memory 专属） | 是——桥接非终态设计 | actor 记忆配置声明迁至 agentcontext.json `resources[].config`，或桥泛化为通用数据源注入机制时退役; 回收时以 golden 等价验证（AC-U-5 基线） | 活跃（ARCH 技术设计 §2.2 裁定: actor 侧数据源注入，非注册特权，保留） |
+
+> 流程教训（迭代 3 Task #14）: 迭代 2 将 memory 移出 layer 时保留遗留配置通道但未标
+> 回收条件，成为后续规范割裂的种子。本条款即由此确立——新增任何桥接先过四要素。
 
 ---
 
@@ -88,10 +135,55 @@
 }
 ```
 
+## 实例: memory（官方内部插件，v2）
+
+官方内部插件的参考实现——与官方外部插件（如 tier）走**同一规范**，仅出身不同
+（清单住主仓内）:
+
+```json
+// crates/plugin-memory/plugin.json
+{
+  "$schema": "loom-plugin/v2",
+  "id": "memory",
+  "name": "Memory",
+  "version": "1.0.0",
+  "loom_version": ">=0.1.8",
+  "layer": "context",
+  "context_resources": [
+    {
+      "scheme": "memory",
+      "priority": 5,
+      "config_schema": { "memory": {} }
+    }
+  ]
+}
+```
+
+要点:
+
+- **清单住 crate 内**（`crates/plugin-memory/plugin.json`），并在官方源数据的
+  `internal` 数组登记（见下节）——满足 F1;
+- **注册走 inventory**（`inventory::submit! { ContextResourcePlugin { scheme:
+  "memory", factory: memory_resource_factory } }`）——满足 F2，与 tier 完全同路径;
+- **config 单方言**（F3）: 工厂从 config envelope 读取 `memory` key（`config_schema`
+  声明）; actor 的 `MemorySpec` 由宿主在链构造前注入 envelope（per-field 合并、
+  actor 侧胜出），malformed 输入 warn 后回退默认（skip-not-truncate）;
+- **版本独立语义化**（D-R1-3）: `version: 1.0.0` 是插件自身版本，与 workspace
+  crate 版本解耦。
+
 ## 官方源数据化（official-plugins.json）
 
 官方插件源清单是数据文件，不是代码: `crates/cli/official-plugins.json`（与
-build.rs 同目录，构建期消费）。每条源:
+build.rs 同目录，构建期消费）。文件为**对象形态**，按出身分两个数组:
+
+```json
+{
+  "external": [ { "id": "...", "default_repo_url": "...", "...": "..." } ],
+  "internal": [ { "id": "memory", "path": "crates/plugin-memory" } ]
+}
+```
+
+**external 条目**（官方外部插件，如 tier）:
 
 | 字段 | 说明 |
 |---|---|
@@ -103,11 +195,19 @@ build.rs 同目录，构建期消费）。每条源:
 | `default_repo_url` | 默认克隆地址 |
 | `ref_env` | ref 覆盖的环境变量 |
 
-**加官方插件 = 编辑此 JSON + 提供仓**，零核心代码改动。
+**internal 条目**（官方内部插件，如 memory）:
+
+| 字段 | 说明 |
+|---|---|
+| `id` | 插件标识（与 `plugin.json` 的 `id` 一致） |
+| `path` | 主仓内清单所在目录（相对仓根） |
+
+**加官方插件 = 编辑此 JSON + 提供清单**（外部另需提供仓），零核心代码改动。
+历史顶层数组形态仍兼容读取（等价于 `external`）。
 
 build.rs 的角色是**官方源清单处理器 + 预装缓存加速器**: 读清单 → clone/复用本地
-目录 → 解析各源 `plugin.json` → 生成嵌入快照。**注册的事实源是 plugin.json 清单，
-不是 build.rs**。
+目录（external）或直接定位主仓路径（internal）→ 解析各源 `plugin.json` → 生成嵌入
+快照。**注册的事实源是 plugin.json 清单，不是 build.rs**。
 
 ## 构建期行为
 

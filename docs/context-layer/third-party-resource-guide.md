@@ -13,8 +13,8 @@
 | 要素 | 说明 |
 |---|---|
 | 实现 `ContextResource` | `context-layer-core` 公共 trait: `scheme` / `priority` / `assemble` |
-| `inventory::submit!` 注册 | 提交 `ContextResourcePlugin { scheme, factory }`，零参工厂 |
-| 自含业务配置 | inventory 工厂是零参闭包，拿不到 per-agent 状态——你的 config 必须内嵌在资源结构体里 |
+| `inventory::submit!` 注册 | 提交 `ContextResourcePlugin { scheme, factory }`，工厂接收 config envelope |
+| 自含业务配置 | 工厂从 config envelope（`resources[].config`）读取你的配置; per-agent 状态可由宿主或资源自身注入 |
 
 依赖边界: 你的 crate 只需依赖 `context-layer-core`（+ 你需要的 proto 类型）。**编译期无法依赖 `agent-runtime`**——官方 `plugin-memory` 同样如此，这正是接缝无特权的实证。
 
@@ -115,10 +115,9 @@ let (sections, _) = registry.assemble_chain(&ctx, 100_000);
 | 替换官方 memory | 写一个同语义的自定义资源，在 `agentcontext.json` 高层用不含 `memory` 条目的 resources 数组禁用官方插件，再注册你的 scheme（参见 [Memory 插件指南 · 配置三态](./memory-plugin-guide.md#配置三态)） |
 | 仅调整官方资源行为 | 优先用 priority 覆盖 / 配置定制，不必写代码 |
 
-注意: 官方 `plugin-memory` 刻意不经 inventory 注册（零参工厂拿不到 per-agent `MemorySpec`，注册会遮蔽内置工厂）。需要 per-agent 状态的官方资源走工厂捕获路径；无状态第三方资源走 inventory——两条路径最终汇入同一装配链。
+注意: 官方 `plugin-memory` 与第三方资源走**同一 inventory 注册路径**（迭代 3 R1 整改统一; per-agent 状态经 config envelope 注入，见 [Memory 插件指南 · 注册路径](./memory-plugin-guide.md#注册路径r1-规范化)）。
 
 ## 已知限制
 
-- **inventory 同 scheme 覆盖 builtin 的行为未定义**（迭代 2 开放问题 O1，留迭代 3 裁决）——不要依赖「注册同名 scheme 覆盖官方资源」。
-- **agentcontext `config` 字段不会传给 inventory 工厂**——第三方配置必须编译期内嵌或由资源自行读取。
-- inventory 注册发生在进程链接期，同一二进制内重复 scheme 的提交顺序不保证——避免同 scheme 多次注册。
+- **inventory 同 scheme 重复注册的提交顺序不保证**——不要依赖「注册同名 scheme 覆盖官方资源」; 替换官方资源走上表的禁用+新增路径。
+- inventory 注册发生在进程链接期，官方插件与第三方插件在同一 registry 汇聚，身份以 `plugin.json` 清单为准（无清单的显示为 `external`）。

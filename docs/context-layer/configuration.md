@@ -88,10 +88,12 @@ ContextLayer 配置可放在三个位置，按优先级顺序合并（上层对�
 
 ### `memory` scheme
 
-官方记忆插件（独立 `plugin-memory` crate，迭代 2 起以官方插件形态接入
-ContextResource 链）。无需 `config` — 插件在链构造时捕获 Agent 的
-`MemorySpec`（来自 `spec.json`），在链装配阶段按当前回合输入
-（`AssemblyContext.turn_input`）检索并渲染记忆段落。
+官方记忆插件（独立 `plugin-memory` crate; 迭代 2 起以官方插件形态接入，迭代 3 R1
+整改起完全规范化——inventory 注册 + `plugin.json` v2 清单，`plugin list` 显示
+`official` / v1.0.0）。插件从 config envelope 的 `memory` key 读取配置: actor 的
+`MemorySpec`（来自 `spec.json`）由宿主在链构造前注入 envelope（per-field 合并、
+actor 侧胜出），在链装配阶段按当前回合输入（`AssemblyContext.turn_input`）检索并
+渲染记忆段落。
 
 ```json
 {
@@ -101,14 +103,15 @@ ContextResource 链）。无需 `config` — 插件在链构造时捕获 Agent �
 }
 ```
 
-**内置默认优先级**：5
+**清单声明优先级**：5
 
 **行为**：生成 `bootstrap_memory` 和 `turn_memory` 段落。如果 Agent 未配置
 `MemorySpec` 或 `delivery.prompt=false`，两个段落都为空，插件不贡献任何内容；
 检索失败时降级为空输出（跳过而非中断）。
 
-**`config` 字段**：当前被记忆插件忽略（与历史行为一致），为未来覆盖
-`MemorySpec` 子集（如 `top_k`）预留。
+**`config` 字段**：经 config envelope 的 `memory` key 读取 `MemorySpec` 子集
+（`config_schema` 声明）。常规配置走 `spec.json` 的 actor 级 `memory` 字段（宿主
+注入、actor 侧胜出）; envelope 缺失或 malformed 时 warn 并回退默认。
 
 **禁用 / 覆盖 / 定制**（迭代 2 语义）：
 

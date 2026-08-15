@@ -17,7 +17,7 @@ Loom 的 context layer（上下文层）文档族。context layer 是唯一顶�
 | [Skill 挂载指南](./skill-mounting-guide.md) | 所有用户 | Skill 安装投影、渐进式披露、MCP 映射 |
 | [数据源最佳实践](./data-source-best-practices.md) | 运维人员、架构师 | 各数据源配置示例、优先级分配、安全约束 |
 | [自定义 Provider 指南](./custom-provider-guide.md) | 开发者 | ContextResource/ResourceProvider 实现、注册、安全约束 |
-| [Memory 插件指南](./memory-plugin-guide.md) | 运维人员、维护者 | 迭代 2 插件化架构、禁用/覆盖/定制三态、行为语义、迁移 |
+| [Memory 插件指南](./memory-plugin-guide.md) | 运维人员、维护者 | 插件架构（迭代 3 R1 规范化）、禁用/覆盖/定制三态、行为语义、迁移 |
 | [第三方资源扩展指南](./third-party-resource-guide.md) | 第三方开发者 | 无特权接缝契约、inventory 注册、EchoInputResource 范例 |
 | [plugin.json 清单指南](./plugin-guide.md) | 插件作者、维护者 | v2 schema 字段表、v1 归一化、executable 预留、官方源数据化 |
 | [plugin list 自省](./plugin-list.md) | 所有用户 | `loom plugin list` 语义、--verbose 排查、--json 对账 |

@@ -33,7 +33,7 @@ ContextLayer 通过 `ContextResource` Trait 统一管理各类数据源的提示
 }
 ```
 
-**无需 `config`** — 工厂捕获 per-agent 的 `MemorySpec`，检索与渲染由 `plugin-memory` 的 `MemoryResource::assemble()` 在链装配阶段执行（迭代 2 插件化）。
+**`config` 经 envelope 传入** — actor 的 `MemorySpec` 由宿主注入 config envelope 的 `memory` key（per-field 合并、actor 侧胜出），检索与渲染由 `plugin-memory` 的 `MemoryResource::assemble()` 在链装配阶段执行（迭代 3 R1 规范化: inventory 注册 + 清单）。
 
 **最佳实践**：
 - 优先级保持 5（高优先级，记忆是 Agent 身份的核心）

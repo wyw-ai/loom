@@ -151,10 +151,16 @@ Profile 级（<profile_dir>/agentcontext.json）
 
 ---
 
-## 内置 Provider
+## 供给单元与三种出身
 
-Loom 内置四个 Provider，通过工厂注册表（`builtin_resource_factories()` HashMap）
-管理：
+Context layer 的供给单元分三种出身（「同一规范，三种出身」——规范判据见
+[plugin.json 清单指南](./plugin-guide.md#插件规范--五面一致判据唯一锚点)）：
+
+| 出身 | 成员 | 供给路径 |
+|---|---|---|
+| 官方内部插件 | memory（`crates/plugin-memory`） | 主仓内 `plugin.json` 清单 + `inventory::submit!` 注册 |
+| 官方外部插件 | warm-summary / message-list（`loom-plugin-context-tier`） | 外部仓清单（嵌入快照）+ inventory 注册 |
+| 宿主内置资源 | file | 工厂注册表（`builtin_resource_factories()` HashMap）——装配基线自身依赖的宿主基础设施，非插件 |
 
 ### 优先级排序
 
@@ -162,15 +168,19 @@ Loom 内置四个 Provider，通过工厂注册表（`builtin_resource_factories
 memory(5) → warm-summary(7) → message-list(10) → file(20)
 ```
 
+（插件优先级由各自 `plugin.json` 清单声明; file 由工厂表定义。）
+
 ### 1. MemoryResource（plugin-memory，优先级 = 5）
 
 - **Scheme**：`"memory"`
 - **作用域**：Thread + Channel
 - **行为**：迭代 2 起以官方插件形态存在于独立 crate `plugin-memory`（仅依赖
-  `context-layer-core` + `proto`，无 agent-runtime 特权）。工厂捕获
-  per-agent 的 `MemorySpec`，检索与渲染在 `assemble()` 内部执行（读取
-  `ctx.turn_input` / `ctx.delivery_context`）。错误时 warn + 空输出降级，
-  预算不足时整段跳过（skip-not-truncate）。
+  `context-layer-core` + `proto`，无 agent-runtime 特权）; 迭代 3 R1 整改起完全
+  规范化——inventory 注册 + `plugin.json` v2 清单（`official`，v1.0.0）。
+  `memory_resource_factory` 从 config envelope 的 `memory` key 构造（actor 的
+  `MemorySpec` 由宿主注入 envelope，per-field 合并、actor 侧胜出），检索与渲染在
+  `assemble()` 内部执行（读取 `ctx.turn_input` / `ctx.delivery_context`）。错误时
+  warn + 空输出降级，预算不足时整段跳过（skip-not-truncate）。
 - **产出段落**：`bootstrap_memory`、`turn_memory`（仅在非空时）
 
 ### 2. WarmSummaryContextResource（优先级 = 7）
@@ -207,10 +217,11 @@ memory(5) → warm-summary(7) → message-list(10) → file(20)
 - **产出段落**：每个文件一个 `file_resource` 段落，格式为
   `--- <文件名> ---\n<内容>`
 
-### 工厂注册表机制
+### 工厂注册表机制（宿主基础设施路径）
 
-内置 Provider 通过 `builtin_resource_factories()` HashMap 注册（替代旧的
-`match` 分支）。新增 Provider 只需在工厂注册表中添加一行：
+宿主内置资源（file）通过 `builtin_resource_factories()` HashMap 注册（替代旧的
+`match` 分支）。这条路径保留作宿主基础设施的接入方式——**新增插件不走此路径**，
+走清单 + inventory 的规范路径（见[插件规范](./plugin-guide.md#插件规范--五面一致判据唯一锚点)）:
 
 ```rust
 // agent_serve.rs — builtin_resource_factories()
@@ -220,7 +231,8 @@ factories.insert("my-scheme".into(), Box::new(|config| {
 ```
 
 `build_context_resource_chain()` 遍历 `agentcontext.json` 声明的 resources，
-通过 scheme 名称从工厂注册表查找对应的工厂闭包，生成 ContextResource 实例。
+按 scheme 名称从**合并后的工厂表**查找工厂闭包，生成 ContextResource 实例——
+表内 file 为硬编码条目，其余条目由 `discover_plugins()`（inventory 注册）汇入。
 
 ---
 

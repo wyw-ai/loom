@@ -167,13 +167,16 @@ memory 业务已迁入独立 crate `crates/plugin-memory`（仅依赖 `context-l
 
 | 行号 | 符号 | 说明 |
 |---|---|---|
-| L8634-8679 | `builtin_resource_factories()` | 工厂注册表 HashMap：memory, message-list, file, warm-summary |
-| L8674-8676 | warm-summary 工厂 | `Box::new(WarmSummaryContextResource::new())` |
-| L8683-8703 | `build_context_resource_chain()` | 遍历 spec.resources，从工厂注册表查找并注册 |
-| L8769 | `compose_envelope_prompt()` | 始终使用 D2 chain（D1 fallback 已删除） |
-| L8799 | D2 chain 注释 | "Always use D2 context resource chain" |
-| L8809 | `unwrap_or_else(default_agent_context_spec)` | context_layer 为 None 时使用默认 chain |
-| L8828 | `compose_with_context_chain()` | 实际组装调用点 |
+| L8768-8805 | `builtin_resource_factories()` | 合并工厂表: file 硬编码条目 + `discover_plugins()`（inventory 注册: memory / warm-summary / message-list）汇入 |
+| L8769-8789 | file 工厂 | 读 config 的 `path` / `max_files`，`FileSystemProvider` + `FileContextResource` |
+| L8809-8815 | `builtin_factory_table_overview()` | `plugin list` 的工厂表自省视图 |
+| L8821-8851 | `build_context_resource_chain()` | 遍历 spec.resources，从合并工厂表查找并注册（显式 priority 经 `PriorityOverrideResource` 覆盖） |
+| L8867-8899 | `inject_memory_envelope()` | actor `MemorySpec` 注入 config envelope `memory` key（per-field 合并、actor 胜出、冲突 error 日志） |
+| L9025 | `compose_envelope_prompt()` | 始终使用 D2 chain（D1 fallback 已删除） |
+| L9055-9057 | D2 chain 注释 | "always active" + None 回退说明 |
+| L9063 | `unwrap_or_else(default_agent_context_spec)` | context_layer 为 None 时使用默认 chain |
+| L9067 | `merge_embedded_global_resources()` | 将嵌入清单（plugin.json）声明的 resources 合并进 spec（不重复） |
+| L9101 | `compose_with_context_chain()` | 实际组装调用点 |
 
 ### Session Reset 集成
 
@@ -239,12 +242,14 @@ memory 业务已迁入独立 crate `crates/plugin-memory`（仅依赖 `context-l
 | `warm_summary.rs` | `assemble_with_summary_produces_formatted_section` | 摘要生成格式化段落 |
 | `warm_summary.rs` | `assemble_skips_when_summary_exceeds_budget` | 超预算时跳过摘要 |
 | `warm_summary.rs` | `persist_and_clear_file_io` | persist/clear 文件 I/O |
-| `agent_serve.rs` | `builtin_resource_factories_registers_all_schemes` | 工厂注册所有 scheme |
+| `agent_serve.rs` | `builtin_resource_factories_registers_all_schemes` | 合并工厂表注册所有 scheme（file + inventory 汇入） |
 | `agent_serve.rs` | `builtin_resource_factories_produces_correct_schemes` | 工厂产出正确 scheme |
 | `agent_serve.rs` | `build_context_resource_chain_assembles_default_spec` | 默认 spec 正确组装 |
 | `agent_serve.rs` | `build_context_resource_chain_skips_unknown_scheme` | 未知 scheme 被跳过 |
+| `agent_serve.rs` | `inject_memory_envelope_merges_per_field_with_actor_spec_winning` | envelope 注入 per-field 合并、actor 胜出（R1 增补） |
 
-**总计：31 个测试，ALL PASS，0 failures，0 flaky**
+**总计：31 个测试，ALL PASS，0 failures，0 flaky**（commit 220fc50 基线; R1 整改另增
+golden 守护与 envelope 合并测试，见 `crates/plugin-memory` 与 `agent_serve.rs` 测试模块）。
 
 ---
 

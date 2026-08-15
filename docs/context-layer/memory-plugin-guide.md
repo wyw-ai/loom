@@ -1,6 +1,6 @@
 # Memory 插件使用指南
 
-> 迭代 2 起，memory 上下文资源以**官方插件形态**（独立 `plugin-memory` crate）接入 ContextResource 链。本文说明插件架构、配置三态（禁用/覆盖/定制）与行为语义。配置字段完整语法参见[配置参考](./configuration.md)。
+> 迭代 2 起，memory 上下文资源以**官方插件形态**（独立 `plugin-memory` crate）接入 ContextResource 链; 迭代 3 R1 整改起**完全规范化**——inventory 注册 + `plugin.json` v2 清单（`official`，v1.0.0），与官方外部插件（tier）同一规范。本文说明插件架构、配置三态（禁用/覆盖/定制）与行为语义。配置字段完整语法参见[配置参考](./configuration.md)。
 
 ---
 
@@ -8,17 +8,19 @@
 
 迭代 2 之前，memory 段落由 compose 路径**预渲染**：composer 在装配链之外单独执行记忆选择，把渲染好的字符串塞给一个包装 Provider。这意味着 memory 是装配链的特判——它不参与 priority 排序的普通路径，第三方也无法用同样方式提供自己的记忆资源。
 
-迭代 2 将 memory 业务整体迁入独立 crate `crates/plugin-memory`，以标准 `ContextResource` 形态接入:
+迭代 2 将 memory 业务整体迁入独立 crate `crates/plugin-memory`，以标准 `ContextResource` 形态接入; 迭代 3 R1 整改补齐规范身份（清单+注册+枚举同构）:
 
 ```
-agentcontext.json 声明 → builtin_resource_factories 捕获 MemorySpec
+agentcontext.json 声明 → inventory 注册（inventory::submit!）
+  → memory_resource_factory 从 config envelope 读取 "memory" key
+    （actor 的 MemorySpec 由宿主注入 envelope，per-field 合并、actor 胜出）
   → MemoryResource（scheme="memory", priority=5）
   → 链装配阶段自行检索 + 渲染（assemble 六步）
 ```
 
-compose 路径的预渲染特判已删除，memory 与 file / warm-summary / message-list 走完全相同的工厂表与装配链。
+compose 路径的预渲染特判已删除，memory 与 warm-summary / message-list 走完全相同的 inventory 注册与装配链（file 为宿主内置资源，走工厂表——见[架构 Wiki](./architecture.md)）。
 
-**零行为变更保证**: 默认配置下段落内容、顺序、降级、预算瀑布与旧预渲染管线 golden 等价（`matches_legacy_prerender_pipeline` 测试锁定）。
+**零行为变更保证**: 默认配置下段落内容、顺序、降级、预算瀑布与旧预渲染管线 golden 等价（`matches_legacy_prerender_pipeline` 测试锁定）; R1 整改同样以 pre-rectification golden 基线守护零漂移。
 
 ## 插件架构
 
@@ -43,9 +45,25 @@ compose 路径的预渲染特判已删除，memory 与 file / warm-summary / mes
 5. 渲染 bootstrap / turn 两段落（空内容跳过）
 6. 任何错误 → `tracing::warn` + 返回空（**降级不中断**，坏存储不能卡死回合）
 
-### 为什么不经 inventory 注册
+### 注册路径（R1 规范化）
 
-`plugin-memory` 刻意**不**用 `inventory::submit!` 自注册: inventory 工厂是零参闭包，拿不到 per-agent 的 `MemorySpec`；注册反而会遮蔽捕获 spec 的内置工厂。这是 ARCH 迭代 2 裁决二的设计约束——需要 per-agent 状态的官方资源走工厂捕获，无状态第三方资源走 inventory。
+`plugin-memory` 与所有资源插件一样经 `inventory::submit!` 自注册:
+
+```rust
+inventory::submit! {
+    context_layer_core::ContextResourcePlugin {
+        scheme: "memory",
+        factory: memory_resource_factory,
+    }
+}
+```
+
+迭代 2 时期它曾走工厂表捕获路径（当时的 inventory 工厂是零参闭包，拿不到 per-agent
+的 `MemorySpec`）。迭代 3 B4 将工厂签名拉平为
+`fn(&Option<serde_json::Value>) -> Box<dyn ContextResource>`——config envelope 统一
+传入，per-agent 状态经宿主注入 envelope（`inject_memory_envelope`: actor 的
+`MemorySpec` 注入 `memory` key，per-field 合并、actor 侧胜出），注册路径随之统一。
+这是「同一规范，三种出身」原则的落地: 出身不再决定注册方式。
 
 ## 配置三态
 
@@ -78,7 +96,11 @@ priority 越小越先装配、越先扣预算。默认声明 5；覆盖为 25 �
 
 ### 定制（customize）
 
-`config` 字段会传入资源工厂。memory 插件**当前忽略** `config`（业务配置以 `spec.json` 的 `MemorySpec` 为准，与历史行为一致），为未来覆盖 `MemorySpec` 子集（如 `top_k`）预留。第三方替身插件则完全依赖自身 `config`。
+`config` 字段会传入资源工厂。memory 插件从 config envelope 的 `memory` key 读取
+`MemorySpec`（`config_schema` 声明，`plugin list --verbose` 的 `config keys` 可见）:
+actor 的记忆配置由宿主在链构造前注入（per-field 合并、actor 侧胜出），显式配置参与
+合并但 actor 侧优先; envelope 缺失或 malformed 时 warn 并回退默认（skip-not-truncate）。
+第三方替身插件则完全依赖自身 `config`。
 
 ## 行为语义速查
 
@@ -88,12 +110,12 @@ priority 越小越先装配、越先扣预算。默认声明 5；覆盖为 25 �
 | `delivery.prompt=false`（MCP-only） | 同上 |
 | 存储文件损坏 / 检索失败 | warn 日志 + 空输出降级，回合不中断 |
 | 预算不足 | 整段跳过（skip-not-truncate，绝不截断） |
-| 显式 `priority` 与内置值不同 | 真实生效于装配顺序（迭代 2 起） |
-| 默认 spec（不覆盖） | 声明值与内置值一致，行为与迭代 1 前完全相同 |
+| 显式 `priority` 与清单值不同 | 真实生效于装配顺序（迭代 2 起） |
+| 默认 spec（不覆盖） | 声明值与清单值一致，行为与迭代 1 前完全相同 |
 
 ## 迁移说明
 
-- **存量配置无需改动**: 默认 spec 的声明 priority 与内置值一致，等价性由 golden 测试锁定。
+- **存量配置无需改动**: 默认 spec 的声明 priority 与清单值一致，等价性由 golden 测试锁定。
 - **依赖隐式 priority=0 的配置**: 迭代 1 已公告（CHANGELOG [Unreleased]）——省略 priority 现为继承/100，显式 `"priority": 0` 仍是永不跳过的保留值。
 - **代码消费方**: `agent_runtime::memory::*` import 路径不变（重导出 shim）；新代码建议直接依赖 `plugin-memory`。
 

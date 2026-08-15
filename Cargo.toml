@@ -30,7 +30,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
 clap = { version = "4", features = ["derive", "env"] }
 chrono = { version = "0.4", features = ["serde"] }
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 axum = { version = "0.7", features = ["ws"] }
 tower = "0.4"

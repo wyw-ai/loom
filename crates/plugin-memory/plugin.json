@@ -1,0 +1,17 @@
+{
+  "$schema": "loom-plugin/v2",
+  "id": "memory",
+  "name": "Memory",
+  "version": "1.0.0",
+  "loom_version": ">=0.1.8",
+  "layer": "context",
+  "context_resources": [
+    {
+      "scheme": "memory",
+      "priority": 5,
+      "config_schema": {
+        "memory": {}
+      }
+    }
+  ]
+}

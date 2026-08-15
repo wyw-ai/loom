@@ -281,12 +281,12 @@ mod tests {
         }
 
         // Sanity: the known participants are present with expected sources.
-        // R1b intermediate state: memory moved from the builtin table to
-        // inventory registration but has no embedded manifest yet, so it
-        // classifies as External until R1c lands the plugin.json v2
-        // manifest (final state: Official).
+        // R1c final state: memory carries an embedded plugin.json v2
+        // manifest (official-plugins.json internal source), so it
+        // classifies as Official — same spec as every other context
+        // plugin, no builtin-table privilege left.
         for (scheme, source) in [
-            ("memory", PluginSource::External),
+            ("memory", PluginSource::Official),
             ("file", PluginSource::Builtin),
             ("warm-summary", PluginSource::Official),
             ("message-list", PluginSource::Official),

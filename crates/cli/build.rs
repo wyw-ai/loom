@@ -27,6 +27,10 @@ const GUIDE_REPO_URL: &str = "https://github.com/wyw-ai/loom-guide.git";
 ///    into OUT_DIR (anchor-checked after clone)
 /// Every stage validates the same `repo_anchor_rel`; a non-empty env var
 /// or fresh clone failing the check panics the build.
+///
+/// This is the *external* source form. Internal workspace plugins (see
+/// `InternalPluginSource`) live inside this repository and are resolved
+/// directly, never through env/sibling/clone.
 struct OfficialPluginSource {
     /// Stable identity of this source (used in diagnostics and by
     /// `loom plugin list`); must be unique across the data file.
@@ -61,39 +65,85 @@ struct OfficialPluginSource {
     ref_env: &'static str,
 }
 
+/// One internal plugin source: a crate inside this workspace whose
+/// `plugin.json` is embedded directly (R1 rectification — the memory
+/// plugin follows the same manifest spec as every other context
+/// plugin). No env override, no sibling lookup, no clone: the path is
+/// workspace-root-relative and a missing `plugin.json` fails the build.
+struct InternalPluginSource {
+    /// Stable identity of this plugin (must be unique across external
+    /// and internal sources; validated at load time).
+    id: &'static str,
+    /// Workspace-root-relative path to the plugin crate directory
+    /// (e.g. `crates/plugin-memory`).
+    path: &'static str,
+    /// Diagnostic identity used in skill/resource source attribution
+    /// (`internal/<id>`), parallel to the external `repo_dir_name`.
+    repo_dir_name: &'static str,
+}
+
+/// Parsed `official-plugins.json`: external repo sources plus internal
+/// workspace plugin sources.
+struct OfficialPluginData {
+    external: &'static [OfficialPluginSource],
+    internal: &'static [InternalPluginSource],
+}
+
 /// Unified plugin entry list, data-driven from `official-plugins.json`
-/// (next to this build script). Pure skill repos (loom-skills,
-/// actor-circuit) have no `plugin.json` and fall back to global-scope
-/// skill loading. Full plugin repos (loom-plugin-context-tier) carry
-/// `plugin.json` for multi-dimensional dispatch. Each source is
-/// validated against its structural `repo_anchor_rel` before content
-/// discovery. Adding an official plugin = editing the JSON + providing
-/// the repo; no build.rs change.
+/// (next to this build script). The file accepts two shapes:
+///
+/// - legacy: a top-level JSON array (external sources only, no
+///   internal plugins);
+/// - object: `{"external": [...], "internal": [{"id", "path"}, ...]}`
+///   (both arrays optional; at least one external source required).
+///
+/// Pure skill repos (loom-skills, actor-circuit) have no `plugin.json`
+/// and fall back to global-scope skill loading. Full plugin repos
+/// (loom-plugin-context-tier) carry `plugin.json` for multi-dimensional
+/// dispatch. Internal sources (plugin-memory) MUST carry `plugin.json`
+/// — a resource-only manifest with no skills is valid. Adding an
+/// official plugin = editing the JSON + providing the repo; no
+/// build.rs change.
 ///
 /// Loaded by `load_official_plugins`; any missing/invalid field, empty
-/// list, or duplicate id fails the build.
-fn load_official_plugins() -> &'static [OfficialPluginSource] {
+/// external list, or duplicate id fails the build.
+fn load_official_plugins() -> OfficialPluginData {
     let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("official-plugins.json");
     println!("cargo:rerun-if-changed={}", manifest_path.display());
     let raw = fs::read_to_string(&manifest_path)
         .unwrap_or_else(|err| panic!("read {} failed: {err}", manifest_path.display()));
     let value: serde_json::Value = serde_json::from_str(&raw)
         .unwrap_or_else(|err| panic!("parse {} failed: {err}", manifest_path.display()));
-    let array = value.as_array().unwrap_or_else(|| {
-        panic!(
-            "{} must be a JSON array of plugin source objects",
+    let (array, internal_array): (Vec<serde_json::Value>, Vec<serde_json::Value>) = match value {
+        serde_json::Value::Array(entries) => (entries, Vec::new()),
+        serde_json::Value::Object(map) => {
+            let external = map
+                .get("external")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let internal = map
+                .get("internal")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            (external, internal)
+        }
+        _ => panic!(
+            "{} must be a JSON array of plugin source objects, or an \
+             object with `external`/`internal` arrays",
             manifest_path.display()
-        )
-    });
+        ),
+    };
     if array.is_empty() {
         panic!(
-            "{} must declare at least one plugin source",
+            "{} must declare at least one external plugin source",
             manifest_path.display()
         );
     }
 
     let mut sources = Vec::with_capacity(array.len());
-    let mut seen_ids: Vec<&str> = Vec::with_capacity(array.len());
+    let mut seen_ids: Vec<&str> = Vec::with_capacity(array.len() + internal_array.len());
     for (index, entry) in array.iter().enumerate() {
         let object = entry.as_object().unwrap_or_else(|| {
             panic!(
@@ -154,7 +204,34 @@ fn load_official_plugins() -> &'static [OfficialPluginSource] {
             ),
         });
     }
-    Box::leak(sources.into_boxed_slice())
+    let mut internal = Vec::with_capacity(internal_array.len());
+    for (index, entry) in internal_array.iter().enumerate() {
+        let object = entry.as_object().unwrap_or_else(|| {
+            panic!(
+                "{} internal entry [{index}] must be an object",
+                manifest_path.display()
+            )
+        });
+        let id = required_str(&manifest_path, index, object, "id");
+        if seen_ids.contains(&id) {
+            panic!(
+                "{} internal entry [{index}] duplicates plugin source id `{id}`",
+                manifest_path.display()
+            );
+        }
+        seen_ids.push(id);
+        let path = required_str(&manifest_path, index, object, "path");
+        internal.push(InternalPluginSource {
+            id: Box::leak(id.to_owned().into_boxed_str()),
+            path: Box::leak(path.to_owned().into_boxed_str()),
+            repo_dir_name: Box::leak(format!("internal/{id}").into_boxed_str()),
+        });
+    }
+
+    OfficialPluginData {
+        external: Box::leak(sources.into_boxed_slice()),
+        internal: Box::leak(internal.into_boxed_slice()),
+    }
 }
 
 fn required_str<'a>(
@@ -218,7 +295,8 @@ fn main() {
         &clone_root,
     );
     let official_plugins = load_official_plugins();
-    let plugin_sources = resolve_plugin_sources(official_plugins, &clone_root);
+    let mut plugin_sources = resolve_plugin_sources(official_plugins.external, &clone_root);
+    plugin_sources.extend(resolve_internal_sources(official_plugins.internal));
 
     generate_guide_snapshot(&guide_dir, &out_dir);
     generate_plugin_snapshot(&plugin_sources, &out_dir);
@@ -251,6 +329,38 @@ fn resolve_plugin_sources(
                 source.ref_env,
                 clone_root,
             ),
+        })
+        .collect()
+}
+
+/// Resolve internal plugin sources: workspace crates whose plugin.json
+/// is embedded directly. No env override, no sibling lookup, no clone —
+/// the declared path is workspace-root-relative and a missing
+/// plugin.json fails loud (internal plugins MUST carry a manifest).
+fn resolve_internal_sources(
+    sources: &'static [InternalPluginSource],
+) -> Vec<ResolvedPluginSource> {
+    let workspace_root = workspace_root();
+    sources
+        .iter()
+        .map(|source| {
+            let dir = workspace_root.join(source.path);
+            let plugin_json = dir.join("plugin.json");
+            if !plugin_json.is_file() {
+                panic!(
+                    "internal plugin `{}` ({}): plugin.json missing at {}",
+                    source.id,
+                    source.path,
+                    plugin_json.display()
+                );
+            }
+            ResolvedPluginSource {
+                repo_dir_name: source.repo_dir_name,
+                content: ContentSource {
+                    path: dir,
+                    cloned: false,
+                },
+            }
         })
         .collect()
 }
@@ -321,13 +431,18 @@ fn resolve_content_source(
     }
 }
 
-fn content_candidates(repo_name: &str) -> Vec<PathBuf> {
+fn workspace_root() -> PathBuf {
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set"));
-    let repo_root = manifest_dir
+    manifest_dir
         .parent()
         .and_then(Path::parent)
-        .expect("crates/cli is inside the workspace root");
+        .expect("crates/cli is inside the workspace root")
+        .to_path_buf()
+}
+
+fn content_candidates(repo_name: &str) -> Vec<PathBuf> {
+    let repo_root = workspace_root();
     let parent = repo_root.parent();
 
     let mut candidates = Vec::new();
@@ -473,8 +588,11 @@ fn generate_plugin_snapshot(sources: &[ResolvedPluginSource], out_dir: &Path) {
     let mut all_skills: Vec<PluginSkillEntry> = Vec::new();
     let mut all_resources: Vec<PluginResourceEntry> = Vec::new();
     let mut all_manifests: Vec<PluginManifestEntry> = Vec::new();
+    // Declared context resources per source (parallel to `sources`),
+    // feeding the zero-content guard below.
+    let mut resource_counts: Vec<usize> = vec![0; sources.len()];
 
-    for source in sources {
+    for (source_index, source) in sources.iter().enumerate() {
         let content = &source.content;
         let plugin_json_path = content.path.join("plugin.json");
 
@@ -527,6 +645,7 @@ fn generate_plugin_snapshot(sources: &[ResolvedPluginSource], out_dir: &Path) {
             // Post-D-C3 every declared resource is global (resource scope
             // dispatch was never implemented), so the flat list is the
             // union of all manifest resources.
+            resource_counts[source_index] = plugin_resources.len();
             all_resources.extend(plugin_resources.iter().cloned());
             all_manifests.push(PluginManifestEntry {
                 id: manifest.id.clone(),
@@ -572,17 +691,21 @@ fn generate_plugin_snapshot(sources: &[ResolvedPluginSource], out_dir: &Path) {
         }
     }
 
-    // Zero-skill guard: every official source must contribute at least one
-    // skill. A source contributing none indicates a drifted repo layout or
-    // a misconfigured anchor; fail loud instead of silently embedding less.
-    for source in sources {
+    // Zero-content guard: every official source must contribute at least
+    // one skill OR one declared context resource. A source contributing
+    // none indicates a drifted repo layout or a misconfigured anchor;
+    // fail loud instead of silently embedding less. (R1 rectification:
+    // resource-only plugins such as the internal memory plugin are valid
+    // official sources — the former skills-only guard would reject them.)
+    for (source, &resource_count) in sources.iter().zip(&resource_counts) {
         let contributed = all_skills
             .iter()
             .filter(|skill| skill.source == source.repo_dir_name)
             .count();
-        if contributed == 0 {
+        if contributed == 0 && resource_count == 0 {
             panic!(
-                "official plugin source `{}` contributed no skills",
+                "official plugin source `{}` contributed no skills and no \
+                 context resources",
                 source.repo_dir_name
             );
         }

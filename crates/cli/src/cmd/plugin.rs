@@ -297,6 +297,30 @@ mod tests {
                 .unwrap_or_else(|| panic!("expected scheme {scheme} in plugin list"));
             assert_eq!(entry.source, source, "unexpected source for {scheme}");
         }
+
+        // R1d presentation snapshot: memory is fully normalized — the
+        // table, JSON, and verbose forms all render from these fields,
+        // so asserting them pins all three output shapes at once.
+        let memory = entries
+            .iter()
+            .find(|e| e.scheme == "memory")
+            .expect("memory entry");
+        assert_eq!(memory.source, PluginSource::Official);
+        assert_eq!(memory.source.label(), "official");
+        assert_eq!(memory.version, "1.0.0");
+        assert_eq!(memory.priority, 5);
+        assert_eq!(memory.plugin_id.as_deref(), Some("memory"));
+        assert_eq!(memory.plugin_name, Some("Memory"));
+        assert_eq!(memory.config_keys, vec!["memory"]);
+        assert_eq!(memory.registered_via, "inventory");
+        assert_eq!(memory.endpoint, "in-process factory");
+
+        // The builtin factory table keeps exactly one privileged scheme
+        // (file); memory must no longer appear there.
+        let file = entries.iter().find(|e| e.scheme == "file").expect("file entry");
+        assert_eq!(file.version, "builtin");
+        assert_eq!(file.plugin_id, None);
+        assert!(file.config_keys.is_empty());
     }
 
     #[test]

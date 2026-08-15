@@ -167,7 +167,8 @@
   "memory", factory: memory_resource_factory } }`）——满足 F2，与 tier 完全同路径;
 - **config 单方言**（F3）: 工厂从 config envelope 读取 `memory` key（`config_schema`
   声明）; actor 的 `MemorySpec` 由宿主在链构造前注入 envelope（per-field 合并、
-  actor 侧胜出），malformed 输入 warn 后回退默认（skip-not-truncate）;
+  actor 侧胜出; 字段冲突时记 error 级日志但合并不中断——D-D3 裁定），
+  malformed 输入 warn 后回退默认（skip-not-truncate）;
 - **版本独立语义化**（D-R1-3）: `version: 1.0.0` 是插件自身版本，与 workspace
   crate 版本解耦。
 

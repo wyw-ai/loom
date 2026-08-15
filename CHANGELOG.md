@@ -41,6 +41,20 @@ drafts and may change between releases.
   context layer is the sole top-level concept (AOP middle layer) and
   "plugin" is the role word for supply units; new `plugin-guide.md`
   and `plugin-list.md` under `docs/context-layer/`.
+- Context layer: the memory context resource is now a fully normalized
+  plugin — registered through `inventory` like every other resource
+  (the builtin factory-table entry is removed), shipping a
+  `plugin.json` v2 manifest embedded via a new `internal` source in
+  `official-plugins.json`, and listed by `loom plugin list` as an
+  Official plugin (v1.0.0) instead of `builtin`. Assembly output is
+  golden-test equivalent to the previous builtin path (baseline hash
+  unchanged across the migration).
+- Docs: `docs/context-layer/plugin-guide.md` is now the single
+  specification anchor for context layer plugins — five-face
+  consistency criteria (manifest, registration, config, listing,
+  documentation), exemption terms with an exemption ledger, and the
+  memory plugin documented as the first normalized internal plugin
+  (including D-D3 conflict error semantics for the memory instance).
 - Context layer: `agentcontext.json` resources that omit `priority` now
   inherit the base-layer value (new resources default to 100) instead of
   silently deserializing to 0. Configs relying on the implicit 0

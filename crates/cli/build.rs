@@ -4,6 +4,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+// Shared plugin.json parser (also compiled into the CLI lib test harness
+// for schema tests). See plugin_manifest.rs for the v1/v2 contract.
+#[path = "plugin_manifest.rs"]
+mod plugin_manifest;
+
+use plugin_manifest::{check_loom_version, parse_plugin_json, PluginManifest, PluginScope};
+
 const GUIDE_REPO_URL: &str = "https://github.com/wyw-ai/loom-guide.git";
 
 /// One official plugin content source repository. A plugin may carry a
@@ -307,101 +314,6 @@ fn generate_guide_snapshot(guide_source: &ContentSource, out_dir: &Path) {
 }
 
 // ---------------------------------------------------------------------------
-// plugin.json parsing (build-time, no serde dependency — manual JSON walk)
-// ---------------------------------------------------------------------------
-
-/// Parsed `plugin.json` manifest from a plugin repository.
-struct PluginManifest {
-    skills: Vec<DeclaredSkill>,
-    resources: Vec<DeclaredResource>,
-}
-
-struct DeclaredSkill {
-    id: String,
-    path: String,
-    scope: PluginScope,
-}
-
-struct DeclaredResource {
-    scheme: String,
-    priority: Option<i32>,
-    scope: PluginScope,
-}
-
-/// Scope classification for build-time dispatch.
-/// - `Global` → project_builtin_skill_targets() / default_agent_context_spec()
-/// - `Scope` → scope-level skill targets / AgentContextSpec overlay
-/// - `ActorBundle` → actor_bundle_skill_targets() / actor-specific agentcontext.json
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PluginScope {
-    Global,
-    Scope,
-    ActorBundle,
-}
-
-fn parse_plugin_json(path: &Path) -> PluginManifest {
-    let raw = fs::read_to_string(path)
-        .unwrap_or_else(|err| panic!("read plugin.json {} failed: {err}", path.display()));
-    let json: serde_json::Value = serde_json::from_str(&raw)
-        .unwrap_or_else(|err| panic!("parse plugin.json {} failed: {err}", path.display()));
-
-    let mut skills = Vec::new();
-    if let Some(arr) = json.get("skills").and_then(|v| v.as_array()) {
-        for entry in arr {
-            let id = entry
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or_else(|| panic!("plugin.json skill missing id: {}", path.display()))
-                .to_owned();
-            let skill_path = entry
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or_else(|| panic!("plugin.json skill `{id}` missing path"))
-                .to_owned();
-            let scope = parse_scope(entry.get("scope"), &id, path);
-            skills.push(DeclaredSkill {
-                id,
-                path: skill_path,
-                scope,
-            });
-        }
-    }
-
-    let mut resources = Vec::new();
-    if let Some(arr) = json.get("context_resources").and_then(|v| v.as_array()) {
-        for entry in arr {
-            let scheme = entry
-                .get("scheme")
-                .and_then(|v| v.as_str())
-                .unwrap_or_else(|| panic!("plugin.json context_resource missing scheme"))
-                .to_owned();
-            let priority = entry.get("priority").and_then(|v| v.as_i64()).map(|n| n as i32);
-            let scope = parse_scope(entry.get("scope"), &scheme, path);
-            resources.push(DeclaredResource {
-                scheme,
-                priority,
-                scope,
-            });
-        }
-    }
-
-    PluginManifest { skills, resources }
-}
-
-fn parse_scope(raw: Option<&serde_json::Value>, label: &str, path: &Path) -> PluginScope {
-    match raw.and_then(|v| v.as_str()) {
-        Some("global") => PluginScope::Global,
-        Some("scope") => PluginScope::Scope,
-        Some("actor-bundle") => PluginScope::ActorBundle,
-        Some(other) => panic!(
-            "plugin.json `{label}` has unknown scope `{other}` in {}",
-            path.display()
-        ),
-        None => PluginScope::Global, // default
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Plugin snapshot generation
 // ---------------------------------------------------------------------------
 
@@ -414,16 +326,32 @@ struct PluginSkillEntry {
     scope: PluginScope,
 }
 
-/// A resource declared in plugin.json, tagged with its dispatch scope.
+/// A resource declared in plugin.json, carrying its plugin identity for
+/// the embedded manifest (v2: plugin_id/version/config_keys are consumed
+/// by `loom plugin list` introspection).
+#[derive(Clone)]
 struct PluginResourceEntry {
     scheme: String,
     priority: Option<i32>,
-    scope: PluginScope,
+    plugin_id: String,
+    version: String,
+    config_keys: Vec<String>,
+}
+
+/// A plugin-level manifest entry for the embedded manifest table.
+struct PluginManifestEntry {
+    id: String,
+    name: String,
+    version: String,
+    layer: String,
+    has_executable: bool,
+    resources: Vec<PluginResourceEntry>,
 }
 
 fn generate_plugin_snapshot(sources: &[ResolvedPluginSource], out_dir: &Path) {
     let mut all_skills: Vec<PluginSkillEntry> = Vec::new();
     let mut all_resources: Vec<PluginResourceEntry> = Vec::new();
+    let mut all_manifests: Vec<PluginManifestEntry> = Vec::new();
 
     for source in sources {
         let content = &source.content;
@@ -435,6 +363,11 @@ fn generate_plugin_snapshot(sources: &[ResolvedPluginSource], out_dir: &Path) {
                 println!("cargo:rerun-if-changed={}", plugin_json_path.display());
             }
             let manifest = parse_plugin_json(&plugin_json_path);
+            check_loom_version(
+                &manifest.loom_version,
+                env!("CARGO_PKG_VERSION"),
+                &manifest.id,
+            );
 
             // Collect skills declared in plugin.json
             for decl in &manifest.skills {
@@ -457,14 +390,31 @@ fn generate_plugin_snapshot(sources: &[ResolvedPluginSource], out_dir: &Path) {
                 );
             }
 
-            // Collect resources declared in plugin.json
+            // Collect resources declared in plugin.json (v2 shape: no scope,
+            // carrying plugin identity for introspection)
+            let mut plugin_resources = Vec::new();
             for decl in &manifest.resources {
-                all_resources.push(PluginResourceEntry {
+                let entry = PluginResourceEntry {
                     scheme: decl.scheme.clone(),
                     priority: decl.priority,
-                    scope: decl.scope,
-                });
+                    plugin_id: manifest.id.clone(),
+                    version: manifest.version.clone(),
+                    config_keys: decl.config_keys.clone(),
+                };
+                plugin_resources.push(entry);
             }
+            // Post-D-C3 every declared resource is global (resource scope
+            // dispatch was never implemented), so the flat list is the
+            // union of all manifest resources.
+            all_resources.extend(plugin_resources.iter().cloned());
+            all_manifests.push(PluginManifestEntry {
+                id: manifest.id.clone(),
+                name: manifest.name.clone(),
+                version: manifest.version.clone(),
+                layer: manifest.layer.clone(),
+                has_executable: manifest.has_executable,
+                resources: plugin_resources,
+            });
 
             // Also scan skills/ dir for any skills NOT listed in plugin.json
             // (treat them as global scope for backward compat within the repo)
@@ -617,48 +567,45 @@ fn generate_plugin_snapshot(sources: &[ResolvedPluginSource], out_dir: &Path) {
     generated.push_str("];\n");
 
     // --- Scope-classified resource declarations ---
+    // Post-D-C3 resources have no scope dimension; the flat global list is
+    // authoritative. Per-plugin arrays feed the manifest table below.
     generated.push_str("\nconst EMBEDDED_GLOBAL_RESOURCES: &[EmbeddedPluginResource] = &[\n");
-    for r in all_resources.iter().filter(|r| r.scope == PluginScope::Global) {
-        let prio = match r.priority {
-            Some(p) => format!("Some({p})"),
-            None => "None".to_string(),
-        };
-        writeln!(
-            generated,
-            "    EmbeddedPluginResource {{ scheme: {:?}, priority: {prio} }},",
-            r.scheme
-        )
-        .expect("write resource snapshot");
+    for r in &all_resources {
+        write_resource_entry(&mut generated, r);
     }
     generated.push_str("];\n");
 
-    generated.push_str("#[allow(dead_code)]\nconst EMBEDDED_SCOPE_RESOURCES: &[EmbeddedPluginResource] = &[\n");
-    for r in all_resources.iter().filter(|r| r.scope == PluginScope::Scope) {
-        let prio = match r.priority {
-            Some(p) => format!("Some({p})"),
-            None => "None".to_string(),
-        };
+    // --- Per-plugin resource arrays + manifest table (v2 introspection) ---
+    all_manifests.sort_by(|a, b| a.id.cmp(&b.id));
+    for manifest in &all_manifests {
+        let static_name = embedded_plugin_resources_static_name(&manifest.id);
         writeln!(
             generated,
-            "    EmbeddedPluginResource {{ scheme: {:?}, priority: {prio} }},",
-            r.scheme
+            "\n#[allow(dead_code)]\nstatic {static_name}: &[EmbeddedPluginResource] = &["
         )
         .expect("write resource snapshot");
+        for r in &manifest.resources {
+            write_resource_entry(&mut generated, r);
+        }
+        generated.push_str("];\n");
     }
-    generated.push_str("];\n");
 
-    generated.push_str("#[allow(dead_code)]\nconst EMBEDDED_BUNDLE_RESOURCES: &[EmbeddedPluginResource] = &[\n");
-    for r in all_resources.iter().filter(|r| r.scope == PluginScope::ActorBundle) {
-        let prio = match r.priority {
-            Some(p) => format!("Some({p})"),
-            None => "None".to_string(),
-        };
+    generated.push_str(
+        "\nstatic EMBEDDED_PLUGIN_MANIFESTS: &[EmbeddedPluginManifest] = &[\n",
+    );
+    for manifest in &all_manifests {
+        let static_name = embedded_plugin_resources_static_name(&manifest.id);
         writeln!(
             generated,
-            "    EmbeddedPluginResource {{ scheme: {:?}, priority: {prio} }},",
-            r.scheme
+            "    EmbeddedPluginManifest {{ id: {:?}, name: {:?}, version: {:?}, layer: {:?}, \
+             has_executable: {}, resources: {static_name} }},",
+            manifest.id,
+            manifest.name,
+            manifest.version,
+            manifest.layer,
+            manifest.has_executable,
         )
-        .expect("write resource snapshot");
+        .expect("write manifest snapshot");
     }
     generated.push_str("];\n");
 
@@ -741,8 +688,16 @@ fn register_skill(
 }
 
 fn embedded_skill_files_static_name(skill_id: &str) -> String {
-    let mut name = String::from("EMBEDDED_SKILL_FILES_");
-    for ch in skill_id.chars() {
+    embedded_static_name("EMBEDDED_SKILL_FILES_", skill_id)
+}
+
+fn embedded_plugin_resources_static_name(plugin_id: &str) -> String {
+    embedded_static_name("EMBEDDED_PLUGIN_RESOURCES_", plugin_id)
+}
+
+fn embedded_static_name(prefix: &str, id: &str) -> String {
+    let mut name = String::from(prefix);
+    for ch in id.chars() {
         if ch.is_ascii_alphanumeric() {
             name.push(ch.to_ascii_uppercase());
         } else {
@@ -750,6 +705,30 @@ fn embedded_skill_files_static_name(skill_id: &str) -> String {
         }
     }
     name
+}
+
+/// Emit one `EmbeddedPluginResource` literal (v2 shape: plugin identity +
+/// declared config keys ride along the scheme/priority pair).
+fn write_resource_entry(generated: &mut String, r: &PluginResourceEntry) {
+    let prio = match r.priority {
+        Some(p) => format!("Some({p})"),
+        None => "None".to_string(),
+    };
+    let config_keys = format!(
+        "&[{}]",
+        r.config_keys
+            .iter()
+            .map(|key| format!("{key:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    writeln!(
+        generated,
+        "    EmbeddedPluginResource {{ scheme: {:?}, priority: {prio}, plugin_id: {:?}, \
+         version: {:?}, config_keys: {config_keys} }},",
+        r.scheme, r.plugin_id, r.version,
+    )
+    .expect("write resource snapshot");
 }
 
 fn collect_files(dir: &Path, emit_rerun: bool) -> Vec<PathBuf> {

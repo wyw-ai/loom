@@ -1461,10 +1461,33 @@ struct EmbeddedBuiltinSkill {
 }
 
 /// A context resource declaration embedded from plugin.json at build time.
+/// v2 extension: plugin identity and declared config keys ride along the
+/// scheme/priority pair for `loom plugin list` introspection and config
+/// validation.
 #[derive(Debug, Clone, Copy)]
 struct EmbeddedPluginResource {
     scheme: &'static str,
     priority: Option<i32>,
+    plugin_id: &'static str,
+    version: &'static str,
+    /// Shallow key set of the plugin's `config_schema` — the config fields
+    /// this resource accepts.
+    config_keys: &'static [&'static str],
+}
+
+/// A plugin-level manifest entry embedded at build time (v2). Consumed by
+/// `loom plugin list` introspection; entries with empty `resources` are
+/// pure skill sources and do not surface as resource plugins.
+#[derive(Debug, Clone, Copy)]
+struct EmbeddedPluginManifest {
+    id: &'static str,
+    name: &'static str,
+    version: &'static str,
+    layer: &'static str,
+    /// `executable` is a reserved (M5) field: schema-validated at build
+    /// time, never loaded; surfaced as "reserved" in `--verbose` output.
+    has_executable: bool,
+    resources: &'static [EmbeddedPluginResource],
 }
 
 include!(concat!(env!("OUT_DIR"), "/loom_skill_embedded.rs"));
@@ -10991,6 +11014,11 @@ mod tests {
     };
     use proto::types::{Actor, ActorKind, MessageKind, Ref, Relation};
 
+    // Shared plugin.json parser (same source build.rs compiles) so the
+    // v1/v2 schema contract is unit-testable.
+    #[path = "../../../../plugin_manifest.rs"]
+    mod plugin_manifest;
+
     #[test]
     fn machine_command_poll_delay_is_stable_and_jittered() {
         let first = machine_command_poll_initial_delay("machine-alpha");
@@ -16362,19 +16390,243 @@ mod tests {
 
     // ── Plugin loader tests ───────────────────────────────────────
 
+    // ── plugin.json v1/v2 schema tests (iter3 S1 B1) ──────────────
+
+    const V1_MANIFEST: &str = r##"{
+        "$schema": "loom-plugin/v1",
+        "id": "loom-plugin-test",
+        "name": "Test Plugin",
+        "version": "1.0.0",
+        "loom_version": ">=0.1.8",
+        "layer": "context",
+        "skills": [
+            { "id": "test-skill", "path": "skills/test-skill", "scope": "global" }
+        ],
+        "context_resources": [
+            {
+                "scheme": "warm-summary",
+                "priority": 7,
+                "scope": "global",
+                "registration": "inventory",
+                "crate": "loom-plugin-test"
+            }
+        ],
+        "config_template": "context-resources/default-agentcontext.json"
+    }"##;
+
+    const V2_MANIFEST: &str = r##"{
+        "$schema": "loom-plugin/v2",
+        "id": "loom-plugin-test",
+        "name": "Test Plugin",
+        "version": "2.0.0",
+        "loom_version": ">=0.1.8",
+        "layer": "context",
+        "skills": [
+            { "id": "test-skill", "path": "skills/test-skill", "scope": "global" }
+        ],
+        "context_resources": [
+            {
+                "scheme": "warm-summary",
+                "priority": 7,
+                "config_schema": {
+                    "max_bytes": { "type": "integer" },
+                    "summary_dir": { "type": "string" }
+                }
+            }
+        ],
+        "config_template": "context-resources/default-agentcontext.json",
+        "executable": {
+            "command": "loom-plugin-test-endpoint",
+            "args": ["--stdio"],
+            "protocol": "jsonrpc-stdio"
+        }
+    }"##;
+
+    fn write_manifest_fixture(content: &str) -> std::path::PathBuf {
+        let dir = tempfile::tempdir().expect("tempdir for plugin.json fixture");
+        let path = dir.keep().join("plugin.json");
+        std::fs::write(&path, content).expect("write plugin.json fixture");
+        path
+    }
+
+    #[test]
+    fn plugin_json_v1_normalizes_removed_fields() {
+        let path = write_manifest_fixture(V1_MANIFEST);
+        let manifest = plugin_manifest::parse_plugin_json(&path);
+        assert_eq!(manifest.id, "loom-plugin-test");
+        assert_eq!(manifest.name, "Test Plugin");
+        assert_eq!(manifest.version, "1.0.0");
+        assert_eq!(manifest.layer, "context");
+        assert_eq!(manifest.skills.len(), 1);
+        assert_eq!(manifest.resources.len(), 1);
+        let resource = &manifest.resources[0];
+        assert_eq!(resource.scheme, "warm-summary");
+        assert_eq!(resource.priority, Some(7));
+        // v1 normalization: registration/crate/scope dropped, no
+        // config_schema declared.
+        assert!(resource.config_keys.is_empty());
+        assert!(!manifest.has_executable);
+    }
+
+    #[test]
+    fn plugin_json_v2_parses_full_fields() {
+        let path = write_manifest_fixture(V2_MANIFEST);
+        let manifest = plugin_manifest::parse_plugin_json(&path);
+        assert_eq!(manifest.id, "loom-plugin-test");
+        assert_eq!(manifest.version, "2.0.0");
+        let resource = &manifest.resources[0];
+        assert_eq!(resource.scheme, "warm-summary");
+        assert_eq!(resource.priority, Some(7));
+        // config_schema keys are collected (sorted) for validation and
+        // `--verbose` display.
+        assert_eq!(resource.config_keys, vec!["max_bytes", "summary_dir"]);
+        assert!(manifest.has_executable);
+    }
+
+    #[test]
+    #[should_panic(expected = "removed field `registration`")]
+    fn plugin_json_v2_rejects_registration() {
+        let v2_with_registration = V2_MANIFEST.replace(
+            "\"config_schema\": {",
+            "\"registration\": \"inventory\",\n                \"config_schema\": {",
+        );
+        let path = write_manifest_fixture(&v2_with_registration);
+        plugin_manifest::parse_plugin_json(&path);
+    }
+
+    #[test]
+    #[should_panic(expected = "removed field `crate`")]
+    fn plugin_json_v2_rejects_crate() {
+        let v2_with_crate =
+            V2_MANIFEST.replace("\"config_schema\": {", "\"crate\": \"x\",\n                \"config_schema\": {");
+        let path = write_manifest_fixture(&v2_with_crate);
+        plugin_manifest::parse_plugin_json(&path);
+    }
+
+    #[test]
+    #[should_panic(expected = "removed field `scope`")]
+    fn plugin_json_v2_rejects_resource_scope() {
+        let v2_with_scope = V2_MANIFEST.replace(
+            "\"config_schema\": {",
+            "\"scope\": \"global\",\n                \"config_schema\": {",
+        );
+        let path = write_manifest_fixture(&v2_with_scope);
+        plugin_manifest::parse_plugin_json(&path);
+    }
+
+    #[test]
+    #[should_panic(expected = "unknown `$schema`")]
+    fn plugin_json_rejects_unknown_schema() {
+        let bad = V2_MANIFEST.replace("loom-plugin/v2", "loom-plugin/v9");
+        let path = write_manifest_fixture(&bad);
+        plugin_manifest::parse_plugin_json(&path);
+    }
+
+    #[test]
+    #[should_panic(expected = "missing `$schema`")]
+    fn plugin_json_rejects_missing_schema() {
+        let bad = V2_MANIFEST.replace("\"$schema\": \"loom-plugin/v2\",", "");
+        let path = write_manifest_fixture(&bad);
+        plugin_manifest::parse_plugin_json(&path);
+    }
+
+    #[test]
+    #[should_panic(expected = "unsupported layer")]
+    fn plugin_json_rejects_non_context_layer() {
+        let bad = V2_MANIFEST.replace("\"layer\": \"context\"", "\"layer\": \"prompt\"");
+        let path = write_manifest_fixture(&bad);
+        plugin_manifest::parse_plugin_json(&path);
+    }
+
+    #[test]
+    #[should_panic(expected = "executable protocol `grpc` is not a legal value")]
+    fn plugin_json_rejects_bad_executable_protocol() {
+        let bad = V2_MANIFEST.replace("jsonrpc-stdio", "grpc");
+        let path = write_manifest_fixture(&bad);
+        plugin_manifest::parse_plugin_json(&path);
+    }
+
+    #[test]
+    #[should_panic(expected = "missing required string field `version`")]
+    fn plugin_json_rejects_missing_required_field() {
+        let bad = V2_MANIFEST.replace("\"version\": \"2.0.0\",", "");
+        let path = write_manifest_fixture(&bad);
+        plugin_manifest::parse_plugin_json(&path);
+    }
+
+    #[test]
+    fn loom_version_check_accepts_satisfied_range() {
+        plugin_manifest::check_loom_version(">=0.1.8", "0.1.8", "loom-plugin-test");
+        plugin_manifest::check_loom_version(">=0.1.8", "0.2.0", "loom-plugin-test");
+        plugin_manifest::check_loom_version(">=0.1.0", "0.1.8-nightly", "loom-plugin-test");
+    }
+
+    #[test]
+    #[should_panic(expected = "requires loom_version >=0.2.0 but this build is 0.1.8")]
+    fn loom_version_check_rejects_unsatisfied_range() {
+        plugin_manifest::check_loom_version(">=0.2.0", "0.1.8", "loom-plugin-test");
+    }
+
+    #[test]
+    #[should_panic(expected = "unsupported loom_version range")]
+    fn loom_version_check_rejects_unsupported_operator() {
+        plugin_manifest::check_loom_version("^0.1.8", "0.1.8", "loom-plugin-test");
+    }
+
+    #[test]
+    fn embedded_plugin_manifest_table_present() {
+        // The real snapshot is generated by build.rs from the official
+        // sources; the context-tier plugin must be there with its two
+        // resources carrying plugin identity.
+        let tier = EMBEDDED_PLUGIN_MANIFESTS
+            .iter()
+            .find(|m| m.id == "loom-plugin-context-tier")
+            .expect("context-tier plugin in embedded manifest table");
+        assert_eq!(tier.layer, "context");
+        let schemes: Vec<&str> = tier.resources.iter().map(|r| r.scheme).collect();
+        assert!(schemes.contains(&"warm-summary"), "schemes: {schemes:?}");
+        assert!(schemes.contains(&"message-list"), "schemes: {schemes:?}");
+        for resource in tier.resources {
+            assert_eq!(resource.plugin_id, "loom-plugin-context-tier");
+            assert!(!resource.version.is_empty());
+        }
+    }
+
+    #[test]
+    fn embedded_global_resources_carry_plugin_identity() {
+        // Post-D-C3 the flat global list is the union of all manifest
+        // resources; every entry must carry its plugin identity.
+        for resource in EMBEDDED_GLOBAL_RESOURCES {
+            assert!(
+                !resource.plugin_id.is_empty(),
+                "resource `{}` missing plugin_id",
+                resource.scheme
+            );
+        }
+    }
+
     #[test]
     fn embedded_plugin_resource_struct_compiles() {
         // Verify the EmbeddedPluginResource type is usable
         let r = EmbeddedPluginResource {
             scheme: "test",
             priority: Some(42),
+            plugin_id: "loom-plugin-test",
+            version: "1.2.3",
+            config_keys: &["alpha", "beta"],
         };
         assert_eq!(r.scheme, "test");
         assert_eq!(r.priority, Some(42));
+        assert_eq!(r.plugin_id, "loom-plugin-test");
+        assert_eq!(r.version, "1.2.3");
+        assert_eq!(r.config_keys, &["alpha", "beta"]);
 
         let r2 = EmbeddedPluginResource {
             scheme: "no-prio",
             priority: None,
+            plugin_id: "loom-plugin-test",
+            version: "1.2.3",
+            config_keys: &[],
         };
         assert_eq!(r2.priority, None);
     }

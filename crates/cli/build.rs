@@ -30,6 +30,9 @@ const GUIDE_REPO_URL: &str = "https://github.com/wyw-ai/loom-guide.git";
 struct OfficialPluginSource {
     /// Stable identity of this source (used in diagnostics and by
     /// `loom plugin list`); must be unique across the data file.
+    // Validated for uniqueness at load time; the field itself is carried for
+    // diagnostics and future surfacing, not read by the build script.
+    #[allow(dead_code)]
     id: &'static str,
     /// Env vars (in priority order) that may point at a local checkout
     /// of the source repo. The first non-empty value that passes the
@@ -709,7 +712,7 @@ fn generate_plugin_snapshot(sources: &[ResolvedPluginSource], out_dir: &Path) {
     }
 
     generated.push_str(
-        "\nstatic EMBEDDED_PLUGIN_MANIFESTS: &[EmbeddedPluginManifest] = &[\n",
+        "\npub(crate) static EMBEDDED_PLUGIN_MANIFESTS: &[EmbeddedPluginManifest] = &[\n",
     );
     for manifest in &all_manifests {
         let static_name = embedded_plugin_resources_static_name(&manifest.id);

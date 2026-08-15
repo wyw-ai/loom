@@ -1465,29 +1465,39 @@ struct EmbeddedBuiltinSkill {
 /// scheme/priority pair for `loom plugin list` introspection and config
 /// validation.
 #[derive(Debug, Clone, Copy)]
-struct EmbeddedPluginResource {
-    scheme: &'static str,
-    priority: Option<i32>,
-    plugin_id: &'static str,
-    version: &'static str,
+pub(crate) struct EmbeddedPluginResource {
+    pub(crate) scheme: &'static str,
+    pub(crate) priority: Option<i32>,
+    // Per-resource provenance; equal to the owning manifest's id by
+    // normalization (asserted in tests). Read by `loom plugin list`.
+    pub(crate) plugin_id: &'static str,
+    pub(crate) version: &'static str,
     /// Shallow key set of the plugin's `config_schema` — the config fields
     /// this resource accepts.
-    config_keys: &'static [&'static str],
+    pub(crate) config_keys: &'static [&'static str],
 }
 
 /// A plugin-level manifest entry embedded at build time (v2). Consumed by
 /// `loom plugin list` introspection; entries with empty `resources` are
 /// pure skill sources and do not surface as resource plugins.
 #[derive(Debug, Clone, Copy)]
-struct EmbeddedPluginManifest {
-    id: &'static str,
-    name: &'static str,
-    version: &'static str,
-    layer: &'static str,
+pub(crate) struct EmbeddedPluginManifest {
+    // Read in tests (normalization invariant vs resource.plugin_id); the
+    // lib reads the per-resource plugin_id instead.
+    #[allow(dead_code)]
+    pub(crate) id: &'static str,
+    pub(crate) name: &'static str,
+    // Schema-complete snapshot fields: `version` is asserted equal to each
+    // resource's embedded version in tests; `layer` is validated at build
+    // time and reserved for future surfacing. Neither is read by the lib.
+    #[allow(dead_code)]
+    pub(crate) version: &'static str,
+    #[allow(dead_code)]
+    pub(crate) layer: &'static str,
     /// `executable` is a reserved (M5) field: schema-validated at build
     /// time, never loaded; surfaced as "reserved" in `--verbose` output.
-    has_executable: bool,
-    resources: &'static [EmbeddedPluginResource],
+    pub(crate) has_executable: bool,
+    pub(crate) resources: &'static [EmbeddedPluginResource],
 }
 
 include!(concat!(env!("OUT_DIR"), "/loom_skill_embedded.rs"));
@@ -8794,6 +8804,22 @@ fn builtin_resource_factories(
     }
 
     factories
+}
+
+/// Introspection view of the builtin resource factory table for
+/// `loom plugin list`: every scheme the table can produce, paired with the
+/// priority of a default-configured instance. Inventory-discovered plugins
+/// are merged into the table by `builtin_resource_factories`, so callers
+/// classify entries by cross-referencing `discover_plugins()` and the
+/// embedded plugin manifests.
+pub(crate) fn builtin_factory_table_overview() -> Vec<(String, i32)> {
+    builtin_resource_factories(None)
+        .into_iter()
+        .map(|(scheme, factory)| {
+            let resource = factory(&None);
+            (scheme, resource.priority())
+        })
+        .collect()
 }
 
 /// Build the ContextResourceRegistry from an AgentContextSpec.

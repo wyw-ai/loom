@@ -197,6 +197,11 @@ enum Cmd {
         #[command(subcommand)]
         sub: GuideCmd,
     },
+    /// List context layer plugins (resource supply units of the layer).
+    Plugin {
+        #[command(subcommand)]
+        sub: PluginCmd,
+    },
     /// Materialize embedded official Loom skills for external runtimes.
     Skill {
         #[command(subcommand)]
@@ -1730,6 +1735,20 @@ enum GuideCmd {
 }
 
 #[derive(Subcommand, Debug)]
+enum PluginCmd {
+    /// List context layer plugins visible to assembly (official, external,
+    /// builtin).
+    List {
+        /// Show per-plugin provenance (source, registration, endpoint).
+        #[arg(long)]
+        verbose: bool,
+        /// (Experimental) Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum SkillCmd {
     /// Write the embedded official Loom skill into a dedicated directory.
     Materialize {
@@ -2049,6 +2068,13 @@ async fn async_main() -> Result<()> {
             GuideCmd::Show { topic } => cmd::guide::show(topic)?,
             GuideCmd::Search { query } => cmd::guide::search(query)?,
             GuideCmd::Update => cmd::guide::update()?,
+        }
+        return Ok(());
+    }
+
+    if let Cmd::Plugin { sub } = &args.cmd {
+        match sub {
+            PluginCmd::List { verbose, json } => cmd::plugin::list(*verbose, *json)?,
         }
         return Ok(());
     }
@@ -3019,6 +3045,7 @@ async fn async_main() -> Result<()> {
         Cmd::Agent { .. } => unreachable!("handled before client setup"),
         Cmd::Provider { .. } => unreachable!("handled before client setup"),
         Cmd::Guide { .. } => unreachable!("handled before client setup"),
+        Cmd::Plugin { .. } => unreachable!("handled before client setup"),
         Cmd::Skill { .. } => unreachable!("handled before client setup"),
         Cmd::Mcp { .. } => unreachable!("handled before client setup"),
         Cmd::Memory { .. } => unreachable!("handled before client setup"),

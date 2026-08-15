@@ -18,6 +18,7 @@ pub mod mcp_memory;
 pub mod memory;
 pub mod message;
 pub mod paths;
+pub mod plugin;
 pub mod provider;
 pub mod reload;
 pub mod reminder;

@@ -8,6 +8,13 @@ drafts and may change between releases.
 
 ## [Unreleased]
 
+### Changed
+
+- Context layer: `agentcontext.json` resources that omit `priority` now
+  inherit the base-layer value (new resources default to 100) instead of
+  silently deserializing to 0. Configs relying on the implicit 0
+  (never-skip reserved value) must declare `priority: 0` explicitly.
+
 ## [0.1.1] - 2026-07-30
 
 - Add repository guardrails for protected release branches.

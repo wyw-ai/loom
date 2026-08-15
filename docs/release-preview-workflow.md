@@ -23,6 +23,23 @@ The workflow ignores pushes to `main` that did not come from a merged
 interrupted rollover. A concurrency group prevents two merges or recovery runs
 from creating the same candidate.
 
+## Documentation and CHANGELOG policy for version improvements
+
+Founder ruling (2026-08-15): `docs/context-layer/` and `CHANGELOG.md` stay
+tracked in git, and every future major version improvement (for example,
+merging a `preview-X.Y.Z` candidate into `main`) follows the rules below.
+
+- Behavioral or on-disk format changes must be recorded under `[Unreleased]`
+  in `CHANGELOG.md` (Keep a Changelog categories) in the same change set,
+  before the improvement ships.
+- Documentation under `docs/` that describes the changed behavior is updated
+  in the same change set and stays git-tracked; new `docs/` subtrees require
+  an explicit `.gitignore` whitelist entry so the docs and the code they
+  describe cannot drift apart.
+- When a `preview-X.Y.Z` candidate merges into `main`, the merge owner checks
+  that accumulated `[Unreleased]` entries cover the candidate's behavioral
+  changes before the rollover creates the next candidate.
+
 ## One-time bot setup
 
 The `wyw-ai` organization does not allow the built-in `GITHUB_TOKEN` to create

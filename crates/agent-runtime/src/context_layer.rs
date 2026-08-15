@@ -187,7 +187,7 @@ impl Default for ContextResourceRegistry {
 ///
 /// Plugin crates (e.g. `loom-plugin-context-tier`) self-register at compile time;
 /// this function traverses those registrations at runtime.
-pub fn discover_plugins() -> HashMap<String, fn() -> Box<dyn ContextResource>> {
+pub fn discover_plugins() -> HashMap<String, fn(&Option<serde_json::Value>) -> Box<dyn ContextResource>> {
     let mut map = HashMap::new();
     for plugin in inventory::iter::<ContextResourcePlugin> {
         map.insert(plugin.scheme.to_string(), plugin.factory);

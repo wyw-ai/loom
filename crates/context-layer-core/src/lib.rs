@@ -216,7 +216,11 @@ pub struct ContextResourcePlugin {
     /// URI scheme this plugin handles (e.g. "warm-summary", "message-list").
     pub scheme: &'static str,
     /// Factory function that creates a new instance of the resource.
-    pub factory: fn() -> Box<dyn ContextResource>,
+    /// Receives the resource's merged config envelope (agentcontext.json
+    /// `resources[].config` plus runtime injections such as the actor
+    /// memory spec). Plugins that need no config ignore it (B4 flattening:
+    /// the parameter used to be dropped by the wrapper layer).
+    pub factory: fn(&Option<serde_json::Value>) -> Box<dyn ContextResource>,
 }
 
 // Enable inventory collection of ContextResourcePlugin entries.

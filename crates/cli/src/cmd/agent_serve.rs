@@ -8760,21 +8760,33 @@ type ResourceFactory = Box<dyn Fn(&Option<Value>) -> Box<dyn ContextResource>>;
 /// Build the builtin resource factory map. Each entry maps a scheme name
 /// to a factory closure that produces a ContextResource.
 ///
-/// Built-in providers (memory, file) are registered directly here.
+/// Built-in providers (memory, file) are registered directly here; both
+/// read their config from the single config channel (B4 flattening).
 /// Plugin providers (warm-summary, message-list, etc.) are discovered via
 /// `inventory::submit!` self-registration — loom does not know their
 /// concrete types (Founder principle: plugin decoupling).
-fn builtin_resource_factories(
-    memory_spec: Option<&proto::methods::MemorySpec>,
-) -> std::collections::HashMap<String, ResourceFactory> {
+fn builtin_resource_factories() -> std::collections::HashMap<String, ResourceFactory> {
     let mut factories: std::collections::HashMap<String, ResourceFactory> =
         std::collections::HashMap::new();
 
-    // memory — captures the actor's MemorySpec; selection runs inside
+    // memory — reads its MemorySpec from the config envelope (key
+    // "memory"), injected from the actor spec at chain-build time or
+    // supplied by agentcontext.json. Selection runs inside
     // MemoryResource::assemble (skip-not-truncate, warn-on-error).
-    let mem_spec = memory_spec.cloned();
-    factories.insert("memory".into(), Box::new(move |_config| {
-        Box::new(MemoryResource::new(mem_spec.clone())) as Box<dyn ContextResource>
+    factories.insert("memory".into(), Box::new(|config| {
+        let spec = config.as_ref().and_then(|c| c.get("memory")).and_then(|v| {
+            match serde_json::from_value::<proto::methods::MemorySpec>(v.clone()) {
+                Ok(spec) => Some(spec),
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        "invalid memory config envelope; falling back to defaults"
+                    );
+                    None
+                }
+            }
+        });
+        Box::new(MemoryResource::new(spec)) as Box<dyn ContextResource>
     }));
 
     // file — reads path + max_files from config.
@@ -8798,9 +8810,11 @@ fn builtin_resource_factories(
     // ── External plugins (via inventory self-registration) ─────────────
     // Plugins like warm-summary and message-list register themselves at
     // compile time via `inventory::submit!`. Loom discovers them here
-    // without knowing their concrete types.
+    // without knowing their concrete types. Since B4 the plugin factory
+    // signature matches ResourceFactory exactly — the config envelope
+    // flows straight through to the plugin.
     for (scheme, factory_fn) in discover_plugins() {
-        factories.insert(scheme, Box::new(move |_config| factory_fn()));
+        factories.insert(scheme, Box::new(factory_fn));
     }
 
     factories
@@ -8813,7 +8827,7 @@ fn builtin_resource_factories(
 /// classify entries by cross-referencing `discover_plugins()` and the
 /// embedded plugin manifests.
 pub(crate) fn builtin_factory_table_overview() -> Vec<(String, i32)> {
-    builtin_resource_factories(None)
+    builtin_resource_factories()
         .into_iter()
         .map(|(scheme, factory)| {
             let resource = factory(&None);
@@ -8829,11 +8843,13 @@ fn build_context_resource_chain(
     memory_spec: Option<&proto::methods::MemorySpec>,
 ) -> ContextResourceRegistry {
     let mut registry = ContextResourceRegistry::new();
-    let factories = builtin_resource_factories(memory_spec);
+    let factories = builtin_resource_factories();
 
     for resource_spec in &spec.resources {
         if let Some(factory) = factories.get(resource_spec.scheme.as_str()) {
-            let resource = factory(&resource_spec.config);
+            let config =
+                inject_memory_envelope(&resource_spec.scheme, resource_spec.config.as_ref(), memory_spec);
+            let resource = factory(&config);
             // An explicit agentcontext priority overrides the resource's
             // inherent priority (iter1 per-field merge promise; AC-M1-2).
             // Default spec entries declare priorities matching the
@@ -8856,6 +8872,82 @@ fn build_context_resource_chain(
     }
 
     registry
+}
+
+/// B4 config flattening + D-D3 conflict visibility for the memory scheme.
+///
+/// The actor's MemorySpec reaches the memory factory through the same
+/// config channel as user agentcontext.json config (envelope key
+/// "memory"), per-field merged with actor-spec values winning (iter1 R2
+/// merge semantics). A field supplied by both sources with different
+/// values is logged at error level — silent override is a debugging
+/// black hole — and the actor-spec value still applies (the resource is
+/// NOT skipped: 5.3 merge semantics stay intact, 5.5 only adds
+/// visibility). Same-value merges are idempotent and silent.
+fn inject_memory_envelope(
+    scheme: &str,
+    user_config: Option<&serde_json::Value>,
+    memory_spec: Option<&proto::methods::MemorySpec>,
+) -> Option<serde_json::Value> {
+    let Some(spec) = memory_spec else {
+        return user_config.cloned();
+    };
+    if scheme != "memory" {
+        return user_config.cloned();
+    }
+    let injected = serde_json::to_value(spec).expect("MemorySpec is serializable");
+    match user_config {
+        None => Some(serde_json::json!({ "memory": injected })),
+        Some(cfg) => {
+            let mut merged = cfg.clone();
+            match merged.get_mut("memory") {
+                Some(user_mem) if user_mem.is_object() && injected.is_object() => {
+                    merge_per_field(user_mem, &injected, "memory");
+                }
+                _ => {
+                    if merged.get("memory").is_some() {
+                        tracing::error!(
+                            field = "memory",
+                            "agentcontext.json config.memory is not an object; actor spec value applies"
+                        );
+                    }
+                    merged["memory"] = injected;
+                }
+            }
+            Some(merged)
+        }
+    }
+}
+
+/// Per-field object merge: `source` (actor spec) values win; differing
+/// values are logged at error level, equal values merge silently.
+fn merge_per_field(target: &mut serde_json::Value, source: &serde_json::Value, path: &str) {
+    let (Some(tobj), Some(sobj)) = (target.as_object_mut(), source.as_object()) else {
+        return;
+    };
+    for (key, sval) in sobj {
+        match tobj.get(key).cloned() {
+            Some(tval) => {
+                if tval.is_object() && sval.is_object() {
+                    let mut nested = tval;
+                    merge_per_field(&mut nested, sval, &format!("{path}.{key}"));
+                    tobj.insert(key.clone(), nested);
+                } else if tval != *sval {
+                    tracing::error!(
+                        field = %format!("{path}.{key}"),
+                        user_value = %tval,
+                        actor_spec_value = %sval,
+                        "config field supplied by both agentcontext.json and actor spec with different values; actor spec value applies"
+                    );
+                    tobj.insert(key.clone(), sval.clone());
+                }
+                // equal values: idempotent, silent
+            }
+            None => {
+                tobj.insert(key.clone(), sval.clone());
+            }
+        }
+    }
 }
 
 /// Adapter that applies an agentcontext-declared priority on top of a
@@ -16306,16 +16398,94 @@ mod tests {
     // (e) builtin_resource_factories factory lookup verification
     #[test]
     fn builtin_resource_factories_registers_all_schemes() {
-        let factories = builtin_resource_factories(None);
+        let factories = builtin_resource_factories();
         assert!(factories.contains_key("memory"), "memory factory must be registered");
         assert!(factories.contains_key("message-list"), "message-list factory must be registered");
         assert!(factories.contains_key("file"), "file factory must be registered");
         assert!(factories.contains_key("warm-summary"), "warm-summary factory must be registered");
     }
 
+    // (f) B4 config flattening — memory factory reads the config envelope
+    #[test]
+    fn memory_factory_reads_config_envelope() {
+        let factories = builtin_resource_factories();
+        let memory = factories.get("memory").expect("memory factory");
+
+        // No envelope → default spec (None inside MemoryResource).
+        let default = memory(&None);
+        assert_eq!(default.scheme(), "memory");
+
+        // Envelope with a memory key round-trips into the resource
+        // without error (selection behavior is covered by plugin-memory
+        // tests; here we prove the config channel is live).
+        let configured = memory(&Some(serde_json::json!({
+            "memory": { "query": { "turnTopK": 3 } }
+        })));
+        assert_eq!(configured.scheme(), "memory");
+        assert_eq!(configured.priority(), 5);
+
+        // Malformed envelope must not panic: warn + defaults.
+        let malformed = memory(&Some(serde_json::json!({
+            "memory": { "query": { "turnTopK": "not-a-number" } }
+        })));
+        assert_eq!(malformed.scheme(), "memory");
+    }
+
+    // (g) B4 D-D3 — envelope injection and conflict merge semantics
+    #[test]
+    fn inject_memory_envelope_merges_per_field_with_actor_spec_winning() {
+        let spec: proto::methods::MemorySpec =
+            serde_json::from_value(serde_json::json!({ "query": { "turnTopK": 2 } }))
+                .expect("serde defaults make partial specs valid");
+
+        // No user config → envelope injected whole.
+        let injected = inject_memory_envelope("memory", None, Some(&spec));
+        assert_eq!(
+            injected,
+            Some(serde_json::json!({ "memory": serde_json::to_value(&spec).unwrap() }))
+        );
+
+        // Non-memory schemes pass through untouched.
+        let passthrough = inject_memory_envelope(
+            "warm-summary",
+            Some(&serde_json::json!({ "maxFiles": 2 })),
+            Some(&spec),
+        );
+        assert_eq!(passthrough, Some(serde_json::json!({ "maxFiles": 2 })));
+
+        // No actor spec → user config passes through untouched.
+        let no_spec = inject_memory_envelope(
+            "memory",
+            Some(&serde_json::json!({ "memory": { "query": { "turnTopK": 9 } } })),
+            None,
+        );
+        assert_eq!(
+            no_spec,
+            Some(serde_json::json!({ "memory": { "query": { "turnTopK": 9 } } }))
+        );
+
+        // Conflict: actor spec value wins; user-only sibling keys survive.
+        let user = serde_json::json!({
+            "memory": { "query": { "turnTopK": 9, "strategy": "recent" } },
+            "other": true
+        });
+        let merged = inject_memory_envelope("memory", Some(&user), Some(&spec)).unwrap();
+        assert_eq!(merged["memory"]["query"]["turnTopK"], 2, "actor spec wins conflicts");
+        assert_eq!(
+            merged["memory"]["query"]["strategy"], "recent",
+            "user-only keys survive the merge"
+        );
+        assert_eq!(merged["other"], true, "non-memory keys untouched");
+
+        // Same value: idempotent merge, no drift.
+        let same = serde_json::json!({ "memory": { "query": { "turnTopK": 2 } } });
+        let idem = inject_memory_envelope("memory", Some(&same), Some(&spec)).unwrap();
+        assert_eq!(idem["memory"]["query"]["turnTopK"], 2);
+    }
+
     #[test]
     fn builtin_resource_factories_produces_correct_schemes() {
-        let factories = builtin_resource_factories(None);
+        let factories = builtin_resource_factories();
         // memory factory
         let mem = factories.get("memory").unwrap()(&None);
         assert_eq!(mem.scheme(), "memory");

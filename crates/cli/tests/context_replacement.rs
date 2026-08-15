@@ -28,8 +28,9 @@ use proto::types::{ScopeKind, ScopeRef};
 // ---------------------------------------------------------------------------
 
 struct EchoInputResource {
-    /// The replacement's own embedded config. Inventory factories are
-    /// zero-arg, so a third-party resource carries its business config
+    /// The replacement's own embedded config. Since B4 the inventory
+    /// factory receives the resource's config envelope, but a
+    /// third-party resource may still carry static business config
     /// itself (ARCH iter2 §2: "第三方替身有自己的 agentcontext config").
     label: &'static str,
 }
@@ -71,7 +72,7 @@ impl ContextResource for EchoInputResource {
 inventory::submit! {
     context_layer_core::ContextResourcePlugin {
         scheme: "echo-input",
-        factory: || Box::new(EchoInputResource::new()),
+        factory: |_config| Box::new(EchoInputResource::new()),
     }
 }
 
@@ -139,7 +140,10 @@ fn third_party_replacement_joins_chain_and_reads_ambient_data() {
     registry.register(Box::new(plugin_memory::MemoryResource::new(Some(
         fixture_memory_spec(root.path()),
     ))));
-    registry.register(factory());
+    // B4: the factory now receives the config envelope. Passing a
+    // non-empty envelope proves the channel is live end-to-end; the
+    // echo resource ignores it, so output is unchanged.
+    registry.register(factory(&Some(serde_json::json!({ "label": "ignored-by-echo" }))));
 
     let (sections, _) = registry.assemble_chain(&ctx, 100_000);
 
@@ -183,9 +187,9 @@ fn third_party_replacement_honors_budget_waterfall() {
     let scope = ScopeRef { kind: ScopeKind::Thread, id: "t".into() };
 
     let mut full = ContextResourceRegistry::new();
-    full.register(factory());
+    full.register(factory(&None));
     let mut tiny = ContextResourceRegistry::new();
-    tiny.register(factory());
+    tiny.register(factory(&None));
 
     let full_ctx = test_ctx(&scope, root.path());
     let mut tiny_ctx = test_ctx(&scope, root.path());

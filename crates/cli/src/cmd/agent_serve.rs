@@ -1618,8 +1618,8 @@ fn merge_embedded_global_resources(spec: &mut AgentContextSpec) {
         if !already_present {
             spec.resources.push(proto::methods::ContextResourceSpec {
                 scheme: resource.scheme.to_string(),
-                mount: resource.scheme.to_string(),
-                priority: resource.priority.unwrap_or(100),
+                mount: Some(resource.scheme.to_string()),
+                priority: Some(resource.priority.unwrap_or(100)),
                 config: None,
             });
         }
@@ -8668,16 +8668,42 @@ fn load_agentcontext_file(path: &Path) -> Option<AgentContextSpec> {
     }
 }
 
-/// Merge two AgentContextSpecs: later entries override earlier ones for
-/// the same scheme. Resources from `base` that don't appear in `overlay`
-/// are preserved.
+/// Merge two AgentContextSpecs with per-field resource merging.
+///
+/// Resources are matched by `scheme`. For a matching pair, each optional
+/// field (`mount`/`priority`/`config`) is taken from the overlay when
+/// present (`Some` overrides) and inherited from the base when omitted
+/// (`None`). Resources whose scheme only exists in the overlay are
+/// appended with the unified defaults `mount = scheme`, `priority = 100` —
+/// the same defaults `merge_embedded_global_resources` applies to embedded
+/// plugin declarations.
+///
+/// Note (context-layer iter 1, R2): an omitted `priority` no longer
+/// deserializes as `0` (the never-skip reserved value). It inherits the
+/// base layer's value, or defaults to `100` for new resources. Explicit
+/// `Some(0)` keeps the reserved semantics.
 fn merge_agentcontext(base: AgentContextSpec, overlay: AgentContextSpec) -> AgentContextSpec {
     let mut resources = base.resources;
     for new_res in overlay.resources {
         if let Some(pos) = resources.iter().position(|r| r.scheme == new_res.scheme) {
-            resources[pos] = new_res;
+            let existing = &mut resources[pos];
+            if new_res.mount.is_some() {
+                existing.mount = new_res.mount;
+            }
+            if new_res.priority.is_some() {
+                existing.priority = new_res.priority;
+            }
+            if new_res.config.is_some() {
+                existing.config = new_res.config;
+            }
         } else {
-            resources.push(new_res);
+            let scheme = new_res.scheme.clone();
+            resources.push(proto::methods::ContextResourceSpec {
+                scheme: new_res.scheme,
+                mount: new_res.mount.or_else(|| Some(scheme.clone())),
+                priority: new_res.priority.or(Some(100)),
+                config: new_res.config,
+            });
         }
     }
     AgentContextSpec {
@@ -16264,8 +16290,8 @@ mod tests {
             effective_scope: vec![],
             resources: vec![proto::methods::ContextResourceSpec {
                 scheme: "nonexistent-scheme".into(),
-                mount: "test".into(),
-                priority: 10,
+                mount: Some("test".into()),
+                priority: Some(10),
                 config: None,
             }],
         };
@@ -16351,8 +16377,8 @@ mod tests {
             effective_scope: vec![],
             resources: vec![proto::methods::ContextResourceSpec {
                 scheme: "memory".into(),
-                mount: "agent-memory".into(),
-                priority: 5,
+                mount: Some("agent-memory".into()),
+                priority: Some(5),
                 config: None,
             }],
         };
@@ -16372,6 +16398,224 @@ mod tests {
         merge_embedded_global_resources(&mut spec);
         // No duplicates should be added for schemes already in the default spec
         assert_eq!(spec.resources.len(), count_before);
+    }
+
+    // ── R2: per-field agentcontext merge ─────────────────────────
+
+    fn ctx_from_json(text: &str) -> AgentContextSpec {
+        serde_json::from_str(text).expect("parse AgentContextSpec json")
+    }
+
+    fn ctx_to_value(spec: &AgentContextSpec) -> serde_json::Value {
+        serde_json::to_value(spec).expect("serialize AgentContextSpec")
+    }
+
+    #[test]
+    fn merge_agentcontext_per_field_some_overrides_none_inherits() {
+        // AC-R2-1: for a matching scheme, each optional field is taken from
+        // the overlay when present and inherited from the base when omitted.
+        let base = ctx_from_json(
+            r#"{"resources":[
+                {"scheme":"memory","mount":"agent-memory","priority":5,
+                 "config":{"depth":3}}]}"#,
+        );
+        let overlay = ctx_from_json(r#"{"resources":[{"scheme":"memory","priority":3}]}"#);
+        let merged = merge_agentcontext(base, overlay);
+        assert_eq!(merged.resources.len(), 1);
+        let res = &merged.resources[0];
+        assert_eq!(res.mount.as_deref(), Some("agent-memory"), "omitted mount inherits base");
+        assert_eq!(res.priority, Some(3), "present priority overrides base");
+        assert_eq!(
+            res.config.as_ref().unwrap().get("depth").and_then(|v| v.as_i64()),
+            Some(3),
+            "omitted config inherits base"
+        );
+    }
+
+    #[test]
+    fn merge_agentcontext_new_resource_gets_unified_defaults() {
+        // AC-R2-1: a scheme new to the overlay gets mount=scheme and
+        // priority=100 — the same defaults merge_embedded_global_resources
+        // applies to embedded plugin declarations.
+        let base = ctx_from_json(r#"{"resources":[{"scheme":"memory","priority":5}]}"#);
+        let overlay =
+            ctx_from_json(r#"{"resources":[{"scheme":"file","config":{"path":"docs"}}]}"#);
+        let merged = merge_agentcontext(base, overlay);
+        assert_eq!(merged.resources.len(), 2);
+        let file = merged.resources.iter().find(|r| r.scheme == "file").unwrap();
+        assert_eq!(file.mount.as_deref(), Some("file"), "default mount equals scheme");
+        assert_eq!(file.priority, Some(100), "default priority is 100");
+        assert!(file.config.is_some(), "explicit config passes through");
+    }
+
+    #[test]
+    fn merge_agentcontext_omitted_priority_no_longer_defaults_to_zero() {
+        // ARCH design §3.3 — the one intentional behavior change of R2:
+        // an omitted priority used to deserialize as 0 (the never-skip
+        // reserved value), silently exempting the resource from the budget
+        // waterfall. It now inherits the base value…
+        let base =
+            ctx_from_json(r#"{"resources":[{"scheme":"memory","mount":"m","priority":5}]}"#);
+        let overlay = ctx_from_json(r#"{"resources":[{"scheme":"memory"}]}"#);
+        let merged = merge_agentcontext(base, overlay);
+        assert_eq!(merged.resources[0].priority, Some(5), "omitted priority inherits base (was 0 before R2)");
+
+        // …and a resource with no base layer defaults to 100, not 0.
+        let base = ctx_from_json(r#"{"resources":[]}"#);
+        let overlay = ctx_from_json(r#"{"resources":[{"scheme":"file"}]}"#);
+        let merged = merge_agentcontext(base, overlay);
+        assert_eq!(merged.resources[0].priority, Some(100), "new resource defaults to 100 (was 0 before R2)");
+        assert_eq!(merged.resources[0].mount.as_deref(), Some("file"));
+    }
+
+    #[test]
+    fn merge_agentcontext_golden_three_tier() {
+        // AC-R2-2: golden equivalence for the three-tier merge chain.
+        // Covers: full-declaration degenerate case (per-field merge ≡ old
+        // whole-resource override when every field is present), mount-only /
+        // priority-only / config-only overlays, new-resource defaults, the
+        // omitted-priority semantic change, and explicit priority 0.
+        let spec_level = ctx_from_json(
+            r#"{"version":1,"resources":[
+                {"scheme":"memory","mount":"agent-memory","priority":5},
+                {"scheme":"warm-summary","mount":"warm","priority":7,
+                 "config":{"share":0.2}},
+                {"scheme":"message-list","mount":"delivery","priority":10}]}"#,
+        );
+        let profile = ctx_from_json(
+            r#"{"version":1,"effective_scope":["thread"],"resources":[
+                {"scheme":"memory","priority":3},
+                {"scheme":"warm-summary","mount":"warm-profile"},
+                {"scheme":"file","config":{"path":"${workspace.dir}/docs"}}]}"#,
+        );
+        let workspace = ctx_from_json(
+            r#"{"version":2,"resources":[
+                {"scheme":"memory","mount":"agent-memory-ws","priority":2,
+                 "config":{"depth":3}},
+                {"scheme":"message-list","priority":0},
+                {"scheme":"file","priority":15}]}"#,
+        );
+
+        let merged = merge_agentcontext(merge_agentcontext(spec_level, profile), workspace);
+
+        // Expected values under the new semantics:
+        // - memory: full workspace declaration replaces every field
+        //   (degenerate case ≡ old whole-override semantics).
+        // - warm-summary: profile overrides mount only; priority 7 and
+        //   config inherit from spec level (omitted priority used to be 0).
+        // - message-list: workspace sets explicit priority 0 (reserved
+        //   never-skip value preserved); mount inherits.
+        // - file: new at profile level with defaults mount="file"/priority
+        //   100; workspace then overrides priority to 15, config inherits.
+        let golden = ctx_from_json(
+            r#"{"version":2,"effective_scope":["thread"],"resources":[
+                {"scheme":"memory","mount":"agent-memory-ws","priority":2,
+                 "config":{"depth":3}},
+                {"scheme":"warm-summary","mount":"warm-profile","priority":7,
+                 "config":{"share":0.2}},
+                {"scheme":"message-list","mount":"delivery","priority":0},
+                {"scheme":"file","mount":"file","priority":15,
+                 "config":{"path":"${workspace.dir}/docs"}}]}"#,
+        );
+        assert_eq!(ctx_to_value(&merged), ctx_to_value(&golden));
+    }
+
+    #[test]
+    fn merge_agentcontext_golden_full_declaration_equivalent_to_whole_override() {
+        // AC-R2-2 degenerate case in isolation: when the overlay declares
+        // every field, per-field merge output is identical to the old
+        // whole-resource replacement.
+        let base = ctx_from_json(
+            r#"{"resources":[
+                {"scheme":"memory","mount":"agent-memory","priority":5,
+                 "config":{"depth":3}}]}"#,
+        );
+        let overlay = ctx_from_json(
+            r#"{"resources":[
+                {"scheme":"memory","mount":"m2","priority":2,
+                 "config":{"depth":9}}]}"#,
+        );
+        let merged = merge_agentcontext(base, overlay);
+        let expected = ctx_from_json(
+            r#"{"resources":[
+                {"scheme":"memory","mount":"m2","priority":2,
+                 "config":{"depth":9}}]}"#,
+        );
+        assert_eq!(ctx_to_value(&merged), ctx_to_value(&expected));
+    }
+
+    #[test]
+    fn merge_agentcontext_preserves_three_tier_order_and_unknown_scheme() {
+        // AC-R2-3: workspace wins over profile wins over spec; unknown
+        // schemes pass through the merge untouched (skipping happens at
+        // chain-build time, see build_context_resource_chain_skips_unknown_scheme).
+        let spec = ctx_from_json(r#"{"resources":[{"scheme":"memory","priority":5}]}"#);
+        let profile = ctx_from_json(r#"{"resources":[{"scheme":"memory","priority":3}]}"#);
+        let workspace = ctx_from_json(r#"{"resources":[{"scheme":"memory","priority":1}]}"#);
+        let merged = merge_agentcontext(merge_agentcontext(spec, profile), workspace);
+        assert_eq!(merged.resources[0].priority, Some(1), "workspace overlay wins");
+
+        let base = ctx_from_json(r#"{"resources":[]}"#);
+        let overlay =
+            ctx_from_json(r#"{"resources":[{"scheme":"totally-unknown","priority":42}]}"#);
+        let merged = merge_agentcontext(base, overlay);
+        assert_eq!(merged.resources.len(), 1);
+        assert_eq!(merged.resources[0].scheme, "totally-unknown");
+        assert_eq!(merged.resources[0].priority, Some(42));
+    }
+
+    #[test]
+    fn merge_agentcontext_explicit_priority_zero_is_reserved_and_preserved() {
+        // AC-R2-3: priority 0 is the never-skip reserved value; an explicit
+        // 0 in an overlay is a present value (Some(0)) that overrides the
+        // base — distinct from an omitted priority.
+        let base =
+            ctx_from_json(r#"{"resources":[{"scheme":"memory","mount":"m","priority":5}]}"#);
+        let overlay = ctx_from_json(r#"{"resources":[{"scheme":"memory","priority":0}]}"#);
+        let merged = merge_agentcontext(base, overlay);
+        assert_eq!(merged.resources[0].priority, Some(0));
+    }
+
+    #[test]
+    fn merge_embedded_global_resources_combines_with_per_field_overlay() {
+        // AC-R2-4: embedded declarations inject materialized defaults
+        // before the three-tier merge; later overlays can still override
+        // per-field, and omitted fields inherit the embedded values.
+        let mut spec =
+            ctx_from_json(r#"{"resources":[{"scheme":"memory","mount":"agent-memory","priority":5}]}"#);
+        merge_embedded_global_resources(&mut spec);
+
+        // The context-tier plugin declares warm-summary globally with
+        // priority 7; the injected entry carries materialized defaults.
+        let ws = spec
+            .resources
+            .iter()
+            .find(|r| r.scheme == "warm-summary")
+            .expect("embedded warm-summary injected");
+        assert_eq!(ws.priority, Some(7));
+        assert_eq!(ws.mount.as_deref(), Some("warm-summary"));
+
+        // A profile-level overlay omitting priority inherits the embedded
+        // value while overriding mount.
+        let profile = ctx_from_json(r#"{"resources":[{"scheme":"warm-summary","mount":"warm"}]}"#);
+        let merged = merge_agentcontext(spec, profile);
+        let ws = merged
+            .resources
+            .iter()
+            .find(|r| r.scheme == "warm-summary")
+            .unwrap();
+        assert_eq!(ws.mount.as_deref(), Some("warm"));
+        assert_eq!(ws.priority, Some(7), "omitted priority inherits embedded value");
+
+        // A workspace-level overlay can still override it explicitly.
+        let workspace = ctx_from_json(r#"{"resources":[{"scheme":"warm-summary","priority":9}]}"#);
+        let merged = merge_agentcontext(merged, workspace);
+        let ws = merged
+            .resources
+            .iter()
+            .find(|r| r.scheme == "warm-summary")
+            .unwrap();
+        assert_eq!(ws.priority, Some(9));
     }
 
     #[test]

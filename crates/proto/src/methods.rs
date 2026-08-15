@@ -3371,13 +3371,32 @@ fn default_context_version() -> u32 {
 }
 
 /// A single resource declaration in agentcontext.yml.
+///
+/// Merge semantics (three-tier agentcontext merge, see `merge_agentcontext`
+/// in the cli crate): resources are matched by `scheme`; each optional field
+/// is taken from the overlay when present (`Some`) and inherited from the
+/// base layer when omitted (`None`). A resource with no base layer gets the
+/// unified defaults `mount = scheme`, `priority = 100` — the same defaults
+/// applied to embedded plugin declarations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextResourceSpec {
+    /// Identity of the declaration; required and never inherited.
     pub scheme: String,
-    pub mount: String,
-    #[serde(default)]
-    pub priority: i32,
+    /// Mount label (informational). `None` = inherit from the base layer;
+    /// defaults to the scheme itself when no base layer declares it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mount: Option<String>,
+    /// Assembly order (smaller = earlier; `0` = never skipped).
+    ///
+    /// Behavior change (context-layer iter 1, R2): an omitted `priority`
+    /// used to deserialize as `0` — the never-skip reserved value — which
+    /// silently exempted the resource from the budget waterfall. It now
+    /// inherits the base layer's value, or defaults to `100` for resources
+    /// with no base layer. An explicit `"priority": 0` keeps the reserved
+    /// never-skip semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<serde_json::Value>,
 }
@@ -3407,20 +3426,20 @@ pub fn default_agent_context_spec() -> AgentContextSpec {
         resources: vec![
             ContextResourceSpec {
                 scheme: "memory".into(),
-                mount: "agent-memory".into(),
-                priority: 5,
+                mount: Some("agent-memory".into()),
+                priority: Some(5),
                 config: None,
             },
             ContextResourceSpec {
                 scheme: "warm-summary".into(),
-                mount: "warm".into(),
-                priority: 7,
+                mount: Some("warm".into()),
+                priority: Some(7),
                 config: None,
             },
             ContextResourceSpec {
                 scheme: "message-list".into(),
-                mount: "delivery".into(),
-                priority: 10,
+                mount: Some("delivery".into()),
+                priority: Some(10),
                 config: None,
             },
         ],

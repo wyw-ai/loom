@@ -6,7 +6,7 @@
 //!
 //! 1. A third-party crate registers a non-memory scheme resource via
 //!    `inventory::submit!` — the same zero-privilege path any external
-//!    plugin uses (`loom-plugin-context-tier` registers warm-summary and
+//!    plugin uses (`plugin-context-tier` registers warm-summary and
 //!    message-list this way).
 //! 2. The replacement resource reads the ambient per-turn data through
 //!    the *same* channels the official memory plugin uses:

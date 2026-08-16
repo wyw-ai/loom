@@ -1,0 +1,24 @@
+[package]
+name = "plugin-context-tier"
+version = "1.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Context Tier plugin — Hot/Warm/Cold temperature model for Loom"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+context-layer-core = { workspace = true }
+proto = { workspace = true }
+loom-platform = { workspace = true }
+anyhow = { workspace = true }
+inventory = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+context-layer-core = { workspace = true, features = ["test-helpers"] }
+
+[lints]
+workspace = true

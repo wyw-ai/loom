@@ -5,7 +5,7 @@
 //! providers (memory, filesystem), and plugin discovery.
 //!
 //! Plugin providers (warm-summary, message-list) live in the
-//! `loom-plugin-context-tier` crate and self-register via
+//! `plugin-context-tier` crate and self-register via
 //! `inventory::submit!`. Loom discovers them at runtime via
 //! [`discover_plugins`] without knowing their concrete types.
 //!
@@ -20,11 +20,11 @@
 pub mod builder;
 pub mod filesystem;
 
-// Force-link the loom-plugin-context-tier crate so its `inventory::submit!`
+// Force-link the plugin-context-tier crate so its `inventory::submit!`
 // registrations are not stripped by the linker. Without this, the
 // plugin registrations would be dead-code eliminated because
-// agent-runtime never references loom-plugin-context-tier's types directly.
-extern crate loom_plugin_context_tier;
+// agent-runtime never references plugin-context-tier's types directly.
+extern crate plugin_context_tier;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -197,7 +197,7 @@ impl Default for ContextResourceRegistry {
 /// Returns a map of scheme → factory function. Loom uses this to populate
 /// the resource factory map without knowing any plugin's concrete types.
 ///
-/// Plugin crates (e.g. `loom-plugin-context-tier`) self-register at compile time;
+/// Plugin crates (e.g. `plugin-context-tier`) self-register at compile time;
 /// this function traverses those registrations at runtime.
 pub fn discover_plugins() -> HashMap<String, fn(&Option<serde_json::Value>) -> Box<dyn ContextResource>> {
     let mut map = HashMap::new();
@@ -334,7 +334,7 @@ mod tests {
     #[test]
     fn discover_plugins_finds_registered_plugins() {
         let plugins = discover_plugins();
-        // loom-plugin-context-tier crate registers warm-summary and message-list.
+        // plugin-context-tier crate registers warm-summary and message-list.
         assert!(
             plugins.contains_key("warm-summary"),
             "warm-summary plugin should be discovered via inventory"

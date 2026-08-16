@@ -4444,7 +4444,7 @@ async fn notification_loop(
             // Clean up persisted Warm summaries for the deleted channel and
             // all its known thread scopes (cleanup on channel deletion).
             for scope_id in state.scope_ids_for_channel(channel_id) {
-                loom_plugin_context_tier::WarmSummaryContextResource::clear(&state.profile_dir, &scope_id);
+                plugin_context_tier::WarmSummaryContextResource::clear(&state.profile_dir, &scope_id);
             }
             if !scopes.is_empty() {
                 tracing::info!(
@@ -8551,7 +8551,7 @@ fn normalize_timezone_value(value: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 // Context Layer MVP — Warm summary persistence + injection
 //
-// Migrated to loom_plugin_context_tier::WarmSummaryContextResource (loom-plugin-context-tier crate,
+// Migrated to plugin_context_tier::WarmSummaryContextResource (plugin-context-tier crate,
 // self-registered via inventory). The session-reset trigger logic below
 // remains in agent_serve.rs because it is a turn-level decision, not a
 // ContextResource (ARCH D3).
@@ -9931,7 +9931,7 @@ async fn translate_one_with_gate(
 
                 if success && !summary_text.trim().is_empty() {
                     // Persist the provider-generated summary (C-1, C-2, C-5).
-                    if let Err(err) = loom_plugin_context_tier::WarmSummaryContextResource::persist(
+                    if let Err(err) = plugin_context_tier::WarmSummaryContextResource::persist(
                         &state.profile_dir,
                         &scope_id,
                         &summary_text,
@@ -16756,14 +16756,14 @@ mod tests {
         // resources carrying plugin identity.
         let tier = EMBEDDED_PLUGIN_MANIFESTS
             .iter()
-            .find(|m| m.id == "loom-plugin-context-tier")
+            .find(|m| m.id == "plugin-context-tier")
             .expect("context-tier plugin in embedded manifest table");
         assert_eq!(tier.layer, "context");
         let schemes: Vec<&str> = tier.resources.iter().map(|r| r.scheme).collect();
         assert!(schemes.contains(&"warm-summary"), "schemes: {schemes:?}");
         assert!(schemes.contains(&"message-list"), "schemes: {schemes:?}");
         for resource in tier.resources {
-            assert_eq!(resource.plugin_id, "loom-plugin-context-tier");
+            assert_eq!(resource.plugin_id, "plugin-context-tier");
             assert!(!resource.version.is_empty());
         }
     }

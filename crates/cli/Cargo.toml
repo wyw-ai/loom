@@ -17,7 +17,7 @@ proto = { workspace = true }
 agent-runtime = { workspace = true }
 context-layer-core = { workspace = true }
 plugin-context-memory = { workspace = true }
-loom-plugin-context-tier = { workspace = true }
+plugin-context-tier = { workspace = true }
 loom-platform = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

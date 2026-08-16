@@ -1,0 +1,27 @@
+{
+  "$schema": "loom-plugin/v2",
+  "id": "plugin-context-tier",
+  "name": "Context Tier — Hot/Warm/Cold Temperature Model",
+  "version": "1.1.0",
+  "loom_version": ">=0.1.8",
+  "layer": "context",
+  "skills": [
+    {
+      "id": "context-tier",
+      "path": "skills/context-tier",
+      "scope": "global"
+    }
+  ],
+  "context_resources": [
+    {
+      "scheme": "warm-summary",
+      "priority": 7
+    },
+    {
+      "scheme": "message-list",
+      "priority": 10
+    }
+  ],
+  "config_template": "context-resources/default-agentcontext.json"
+}
+

@@ -17,21 +17,16 @@
       "repo_env": "LOOM_ACTOR_CIRCUIT_REPO",
       "default_repo_url": "https://github.com/wyw-ai/actor-circuit.git",
       "ref_env": "LOOM_ACTOR_CIRCUIT_REF"
-    },
-    {
-      "id": "loom-plugin-context-tier",
-      "dir_env": ["LOOM_CONTEXT_TIER_DIR"],
-      "repo_dir_name": "loom-plugin-context-tier",
-      "repo_anchor_rel": "skills",
-      "repo_env": "LOOM_CONTEXT_TIER_REPO",
-      "default_repo_url": "https://github.com/wyw-ai/loom-plugin-context-tier.git",
-      "ref_env": "LOOM_CONTEXT_TIER_REF"
     }
   ],
   "internal": [
     {
       "id": "plugin-context-memory",
       "path": "crates/plugin-context-memory"
+    },
+    {
+      "id": "plugin-context-tier",
+      "path": "crates/plugin-context-tier"
     }
   ]
 }

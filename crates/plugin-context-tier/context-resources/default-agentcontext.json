@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "effectiveScope": ["thread", "channel"],
+  "resources": [
+    {
+      "scheme": "memory",
+      "mount": "agent-memory",
+      "priority": 5,
+      "config": {}
+    },
+    {
+      "scheme": "warm-summary",
+      "mount": "warm",
+      "priority": 7,
+      "config": {}
+    },
+    {
+      "scheme": "message-list",
+      "mount": "delivery",
+      "priority": 10,
+      "config": {}
+    },
+    {
+      "scheme": "file",
+      "mount": "workspace",
+      "priority": 20,
+      "config": {},
+      "_comment": "optional, not in default chain — include only if workspace file injection is needed"
+    }
+  ]
+}

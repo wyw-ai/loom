@@ -21,9 +21,9 @@ dependencies = [
  "inventory",
  "libc",
  "loom-platform",
- "loom-plugin-context-tier",
  "parking_lot",
  "plugin-context-memory",
+ "plugin-context-tier",
  "proto",
  "serde",
  "serde_json",
@@ -2583,9 +2583,9 @@ dependencies = [
  "hex",
  "inventory",
  "loom-platform",
- "loom-plugin-context-tier",
  "parking_lot",
  "plugin-context-memory",
+ "plugin-context-tier",
  "proto",
  "pulldown-cmark",
  "ratatui",
@@ -2645,18 +2645,6 @@ dependencies = [
  "tokio",
  "widestring",
  "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "loom-plugin-context-tier"
-version = "1.0.0"
-dependencies = [
- "anyhow",
- "context-layer-core",
- "inventory",
- "loom-platform",
- "proto",
- "tracing",
 ]
 
 [[package]]
@@ -3471,6 +3459,19 @@ dependencies = [
  "tempfile",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "plugin-context-tier"
+version = "1.1.0"
+dependencies = [
+ "anyhow",
+ "context-layer-core",
+ "inventory",
+ "loom-platform",
+ "proto",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]

@@ -98,9 +98,8 @@ struct OfficialPluginData {
 ///   (both arrays optional; at least one external source required).
 ///
 /// Pure skill repos (loom-skills, actor-circuit) have no `plugin.json`
-/// and fall back to global-scope skill loading. Full plugin repos
-/// (loom-plugin-context-tier) carry `plugin.json` for multi-dimensional
-/// dispatch. Internal sources (plugin-context-memory) MUST carry `plugin.json`
+/// and fall back to global-scope skill loading. Internal sources
+/// (plugin-context-memory, plugin-context-tier) MUST carry `plugin.json`
 /// — a resource-only manifest with no skills is valid. Adding an
 /// official plugin = editing the JSON + providing the repo; no
 /// build.rs change.

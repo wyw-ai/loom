@@ -16715,6 +16715,28 @@ mod tests {
     }
 
     #[test]
+    fn plugin_json_accepts_skill_layer_skills_only() {
+        // Task #16 E3: skills-only official sources (loom-skills,
+        // actor-circuit) declare layer "skill" with no context_resources.
+        let skill_only = V2_MANIFEST
+            .replace("\"layer\": \"context\"", "\"layer\": \"skill\"")
+            .replace(",\n        \"context_resources\": [\n            {\n                \"scheme\": \"warm-summary\",\n                \"priority\": 7,\n                \"config_schema\": {\n                    \"max_bytes\": { \"type\": \"integer\" },\n                    \"summary_dir\": { \"type\": \"string\" }\n                }\n            }\n        ]", "");
+        let path = write_manifest_fixture(&skill_only);
+        let manifest = plugin_manifest::parse_plugin_json(&path);
+        assert_eq!(manifest.layer, "skill");
+        assert_eq!(manifest.skills.len(), 1);
+        assert!(manifest.resources.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "declares layer `skill` but lists `context_resources`")]
+    fn plugin_json_rejects_skill_layer_with_resources() {
+        let bad = V2_MANIFEST.replace("\"layer\": \"context\"", "\"layer\": \"skill\"");
+        let path = write_manifest_fixture(&bad);
+        plugin_manifest::parse_plugin_json(&path);
+    }
+
+    #[test]
     #[should_panic(expected = "executable protocol `grpc` is not a legal value")]
     fn plugin_json_rejects_bad_executable_protocol() {
         let bad = V2_MANIFEST.replace("jsonrpc-stdio", "grpc");

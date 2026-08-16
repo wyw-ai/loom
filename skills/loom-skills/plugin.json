@@ -1,0 +1,20 @@
+{
+  "$schema": "loom-plugin/v2",
+  "id": "loom-skills",
+  "name": "Loom Official Skills",
+  "version": "0.1.0",
+  "loom_version": ">=0.1.8",
+  "layer": "skill",
+  "skills": [
+    {
+      "id": "loom",
+      "path": "skills/loom",
+      "scope": "global"
+    },
+    {
+      "id": "attachment",
+      "path": "skills/attachment",
+      "scope": "global"
+    }
+  ]
+}

@@ -68,8 +68,14 @@ pub enum PluginScope {
     ActorBundle,
 }
 
-/// The only layer value accepted in S1. S2 may extend the enum.
+/// The only resource-bearing layer accepted in S1. S2 may extend the enum.
 pub const PLUGIN_LAYER_CONTEXT: &str = "context";
+
+/// Skills-only layer (Task #16 E3): the plugin contributes global-scope
+/// skills but no context resources. A `skill`-layer manifest declaring
+/// `context_resources` fails loud — resources belong to the `context`
+/// layer contract.
+pub const PLUGIN_LAYER_SKILL: &str = "skill";
 
 /// The only `executable.protocol` value accepted in S1 (reserved field).
 pub const PLUGIN_EXECUTABLE_PROTOCOL_JSONRPC_STDIO: &str = "jsonrpc-stdio";
@@ -87,10 +93,10 @@ pub fn parse_plugin_json(path: &Path) -> PluginManifest {
     let version = required_str(&json, "version", path).to_owned();
     let loom_version = required_str(&json, "loom_version", path).to_owned();
     let layer = required_str(&json, "layer", path).to_owned();
-    if layer != PLUGIN_LAYER_CONTEXT {
+    if layer != PLUGIN_LAYER_CONTEXT && layer != PLUGIN_LAYER_SKILL {
         panic!(
             "plugin.json `{id}` declares unsupported layer `{layer}` in {} \
-             (S1 accepts only `{PLUGIN_LAYER_CONTEXT}`)",
+             (accepted layers: `{PLUGIN_LAYER_CONTEXT}`, `{PLUGIN_LAYER_SKILL}`)",
             path.display()
         );
     }
@@ -123,6 +129,14 @@ pub fn parse_plugin_json(path: &Path) -> PluginManifest {
 
     let mut resources = Vec::new();
     if let Some(arr) = json.get("context_resources").and_then(|v| v.as_array()) {
+        if layer == PLUGIN_LAYER_SKILL {
+            panic!(
+                "plugin.json `{id}` declares layer `{PLUGIN_LAYER_SKILL}` but lists \
+                 `context_resources` in {} (skill-layer plugins are skills-only; \
+                 resources require layer `{PLUGIN_LAYER_CONTEXT}`)",
+                path.display()
+            );
+        }
         for entry in arr {
             let scheme = entry
                 .get("scheme")

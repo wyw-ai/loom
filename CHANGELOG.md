@@ -20,6 +20,16 @@ drafts and may change between releases.
   reserves the `executable` field for the future process-boundary
   form. v1 manifests remain accepted and are normalized to v2 at
   build time.
+- Workspace crate `plugin-context-tier`: the context-tier plugin
+  migrated from its external repository into the workspace
+  (`crates/plugin-context-tier`, manifest id `plugin-context-tier`,
+  version 1.1.0 kept as an independent semantic version).
+- Skills-only internal plugins: `skills/loom-skills` (loom +
+  attachment skills) and `skills/actor-circuit` (L0/L1/L2
+  collaboration vocabulary, MIT-attributed from the upstream
+  read-only clone) onboarded with v2 manifests at layer `skill`;
+  a skill-layer manifest declaring `context_resources` now fails
+  loud at load time.
 
 ### Changed
 
@@ -72,6 +82,13 @@ drafts and may change between releases.
   previous pre-rendered pipeline. `plugin-memory` depends only on
   `context-layer-core`/`loom-proto` (no `agent-runtime` dependency),
   proving the third-party plugin path is privilege-free.
+
+- Ecosystem integration: `plugin-memory` renamed to
+  `plugin-context-memory` (crate, manifest id and all references);
+  `official-plugins.json` now lists every plugin as internal with the
+  external array retired empty, and `build.rs` guards "at least one
+  source overall" instead of requiring an external source. Golden
+  baselines stay byte-identical across the source switch.
 
 ## [0.1.1] - 2026-07-30
 

@@ -13,89 +13,38 @@ use plugin_manifest::{check_loom_version, parse_plugin_json, PluginScope};
 
 const GUIDE_REPO_URL: &str = "https://github.com/wyw-ai/loom-guide.git";
 
-/// One official plugin content source repository. A plugin may carry a
-/// `plugin.json` manifest declaring skill scope (global/scope/actor-bundle)
-/// and context resource declarations. Sources without `plugin.json` are
-/// treated as pure skill repositories with all skills at global scope
-/// (backward compatible with the former `OFFICIAL_SKILL_SOURCES`).
-///
-/// Source resolution lifecycle (see `resolve_content_source`):
-/// 1. env override — first non-empty `dir_env` var wins (anchor-checked)
-/// 2. sibling lookup — `<workspace-parent>/<repo_dir_name>`, then
-///    `<workspace>/<repo_dir_name>` (anchor-checked)
-/// 3. clone — `repo_env` or `default_repo_url` (+ optional `ref_env`)
-///    into OUT_DIR (anchor-checked after clone)
-/// Every stage validates the same `repo_anchor_rel`; a non-empty env var
-/// or fresh clone failing the check panics the build.
-///
-/// This is the *external* source form. Internal workspace plugins (see
-/// `InternalPluginSource`) live inside this repository and are resolved
-/// directly, never through env/sibling/clone.
-struct OfficialPluginSource {
-    /// Stable identity of this source (used in diagnostics and by
-    /// `loom plugin list`); must be unique across the data file.
-    // Validated for uniqueness at load time; the field itself is carried for
-    // diagnostics and future surfacing, not read by the build script.
-    #[allow(dead_code)]
-    id: &'static str,
-    /// Env vars (in priority order) that may point at a local checkout
-    /// of the source repo. The first non-empty value that passes the
-    /// anchor check wins; a non-empty value failing it panics.
-    dir_env: &'static [&'static str],
-    /// Repository directory name, used both for sibling-directory lookup
-    /// and as the temp clone directory name under OUT_DIR.
-    repo_dir_name: &'static str,
-    /// Repo-relative path that must exist for a candidate directory to be
-    /// accepted as a valid checkout of this source repo (structural anchor).
-    ///
-    /// (a) The anchor points at the repo's defining layout (e.g. `skills`),
-    /// (b) never at an individual content file, and
-    /// (c) serves as a validity check only — it never filters which skills
-    ///     or resources are loaded; content discovery scans the whole repo
-    ///     (see `scan_and_register_skills`).
-    /// (d) A missing anchor panics the build (fail-loud by design, guarding
-    ///     against wrong-dir or drifted repo layouts).
-    repo_anchor_rel: &'static str,
-    /// Env var overriding the repo URL used when cloning is required.
-    repo_env: &'static str,
-    /// Repo URL cloned when no `repo_env` override is set and no local
-    /// checkout is found by env or sibling lookup.
-    default_repo_url: &'static str,
-    /// Env var for an optional git ref (branch/tag) used when cloning.
-    ref_env: &'static str,
-}
-
 /// One internal plugin source: a crate inside this workspace whose
 /// `plugin.json` is embedded directly (R1 rectification — the memory
 /// plugin follows the same manifest spec as every other context
 /// plugin). No env override, no sibling lookup, no clone: the path is
 /// workspace-root-relative and a missing `plugin.json` fails the build.
 struct InternalPluginSource {
-    /// Stable identity of this plugin (must be unique across external
-    /// and internal sources; validated at load time).
+    /// Stable identity of this plugin (must be unique across internal
+    /// sources; validated at load time).
     id: &'static str,
     /// Workspace-root-relative path to the plugin crate directory
     /// (e.g. `crates/plugin-context-memory`).
     path: &'static str,
     /// Diagnostic identity used in skill/resource source attribution
-    /// (`internal/<id>`), parallel to the external `repo_dir_name`.
+    /// (`internal/<id>`).
     repo_dir_name: &'static str,
 }
 
-/// Parsed `official-plugins.json`: external repo sources plus internal
-/// workspace plugin sources.
+/// Parsed `official-plugins.json`: internal workspace plugin sources.
+/// The external source form is retired (Task #16 E5) — every official
+/// plugin now lives in this repository.
 struct OfficialPluginData {
-    external: &'static [OfficialPluginSource],
     internal: &'static [InternalPluginSource],
 }
 
 /// Unified plugin entry list, data-driven from `official-plugins.json`
-/// (next to this build script). The file accepts two shapes:
+/// (next to this build script). Current shape:
+/// `{"internal": [{"id", "path"}, ...]}`.
 ///
-/// - legacy: a top-level JSON array (external sources only, no
-///   internal plugins);
-/// - object: `{"external": [...], "internal": [{"id", "path"}, ...]}`
-///   (both arrays optional; at least one source overall required).
+/// Legacy shapes (a top-level JSON array of external sources, or an
+/// object with a non-empty `external` array) are recognized but
+/// retired: they fail loud with a migration hint instead of silently
+/// resolving remote content.
 ///
 /// Pure skill sources (loom-skills, actor-circuit) carry a skills-only
 /// `plugin.json` (layer "skill", no context_resources). Internal
@@ -104,7 +53,7 @@ struct OfficialPluginData {
 /// providing the content; no build.rs change.
 ///
 /// Loaded by `load_official_plugins`; any missing/invalid field, empty
-/// external list, or duplicate id fails the build.
+/// internal list, or duplicate id fails the build.
 fn load_official_plugins() -> OfficialPluginData {
     let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("official-plugins.json");
     println!("cargo:rerun-if-changed={}", manifest_path.display());
@@ -112,97 +61,51 @@ fn load_official_plugins() -> OfficialPluginData {
         .unwrap_or_else(|err| panic!("read {} failed: {err}", manifest_path.display()));
     let value: serde_json::Value = serde_json::from_str(&raw)
         .unwrap_or_else(|err| panic!("parse {} failed: {err}", manifest_path.display()));
-    let (array, internal_array): (Vec<serde_json::Value>, Vec<serde_json::Value>) = match value {
-        serde_json::Value::Array(entries) => (entries, Vec::new()),
+    let internal_array: Vec<serde_json::Value> = match value {
+        serde_json::Value::Array(entries) => {
+            if !entries.is_empty() {
+                panic!(
+                    "{} uses the retired top-level array form (external sources). \
+                     External plugin sources are retired (Task #16 E5): move the \
+                     plugin content into this repository and list it under \
+                     `internal` instead",
+                    manifest_path.display()
+                );
+            }
+            Vec::new()
+        }
         serde_json::Value::Object(map) => {
-            let external = map
-                .get("external")
+            if let Some(external) = map.get("external").and_then(|v| v.as_array()) {
+                if !external.is_empty() {
+                    panic!(
+                        "{} declares {} retired external plugin source(s). \
+                         External plugin sources are retired (Task #16 E5): move \
+                         the plugin content into this repository and list it \
+                         under `internal` instead",
+                        manifest_path.display(),
+                        external.len()
+                    );
+                }
+            }
+            map.get("internal")
                 .and_then(|v| v.as_array())
                 .cloned()
-                .unwrap_or_default();
-            let internal = map
-                .get("internal")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-            (external, internal)
+                .unwrap_or_default()
         }
         _ => panic!(
-            "{} must be a JSON array of plugin source objects, or an \
-             object with `external`/`internal` arrays",
+            "{} must be an object with an `internal` array of plugin sources",
             manifest_path.display()
         ),
     };
-    if array.is_empty() && internal_array.is_empty() {
+    if internal_array.is_empty() {
         panic!(
-            "{} must declare at least one plugin source (external or internal)",
+            "{} must declare at least one internal plugin source",
             manifest_path.display()
         );
     }
 
-    let mut sources = Vec::with_capacity(array.len());
-    let mut seen_ids: Vec<&str> = Vec::with_capacity(array.len() + internal_array.len());
-    for (index, entry) in array.iter().enumerate() {
-        let object = entry.as_object().unwrap_or_else(|| {
-            panic!(
-                "{} entry [{index}] must be an object",
-                manifest_path.display()
-            )
-        });
-        let id = required_str(&manifest_path, index, object, "id");
-        if seen_ids.contains(&id) {
-            panic!(
-                "{} entry [{index}] duplicates plugin source id `{id}`",
-                manifest_path.display()
-            );
-        }
-        seen_ids.push(id);
-
-        let dir_env_raw = required_str_array(&manifest_path, index, object, "dir_env");
-        if dir_env_raw.is_empty() {
-            panic!(
-                "{} entry [{index}] (`{id}`) must list at least one dir_env",
-                manifest_path.display()
-            );
-        }
-
-        sources.push(OfficialPluginSource {
-            id: Box::leak(id.to_owned().into_boxed_str()),
-            dir_env: Box::leak(
-                dir_env_raw
-                    .into_iter()
-                    .map(|s| Box::leak(s.to_owned().into_boxed_str()) as &'static str)
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice(),
-            ),
-            repo_dir_name: Box::leak(
-                required_str(&manifest_path, index, object, "repo_dir_name")
-                    .to_owned()
-                    .into_boxed_str(),
-            ),
-            repo_anchor_rel: Box::leak(
-                required_str(&manifest_path, index, object, "repo_anchor_rel")
-                    .to_owned()
-                    .into_boxed_str(),
-            ),
-            repo_env: Box::leak(
-                required_str(&manifest_path, index, object, "repo_env")
-                    .to_owned()
-                    .into_boxed_str(),
-            ),
-            default_repo_url: Box::leak(
-                required_str(&manifest_path, index, object, "default_repo_url")
-                    .to_owned()
-                    .into_boxed_str(),
-            ),
-            ref_env: Box::leak(
-                required_str(&manifest_path, index, object, "ref_env")
-                    .to_owned()
-                    .into_boxed_str(),
-            ),
-        });
-    }
     let mut internal = Vec::with_capacity(internal_array.len());
+    let mut seen_ids: Vec<&str> = Vec::with_capacity(internal_array.len());
     for (index, entry) in internal_array.iter().enumerate() {
         let object = entry.as_object().unwrap_or_else(|| {
             panic!(
@@ -227,7 +130,6 @@ fn load_official_plugins() -> OfficialPluginData {
     }
 
     OfficialPluginData {
-        external: Box::leak(sources.into_boxed_slice()),
         internal: Box::leak(internal.into_boxed_slice()),
     }
 }
@@ -246,39 +148,6 @@ fn required_str<'a>(
     })
 }
 
-fn required_str_array(
-    manifest_path: &Path,
-    index: usize,
-    object: &serde_json::Map<String, serde_json::Value>,
-    field: &str,
-) -> Vec<String> {
-    let invalid_array = || {
-        panic!(
-            "{} entry [{index}] field `{field}` must be an array of non-empty strings",
-            manifest_path.display()
-        )
-    };
-    let array = object
-        .get(field)
-        .and_then(|v| v.as_array())
-        .unwrap_or_else(invalid_array);
-    let mut values = Vec::with_capacity(array.len());
-    for item in array {
-        let invalid_item = || {
-            panic!(
-                "{} entry [{index}] field `{field}` must be an array of non-empty strings",
-                manifest_path.display()
-            )
-        };
-        let s = item.as_str().unwrap_or_else(invalid_item);
-        if s.is_empty() {
-            invalid_item();
-        }
-        values.push(s.to_owned());
-    }
-    values
-}
-
 fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by cargo"));
     let clone_root = out_dir.join("official-runtime-content");
@@ -293,8 +162,7 @@ fn main() {
         &clone_root,
     );
     let official_plugins = load_official_plugins();
-    let mut plugin_sources = resolve_plugin_sources(official_plugins.external, &clone_root);
-    plugin_sources.extend(resolve_internal_sources(official_plugins.internal));
+    let plugin_sources = resolve_internal_sources(official_plugins.internal);
 
     generate_guide_snapshot(&guide_dir, &out_dir);
     generate_plugin_snapshot(&plugin_sources, &out_dir);
@@ -308,27 +176,6 @@ fn main() {
 struct ResolvedPluginSource {
     repo_dir_name: &'static str,
     content: ContentSource,
-}
-
-fn resolve_plugin_sources(
-    sources: &'static [OfficialPluginSource],
-    clone_root: &Path,
-) -> Vec<ResolvedPluginSource> {
-    sources
-        .iter()
-        .map(|source| ResolvedPluginSource {
-            repo_dir_name: source.repo_dir_name,
-            content: resolve_content_source(
-                source.dir_env,
-                source.repo_dir_name,
-                source.repo_anchor_rel,
-                source.repo_env,
-                source.default_repo_url,
-                source.ref_env,
-                clone_root,
-            ),
-        })
-        .collect()
 }
 
 /// Resolve internal plugin sources: workspace crates whose plugin.json

@@ -1,0 +1,45 @@
+version: v0alpha1
+kind: product-binding
+name: replace-with-product-and-circuit
+
+description: Explain how one product represents an Actor Circuit.
+
+circuit: replace-with-circuit-name
+
+product:
+  name: replace-with-product-name
+  version: replace-with-version
+  documentation: replace-with-reference
+
+map:
+  actors:
+    circuit_actor: product_identity_or_address
+
+  parameters:
+    circuit_parameter: product_configuration
+
+  prompts:
+    circuit_prompt: product_prompt_or_instruction_reference
+
+  memory:
+    circuit_memory_name: product_field_or_external_store
+
+  steps:
+    circuit_step_name: product_api_event_task_or_action
+
+  communication:
+    mode: product_behavior
+    delivery: product_behavior
+    wait_for: product_evidence
+    match_by: product_fields
+
+  evidence:
+    circuit_evidence: product_event_log_trace_or_record
+
+missing:
+  - circuit_semantic: replace-with-missing-semantic
+    supplied_by: external_mechanism_or_none
+
+rules:
+  - Do not map message delivery to acceptance unless the product really records acceptance.
+  - Record the resolved parameter and prompt values used by an evaluation run.

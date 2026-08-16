@@ -1,0 +1,32 @@
+version: v0alpha1
+kind: gate
+name: stop
+
+description: End a collaboration scope with an explicit terminal status.
+
+input:
+  active_scope: required
+  reason: optional
+
+output:
+  scope: terminal
+
+parameters:
+  status:
+    type: enum
+    values: [succeeded, failed, cancelled, rejected, not_satisfied, transferred, timed_out, needs_revision]
+    required: true
+
+state:
+  remembers:
+    - terminal_status
+    - terminal_reason_if_any
+
+evidence:
+  records:
+    - terminal_status
+    - terminal_reason_if_any
+
+rules:
+  - Inactivity is not Stop.
+  - A stopped scope has no implicit continuation.

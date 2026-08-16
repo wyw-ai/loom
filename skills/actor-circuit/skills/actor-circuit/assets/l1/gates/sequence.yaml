@@ -1,0 +1,33 @@
+version: v0alpha1
+kind: gate
+name: sequence
+
+description: Enable a successor only after its declared predecessor reaches the required completion outcome.
+
+input:
+  predecessor: required
+  observed_completion_outcome: required
+  successor: required
+
+output:
+  successor: enabled
+
+parameters:
+  required_completion_outcome:
+    type: outcome_label
+    required: true
+
+state:
+  remembers:
+    - observed_completion_outcome
+
+evidence:
+  records:
+    - required_completion_outcome
+    - observed_completion_outcome
+    - continuation
+
+rules:
+  - Dispatching or starting the predecessor is not its completion outcome.
+  - Sequence defines ordering, not Actor assignment or information transport.
+  - A direct then edge in a Circuit uses Sequence semantics.

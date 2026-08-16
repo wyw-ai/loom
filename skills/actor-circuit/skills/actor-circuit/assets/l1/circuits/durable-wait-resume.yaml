@@ -1,0 +1,113 @@
+version: v0alpha1
+kind: circuit
+name: durable-wait-resume
+
+description: Persist a declared Wait and let an independent Resume, Timeout, or observed Stop resolve it exactly once.
+
+uses: [wait, resume, timeout, stop]
+
+actors:
+  waiter: actor
+  signaler: human_or_actor
+
+parameters:
+  wait_timeout: 24h
+
+memory:
+  circuit_scope: {store: durable}
+  work_id: {store: durable}
+  wait_id: {store: durable}
+  active_path: {store: durable}
+  continuation: {store: durable}
+  pending_wait: {store: durable}
+  resolved_wait: {store: durable}
+  resume_condition: {store: durable}
+  resume_signal: {store: durable}
+  deadline: {store: durable}
+  timeout_outcome: {store: durable}
+  resolution_winner: {store: durable}
+
+start: begin_wait
+
+pending_relationships:
+  wait_resolution:
+    opened_by: begin_wait
+    state: pending_wait
+    policy: first_committed_outcome_wins
+    winner_as: resolution_winner
+    resolved_by:
+      resume: resume_from_signal
+      timeout: deadline_timeout
+      observed_stop: stop_waiting_scope
+
+steps:
+  begin_wait:
+    gate: wait
+    input:
+      active_path: active_path
+      continuation: continuation
+      resolution_outcomes: [resume, timeout, observed_stop]
+    with:
+      resume_method: signal
+      timeout: wait_timeout
+    save:
+      wait_state_as: pending_wait
+
+  resume_from_signal:
+    gate: resume
+    enabled_by: matching_resume_signal
+    input:
+      pending_wait: pending_wait
+      signal: resume_signal
+    with:
+      match_method: rule
+      delivery: store_and_forward
+      activation: wakes
+      match_by: [work_id, wait_id]
+    save:
+      wait_state_as: resolved_wait
+      continuation_as: continuation
+    then:
+      resolved: completed
+
+  deadline_timeout:
+    gate: timeout
+    enabled_by: deadline_crossed
+    input:
+      pending_relationship_or_operation: pending_wait
+    with:
+      duration: wait_timeout
+      late_result_policy: record_without_reopening
+    save:
+      outcome_as: timeout_outcome
+    then:
+      timed_out: timed_out
+
+  stop_waiting_scope:
+    gate: stop
+    enabled_by: declared_terminal_condition
+    input: {active_scope: circuit_scope}
+    with: {status: cancelled}
+
+  completed:
+    gate: stop
+    input: {active_scope: circuit_scope}
+    with: {status: succeeded}
+
+  timed_out:
+    gate: stop
+    input: {active_scope: circuit_scope}
+    with: {status: timed_out}
+
+evaluation:
+  freeze: [resolved_parameters, resolved_prompts, actor_bindings]
+  record: [inputs, state_transitions, messages, decisions, outputs]
+
+rules:
+  - Wait commits only pending_wait and preserves continuation; it does not also return a signal, timeout, or terminal result.
+  - Resume, Timeout, and Stop are independent Gate occurrences that may resolve pending_wait.
+  - The first committed resolution wins; later signals or outcomes cannot reopen pending_wait or advance continuation again.
+  - Resume must match the still-pending wait_id before it restores continuation.
+  - Timeout resolves pending_wait without implying that any underlying Actor work has stopped.
+  - stop_waiting_scope resolves pending_wait only when its Stop outcome is observed as terminal for this relationship.
+  - The durable memory declaration permits the Wait and continuation to survive the Circuit's declared failure boundary.

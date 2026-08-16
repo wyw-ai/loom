@@ -1,0 +1,60 @@
+version: v0alpha1
+kind: gate
+name: delegate
+
+description: Commit execution ownership of an explicitly bounded work scope to another Actor.
+
+input:
+  delegator: required
+  delegatee: required
+  work_scope: bounded
+
+output:
+  execution_owner: delegatee
+  gate_outcome: committed
+
+ownership:
+  continuation: unchanged
+  execution:
+    before: delegator
+    after: delegatee
+
+parameters:
+  delivery:
+    type: enum
+    values: [immediate, store_and_forward]
+    required: true
+
+  activation:
+    type: enum
+    values: [wakes, notify_only]
+    required: true
+
+  acceptance:
+    type: enum
+    values: [not_required, required_before_commit]
+    required: true
+
+  match_by:
+    type: identity_list
+    required: true
+
+state:
+  remembers:
+    - bounded_work_scope
+    - previous_execution_owner
+    - execution_owner
+
+evidence:
+  records:
+    - resolved_parameters
+    - delivery
+    - acceptance_if_required
+    - execution_ownership_commit
+
+rules:
+  - Delegate changes who executes the bounded work.
+  - It does not transfer the right to continue the whole path.
+  - Any required delivery and acceptance must finish before the Delegate Gate commits.
+  - Delegate does not create a result boundary; compose Call and Return explicitly when an outcome is required.
+  - After Delegate commits, the delegator may continue independently or enter an explicitly declared Wait or Boundary.

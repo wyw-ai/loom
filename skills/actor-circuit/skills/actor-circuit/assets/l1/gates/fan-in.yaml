@@ -1,0 +1,117 @@
+version: v0alpha1
+kind: gate
+name: fan-in
+
+description: Observe satisfaction signals from a declared input set and enable one continuation when its convergence condition becomes satisfied.
+
+input:
+  declared_inputs: many
+  satisfaction_signal: one_at_a_time
+
+output:
+  continuation: enabled_once
+
+parameters:
+  completion_rule:
+    type: enum
+    values: [all, first_acceptable, quorum]
+    required: true
+
+  quorum:
+    type: integer
+    minimum: 1
+    required_when:
+      completion_rule: quorum
+
+  qualification_method:
+    type: enum
+    values: [any_signal, rule, prompt, human, external]
+    required_when:
+      completion_rule: [first_acceptable, quorum]
+
+  remaining_inputs:
+    type: enum
+    values: [request_cancel, ignore, keep_running]
+    required_when:
+      completion_rule: [first_acceptable, quorum]
+
+  after_request_cancel:
+    type: enum
+    values: [continue_without_waiting, wait_for_stop]
+    required_when:
+      remaining_inputs: request_cancel
+
+  late_signals:
+    type: enum
+    values: [ignore, record_without_reopening]
+    required: true
+
+  corrections:
+    type: enum
+    values: [first_counts, latest_supersedes]
+    required_when:
+      qualification_method: [prompt, human]
+
+  timeout:
+    type: duration
+    required: false
+
+  mode:
+    type: enum
+    values: [synchronous, asynchronous]
+    required_when: signals_cross_actor_boundaries
+
+  delivery:
+    type: enum
+    values: [immediate, store_and_forward]
+    required_when: signals_cross_actor_boundaries
+
+  activation:
+    type: enum
+    values: [wakes, notify_only]
+    required_when: signals_cross_actor_boundaries
+
+  match_by:
+    type: identity_list
+    required_when: signals_cross_actor_boundaries
+
+prompt_slots:
+  qualifying_signal:
+    required_when:
+      qualification_method: prompt
+    purpose: Describe what makes an input signal count toward continuation.
+
+state:
+  remembers:
+    - join_id
+    - expected_inputs
+    - satisfied_inputs
+    - convergence_satisfied
+    - continuation_fired
+    - cancellation_requested_inputs_if_any
+    - observed_stopped_inputs_if_waiting
+
+communication:
+  required_when: signals_cross_actor_boundaries
+  waits_for: satisfaction_signal
+
+evidence:
+  records:
+    - resolved_parameters
+    - satisfaction_signals
+    - join_state_updates
+    - continuation_decision
+
+rules:
+  - Expected input membership must be declared or versioned before it is evaluated.
+  - Silence is not input satisfaction.
+  - One logical input may satisfy the convergence condition at most once.
+  - Only the first unsatisfied-to-satisfied transition may fire the continuation.
+  - Fan-in may observe inputs from any source and does not require a preceding Fan-out.
+  - Fan-in decides when to continue; work results remain in separate Result State and are not merged or consumed here.
+  - Request_cancel sends a Cancel request; it does not prove that an input scope has stopped.
+  - With wait_for_stop, the continuation fires only after the declared remaining input scopes produce observed Stop outcomes.
+  - With continue_without_waiting, requested cancellation does not delay the continuation.
+  - Late signals follow late_signals and never reopen a fired continuation implicitly.
+  - Before declaring an input missing, rebuild the participation ledger from current state; a stale read is not proof of absence.
+  - With latest_supersedes, a correction replaces the input's earlier satisfied signal; the superseded signal never counts toward convergence.

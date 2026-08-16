@@ -1,0 +1,96 @@
+version: v0alpha1
+kind: circuit
+name: synchronous-call
+
+description: Open a synchronous Call boundary, resolve it through a separate Return, and then close the caller scope.
+
+uses: [call, return, stop]
+
+actors:
+  caller: actor
+  callee: actor
+
+memory:
+  circuit_scope: {store: durable}
+  work_id: {store: durable}
+  call_id: {store: ephemeral}
+  pending_call_boundary: {store: ephemeral}
+  completion_signal: {store: ephemeral}
+  result_ref: {store: external}
+  completion_outcome: {store: durable}
+
+start: open_call
+
+steps:
+  open_call:
+    gate: call
+    input:
+      caller: caller
+      callee: callee
+      request: [work_id, call_id, request]
+    with:
+      mode: synchronous
+      delivery: immediate
+      activation: wakes
+      match_by: [work_id, call_id]
+    save:
+      boundary_as: pending_call_boundary
+    then:
+      opened: receive_return
+
+  receive_return:
+    gate: return
+    input:
+      pending_boundary: pending_call_boundary
+      completion_signal: completion_signal
+      work_result: result_ref
+    outcome: completion_signal.outcome
+    with:
+      delivery: immediate
+      activation: wakes
+      match_by: [work_id, call_id]
+    save:
+      completion_outcome_as: completion_outcome
+      work_result_as: result_ref
+    then:
+      completed: completed
+      partial: partial
+      failed: failed
+      rejected: rejected
+      cancelled: cancelled
+
+  completed:
+    gate: stop
+    input: {active_scope: circuit_scope}
+    with: {status: succeeded}
+
+  partial:
+    gate: stop
+    input: {active_scope: circuit_scope}
+    with: {status: not_satisfied}
+
+  failed:
+    gate: stop
+    input: {active_scope: circuit_scope}
+    with: {status: failed}
+
+  rejected:
+    gate: stop
+    input: {active_scope: circuit_scope}
+    with: {status: rejected}
+
+  cancelled:
+    gate: stop
+    input: {active_scope: circuit_scope}
+    with: {status: cancelled}
+
+evaluation:
+  freeze: [resolved_parameters, resolved_prompts, actor_bindings]
+  record: [inputs, state_transitions, messages, decisions, outputs]
+
+rules:
+  - Call commits only the opening of pending_call_boundary.
+  - Return is a separate Gate occurrence that alone records the completion signal and optional work result.
+  - The caller owns the continuation until Return resolves the Call boundary.
+  - Blocked is not terminal in this Circuit, so a blocked signal leaves the boundary pending.
+  - A duplicate or late outcome cannot resolve pending_call_boundary twice.

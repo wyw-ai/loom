@@ -1,0 +1,81 @@
+version: v0alpha1
+kind: fan-in-policy
+name: quorum
+
+description: Continue after a declared count or weight of eligible inputs supplies qualifying satisfaction signals.
+
+parameters:
+  threshold:
+    type: number
+    minimum: 1
+    required: true
+
+  qualification_method:
+    type: enum
+    values: [any_signal, rule, prompt, human, external]
+    required: true
+
+  weighting:
+    type: enum
+    values: [equal, declared]
+    required: true
+
+  input_weights:
+    type: input_weight_map
+    required_when:
+      weighting: declared
+
+  membership_changes:
+    type: enum
+    values: [reject, recalculate]
+    required: true
+
+  remaining_inputs:
+    type: enum
+    values: [request_cancel, ignore, keep_running]
+    required: true
+
+  after_request_cancel:
+    type: enum
+    values: [continue_without_waiting, wait_for_stop]
+    required_when:
+      remaining_inputs: request_cancel
+
+  corrections:
+    type: enum
+    values: [first_counts, latest_supersedes]
+    required_when:
+      qualification_method: [prompt, human]
+
+prompt_slots:
+  qualifying_signal:
+    required_when:
+      qualification_method: prompt
+    purpose: Describe which input satisfaction signals count toward the quorum.
+
+state:
+  remembers:
+    - eligible_inputs
+    - satisfied_inputs
+    - satisfied_count_or_weight
+    - convergence_satisfied
+    - continuation_fired
+    - remaining_input_disposition
+    - cancellation_requested_inputs_if_any
+    - observed_stopped_inputs_if_waiting
+
+evidence:
+  records:
+    - resolved_parameters
+    - qualification_decisions
+    - threshold_progress
+    - continuation_decision
+
+rules:
+  - Duplicate satisfaction signals from one logical input must not count twice.
+  - Membership, threshold, and weighting remain observable.
+  - Work results remain in separate Result State and are not merged or consumed by Quorum itself.
+  - Request_cancel sends a Cancel request and does not itself prove termination.
+  - With wait_for_stop, the continuation fires only after the declared remaining input scopes produce observed Stop outcomes.
+  - With continue_without_waiting, requested cancellation does not delay the continuation.
+  - With latest_supersedes, a correction replaces the input's earlier qualifying signal; the superseded signal never counts toward the quorum.

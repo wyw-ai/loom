@@ -1,0 +1,188 @@
+version: v0alpha1
+kind: channel
+name: instant-messaging
+
+description: >
+  Person-operated chat used as a collaboration medium: one-to-one and group
+  conversations where messages are delivered store-and-forward and answered by
+  people on their own schedule. The platform moves messages; acceptance,
+  ownership commitment, convergence, and result retention remain
+  collaboration-level concerns.
+
+traits:
+  - Delivery is store-and-forward. A recipient may answer in seconds or days.
+  - Recipients are people. They rephrase, delay, forget, reply in the wrong thread, and go offline.
+  - Messages are addressed to people or groups, never to work items.
+  - Group messages are broadcasts. The platform creates no per-recipient work branch.
+  - Silence carries no meaning. It is not acceptance, rejection, or progress.
+
+capabilities:
+  delivery_receipt:
+    question: Does the sender learn that a message reached the recipient's app or device?
+    affects: [acknowledgement]
+
+  read_receipt:
+    question: Does the sender learn that a specific person read a specific message?
+    affects: [acknowledgement, evidence]
+
+  reply_reference:
+    question: Can a reply carry a reliable reference to the message it answers (thread, quote)?
+    affects: [match_by]
+
+  proactive_contact:
+    question: May the Actor open a conversation, or must a person speak first?
+    affects: [delivery]
+
+  message_format:
+    question: How much length and structure can one message carry, and how long does history survive?
+    affects: [result_carriage, memory]
+
+  recall:
+    question: Can a sent message be withdrawn, within what window, and does withdrawal undo having been read?
+    affects: [cancel]
+
+  private_in_scope:
+    question: Can a message be restricted to named recipients while staying attached to the shared scope?
+    affects: [visibility]
+
+  send_deduplication:
+    question: Does the platform deduplicate retried sends by a caller-supplied key?
+    affects: [evidence, acknowledgement]
+
+caveats:
+  - id: broadcast-is-not-fan-out
+    observe: >
+      One task message posted to a group looks like a Fan-out, but replies
+      arrive unattributed and cannot be assigned to branches.
+    because: >
+      The platform broadcasts the message. It creates no per-recipient branch
+      identity and no per-branch reply channel.
+    handle: >
+      Create branch identities yourself and carry them in the message
+      (work_id, branch_id). Record branch_membership in state; never infer it
+      from group membership. Each branch keeps its own L0 path.
+    affects: [fan-out, match_by, branch_membership]
+
+  - id: receipt-is-not-acceptance
+    observe: >
+      A message shows as delivered or read, which looks like the recipient
+      has taken the work.
+    because: >
+      Platform receipts cover delivery at most. Acceptance is a person's
+      commitment to a bounded scope, and the medium has no primitive for it.
+    handle: >
+      Set acknowledgement to receipt at most. When a Gate requires
+      acceptance, ask for it explicitly in the prompt and record the
+      confirming reply as a separate signal in evidence. Delivery,
+      acceptance, and commitment stay three distinct facts.
+    affects: [acknowledgement, delegate, transfer, evidence]
+
+  - id: silence-means-nothing
+    observe: >
+      Hours pass with no reply, and "not received", "working on it", and
+      "declined" look exactly the same.
+    because: >
+      People answer on their own schedule; the medium reports nothing about
+      work in progress.
+    handle: >
+      Use mode: asynchronous with delivery: store_and_forward. Represent the
+      pending state as explicit Wait State with a declared timeout outcome
+      instead of assuming one. Never infer an outcome from silence.
+    affects: [mode, delivery, wait, timeout]
+
+  - id: arrival-order-is-not-causation
+    observe: >
+      Replies arrive out of order, several tasks are answered in one message,
+      or a reply lands while its request is being re-sent.
+    because: >
+      The medium does not order messages across conversations, and people
+      batch their answers.
+    handle: >
+      Carry explicit correlation identities in every request and ask people
+      to quote them. Correlate by match_by only, never by arrival time.
+    affects: [match_by]
+
+  - id: duplicate-signals
+    observe: >
+      The same person confirms the same item twice: a resent message, a
+      follow-up "did you get this?", a repeated "done".
+    because: >
+      People resend and clients retry. The medium offers no exactly-once
+      guarantee.
+    handle: >
+      Make satisfaction idempotent: one declared input satisfies a Join at
+      most once. Record duplicates in evidence without re-firing the
+      continuation.
+    affects: [fan-in, late_signals, evidence]
+
+  - id: cancel-cannot-recall
+    observe: >
+      After a cancel request, the work still completes; the recipient had
+      read the original message long before.
+    because: >
+      A delivered message exists on the recipient's device and in their head.
+      Recall, where offered, has a time window and never un-reads a message.
+    handle: >
+      Treat cancel as a directed request, not a guarantee. Choose
+      after_request_cancel: continue_without_waiting, apply the late_signals
+      policy to whatever still arrives, and let Stop declare its own scope.
+    affects: [cancel, stop, late_signals]
+
+  - id: message-is-not-result-storage
+    observe: >
+      A long result is truncated, loses its structure, or cannot be found
+      again days later.
+    because: >
+      Chat messages are short, weakly structured, unaddressable, and their
+      history may not be retained.
+    handle: >
+      Keep work results in an external store and send only a reference plus
+      the completion signal. Mark the result memory as store: external.
+    affects: [memory, result_carriage]
+
+  - id: human-correlation-is-fragile
+    observe: >
+      A reply does not say which task it answers, mentions the wrong person,
+      or mixes several tasks together.
+    because: >
+      Correlation depends on people quoting references, and people are
+      unreliable carriers of structure.
+    handle: >
+      Give every request a short human-quotable identity. Park unattributable
+      signals in a pending state and ask for clarification instead of
+      guessing; record the attribution decision in evidence.
+    affects: [match_by, evidence]
+
+  - id: audience-is-not-subject
+    observe: >
+      A private instruction sent by direct message loses the workflow's
+      context, or a public one-word reply leaks a hidden assignment to the
+      whole group.
+    because: >
+      Chat treats private and shared as separate scopes, every shared
+      message is visible to the whole audience, and an @ mention both wakes
+      and reveals its target.
+    handle: >
+      Keep restricted exchanges attached to the shared scope when the
+      platform allows it, and keep a reply within the audience of the
+      message that prompted it. Name a subject without @ unless they should
+      see and act. Never announce a hidden assignment before the restricted
+      message carrying it has actually been sent.
+    affects: [visibility, activation]
+
+  - id: at-most-once-is-not-exactly-once
+    observe: >
+      A send times out with an unknown result, and the retry creates a
+      duplicate — or a deduplication key creates the illusion that delivery
+      is proven.
+    because: >
+      The medium can deduplicate message creation, but persisting the
+      message and persisting its delivery are separate steps, and
+      downstream side effects are outside its control.
+    handle: >
+      Retry with a stable key built from the logical action identity
+      (work_id, action, round) so the first persisted message wins. Keep
+      satisfaction idempotent on the receiving side regardless. When
+      delivery must be proven, use acknowledgement and reconciliation,
+      never a retry.
+    affects: [acknowledgement, evidence, fan-in]

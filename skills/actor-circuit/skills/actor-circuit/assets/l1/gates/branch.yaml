@@ -1,0 +1,46 @@
+version: v0alpha1
+kind: gate
+name: branch
+
+description: Select one or more candidate continuations from an observable decision fact.
+
+input:
+  decision_context: required
+  possible_paths: many
+
+output:
+  candidate_continuations: one_or_many
+
+parameters:
+  selection:
+    type: enum
+    values: [one, one_or_many]
+    required: true
+
+  decision_method:
+    type: enum
+    values: [rule, prompt, human, external]
+    required: true
+
+prompt_slots:
+  decision_criteria:
+    required_when:
+      decision_method: prompt
+    purpose: Describe how the decision context should select the next path.
+
+state:
+  remembers:
+    - observed_decision_context
+    - candidate_continuations
+
+evidence:
+  records:
+    - resolved_parameters
+    - decision
+    - candidate_continuations
+
+rules:
+  - A Human, Agent, Service, or deterministic rule may make the decision.
+  - Branch chooses paths; Route chooses an Actor.
+  - Selecting several candidate continuations does not make them independently active.
+  - Fan-out performs the path expansion when several selected continuations must advance independently.

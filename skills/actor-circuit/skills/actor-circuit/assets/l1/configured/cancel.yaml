@@ -1,0 +1,38 @@
+version: v0alpha1
+kind: termination-request
+name: cancel
+
+description: Request that a declared target path or scope terminate as cancelled.
+
+input:
+  target: required
+  reason: optional
+
+output:
+  request: cancellation_requested
+
+parameters:
+  propagation:
+    type: enum
+    values: [target_only, include_descendants]
+    required: true
+
+  wait_for_stop:
+    type: boolean
+    required: true
+
+state:
+  remembers:
+    - cancellation_target
+    - request_status
+    - observed_stop_if_required
+
+evidence:
+  records:
+    - resolved_parameters
+    - cancellation_request
+    - observed_terminal_status_if_any
+
+rules:
+  - Cancel requests termination; it does not prove that the target has stopped.
+  - A continuation that requires termination waits for an observed Stop(cancelled).

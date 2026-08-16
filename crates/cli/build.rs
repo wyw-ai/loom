@@ -95,14 +95,13 @@ struct OfficialPluginData {
 /// - legacy: a top-level JSON array (external sources only, no
 ///   internal plugins);
 /// - object: `{"external": [...], "internal": [{"id", "path"}, ...]}`
-///   (both arrays optional; at least one external source required).
+///   (both arrays optional; at least one source overall required).
 ///
-/// Pure skill repos (loom-skills, actor-circuit) have no `plugin.json`
-/// and fall back to global-scope skill loading. Internal sources
-/// (plugin-context-memory, plugin-context-tier) MUST carry `plugin.json`
-/// — a resource-only manifest with no skills is valid. Adding an
-/// official plugin = editing the JSON + providing the repo; no
-/// build.rs change.
+/// Pure skill sources (loom-skills, actor-circuit) carry a skills-only
+/// `plugin.json` (layer "skill", no context_resources). Internal
+/// sources MUST carry `plugin.json` — a resource-only manifest with
+/// no skills is valid. Adding an official plugin = editing the JSON +
+/// providing the content; no build.rs change.
 ///
 /// Loaded by `load_official_plugins`; any missing/invalid field, empty
 /// external list, or duplicate id fails the build.
@@ -134,9 +133,9 @@ fn load_official_plugins() -> OfficialPluginData {
             manifest_path.display()
         ),
     };
-    if array.is_empty() {
+    if array.is_empty() && internal_array.is_empty() {
         panic!(
-            "{} must declare at least one external plugin source",
+            "{} must declare at least one plugin source (external or internal)",
             manifest_path.display()
         );
     }

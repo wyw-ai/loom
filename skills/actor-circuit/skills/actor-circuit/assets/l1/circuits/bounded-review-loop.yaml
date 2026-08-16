@@ -1,0 +1,193 @@
+version: v0alpha1
+kind: circuit
+name: bounded-review-loop
+
+description: Generate, review, and revise a candidate for at most three rounds, ending as not_satisfied when the bound is reached.
+
+instance_of: [evaluator-optimizer]
+
+uses: [call, return, branch, sequence, stop]
+
+actors:
+  coordinator: actor
+  generator: actor
+  reviewer: actor
+
+parameters:
+  max_rounds: 3
+
+prompts:
+  review_candidate: |
+    Review the candidate against the task goal and supplied constraints.
+    Return concrete strengths, defects, risks, and supporting evidence.
+  decide_review: |
+    Accept only when the candidate satisfies the task goal and no material defect remains.
+    Otherwise request a revision and preserve the review reasons.
+
+memory:
+  circuit_scope: {store: durable}
+  work_id: {store: durable}
+  round_id: {store: durable, initial: 1}
+  pending_generation_boundary: {store: ephemeral}
+  generation_completion_signal: {store: durable}
+  generation_completion_outcome: {store: durable}
+  candidate_ref: {store: external}
+  pending_review_boundary: {store: durable}
+  review_completion_signal: {store: durable}
+  review_completion_outcome: {store: durable}
+  review_result: {store: durable}
+
+start: open_generation_call
+
+steps:
+  open_generation_call:
+    gate: call
+    input:
+      caller: coordinator
+      callee: generator
+      request: [work_id, round_id]
+    with:
+      mode: synchronous
+      delivery: immediate
+      activation: wakes
+      match_by: [work_id, round_id]
+    save:
+      boundary_as: pending_generation_boundary
+    then:
+      opened: receive_generation_return
+
+  receive_generation_return:
+    gate: return
+    input:
+      pending_boundary: pending_generation_boundary
+      completion_signal: generation_completion_signal
+      work_result: candidate_ref
+    outcome: generation_completion_signal.outcome
+    with:
+      delivery: immediate
+      activation: wakes
+      match_by: [work_id, round_id]
+    save:
+      completion_signal_as: generation_completion_signal
+      completion_outcome_as: generation_completion_outcome
+      work_result_as: candidate_ref
+    then:
+      completed: open_review_call
+      partial: generation_failed
+      failed: generation_failed
+      rejected: generation_failed
+      blocked: generation_failed
+      cancelled: generation_failed
+
+  open_review_call:
+    gate: call
+    input:
+      caller: coordinator
+      callee: reviewer
+      request: [work_id, round_id, candidate_ref, review_candidate]
+    with:
+      mode: asynchronous
+      delivery: store_and_forward
+      activation: wakes
+      match_by: [work_id, round_id]
+    save:
+      boundary_as: pending_review_boundary
+    then:
+      opened: receive_review_return
+
+  receive_review_return:
+    gate: return
+    input:
+      pending_boundary: pending_review_boundary
+      completion_signal: review_completion_signal
+      work_result: review_result
+    outcome: review_completion_signal.outcome
+    with:
+      delivery: store_and_forward
+      activation: wakes
+      match_by: [work_id, round_id]
+    save:
+      completion_signal_as: review_completion_signal
+      completion_outcome_as: review_completion_outcome
+      work_result_as: review_result
+    then:
+      completed: decide_quality
+      partial: decide_quality
+      failed: review_failed
+      rejected: review_failed
+      blocked: review_failed
+      cancelled: review_failed
+
+  decide_quality:
+    gate: branch
+    input:
+      decision_context: review_result
+      possible_paths: [accepted, revision_requested]
+    with:
+      selection: one
+      decision_method: prompt
+    prompt:
+      decision_criteria: decide_review
+    then:
+      accepted: accepted
+      revision_requested: check_round_limit
+
+  check_round_limit:
+    gate: branch
+    input:
+      decision_context: [round_id, max_rounds]
+      possible_paths: [can_continue, limit_reached]
+    with:
+      selection: one
+      decision_method: rule
+    then:
+      can_continue: advance_round
+      limit_reached: not_satisfied
+
+  advance_round:
+    gate: sequence
+    input:
+      predecessor: check_round_limit
+      observed_completion_outcome: can_continue
+      successor: open_generation_call
+    with:
+      required_completion_outcome: can_continue
+    update:
+      round_id: increment
+    then:
+      enabled: open_generation_call
+
+  accepted:
+    gate: stop
+    input: {active_scope: circuit_scope}
+    with: {status: succeeded}
+
+  not_satisfied:
+    gate: stop
+    input: {active_scope: circuit_scope}
+    with: {status: not_satisfied}
+
+  generation_failed:
+    gate: stop
+    input: {active_scope: circuit_scope}
+    with: {status: failed}
+
+  review_failed:
+    gate: stop
+    input: {active_scope: circuit_scope}
+    with: {status: failed}
+
+evaluation:
+  freeze: [resolved_parameters, resolved_prompts, actor_bindings]
+  record: [inputs, state_transitions, messages, decisions, outputs]
+
+rules:
+  - The review criteria stay in a prompt instead of becoming a false universal enum.
+  - Call and Return are distinct Gate occurrences for both generation and review.
+  - Each Return derives its structural outcome from the matched completion signal and stores any work result separately.
+  - Blocked is terminal for generation and review boundaries in this Circuit and ends circuit_scope as failed.
+  - Every Return and review decision matches one exact round_id.
+  - check_round_limit is an explicit Branch; Sequence does not hide the round-limit decision.
+  - A back edge is enabled only when round_id is less than max_rounds, and it increments round_id exactly once.
+  - Reaching max_rounds terminates circuit_scope as not_satisfied.
+  - Results from an older round cannot resolve a newer round.

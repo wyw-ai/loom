@@ -1,0 +1,48 @@
+version: v0alpha1
+kind: circuit-form
+name: loop
+
+description: Return to an earlier step until a declared stopping condition holds.
+
+contains:
+  - forward_path
+  - decision
+  - back_edge
+
+parameters:
+  decision_method:
+    type: enum
+    values: [rule, prompt, human, external]
+    required: true
+
+  max_rounds:
+    type: integer
+    minimum: 1
+    required: true
+
+  max_duration:
+    type: duration
+    required: false
+
+prompt_slots:
+  continue_or_stop:
+    required_when:
+      decision_method: prompt
+    purpose: Describe when another round is useful and when the loop should stop.
+
+state:
+  remembers:
+    - current_round
+    - started_at
+    - deadline_if_any
+
+evidence:
+  records:
+    - resolved_parameters
+    - decision_per_round
+    - terminal_reason
+
+rules:
+  - Loop never exceeds max_rounds.
+  - Every round has a stable identity.
+  - Results from an older round must not resolve a newer round.

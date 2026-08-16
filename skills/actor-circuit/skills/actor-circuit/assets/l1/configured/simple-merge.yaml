@@ -1,0 +1,28 @@
+version: v0alpha1
+kind: circuit-form
+name: simple-merge
+
+description: Let mutually exclusive or otherwise non-concurrent paths share one continuation without waiting.
+
+input:
+  paths: many
+  concurrency_assumption: required
+
+output:
+  continuation: one
+
+parameters:
+  concurrency_assumption:
+    type: enum
+    values: [mutually_exclusive, otherwise_non_concurrent]
+    required: true
+
+evidence:
+  records:
+    - resolved_parameters
+    - selected_input_path
+    - continuation_activation
+
+rules:
+  - Simple Merge has no Join State and does not wait for other paths.
+  - If several input paths may be active, each arrival is a separate activation rather than synchronization.

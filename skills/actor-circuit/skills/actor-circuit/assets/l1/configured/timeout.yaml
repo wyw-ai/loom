@@ -1,0 +1,44 @@
+version: v0alpha1
+kind: resolution
+name: timeout
+
+description: Produce a timeout outcome when a declared deadline is crossed for a still-pending relationship or operation.
+
+applies_to: [wait, call, delegate, fan-in]
+
+input:
+  pending_relationship_or_operation: required
+
+parameters:
+  duration:
+    type: duration
+    required: true
+
+  late_result_policy:
+    type: enum
+    values: [ignore, record_without_reopening]
+    required: true
+
+output:
+  outcome: timed_out
+
+state:
+  remembers:
+    - deadline
+    - resolved_pending_relationship_or_operation
+    - late_result_if_recorded
+
+evidence:
+  records:
+    - resolved_parameters
+    - deadline
+    - timeout_event
+    - late_result_resolution
+
+rules:
+  - Timeout may commit only while its declared relationship or operation is still pending.
+  - Timeout cannot undo or resolve an already committed Transfer.
+  - Timeout is not automatically failure.
+  - Timeout does not necessarily stop the underlying Actor work.
+  - The Circuit decides whether to retry, degrade, escalate, cancel, or stop.
+  - A late result follows late_result_policy but cannot reopen or advance the resolved relationship.

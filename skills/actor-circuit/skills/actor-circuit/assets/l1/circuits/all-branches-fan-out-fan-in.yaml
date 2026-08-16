@@ -1,0 +1,158 @@
+version: v0alpha1
+kind: circuit
+name: all-branches-fan-out-fan-in
+
+description: Create known branches, assign each bounded scope, collect each Return, converge only on completion signals, and retain work results separately.
+
+instance_of: [orchestrator-worker]
+
+uses: [fan-out, delegate, call, return, fan-in, branch, stop]
+
+actors:
+  coordinator: actor
+  workers: many_actors
+
+parameters:
+  acceptable_branch_outcomes: [completed]
+  require_branch_result: true
+
+memory:
+  circuit_scope: {store: durable}
+  work_id: {store: durable}
+  fanout_id: {store: durable}
+  join_id: {store: durable}
+  branch_membership: {store: durable}
+  active_branches: {store: durable}
+  branch_execution_owners: {store: durable}
+  pending_branch_boundaries: {store: durable}
+  branch_completion_signals: {store: durable}
+  branch_completion_outcomes: {store: durable}
+  branch_results: {store: external}
+  join_state: {store: durable}
+
+start: create_branches
+
+steps:
+  create_branches:
+    gate: fan-out
+    input:
+      branch_specification: branch_specs
+    with:
+      strategy: partition
+    save:
+      branches_as: branch_membership
+      active_branches_as: active_branches
+    then:
+      branches_created: delegate_branches
+
+  delegate_branches:
+    gate: delegate
+    for_each: branch_membership
+    input:
+      delegator: coordinator
+      delegatee: workers[branch_id]
+      work_scope: branch_work_scope[branch_id]
+    with:
+      delivery: store_and_forward
+      activation: wakes
+      acceptance: required_before_commit
+      match_by: [work_id, fanout_id, branch_id]
+    save:
+      execution_owner_as: branch_execution_owners[branch_id]
+    then:
+      committed: open_branch_boundary
+
+  open_branch_boundary:
+    gate: call
+    for_each: branch_membership
+    input:
+      caller: coordinator
+      callee: workers[branch_id]
+      request: [work_id, fanout_id, branch_id, branch_work_scope]
+    with:
+      mode: asynchronous
+      delivery: store_and_forward
+      activation: wakes
+      match_by: [work_id, fanout_id, branch_id]
+    save:
+      boundary_as: pending_branch_boundaries[branch_id]
+    then:
+      opened: receive_branch_return
+
+  receive_branch_return:
+    gate: return
+    for_each_pending: pending_branch_boundaries
+    input:
+      pending_boundary: pending_branch_boundaries[branch_id]
+      completion_signal: branch_completion_signal[branch_id]
+      work_result: branch_work_result[branch_id]
+    outcome: branch_completion_signal[branch_id].outcome
+    with:
+      delivery: store_and_forward
+      activation: wakes
+      match_by: [work_id, fanout_id, branch_id]
+    save:
+      completion_signal_as: branch_completion_signals[branch_id]
+      completion_outcome_as: branch_completion_outcomes[branch_id]
+      work_result_as: branch_results[branch_id]
+    then:
+      completed: converge
+      partial: converge
+      failed: converge
+      rejected: converge
+      blocked: converge
+      cancelled: converge
+
+  converge:
+    gate: fan-in
+    on_each: branch_completion_signals
+    input:
+      declared_inputs: branch_membership
+      satisfaction_signal: current_branch_completion_signal
+    with:
+      completion_rule: all
+      late_signals: record_without_reopening
+      mode: asynchronous
+      delivery: store_and_forward
+      activation: wakes
+      match_by: [work_id, fanout_id, join_id, branch_id]
+    save:
+      join_state_as: join_state
+    then:
+      enabled_once: assess_results
+
+  assess_results:
+    gate: branch
+    input:
+      decision_context: [acceptable_branch_outcomes, require_branch_result, branch_completion_outcomes, branch_results]
+      possible_paths: [all_acceptable, not_satisfied]
+    with:
+      selection: one
+      decision_method: rule
+    then:
+      all_acceptable: completed
+      not_satisfied: not_satisfied
+
+  completed:
+    gate: stop
+    input: {active_scope: circuit_scope}
+    with: {status: succeeded}
+
+  not_satisfied:
+    gate: stop
+    input: {active_scope: circuit_scope}
+    with: {status: not_satisfied}
+
+evaluation:
+  freeze: [resolved_parameters, resolved_prompts, actor_bindings]
+  record: [inputs, state_transitions, messages, decisions, outputs]
+
+rules:
+  - Fan-out creates branch paths; Delegate separately commits each branch's execution owner.
+  - Because delegated branch outcomes are required, each branch explicitly opens a Call boundary and resolves it through Return.
+  - Return stores completion signals, completion outcomes, and optional work results as separate facts.
+  - Fan-in receives only one completion signal at a time and never reads, merges, or consumes branch_results.
+  - Blocked is terminal for each branch boundary in this Circuit, so it counts as a returned input but cannot make the final result acceptable.
+  - The downstream Branch succeeds only when every completion outcome is acceptable and every declared branch has a result; Fan-in only determines when every declared input has returned.
+  - Duplicate completion signals cannot satisfy one declared input twice or reopen the enabled continuation.
+  - Every Stop terminates circuit_scope and no larger implicit scope.

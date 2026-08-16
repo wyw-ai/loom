@@ -1,0 +1,57 @@
+version: v0alpha1
+kind: gate
+name: fan-out
+
+description: Split one work path into multiple independently advancing branches.
+
+input:
+  branch_specification: required
+
+output:
+  branches: many
+
+parameters:
+  strategy:
+    type: enum
+    values: [partition, replication, diversification]
+    required: true
+
+  mode:
+    type: enum
+    values: [synchronous, asynchronous]
+    required_when: branches_cross_actor_boundaries
+
+  delivery:
+    type: enum
+    values: [immediate, store_and_forward]
+    required_when: branches_cross_actor_boundaries
+
+  activation:
+    type: enum
+    values: [wakes, notify_only]
+    required_when: branches_cross_actor_boundaries
+
+  acknowledgement:
+    type: enum
+    values: [none, receipt, acceptance]
+    required_when: branches_cross_actor_boundaries
+
+  match_by:
+    type: identity_list
+    required_when: branches_cross_actor_boundaries
+
+state:
+  remembers:
+    - branch_membership
+    - active_branches
+
+evidence:
+  records:
+    - resolved_parameters
+    - created_branches
+    - delivery_or_acceptance_events
+
+rules:
+  - Every branch has a stable identity.
+  - Branches may progress in parallel without running at exactly the same time.
+  - Fan-out creates work branches; it is not message broadcast.

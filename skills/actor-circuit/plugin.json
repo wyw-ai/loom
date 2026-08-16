@@ -1,0 +1,15 @@
+{
+  "$schema": "loom-plugin/v2",
+  "id": "actor-circuit",
+  "name": "Actor Circuit — Logic Gates of Multi-Actor Collaboration",
+  "version": "0.1.0",
+  "loom_version": ">=0.1.8",
+  "layer": "skill",
+  "skills": [
+    {
+      "id": "actor-circuit",
+      "path": "skills/actor-circuit",
+      "scope": "global"
+    }
+  ]
+}

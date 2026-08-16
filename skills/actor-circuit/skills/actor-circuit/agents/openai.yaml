@@ -1,0 +1,4 @@
+interface:
+  display_name: "Actor Circuit"
+  short_description: "Model Multi-Actor collaboration as logic circuits"
+  default_prompt: "Use $actor-circuit to reason about this collaboration design across L0, L1, and L2."

@@ -1,0 +1,39 @@
+version: v0alpha1
+kind: gate
+name: route
+
+description: Select an Actor as the candidate for a later responsibility-bearing transition.
+
+input:
+  candidates: one_or_many_actors
+  routing_context: required
+
+output:
+  candidate_actor: zero_or_one
+
+parameters:
+  routing_method:
+    type: enum
+    values: [rule, prompt, human, external]
+    required: true
+
+prompt_slots:
+  selection_criteria:
+    required_when:
+      routing_method: prompt
+    purpose: Describe how capabilities, content, availability, and policy affect Actor selection.
+
+state:
+  remembers:
+    - routing_context
+    - candidate_actor
+
+evidence:
+  records:
+    - resolved_parameters
+    - candidates
+    - candidate_selection
+
+rules:
+  - Route only selects a candidate Actor for a later transition.
+  - It does not deliver work, prove acceptance, or change execution or continuation ownership.

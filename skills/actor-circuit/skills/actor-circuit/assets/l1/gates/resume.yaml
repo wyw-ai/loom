@@ -1,0 +1,59 @@
+version: v0alpha1
+kind: gate
+name: resume
+
+description: Resolve a Wait State through its declared success signal and restore the preserved continuation.
+
+input:
+  pending_wait: required
+  signal: required
+
+output:
+  gate_outcome: resolved
+  wait_state: resolved
+  path: active
+  continuation: restored
+
+parameters:
+  match_method:
+    type: enum
+    values: [rule, prompt, human, external]
+    required: true
+
+  delivery:
+    type: enum
+    values: [immediate, store_and_forward]
+    required_when: signal_crosses_actor_boundary
+
+  activation:
+    type: enum
+    values: [wakes, notify_only]
+    required_when: signal_crosses_actor_boundary
+
+  match_by:
+    type: identity_list
+    required_when: signal_crosses_actor_boundary
+
+prompt_slots:
+  signal_match:
+    required_when:
+      match_method: prompt
+    purpose: Describe when an observed signal resolves this exact Wait.
+
+state:
+  remembers:
+    - resolved_wait
+    - restored_continuation
+
+evidence:
+  records:
+    - resolved_parameters
+    - observed_signal
+    - match_decision
+    - restored_continuation
+
+rules:
+  - Resume does not impose synchronous or asynchronous timing on the original Wait or its signal transport.
+  - The signal must match a still-pending Wait and one of its declared resolution outcomes.
+  - A stale signal must not resume a newer Wait.
+  - A duplicate signal must not resume the path twice.

@@ -1,0 +1,51 @@
+version: v0alpha1
+kind: gate
+name: wait
+
+description: Move an active path into Wait State while preserving its continuation and declaring its possible resolution outcomes.
+
+input:
+  active_path: required
+  continuation: required
+  resolution_outcomes: required
+
+output:
+  wait_state: pending
+  continuation: preserved
+
+parameters:
+  resume_method:
+    type: enum
+    values: [signal, rule, prompt, human]
+    required: true
+
+  timeout:
+    type: duration
+    required: false
+
+prompt_slots:
+  resume_criteria:
+    required_when:
+      resume_method: prompt
+    purpose: Describe when the observed context is sufficient to resume this Wait.
+
+state:
+  remembers:
+    - wait_id
+    - preserved_continuation
+    - declared_resolution_outcomes
+    - resume_condition
+    - deadline_if_any
+
+evidence:
+  records:
+    - resolved_parameters
+    - wait_started
+    - declared_resolution_outcomes
+    - resolving_event_or_decision
+
+rules:
+  - Wait preserves a future continuation.
+  - It is neither failure nor completion.
+  - The surrounding Circuit declares every outcome that may resolve this exact Wait.
+  - Only one declared outcome may resolve the preserved continuation.

@@ -1,0 +1,35 @@
+version: v0alpha1
+kind: gate
+name: transfer
+
+description: Commit the right and obligation to continue a path to another Actor.
+
+input:
+  current_owner: required
+  next_owner: required
+  continuation: required
+
+output:
+  continuation_owner: next_owner_after_commit
+  gate_outcome: committed
+
+ownership:
+  before: current_owner
+  after: next_owner
+
+state:
+  remembers:
+    - previous_continuation_owner
+    - continuation_owner
+
+evidence:
+  records:
+    - previous_continuation_owner
+    - next_continuation_owner
+    - ownership_commit
+
+rules:
+  - Proposal, delivery, and acceptance happen outside this Gate.
+  - Any acceptance required by the surrounding protocol must be satisfied before this Gate occurs.
+  - A Transfer Gate occurrence is the ownership commit, not a pending handoff.
+  - At most one Actor may be the committed continuation owner.

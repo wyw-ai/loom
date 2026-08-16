@@ -1,15 +1,5 @@
 {
-  "external": [
-    {
-      "id": "actor-circuit",
-      "dir_env": ["LOOM_ACTOR_CIRCUIT_DIR"],
-      "repo_dir_name": "actor-circuit",
-      "repo_anchor_rel": "skills",
-      "repo_env": "LOOM_ACTOR_CIRCUIT_REPO",
-      "default_repo_url": "https://github.com/wyw-ai/actor-circuit.git",
-      "ref_env": "LOOM_ACTOR_CIRCUIT_REF"
-    }
-  ],
+  "external": [],
   "internal": [
     {
       "id": "plugin-context-memory",
@@ -22,6 +12,10 @@
     {
       "id": "loom-skills",
       "path": "skills/loom-skills"
+    },
+    {
+      "id": "actor-circuit",
+      "path": "skills/actor-circuit"
     }
   ]
 }

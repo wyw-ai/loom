@@ -1,0 +1,58 @@
+version: v0alpha1
+kind: gate
+name: return
+
+description: Resolve a pending Call boundary, or a boundary explicitly composed with Delegate, through an Actor-produced outcome.
+
+input:
+  pending_boundary: required
+  completion_signal: required
+  work_result: optional
+
+output:
+  pending_boundary: resolved
+  continuation: enabled
+  work_result: available_when_present
+
+outcome:
+  type: enum
+  values: [completed, partial, failed, rejected, blocked, cancelled]
+  required: true
+
+parameters:
+  delivery:
+    type: enum
+    values: [immediate, store_and_forward]
+    required: true
+
+  activation:
+    type: enum
+    values: [wakes, notify_only]
+    required: true
+
+  match_by:
+    type: identity_list
+    required: true
+
+state:
+  remembers:
+    - resolved_boundary
+    - completion_outcome
+    - work_result_reference_if_any
+
+evidence:
+  records:
+    - resolved_parameters
+    - matched_pending_boundary
+    - completion_signal
+    - completion_outcome
+    - work_result_reference_if_any
+
+rules:
+  - The completion signal must match the exact pending boundary.
+  - A work result is optional and remains separate from the completion signal.
+  - Delegate may use Return only when the Circuit explicitly composed a Boundary State with that delegation.
+  - One pending boundary may be resolved only once.
+  - Blocked resolves the boundary only when the Circuit declares it terminal for that relationship.
+  - If blocked is not terminal for that relationship, no Return commits and the boundary remains pending.
+  - Timeout and an observed boundary-resolving Stop are alternative resolutions, not fabricated Returns.

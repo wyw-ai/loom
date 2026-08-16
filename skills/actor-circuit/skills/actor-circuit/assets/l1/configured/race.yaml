@@ -1,0 +1,63 @@
+version: v0alpha1
+kind: fan-in-policy
+name: race
+
+description: Continue from the first eligible input whose satisfaction signal meets an acceptance condition.
+
+parameters:
+  acceptance_method:
+    type: enum
+    values: [rule, prompt, human, external]
+    required: true
+
+  tie_breaker:
+    type: enum
+    values: [declared_priority, input_order, earliest_signal]
+    required: true
+
+  input_priority:
+    type: input_priority_map
+    required_when:
+      tie_breaker: declared_priority
+
+  remaining_inputs:
+    type: enum
+    values: [request_cancel, ignore, keep_running]
+    required: true
+
+  after_request_cancel:
+    type: enum
+    values: [continue_without_waiting, wait_for_stop]
+    required_when:
+      remaining_inputs: request_cancel
+
+prompt_slots:
+  acceptance_criteria:
+    required_when:
+      acceptance_method: prompt
+    purpose: Describe what makes an input satisfaction signal eligible to win the race.
+
+state:
+  remembers:
+    - eligible_inputs
+    - accepted_input
+    - convergence_satisfied
+    - continuation_fired
+    - remaining_input_disposition
+    - cancellation_requested_inputs_if_any
+    - observed_stopped_inputs_if_waiting
+
+evidence:
+  records:
+    - resolved_parameters
+    - signal_arrival_order
+    - acceptance_decisions
+    - accepted_input
+
+rules:
+  - The first signal to arrive is not necessarily acceptable.
+  - Near-simultaneous winners use the selected tie_breaker.
+  - Work results remain in separate Result State and are not selected or consumed by Race itself.
+  - Request_cancel sends a Cancel request and does not itself prove termination.
+  - With wait_for_stop, the continuation fires only after the declared remaining input scopes produce observed Stop outcomes.
+  - With continue_without_waiting, requested cancellation does not delay the continuation.

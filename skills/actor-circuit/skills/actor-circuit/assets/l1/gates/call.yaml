@@ -1,0 +1,62 @@
+version: v0alpha1
+kind: gate
+name: call
+
+description: Open a bounded request/response boundary with another Actor while the caller keeps the continuation.
+
+input:
+  caller: required
+  callee: required
+  request: required
+
+output:
+  boundary: pending
+  gate_outcome: opened
+
+ownership:
+  continuation: caller
+  execution: callee
+
+parameters:
+  mode:
+    type: enum
+    values: [synchronous, asynchronous]
+    required: true
+
+  delivery:
+    type: enum
+    values: [immediate, store_and_forward]
+    required: true
+
+  activation:
+    type: enum
+    values: [wakes, notify_only]
+    required: true
+
+  match_by:
+    type: identity_list
+    required: true
+
+state:
+  remembers:
+    - pending_boundary
+    - caller_continuation
+    - declared_resolution_outcomes
+    - request_outcome_correlation
+
+communication:
+  sends: request
+  later_outcome_matches: pending_boundary
+
+evidence:
+  records:
+    - resolved_parameters
+    - request_sent
+    - boundary_opened
+    - caller_continuation
+
+rules:
+  - The caller keeps the right and obligation to continue afterward.
+  - Call commits when the request/response Boundary State is opened; it does not also return a result.
+  - Return, Timeout, or another explicitly declared boundary outcome resolves the Boundary later.
+  - Any required delivery or acceptance is a protocol precondition for this Gate, not its outcome.

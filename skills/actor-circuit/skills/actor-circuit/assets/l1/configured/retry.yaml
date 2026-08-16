@@ -1,0 +1,78 @@
+version: v0alpha1
+kind: circuit-form
+name: retry
+
+description: Repeat one operation after selected outcomes and within a declared attempt limit.
+
+input:
+  operation: required
+  triggering_outcome: required
+
+parameters:
+  max_attempts:
+    type: integer
+    minimum: 1
+    required: true
+
+  retry_decision:
+    type: enum
+    values: [outcome_list, prompt, human, external]
+    required: true
+
+  retry_on:
+    type: outcome_list
+    required_when:
+      retry_decision: outcome_list
+
+  non_retryable_outcomes:
+    type: outcome_list
+    required: true
+
+  backoff:
+    type: enum
+    values: [none, fixed, linear, exponential]
+    required: true
+
+  backoff_delay:
+    type: duration
+    required_when:
+      backoff: [fixed, linear, exponential]
+
+  effect_policy:
+    type: enum
+    values: [side_effect_free, idempotent, compensate_before_retry, prohibit_retry]
+    required: true
+
+  late_outcome_policy:
+    type: enum
+    values: [ignore, record_without_advancing, accept_only_if_attempt_is_still_pending]
+    required: true
+
+prompt_slots:
+  retry_criteria:
+    required_when:
+      retry_decision: prompt
+    purpose: Describe which failures are likely to benefit from another attempt.
+
+state:
+  remembers:
+    - attempt_id
+    - previous_outcome
+    - remaining_attempts
+    - effects_by_attempt
+    - late_outcomes_if_recorded
+
+evidence:
+  records:
+    - resolved_parameters
+    - decision_per_attempt
+    - effects_per_attempt
+    - terminal_outcome
+
+rules:
+  - Retry is a failure-conditioned Loop.
+  - Every attempt has a stable identity.
+  - non_retryable_outcomes takes precedence over retry_on or any prompt, Human, or external retry decision.
+  - A new attempt is allowed only when effect_policy is side_effect_free, idempotent, or compensate_before_retry; prohibit_retry schedules no new attempt.
+  - A late outcome must match its exact attempt and follows late_outcome_policy; it cannot resolve or advance a newer attempt.
+  - Retry never exceeds max_attempts.

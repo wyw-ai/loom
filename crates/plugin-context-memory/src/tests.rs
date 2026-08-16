@@ -18,7 +18,7 @@ use crate::{JsonlMemoryStore, MemoryRenderer, MemoryResource, MemorySelector};
 use crate::load_bootstrap_and_turn;
 
 fn tmpdir(tag: &str) -> PathBuf {
-    let p = std::env::temp_dir().join(format!("loom-plugin-memory-{tag}-{}", uuid::Uuid::new_v4()));
+    let p = std::env::temp_dir().join(format!("loom-plugin-context-memory-{tag}-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&p).unwrap();
     p
 }

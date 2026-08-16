@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/proto", "crates/context-layer-core", "crates/plugin-memory", "crates/agent-runtime", "crates/server", "crates/cli", "crates/gui", "crates/loom-platform", "crates/loom-shell"]
+members = ["crates/proto", "crates/context-layer-core", "crates/plugin-context-memory", "crates/agent-runtime", "crates/server", "crates/cli", "crates/gui", "crates/loom-platform", "crates/loom-shell"]
 # GUI crate pulls a sizable native dep tree (Tauri + system webkit on macOS, webkit2gtk
 # on Linux). Keep it out of the default `cargo build` the CI uses by excluding it
 # from `default-members`; developers opt in via `make gui-dev` / `cargo tauri dev`.
-default-members = ["crates/proto", "crates/plugin-memory", "crates/agent-runtime", "crates/server", "crates/cli"]
+default-members = ["crates/proto", "crates/plugin-context-memory", "crates/agent-runtime", "crates/server", "crates/cli"]
 
 [workspace.package]
 version = "0.1.8"
@@ -18,7 +18,7 @@ agent-runtime = { path = "crates/agent-runtime" }
 context-layer-core = { path = "crates/context-layer-core" }
 loom-plugin-context-tier = { path = "../loom-plugin-context-tier" }
 loom-platform = { path = "crates/loom-platform" }
-plugin-memory = { path = "crates/plugin-memory" }
+plugin-context-memory = { path = "crates/plugin-context-memory" }
 dunce = "1"
 inventory = "0.3"
 

@@ -16396,7 +16396,7 @@ mod tests {
         assert_eq!(default.scheme(), "memory");
 
         // Envelope with a memory key round-trips into the resource
-        // without error (selection behavior is covered by plugin-memory
+        // without error (selection behavior is covered by plugin-context-memory
         // tests; here we prove the config channel is live).
         let configured = memory(&Some(serde_json::json!({
             "memory": { "query": { "turnTopK": 3 } }
@@ -17283,8 +17283,8 @@ mod tests {
         ts: &str,
         confidence: &str,
         summary: &str,
-    ) -> plugin_memory::MemoryRecord {
-        plugin_memory::MemoryRecord {
+    ) -> plugin_context_memory::MemoryRecord {
+        plugin_context_memory::MemoryRecord {
             schema_version: 1,
             id: id.into(),
             actor_id: GOLDEN_ACTOR_ID.into(),
@@ -17296,7 +17296,7 @@ mod tests {
             confidence: confidence.into(),
             // per_channel defaults true: records must carry the fixture
             // channel id to be visible to the channel-scoped selector.
-            source: plugin_memory::MemorySource {
+            source: plugin_context_memory::MemorySource {
                 channel_id: GOLDEN_CHANNEL_ID.into(),
                 thread_id: GOLDEN_SCOPE_ID.into(),
                 message_ids: Vec::new(),
@@ -17305,7 +17305,7 @@ mod tests {
         }
     }
 
-    fn golden_memory_records() -> Vec<plugin_memory::MemoryRecord> {
+    fn golden_memory_records() -> Vec<plugin_context_memory::MemoryRecord> {
         vec![
             golden_memory_record(
                 "mem_g1",
@@ -17350,10 +17350,10 @@ mod tests {
     /// for the golden scope, and a single notes file (a single file keeps
     /// the FileSystemProvider listing order platform-independent).
     fn golden_fixture_profile(dir: &Path) {
-        use plugin_memory::MemoryStore as _;
+        use plugin_context_memory::MemoryStore as _;
 
         let spec = golden_memory_spec();
-        let store = plugin_memory::open_memory_store(dir, &spec);
+        let store = plugin_context_memory::open_memory_store(dir, &spec);
         for record in golden_memory_records() {
             store.append(&record).expect("append golden memory record");
         }

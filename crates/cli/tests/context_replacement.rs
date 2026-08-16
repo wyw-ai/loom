@@ -15,11 +15,11 @@
 //!    third-party replacement carries its config itself).
 //! 3. It participates in the same chain assembly: priority ordering and
 //!    the budget waterfall (skip-not-truncate) treat it identically to
-//!    the official `plugin-memory` resource.
+//!    the official `plugin-context-memory` resource.
 
 use agent_runtime::context_layer::{discover_plugins, ContextResourceRegistry};
 use context_layer_core::{AssemblyContext, ContextResource, PromptSection, SectionSource};
-use plugin_memory::{JsonlMemoryStore, MemoryRecord, MemoryStore};
+use plugin_context_memory::{JsonlMemoryStore, MemoryRecord, MemoryStore};
 use proto::methods::MemorySpec;
 use proto::types::{ScopeKind, ScopeRef};
 
@@ -137,7 +137,7 @@ fn third_party_replacement_joins_chain_and_reads_ambient_data() {
     // 2. Same-chain assembly: official memory plugin (priority 5) and the
     //    third-party replacement (priority 15) in one registry.
     let mut registry = ContextResourceRegistry::new();
-    registry.register(Box::new(plugin_memory::MemoryResource::new(Some(
+    registry.register(Box::new(plugin_context_memory::MemoryResource::new(Some(
         fixture_memory_spec(root.path()),
     ))));
     // B4: the factory now receives the config envelope. Passing a

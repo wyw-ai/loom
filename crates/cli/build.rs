@@ -75,7 +75,7 @@ struct InternalPluginSource {
     /// and internal sources; validated at load time).
     id: &'static str,
     /// Workspace-root-relative path to the plugin crate directory
-    /// (e.g. `crates/plugin-memory`).
+    /// (e.g. `crates/plugin-context-memory`).
     path: &'static str,
     /// Diagnostic identity used in skill/resource source attribution
     /// (`internal/<id>`), parallel to the external `repo_dir_name`.
@@ -100,7 +100,7 @@ struct OfficialPluginData {
 /// Pure skill repos (loom-skills, actor-circuit) have no `plugin.json`
 /// and fall back to global-scope skill loading. Full plugin repos
 /// (loom-plugin-context-tier) carry `plugin.json` for multi-dimensional
-/// dispatch. Internal sources (plugin-memory) MUST carry `plugin.json`
+/// dispatch. Internal sources (plugin-context-memory) MUST carry `plugin.json`
 /// — a resource-only manifest with no skills is valid. Adding an
 /// official plugin = editing the JSON + providing the repo; no
 /// build.rs change.

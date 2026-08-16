@@ -10,7 +10,7 @@ path = "src/lib.rs"
 [dependencies]
 proto = { workspace = true }
 context-layer-core = { workspace = true }
-plugin-memory = { workspace = true }
+plugin-context-memory = { workspace = true }
 loom-plugin-context-tier = { workspace = true }
 loom-platform = { workspace = true }
 anyhow = { workspace = true }

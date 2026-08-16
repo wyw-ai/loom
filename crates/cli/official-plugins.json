@@ -30,8 +30,8 @@
   ],
   "internal": [
     {
-      "id": "memory",
-      "path": "crates/plugin-memory"
+      "id": "plugin-context-memory",
+      "path": "crates/plugin-context-memory"
     }
   ]
 }

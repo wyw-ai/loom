@@ -309,7 +309,7 @@ mod tests {
         assert_eq!(memory.source.label(), "official");
         assert_eq!(memory.version, "1.0.0");
         assert_eq!(memory.priority, 5);
-        assert_eq!(memory.plugin_id.as_deref(), Some("memory"));
+        assert_eq!(memory.plugin_id.as_deref(), Some("plugin-context-memory"));
         assert_eq!(memory.plugin_name, Some("Memory"));
         assert_eq!(memory.config_keys, vec!["memory"]);
         assert_eq!(memory.registered_via, "inventory");

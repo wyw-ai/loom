@@ -1,4 +1,4 @@
-//! plugin-memory — the official memory ContextResource plugin.
+//! plugin-context-memory — the official memory ContextResource plugin.
 //!
 //! Migrated wholesale from `agent-runtime::memory` (iter2, ARCH design
 //! §3): the memory business modules (selector / renderer / store /

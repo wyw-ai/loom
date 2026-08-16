@@ -149,7 +149,7 @@ pub fn build_envelope(cx: &BuildContext<'_>) -> (String, Vec<PromptSection>) {
 }
 
 fn build_memory_store(profile_dir: &Path, spec: &MemorySpec) -> JsonlMemoryStore {
-    plugin_memory::open_memory_store(profile_dir, spec)
+    plugin_context_memory::open_memory_store(profile_dir, spec)
 }
 
 /// Directly expose the concrete store; used by the MCP bridge subcommand
@@ -163,7 +163,7 @@ pub fn open_memory_store_dyn(
     profile_dir: &Path,
     spec: &MemorySpec,
 ) -> std::sync::Arc<dyn MemoryStore> {
-    plugin_memory::open_memory_store_dyn(profile_dir, spec)
+    plugin_context_memory::open_memory_store_dyn(profile_dir, spec)
 }
 
 #[cfg(test)]

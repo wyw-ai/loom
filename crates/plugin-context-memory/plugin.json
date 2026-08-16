@@ -1,6 +1,6 @@
 {
   "$schema": "loom-plugin/v2",
-  "id": "memory",
+  "id": "plugin-context-memory",
   "name": "Memory",
   "version": "1.0.0",
   "loom_version": ">=0.1.8",

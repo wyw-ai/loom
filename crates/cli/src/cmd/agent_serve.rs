@@ -17720,4 +17720,155 @@ mod tests {
             .expect("create golden dir");
         std::fs::write(&baseline_path, &snapshot).expect("write R1 baseline");
     }
+
+    // ── Task #16 E0 — pre-integration ecosystem baseline ───────────────
+    //
+    // Captures the full embedded-plugin surface BEFORE the ecosystem
+    // integration batches (E1 rename, E2 tier migration, E3 skills-only
+    // manifest, E4 actor-circuit copy, E5 external retirement):
+    //   * assembly — the resource-chain projection for the standard
+    //     fixture (default spec + file resource + embedded merge),
+    //     identical in shape to the pre-unification golden
+    //   * skills — every embedded skill with its file set, each file
+    //     pinned by path + FNV-1a content hash (proves the external→
+    //     internal source swap embeds byte-identical content)
+    //   * resources — identity-free projection of the embedded global
+    //     resource declarations (scheme/priority/config_keys; plugin id
+    //     and version are intentionally excluded — E1/E2 rename them by
+    //     design)
+    //
+    // AC-V-6: this baseline MUST land as the first commit of the
+    // integration branch; every later batch keeps it byte-identical.
+    //
+    // Regenerate:
+    //   LOOM_UPDATE_GOLDEN=1 cargo test -p loom-cli matches_pre_integration
+    // or explicitly:
+    //   cargo test -p loom-cli --lib dump_pre_integration_baseline -- --ignored
+
+    /// FNV-1a 64-bit content checksum — deterministic across platforms
+    /// and rustc versions, unlike std's unspecified Hasher output.
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    fn pre_integration_baseline_document(dir: &Path) -> serde_json::Value {
+        let scope = ScopeRef {
+            kind: ScopeKind::Thread,
+            id: GOLDEN_SCOPE_ID.into(),
+        };
+        let ctx = golden_assembly_ctx(dir, &scope);
+
+        let mut spec = proto::methods::default_agent_context_spec();
+        spec.resources.push(proto::methods::ContextResourceSpec {
+            scheme: "file".into(),
+            mount: Some("notes".into()),
+            priority: Some(20),
+            config: Some(serde_json::json!({
+                "path": "notes",
+                "max_files": 5
+            })),
+        });
+        merge_embedded_global_resources(&mut spec);
+        let memory_spec = golden_memory_spec();
+        let assembly = chain_section_projection(&spec, Some(&memory_spec), &ctx);
+
+        let skills: Vec<serde_json::Value> = EMBEDDED_BUILTIN_SKILLS
+            .iter()
+            .map(|skill| {
+                serde_json::json!({
+                    "id": skill.id,
+                    "files": skill
+                        .files
+                        .iter()
+                        .map(|file| serde_json::json!({
+                            "path": file.path,
+                            "fnv1a64": format!("{:016x}", fnv1a64(file.content.as_bytes())),
+                        }))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+
+        let resources: Vec<serde_json::Value> = EMBEDDED_GLOBAL_RESOURCES
+            .iter()
+            .map(|resource| {
+                serde_json::json!({
+                    "scheme": resource.scheme,
+                    "priority": resource.priority,
+                    "config_keys": resource.config_keys,
+                })
+            })
+            .collect();
+
+        serde_json::json!({
+            "scenario": "pre-integration ecosystem baseline (Task #16 E0)",
+            "fixture": {
+                "records": 6,
+                "actor_id": GOLDEN_ACTOR_ID,
+                "channel_id": GOLDEN_CHANNEL_ID,
+                "scope_id": GOLDEN_SCOPE_ID,
+            },
+            "assembly": assembly,
+            "skills": skills,
+            "resources": resources,
+        })
+    }
+
+    fn pre_integration_baseline_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("golden")
+            .join("baseline-pre-integration.json")
+    }
+
+    #[test]
+    fn matches_pre_integration_baseline() {
+        let dir = tempfile::tempdir().expect("tempdir for integration baseline fixture");
+        golden_fixture_profile(dir.path());
+        let document = pre_integration_baseline_document(dir.path());
+        let mut snapshot = serde_json::to_string_pretty(&document)
+            .expect("serialize integration baseline document");
+        snapshot.push('\n');
+
+        let baseline_path = pre_integration_baseline_path();
+        if std::env::var("LOOM_UPDATE_GOLDEN").ok().as_deref() == Some("1") {
+            std::fs::create_dir_all(baseline_path.parent().expect("baseline parent dir"))
+                .expect("create golden dir");
+            std::fs::write(&baseline_path, &snapshot).expect("write integration baseline");
+            return;
+        }
+        let expected = std::fs::read_to_string(&baseline_path).unwrap_or_else(|err| {
+            panic!(
+                "integration baseline missing or unreadable ({err}); regenerate with \
+                 LOOM_UPDATE_GOLDEN=1 cargo test -p loom-cli matches_pre_integration"
+            )
+        });
+        let expected = expected.replace("\r\n", "\n");
+        assert_eq!(
+            snapshot, expected,
+            "pre-integration ecosystem baseline drifted; if intentional, regenerate the golden"
+        );
+    }
+
+    /// Explicit dump entry point for the E0 baseline (mirrors the R1a
+    /// pattern). Ignored by default; run with --ignored to regenerate.
+    #[test]
+    #[ignore = "baseline regeneration only: cargo test -p loom-cli --lib dump_pre_integration_baseline -- --ignored"]
+    fn dump_pre_integration_baseline() {
+        let dir = tempfile::tempdir().expect("tempdir for integration baseline dump");
+        golden_fixture_profile(dir.path());
+        let document = pre_integration_baseline_document(dir.path());
+        let mut snapshot = serde_json::to_string_pretty(&document)
+            .expect("serialize integration baseline document");
+        snapshot.push('\n');
+        let baseline_path = pre_integration_baseline_path();
+        std::fs::create_dir_all(baseline_path.parent().expect("baseline parent dir"))
+            .expect("create golden dir");
+        std::fs::write(&baseline_path, &snapshot).expect("write integration baseline");
+    }
 }

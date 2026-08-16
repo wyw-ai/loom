@@ -20,28 +20,32 @@
 （层的供给单元），不是独立系统。`plugin.json` 是供给单元的声明清单，也是注册的
 事实源。
 
-> 仓名消歧: 官方插件仓 `loom-plugin-context-tier` 的名字沿袭迭代 1 历史，指
-> 「context layer 的 tier 资源插件」，不是一个独立的插件系统。
+> 仓名与命名规范（AC-V-1 锚点）: 官方 context layer Rust 插件 crate 与清单 `id`
+> 严格归一 `plugin-context-<功能>` 族（如 `plugin-context-memory` /
+> `plugin-context-tier`）——crates/ 目录名、清单 id、本文锚点文本三处一致。
+> 纯 skill 源（非 Rust crate）不入该族，用内容名（`loom-skills` /
+> `actor-circuit`）。scheme 是协议标识，**永不随 crate 名变**（D-16-1）。
 
 ---
 
 ## 插件规范 — 五面一致判据（唯一锚点）
 
-**核心原则: 「同一规范，三种出身」。** 出身（官方内部 / 官方外部 / 第三方）只决定
+**核心原则: 「同一规范，两种出身」。** 出身（官方内部 / 第三方）只决定
 代码住哪、谁维护，**不改变任何用户可见行为面**。出身是溯源元数据，不是行为轴。
+官方外部源形态已退役（Task #16 E5）——全部官方插件住主仓内。
 
 「符合 context layer plugin 规范」= 以下五面全部成立:
 
 | 面 | 判据 | 用户可见锚点 |
 |---|---|---|
-| **F1 清单面（声明）** | 每个插件恰有一份 `plugin.json`（v2）七字段全声明。官方内部插件清单住主仓内（如 `crates/plugin-memory/plugin.json`）并纳入官方源数据; 官方外部住其仓并登记官方源; 第三方住己仓。**零无籍插件** | `plugin.json` 存在且可解析 |
+| **F1 清单面（声明）** | 每个插件恰有一份 `plugin.json`（v2）七字段全声明。官方插件清单住主仓内（如 `crates/plugin-context-memory/plugin.json`）并纳入官方源数据; 第三方住己仓。**零无籍插件** | `plugin.json` 存在且可解析 |
 | **F2 注册面（供给）** | 统一注册语义——同一标准 inventory 路径（`ContextResourcePlugin` + `inventory::submit!`）。出身不改变注册方式，无编译期专属接线 | `plugin list --verbose` 的 `registered:` 列 |
 | **F3 config 面（配置）** | 唯一配置方言 `resources[].config` + per-field 合并。无插件专属顶层配置通道; 遗留字段只能是兼容别名（可迁移、有废弃周期），不是并行通道 | `config keys:` 列（源自 `config_schema`） |
 | **F4 枚举面（自省）** | `plugin list` 行**同构**——所有字段可解析（id/name/version/source/priority/config_keys/registered_via/endpoint 无 None 空洞）; 出身差异只体现为 `source` 溯源取值（`official` / `external`） | `plugin list` 表格与 `--json` |
 | **F5 排查面（溯源）** | 同一排查路径——`--verbose` 四问结构一致（谁注册/什么身份/接受什么配置/端点在哪），section 级溯源（`SectionSource`）统一覆盖 | `--verbose` 输出 + section 溯源 |
 
-**出身与 `source` 取值的对应**: 官方内部与官方外部插件在 `plugin list` 中均显示
-`official`（清单在册 + inventory 注册）; 第三方 inventory 注册但无清单的显示
+**出身与 `source` 取值的对应**: 官方插件（清单在册 + inventory 注册）在
+`plugin list` 中显示 `official`; 第三方 inventory 注册但无官方清单的显示
 `external`。宿主内置资源（如 `file`）不是插件——它是装配基线自身依赖的宿主基础设施
 （无业务语义、无版本演进诉求），在表格中 version 列显示 `builtin` 以区分。
 
@@ -76,18 +80,19 @@
 | 字段 | 必填 | 说明 |
 |---|---|---|
 | `$schema` | 是 | `loom-plugin/v1` 或 `loom-plugin/v2`（见下文归一化规则） |
-| `id` | 是 | 唯一标识，kebab-case（如 `loom-plugin-context-tier`） |
+| `id` | 是 | 唯一标识，kebab-case。官方 context 层插件归一 `plugin-context-*` 族（如 `plugin-context-tier`）; 纯 skill 源用内容名（如 `loom-skills`） |
 | `name` | 是 | 显示名（`loom plugin list --verbose` 展示） |
 | `version` | 是 | 插件版本，`X.Y.Z` |
 | `loom_version` | 是 | 兼容范围，仅支持 `>=X.Y.Z` 形式；构建期检查，不满足则 build fail |
-| `layer` | 是 | 枚举，S1 仅接受 `"context"`（S2 可能扩展其他层） |
+| `layer` | 是 | 枚举: `"context"`（资源层插件）或 `"skill"`（纯 skill 源，Task #16 E3 引入）。`"skill"` 层清单不得声明 `context_resources`（fail loud） |
 | `skills[]` | 否 | 纯内容形态声明。每项: `id`（必填）、`path`（必填，相对仓根）、`scope`（`global` \| `scope` \| `actor-bundle`，缺省 `global`） |
 | `context_resources[]` | 否 | 资源形态声明。每项: `scheme`（必填，对应 `ContextResourcePlugin.scheme`）、`priority`（可选，缺省 100）、`config_schema`（可选，v2 新增，声明本插件接受的 config 字段 key 集，供校验与 `--verbose` 展示） |
 | `config_template` | 否 | agentcontext.json 模板的相对路径（init 时供给） |
 | `executable` | 否 | **M5 预留字段，本轮不实现装载**: `command`（必填，string）、`args`（可选，string 数组）、`protocol`（必填，枚举仅 `jsonrpc-stdio`）。仅在 schema 层校验合法值，`--verbose` 展示为 reserved |
 
-同一份清单可同时声明 `skills` 与 `context_resources`——schema 同时覆盖资源形态与
-纯内容形态（纯内容的运行期装载属 S2）。
+同一份清单可同时声明 `skills` 与 `context_resources`（仅 `"context"` 层）;
+`"skill"` 层清单只声明 `skills`（skills-only 形态，如 `loom-skills` /
+`actor-circuit`）。
 
 ## v2 相对 v1 的变更集
 
@@ -114,12 +119,12 @@
 - 理由: 迁移工具的服务对象（未知第三方）在 S2 之前不存在（YAGNI）；现存 v1 清单
   随迭代同步升级。S2 引入运行期安装时再评估迁移需求。
 
-## 实例: loom-plugin-context-tier（v2）
+## 实例: plugin-context-tier（v2，官方 context 层插件）
 
 ```json
 {
   "$schema": "loom-plugin/v2",
-  "id": "loom-plugin-context-tier",
+  "id": "plugin-context-tier",
   "name": "Context Tier — Hot/Warm/Cold Temperature Model",
   "version": "1.1.0",
   "loom_version": ">=0.1.8",
@@ -135,16 +140,15 @@
 }
 ```
 
-## 实例: memory（官方内部插件，v2）
+## 实例: plugin-context-memory（v2，官方 context 层插件）
 
-官方内部插件的参考实现——与官方外部插件（如 tier）走**同一规范**，仅出身不同
-（清单住主仓内）:
+官方插件的参考实现——清单住 crate 内，注册走 inventory，与 tier 完全同路径:
 
 ```json
-// crates/plugin-memory/plugin.json
+// crates/plugin-context-memory/plugin.json
 {
   "$schema": "loom-plugin/v2",
-  "id": "memory",
+  "id": "plugin-context-memory",
   "name": "Memory",
   "version": "1.0.0",
   "loom_version": ">=0.1.8",
@@ -161,7 +165,7 @@
 
 要点:
 
-- **清单住 crate 内**（`crates/plugin-memory/plugin.json`），并在官方源数据的
+- **清单住 crate 内**（`crates/plugin-context-memory/plugin.json`），并在官方源数据的
   `internal` 数组登记（见下节）——满足 F1;
 - **注册走 inventory**（`inventory::submit! { ContextResourcePlugin { scheme:
   "memory", factory: memory_resource_factory } }`）——满足 F2，与 tier 完全同路径;
@@ -172,43 +176,58 @@
 - **版本独立语义化**（D-R1-3）: `version: 1.0.0` 是插件自身版本，与 workspace
   crate 版本解耦。
 
-## 官方源数据化（official-plugins.json）
-
-官方插件源清单是数据文件，不是代码: `crates/cli/official-plugins.json`（与
-build.rs 同目录，构建期消费）。文件为**对象形态**，按出身分两个数组:
+## 实例: loom-skills（v2，官方 skill 层源，skills-only）
 
 ```json
+// skills/loom-skills/plugin.json
 {
-  "external": [ { "id": "...", "default_repo_url": "...", "...": "..." } ],
-  "internal": [ { "id": "memory", "path": "crates/plugin-memory" } ]
+  "$schema": "loom-plugin/v2",
+  "id": "loom-skills",
+  "name": "Loom Official Skills",
+  "version": "0.1.0",
+  "loom_version": ">=0.1.8",
+  "layer": "skill",
+  "skills": [
+    { "id": "loom", "path": "skills/loom", "scope": "global" },
+    { "id": "attachment", "path": "skills/attachment", "scope": "global" }
+  ]
 }
 ```
 
-**external 条目**（官方外部插件，如 tier）:
+skill 层源只供给 skills，不声明 `context_resources`（schema 层 fail loud 守卫）。
+`actor-circuit`（`skills/actor-circuit/`）同形态。
 
-| 字段 | 说明 |
-|---|---|
-| `id` | 源标识（`--verbose` 展示用） |
-| `dir_env` | 本地目录覆盖的环境变量列表（按序探测） |
-| `repo_dir_name` | 缓存目录名 |
-| `repo_anchor_rel` | 仓库锚点相对路径（校验仓库身份） |
-| `repo_env` | 仓库 URL 覆盖的环境变量 |
-| `default_repo_url` | 默认克隆地址 |
-| `ref_env` | ref 覆盖的环境变量 |
+## 官方源数据化（official-plugins.json）
 
-**internal 条目**（官方内部插件，如 memory）:
+官方插件源清单是数据文件，不是代码: `crates/cli/official-plugins.json`（与
+build.rs 同目录，构建期消费）。文件为**对象形态**，external 源形态已退役
+（Task #16 E5），仅存 `internal` 数组:
+
+```json
+{
+  "internal": [
+    { "id": "plugin-context-memory", "path": "crates/plugin-context-memory" },
+    { "id": "plugin-context-tier", "path": "crates/plugin-context-tier" },
+    { "id": "loom-skills", "path": "skills/loom-skills" },
+    { "id": "actor-circuit", "path": "skills/actor-circuit" }
+  ]
+}
+```
+
+**internal 条目**（官方插件，全部住主仓内）:
 
 | 字段 | 说明 |
 |---|---|
 | `id` | 插件标识（与 `plugin.json` 的 `id` 一致） |
 | `path` | 主仓内清单所在目录（相对仓根） |
 
-**加官方插件 = 编辑此 JSON + 提供清单**（外部另需提供仓），零核心代码改动。
-历史顶层数组形态仍兼容读取（等价于 `external`）。
+**加官方插件 = 编辑此 JSON + 在主仓提供清单与内容**，零核心代码改动。
 
-build.rs 的角色是**官方源清单处理器 + 预装缓存加速器**: 读清单 → clone/复用本地
-目录（external）或直接定位主仓路径（internal）→ 解析各源 `plugin.json` → 生成嵌入
-快照。**注册的事实源是 plugin.json 清单，不是 build.rs**。
+**legacy 兼容（一版期）**: 历史顶层数组形态与 `external` 键仍可解析，但
+external 非空时构建失败并提示迁移到 `internal`（fail loud，不静默拉取远程内容）。
+
+build.rs 的角色是**官方源清单处理器**: 读清单 → 定位主仓内路径 → 解析各源
+`plugin.json` → 生成嵌入快照。**注册的事实源是 plugin.json 清单，不是 build.rs**。
 
 ## 构建期行为
 

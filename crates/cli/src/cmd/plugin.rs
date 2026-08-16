@@ -324,6 +324,61 @@ mod tests {
     }
 
     #[test]
+    fn ecosystem_integration_terminal_snapshot() {
+        // Task #16 E6 terminal state (INV-16-3): all four official
+        // plugins live in this repository, the external source form is
+        // retired, and the shipped configuration has no External rows.
+        let entries = collect_plugin_entries().expect("collect plugin entries");
+
+        assert!(
+            entries.iter().all(|e| e.source != PluginSource::External),
+            "shipped config must not contain external rows"
+        );
+
+        // tier migrated in-repo: both schemes Official 1.1.0 under the
+        // plugin-context-tier identity.
+        for scheme in ["warm-summary", "message-list"] {
+            let entry = entries
+                .iter()
+                .find(|e| e.scheme == scheme)
+                .unwrap_or_else(|| panic!("expected scheme {scheme} in plugin list"));
+            assert_eq!(entry.source, PluginSource::Official, "{scheme}");
+            assert_eq!(entry.version, "1.1.0", "{scheme}");
+            assert_eq!(
+                entry.plugin_id.as_deref(),
+                Some("plugin-context-tier"),
+                "{scheme}"
+            );
+        }
+
+        // Skills-only sources embed as layer "skill" manifests with no
+        // context resources.
+        for id in ["loom-skills", "actor-circuit"] {
+            let manifest = EMBEDDED_PLUGIN_MANIFESTS
+                .iter()
+                .find(|m| m.id == id)
+                .unwrap_or_else(|| panic!("expected skills-only manifest {id}"));
+            assert_eq!(manifest.layer, "skill", "{id}");
+            assert!(manifest.resources.is_empty(), "{id} must not declare resources");
+        }
+
+        // Exactly four official manifests ship (embedded table is
+        // alphabetically ordered).
+        let mut ids: Vec<&str> = EMBEDDED_PLUGIN_MANIFESTS.iter().map(|m| m.id).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![
+                "actor-circuit",
+                "loom-skills",
+                "plugin-context-memory",
+                "plugin-context-tier"
+            ],
+            "official manifest set diverged from terminal state"
+        );
+    }
+
+    #[test]
     fn ghost_detection_flags_unbacked_manifest_schemes() {
         let mut known = HashMap::new();
         known.insert("memory".to_string(), 5);

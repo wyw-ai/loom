@@ -438,7 +438,8 @@ enum ServiceCmd {
     /// Start a `lifecycle = thread_bound` instance by writing a
     /// per-instance `request.json`. A running `loom service serve`
     /// host watches the spec's `instances/` directory and dispatches
-    /// the plugin task on observation. See design §4.7.3.
+    /// the plugin task on observation. Updating the effective scope or
+    /// params restarts an active instance. See design §4.7.3.
     Start {
         /// ServiceSpec id (must declare `lifecycle = thread_bound`).
         #[arg(long = "spec")]

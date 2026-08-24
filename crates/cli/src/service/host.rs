@@ -776,6 +776,9 @@ async fn run_one_instance(
 /// * For each `<thread_id>/request.json` not in `active`, reads the
 ///   request and spawns [`run_one_instance`] with a [`JoinHandle`]
 ///   stored under the thread id.
+/// * For an active instance whose effective request changed, aborts the old
+///   task and respawns it with the new scope/params. Repeating `service start`
+///   with only a refreshed `created_at` timestamp remains a no-op.
 /// * For each `active` entry whose plugin task has **finished**
 ///   (e.g. the scheduler observed `service.self_complete` and
 ///   self-aborted, or the plugin returned naturally), reaps the
@@ -797,6 +800,11 @@ async fn run_one_instance(
 /// The watcher itself is panic-free: per-instance failures are
 /// logged and do not unwind the loop. Returning `Ok(())` is the only
 /// non-panic outcome.
+struct ActiveInstance {
+    request: super::instance::InstanceRequest,
+    handle: JoinHandle<()>,
+}
+
 async fn supervise_instances(
     mut spec: ServiceSpec,
     plugin: Arc<dyn ServicePlugin>,
@@ -806,7 +814,7 @@ async fn supervise_instances(
     specs_dir: Option<PathBuf>,
     runtime_reporting: Option<RuntimeReporting>,
 ) -> Result<()> {
-    let mut active: HashMap<String, JoinHandle<()>> = HashMap::new();
+    let mut active: HashMap<String, ActiveInstance> = HashMap::new();
     let spec_id = spec.id.clone();
     let reload_marker = specs_dir
         .as_ref()
@@ -844,14 +852,14 @@ async fn supervise_instances(
                         actor_id = spec.actor.id.clone();
                         watch_thread_closed = watches_thread_closed(&spec);
                         visibility = None;
-                        for (instance_id, handle) in active.drain() {
+                        for (instance_id, instance) in active.drain() {
                             tracing::info!(
                                 spec_id = %spec_id,
                                 instance_id = %instance_id,
                                 epoch_ms = current_epoch,
                                 "reload requested; aborting thread-bound instance",
                             );
-                            handle.abort();
+                            instance.handle.abort();
                         }
                     }
                     Ok(None) => tracing::warn!(
@@ -874,7 +882,7 @@ async fn supervise_instances(
         //    stopped and don't re-spawn it.
         let to_reap: Vec<String> = active
             .iter()
-            .filter(|(_, h)| h.is_finished())
+            .filter(|(_, instance)| instance.handle.is_finished())
             .map(|(k, _)| k.clone())
             .collect();
         for instance_id in to_reap {
@@ -926,13 +934,13 @@ async fn supervise_instances(
                     .cloned()
                     .collect();
                 for instance_id in closed {
-                    if let Some(handle) = active.remove(&instance_id) {
+                    if let Some(instance) = active.remove(&instance_id) {
                         tracing::info!(
                             spec_id = %spec_id,
                             instance_id = %instance_id,
                             "bound thread no longer visible; reaping (auto_stop_on=thread.closed)",
                         );
-                        handle.abort();
+                        instance.handle.abort();
                         match super::instance::delete_request(&data_root, &spec_id, &instance_id) {
                             Ok(_) => {}
                             Err(e) => tracing::warn!(
@@ -965,21 +973,20 @@ async fn supervise_instances(
             .cloned()
             .collect();
         for instance_id in to_drop {
-            if let Some(handle) = active.remove(&instance_id) {
+            if let Some(instance) = active.remove(&instance_id) {
                 tracing::info!(
                     spec_id = %spec_id,
                     instance_id = %instance_id,
                     "request file gone; aborting instance task",
                 );
-                handle.abort();
+                instance.handle.abort();
             }
         }
 
-        // Spawn instances that appeared since the last tick.
+        // Spawn new instances and restart active instances whose effective
+        // request changed. Read before checking `active` so overwriting an
+        // existing request is observable without a separate reload marker.
         for instance_id in listed {
-            if active.contains_key(&instance_id) {
-                continue;
-            }
             let request = match super::instance::read_request(&data_root, &spec_id, &instance_id) {
                 Ok(Some(r)) => r,
                 Ok(None) => continue,
@@ -993,6 +1000,22 @@ async fn supervise_instances(
                     continue;
                 }
             };
+            let request_changed = active
+                .get(&instance_id)
+                .map(|instance| !instance.request.same_execution(&request))
+                .unwrap_or(false);
+            if request_changed {
+                if let Some(instance) = active.remove(&instance_id) {
+                    tracing::info!(
+                        spec_id = %spec_id,
+                        instance_id = %instance_id,
+                        "instance request changed; restarting instance task",
+                    );
+                    instance.handle.abort();
+                }
+            } else if active.contains_key(&instance_id) {
+                continue;
+            }
             tracing::info!(
                 spec_id = %spec_id,
                 instance_id = %instance_id,
@@ -1007,6 +1030,7 @@ async fn supervise_instances(
             let spec_for_log = spec_id.clone();
             let spec_path_c = resolve_spec_path(specs_dir.as_deref(), &spec_id);
             let reporting_c = runtime_reporting.clone();
+            let active_request = request.clone();
             let join = tokio::spawn(async move {
                 if let Err(e) = run_one_instance(
                     spec_c,
@@ -1028,7 +1052,13 @@ async fn supervise_instances(
                     );
                 }
             });
-            active.insert(instance_id, join);
+            active.insert(
+                instance_id,
+                ActiveInstance {
+                    request: active_request,
+                    handle: join,
+                },
+            );
         }
 
         // Wait either for next tick or shutdown.
@@ -1039,8 +1069,8 @@ async fn supervise_instances(
     }
 
     tracing::info!(spec_id = %spec_id, "thread-bound watcher shutting down");
-    for (_, handle) in active.drain() {
-        handle.abort();
+    for (_, instance) in active.drain() {
+        instance.handle.abort();
     }
     Ok(())
 }

@@ -198,8 +198,8 @@ pub fn validate(path: PathBuf) -> Result<()> {
 ///
 /// Looks up the ServiceSpec, asserts `lifecycle = thread_bound`, and
 /// writes a per-instance `request.json` under the host data root.
-/// Idempotent — re-running with the same scope overwrites the params,
-/// which the host watcher debounces by file mtime / content hash.
+/// Idempotent — re-running with the same effective scope/params is a no-op for
+/// the active task; changing either causes the host to restart that instance.
 pub fn start(
     spec_id: String,
     thread: String,

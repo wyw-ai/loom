@@ -715,6 +715,10 @@ async fn emit_per_line(
             payload.get("schema").and_then(Value::as_str),
         ) {
             let summary = service_fact_summary(schema, &payload);
+            let target_key = emit
+                .task_fact_target_key_template
+                .as_deref()
+                .map(|template| render_task_fact_target_key(template, &payload));
             runtime
                 .append_task_fact(
                     task_id,
@@ -723,6 +727,8 @@ async fn emit_per_line(
                     Some(&artifact_id),
                     summary,
                     Some(body_hash),
+                    target_key.as_deref(),
+                    emit.replace_active_task_fact,
                 )
                 .await
                 .with_context(|| format!("append_task_fact for job `{}`", job.id))?;
@@ -817,6 +823,38 @@ fn render_artifact_name(template: &str, payload: &Value) -> String {
                     .map(sanitize_name_segment)
                     .unwrap_or_else(|| format!("{{{key}}}"));
                 out.push_str(&replacement);
+                i += close + 1;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// Render a task-fact target key without filename sanitization. String,
+/// numeric, and boolean top-level values are supported so a template such as
+/// `{repo}:{mrId}` can preserve repository paths and numeric ids.
+fn render_task_fact_target_key(template: &str, payload: &Value) -> String {
+    let mut out = String::with_capacity(template.len());
+    let bytes = template.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            if let Some(close) = template[i..].find('}') {
+                let key = &template[i + 1..i + close];
+                let replacement = payload.get(key).and_then(|value| match value {
+                    Value::String(value) => Some(value.clone()),
+                    Value::Number(value) => Some(value.to_string()),
+                    Value::Bool(value) => Some(value.to_string()),
+                    _ => None,
+                });
+                out.push_str(
+                    replacement
+                        .as_deref()
+                        .unwrap_or_else(|| &template[i..i + close + 1]),
+                );
                 i += close + 1;
                 continue;
             }
@@ -964,6 +1002,24 @@ mod tests {
         let payload = json!({"event_kind": "merged"});
         let out = render_artifact_name("mr-{event_kind}-{missing}.json", &payload);
         assert_eq!(out, "mr-merged-{missing}.json");
+    }
+
+    #[test]
+    fn render_task_fact_target_key_supports_strings_and_numbers() {
+        let payload = json!({"repo": "aone/a1", "mrId": 29048650});
+        assert_eq!(
+            render_task_fact_target_key("{repo}:{mrId}", &payload),
+            "aone/a1:29048650"
+        );
+    }
+
+    #[test]
+    fn render_task_fact_target_key_keeps_unknown_placeholders() {
+        let payload = json!({"repo": "aone/a1"});
+        assert_eq!(
+            render_task_fact_target_key("{repo}:{mrId}", &payload),
+            "aone/a1:{mrId}"
+        );
     }
 
     #[test]

@@ -11,8 +11,10 @@
 //! `loom service start --spec <id> --in <thread> --params {...}` is the
 //! supported writer; `loom service stop --spec <id> --in <thread>`
 //! removes the file. The running `loom service serve` host watches each
-//! spec's `instances/` directory and on-create dispatches a per-instance
-//! plugin task; on-delete it tears the task down.
+//! spec's `instances/` directory and dispatches a per-instance plugin task.
+//! Rewriting a request with different execution fields restarts the active
+//! task; changing only inspection metadata such as `created_at` is a no-op.
+//! Deleting the request tears the task down.
 //!
 //! v1 keeps `instance_id == thread_id` (the only supported `bind.scope`
 //! today). The schema permits a richer scope shape so we don't repaint
@@ -46,6 +48,21 @@ pub struct InstanceRequest {
     /// ISO8601 timestamp for human inspection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
+}
+
+impl InstanceRequest {
+    /// Whether two requests describe the same running instance execution.
+    ///
+    /// `created_at` is deliberately excluded: `service start` refreshes that
+    /// inspection timestamp on every invocation, but repeating the same
+    /// effective request must remain idempotent. Scope or parameter changes
+    /// require the host to restart the active plugin task.
+    pub fn same_execution(&self, other: &Self) -> bool {
+        self.version == other.version
+            && self.spec_id == other.spec_id
+            && self.scope == other.scope
+            && self.params == other.params
+    }
 }
 
 fn default_version() -> u32 {
@@ -233,5 +250,23 @@ mod tests {
             .unwrap();
         assert_eq!(back.params, r.params);
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn execution_comparison_ignores_created_at_only() {
+        let mut original = req("mr-detector", "thread_y");
+        let mut repeated = original.clone();
+        repeated.created_at = Some("2026-05-04T00:00:00Z".to_string());
+        assert!(original.same_execution(&repeated));
+
+        repeated.params = serde_json::json!({"mr_url": "https://example.test/mr/2"});
+        assert!(!original.same_execution(&repeated));
+
+        repeated = original.clone();
+        repeated.scope.channel_id = Some("ch_other".to_string());
+        assert!(!original.same_execution(&repeated));
+
+        original.version = 2;
+        assert!(!original.same_execution(&req("mr-detector", "thread_y")));
     }
 }

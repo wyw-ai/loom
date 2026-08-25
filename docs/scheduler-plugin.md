@@ -97,6 +97,8 @@ loom service serve --allow-services ops_watchers
 | `singleInFlight` | 否 | `true` | 同 job 上一次 fire 没结束时，下一次 tick 跳过（warn 日志）。§8.5 默认值。|
 | `awaitReply` | 否 | `false` | 设为 true 时 directed message 后阻塞等 `RespondsTo`；`targetAgent` 必填。结果只用于日志，不回写。|
 | `awaitTimeoutSecs` | 否 | `60` | `awaitReply=true` 时的 timeout。Doc 推荐 ≤ tick 间隔的 1/2。|
+| `emit.taskFactTargetKeyTemplate` | 否 | `mrId` / `workitemId` fallback | `artifact_per_json_line` 且 payload 同时带 `taskId`/`schema` 时，用顶层字段模板生成 durable task fact 的 `targetKey`，例如 `{repo}:{mrId}`。|
+| `emit.replaceActiveTaskFact` | 否 | `false` | 为 true 时，新 observation 会 supersede 同 task/kind/targetKey 的旧 active facts；完全相同的 payload 仍复用原 fact。适合只需要“当前状态”的轮询器。|
 
 ## 4. 触发链路
 

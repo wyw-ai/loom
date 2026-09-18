@@ -2916,10 +2916,14 @@ fn zcode_manifest() -> ProviderManifest {
         ],
         BTreeMap::from([("print".into(), mode)]),
         &[
-            ("bigmodel/GLM-5.2", "GLM-5.2 (BigModel)"),
-            ("bigmodel/GLM-5-Turbo", "GLM-5 Turbo (BigModel)"),
-            ("zai/GLM-5.2", "GLM-5.2 (Z.AI)"),
-            ("zai/GLM-5-Turbo", "GLM-5 Turbo (Z.AI)"),
+            ("bigmodel/glm-5.3", "GLM-5.3 (BigModel)"),
+            ("bigmodel/glm-5.3-flash", "GLM-5.3 Flash (BigModel)"),
+            ("bigmodel/glm-5.1-highspeed", "GLM-5.1 Highspeed (BigModel)"),
+            ("bigmodel/glm-5-turbo", "GLM-5 Turbo (BigModel)"),
+            ("zai/glm-5.3", "GLM-5.3 (Z.AI)"),
+            ("zai/glm-5.3-flash", "GLM-5.3 Flash (Z.AI)"),
+            ("zai/glm-5.1-highspeed", "GLM-5.1 Highspeed (Z.AI)"),
+            ("zai/glm-5-turbo", "GLM-5 Turbo (Z.AI)"),
         ],
     )
 }

@@ -82,7 +82,7 @@ export function StopRunButton({
         ) : (
           <XCircle size={11} />
         )}
-        {confirming ? "Stop?" : label}
+        {confirming ? confirmLabel : label}
       </button>
     );
   }

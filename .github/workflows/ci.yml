@@ -74,7 +74,7 @@ jobs:
         uses: actions/checkout@v6.0.3
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v6.0.8
+        uses: pnpm/action-setup@v6.0.10
         with:
           version: 9
 
@@ -114,6 +114,9 @@ jobs:
 
       - name: Check release metadata script syntax
         run: node --check scripts/write-release-downloads.mjs
+
+      - name: Test release preview automation
+        run: node --test scripts/tests/release-preview.test.mjs
 
       - name: Test release packaging scripts
         run: bash scripts/tests/release-scripts.test.sh

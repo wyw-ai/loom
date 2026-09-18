@@ -6,6 +6,7 @@ import { workflowSummary, workflowResultSummary } from "@/lib/message-utils";
 import { formatTime } from "@/lib/utils";
 import { displayName } from "@/lib/format-utils";
 import { AgentMessageAvatar } from "@/components/agent/AgentMessageAvatar";
+import { useI18n } from "@/lib/i18n";
 
 export const WorkflowEventRow = memo(function WorkflowEventRow({
   actor,
@@ -16,11 +17,12 @@ export const WorkflowEventRow = memo(function WorkflowEventRow({
   actors: Record<string, Actor>;
   message: Message;
 }) {
+  const { t } = useI18n();
   const summary = workflowSummary(message, actors);
   return (
     <div className="mx-auto flex max-w-[80%] items-center gap-2 rounded-xl border border-[#dfe3ec] bg-[#f7f8fb] px-3 py-2 text-xs text-[#667085]">
       <Check size={14} />
-      <span className="min-w-0 flex-1 truncate">{summary}</span>
+      <span className="min-w-0 flex-1 truncate">{t(summary)}</span>
       <span>{formatTime(message.createdAt)}</span>
       {actor && <Badge variant="outline">{displayName(actor)}</Badge>}
     </div>
@@ -40,6 +42,7 @@ export const WorkflowResultRow = memo(function WorkflowResultRow({
   message: Message;
   onOpenAgentSettings: (actorId: string) => void;
 }) {
+  const { t } = useI18n();
   return (
     <article className="group rounded-xl px-4 py-3 transition-colors hover:bg-[#f7f8fb]">
       <div className="flex items-start gap-4">
@@ -54,9 +57,9 @@ export const WorkflowResultRow = memo(function WorkflowResultRow({
           <div className="flex flex-wrap items-center gap-2">
             <span className="font-semibold text-[#111827]">{actor ? displayName(actor) : message.authorActorId}</span>
             <span className="text-xs text-muted-foreground">{formatTime(message.createdAt)}</span>
-            <Badge variant="success">task result</Badge>
+            <Badge variant="success">{t("task result")}</Badge>
           </div>
-          <div className="mt-1 text-sm leading-6 text-[#303849]">{workflowResultSummary(message)}</div>
+          <div className="mt-1 text-sm leading-6 text-[#303849]">{t(workflowResultSummary(message))}</div>
         </div>
       </div>
     </article>

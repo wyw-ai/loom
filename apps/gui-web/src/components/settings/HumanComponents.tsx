@@ -2,6 +2,7 @@ import { ActorAvatar } from "@/components/agent/ActorAvatar";
 import { HostDetailSection } from "@/components/shared/UIComponents";
 import type { Actor } from "@/ipc/types";
 import { displayName } from "@/lib/format-utils";
+import { useI18n } from "@/lib/i18n";
 
 export function HumanListItem({ human }: { human: Actor }) {
   return (
@@ -20,19 +21,20 @@ export function HumanListItem({ human }: { human: Actor }) {
 }
 
 export function HumanRosterOverview({ humans }: { humans: Actor[] }) {
+  const { t } = useI18n();
   return (
     <div className="min-h-full bg-white">
       <section className="border-b border-[#dfe3ec] px-6 py-6 lg:px-8">
-        <h2 className="text-xl font-bold text-[#111827]">Humans</h2>
+        <h2 className="text-xl font-bold text-[#111827]">{t("Humans")}</h2>
         <p className="mt-2 text-sm text-[#667085]">
-          {humans.length} registered on this server
+          {t("{{count}} registered on this server", { count: humans.length })}
         </p>
       </section>
 
-      <HostDetailSection title="Human Directory" count={humans.length}>
+      <HostDetailSection title={t("Human Directory")} count={humans.length}>
         {humans.length === 0 ? (
           <div className="rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] p-4 text-sm text-[#667085]">
-            No humans registered.
+            {t("No humans registered.")}
           </div>
         ) : (
           <div className="space-y-2">

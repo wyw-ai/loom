@@ -2399,8 +2399,7 @@ fn claude_manifest() -> ProviderManifest {
         lit("--session-id"),
         lit("{session.id}"),
         when("model", vec![lit("--model"), lit("{model}")]),
-        lit("-p"),
-        lit("{prompt.full}"),
+        lit("--print"),
     ];
     let resume_args = vec![
         lit("--add-dir"),
@@ -2415,15 +2414,19 @@ fn claude_manifest() -> ProviderManifest {
         lit("--resume"),
         lit("{session.id}"),
         when("model", vec![lit("--model"), lit("{model}")]),
-        lit("-p"),
-        lit("{prompt.full}"),
+        lit("--print"),
     ];
     let session = ProviderSessionSpec {
         id_source: Some(ProviderSessionIdSource::LoomUuid),
         resume_args,
         scope: Some("actor_scope".into()),
     };
-    let print_mode = mode("{bin}", first_args, "claude_stream_json", Some(session));
+    let mut print_mode = mode("{bin}", first_args, "claude_stream_json", Some(session));
+    // Claude's --print mode reads the prompt from stdin when no positional
+    // prompt is supplied. Keep large Loom turn contexts out of argv: Linux
+    // limits each execve argument to roughly 128 KiB even when ARG_MAX is
+    // much larger.
+    print_mode.stdin = Some("{prompt.full}".into());
     let nonprint_mode = ProviderModeSpec {
         transport: "interactive_command".into(),
         command: "{bin}".into(),
@@ -2913,10 +2916,14 @@ fn zcode_manifest() -> ProviderManifest {
         ],
         BTreeMap::from([("print".into(), mode)]),
         &[
-            ("bigmodel/GLM-5.2", "GLM-5.2 (BigModel)"),
-            ("bigmodel/GLM-5-Turbo", "GLM-5 Turbo (BigModel)"),
-            ("zai/GLM-5.2", "GLM-5.2 (Z.AI)"),
-            ("zai/GLM-5-Turbo", "GLM-5 Turbo (Z.AI)"),
+            ("bigmodel/glm-5.3", "GLM-5.3 (BigModel)"),
+            ("bigmodel/glm-5.3-flash", "GLM-5.3 Flash (BigModel)"),
+            ("bigmodel/glm-5.1-highspeed", "GLM-5.1 Highspeed (BigModel)"),
+            ("bigmodel/glm-5-turbo", "GLM-5 Turbo (BigModel)"),
+            ("zai/glm-5.3", "GLM-5.3 (Z.AI)"),
+            ("zai/glm-5.3-flash", "GLM-5.3 Flash (Z.AI)"),
+            ("zai/glm-5.1-highspeed", "GLM-5.1 Highspeed (Z.AI)"),
+            ("zai/glm-5-turbo", "GLM-5 Turbo (Z.AI)"),
         ],
     )
 }
@@ -2993,10 +3000,16 @@ fn fallback_command_dirs() -> Vec<PathBuf> {
     if let Some(home) = std::env::var_os("HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+        .or_else(dirs::home_dir)
     {
         dirs.push(home.join(".local").join("bin"));
         dirs.push(home.join(".cargo").join("bin"));
         dirs.push(home.join(".bun").join("bin"));
+        // Kimi Code installs its launcher here by default. User services
+        // (systemd/launchd) commonly start with a minimal PATH, so relying on
+        // the interactive shell to contribute this directory makes provider
+        // discovery silently differ between a terminal and loom-daemon.
+        dirs.push(home.join(".kimi-code").join("bin"));
         let nvm_node_root = home.join(".nvm").join("versions").join("node");
         if let Ok(entries) = std::fs::read_dir(nvm_node_root) {
             dirs.extend(
@@ -3056,6 +3069,19 @@ fn is_executable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallback_command_dirs_include_the_default_kimi_install_location() {
+        let Some(home) = std::env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(dirs::home_dir)
+        else {
+            return;
+        };
+
+        assert!(fallback_command_dirs().contains(&home.join(".kimi-code").join("bin")));
+    }
     use proto::methods::ProviderDecoderEventSpec;
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -3955,7 +3981,7 @@ mod tests {
     }
 
     #[test]
-    fn builtin_claude_uses_full_prompt_without_system_append() {
+    fn builtin_claude_uses_full_prompt_via_stdin_without_system_append() {
         let dir = temp_dir("path");
         make_executable(&dir.join("claude"));
         let registry = ProviderRegistry::load(&temp_dir("config")).expect("registry");
@@ -3981,7 +4007,9 @@ mod tests {
         assert!(!transport.args.contains(&"--append-system-prompt".into()));
         assert!(!transport.args.contains(&"{prompt.system}".into()));
         assert!(!transport.args.contains(&"{prompt.user}".into()));
-        assert!(transport.args.contains(&"{prompt.full}".into()));
+        assert!(!transport.args.contains(&"{prompt.full}".into()));
+        assert!(transport.args.contains(&"--print".into()));
+        assert_eq!(transport.stdin.as_deref(), Some("{prompt.full}"));
         assert!(transport.args.contains(&"{agent.configDir}".into()));
         assert!(transport.args.contains(&"{agent.skillWorkspace}".into()));
         assert!(!transport.args.contains(&"{loom.configDir}".into()));

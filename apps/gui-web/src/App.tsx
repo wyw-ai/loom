@@ -6,13 +6,28 @@ import {
   type ScopeRef,
   type Workspace,
 } from "@/ipc/types";
-import { detailPanelBreakpoint, machineStatusPollIntervalMs } from "@/lib/constants";
+import {
+  defaultPanelSizes,
+  detailPanelBreakpoint,
+  machineStatusPollIntervalMs,
+} from "@/lib/constants";
 import type { AgentFormState } from "@/lib/types";
 import { defaultWakeSpec } from "@/lib/wake-utils";
+import { useI18n } from "@/lib/i18n";
 import { channelMentionAgentActors } from "@/lib/channel-utils";
 import { WorkspaceShell } from "@/containers/WorkspaceShell";
 import { OnboardingView } from "@/components/views/OnboardingView";
+import { WebConnectionView } from "@/components/views/WebConnectionView";
 import { ErrorBoundary } from "@/components/shared/ErrorBoundary";
+import {
+  ServerPasswordDialog,
+  type ServerPasswordPrompt,
+} from "@/components/shared/ServerPasswordDialog";
+import {
+  configureWebConnection,
+  hasWebConnectionConfig,
+  isWebMode,
+} from "@/ipc/bridge";
 import * as D from "@/lib/derived";
 import { usePanelResize } from "@/hooks/usePanelResize";
 import { useStreamHandler } from "@/hooks/useStreamHandler";
@@ -27,6 +42,7 @@ import { useAppEffects } from "@/hooks/useAppEffects";
 
 
 export function App() {
+  const { t } = useI18n();
   const {
     config, setConfig, workspace, setWorkspace, connection, setConnection,
     error, setError, notice, setNotice, busy, setBusy, workspaceForm, setWorkspaceForm,
@@ -63,6 +79,10 @@ export function App() {
     Record<string, Record<string, ChannelMemberConfig>>
   >({});
   const [messageAnchorId, setMessageAnchorId] = useState<string | null>(null);
+  const [serverPasswordPrompt, setServerPasswordPrompt] = useState<ServerPasswordPrompt | null>(null);
+  const [threadPanelMaximized, setThreadPanelMaximized] = useState(false);
+  const [threadPanelRestoring, setThreadPanelRestoring] = useState(false);
+  const threadRestoreTimerRef = useRef<number | null>(null);
 
   const activeScopeRef = useRef<ScopeRef | null>(null);
   const activeThreadScopeRef = useRef<ScopeRef | null>(null);
@@ -75,6 +95,30 @@ export function App() {
   const hasOpenedConnectionRef = useRef(false);
   const reconnectTimerRef = useRef<number | null>(null);
   const reconnectAttemptRef = useRef(0);
+  const serverPasswordsRef = useRef(new Map<string, string>());
+  const serverPasswordResolverRef = useRef<((password: string | null) => void) | null>(null);
+
+  const requestServerPassword = useCallback((prompt: ServerPasswordPrompt) => {
+    serverPasswordResolverRef.current?.(null);
+    return new Promise<string | null>((resolve) => {
+      serverPasswordResolverRef.current = resolve;
+      setServerPasswordPrompt(prompt);
+    });
+  }, []);
+  const submitServerPassword = useCallback((password: string) => {
+    const resolve = serverPasswordResolverRef.current;
+    serverPasswordResolverRef.current = null;
+    setServerPasswordPrompt(null);
+    resolve?.(password);
+  }, []);
+  const cancelServerPassword = useCallback(() => {
+    const resolve = serverPasswordResolverRef.current;
+    serverPasswordResolverRef.current = null;
+    setServerPasswordPrompt(null);
+    resolve?.(null);
+  }, []);
+
+  useEffect(() => () => serverPasswordResolverRef.current?.(null), []);
 
   const account = config.account ?? null;
   const workspaces = config.workspaces ?? [];
@@ -128,6 +172,7 @@ export function App() {
     loadConfig,
     loadWorkspaceData,
     connectWorkspace,
+    connectionGenerationRef,
   } = useWorkspaceConnection({
     config,
     setConfig,
@@ -156,19 +201,25 @@ export function App() {
     reconnectTimerRef,
     reconnectAttemptRef,
     actorIdRef,
+    serverPasswordsRef,
+    requestServerPassword,
   });
 
   const {
-    updateChannelGroups,
+    removeChannelFromGroupsLocally,
+    applyRemoteChannelLayout,
     addChannelGroup,
     renameChannelGroup,
     removeChannelGroup,
     toggleChannelGroup,
     moveChannelToGroup,
+    reorderChannelGroup,
   } = useChannelGroups({
     channelGroups,
     setChannelGroups,
     channelGroupsKey,
+    connection,
+    workspaceId: workspace?.id,
   });
 
   const { handleStream, applyChannelDeleted } = useStreamHandler({
@@ -195,7 +246,8 @@ export function App() {
     setReplyTo,
     setActiveChannelId,
     setActiveThreadId,
-    updateChannelGroups,
+    removeChannelFromGroupsLocally,
+    applyRemoteChannelLayout,
     refreshInbox,
   });
 
@@ -215,6 +267,7 @@ export function App() {
     reconnectTimerRef,
     reconnectAttemptRef,
     clearReconnectTimer,
+    connectionGenerationRef,
   });
 
   useEffect(() => {
@@ -290,6 +343,7 @@ export function App() {
     openLocalPath,
     createChannelWithTitle,
     renameChannel,
+    updateChannelVisibility,
     deleteChannel,
     sendMessage,
     sendThreadMessage,
@@ -371,6 +425,30 @@ export function App() {
     applyChannelDeleted,
   });
 
+  const saveWebConnection = useCallback(async (args: {
+    serverUrl: string;
+    actorId: string;
+    displayName: string;
+  }) => {
+    setBusy("web:connect");
+    setError(null);
+    try {
+      const next = configureWebConnection(args);
+      applyConfig(next);
+      const workspaceId = next.active ?? next.workspaces[0]?.id;
+      if (!workspaceId) throw new Error("Web workspace was not saved");
+      const connected = await connectWorkspace(workspaceId, { quiet: true });
+      if (connected) {
+        finishOnboarding();
+        pushNotice(`Connected to ${connected.name}`);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(null);
+    }
+  }, [applyConfig, connectWorkspace, finishOnboarding, pushNotice]);
+
   const chatEmpty =
     connection === "open"
       ? activeChannel
@@ -399,19 +477,49 @@ export function App() {
   const selectedRun = selectedRunId ? runs[selectedRunId] ?? null : null;
 
   const showWorkspaceChrome =
-    view === "chat" ||
-    view === "threads" ||
-    view === "channels" ||
-    view === "direct" ||
-    view === "inbox" ||
-    view === "tasks" ||
-    view === "runs" ||
-    view === "settings";
+    view !== "spaces" && view !== "account" && view !== "system";
   const showChatDetail =
     view === "chat" &&
     (Boolean(activeThread) || (Boolean(channelPanelTab) && Boolean(activeChannel)) || searchPanelOpen);
   const detailVisibleInGrid =
     showChatDetail && viewportWidth >= detailPanelBreakpoint;
+
+  const restoreThreadPanel = useCallback(() => {
+    setThreadPanelMaximized(false);
+    setThreadPanelRestoring(true);
+    if (threadRestoreTimerRef.current !== null) {
+      window.clearTimeout(threadRestoreTimerRef.current);
+    }
+    threadRestoreTimerRef.current = window.setTimeout(() => {
+      setThreadPanelRestoring(false);
+      threadRestoreTimerRef.current = null;
+    }, 220);
+    setPanelSizes((current) => ({
+      ...current,
+      detail: defaultPanelSizes.detail,
+    }));
+  }, [setPanelSizes]);
+  const maximizeThreadPanel = useCallback(() => {
+    if (threadRestoreTimerRef.current !== null) {
+      window.clearTimeout(threadRestoreTimerRef.current);
+      threadRestoreTimerRef.current = null;
+    }
+    setThreadPanelRestoring(false);
+    setThreadPanelMaximized(true);
+  }, []);
+
+  useEffect(() => {
+    if (!activeThread || searchPanelOpen || view !== "chat") {
+      setThreadPanelMaximized(false);
+      setThreadPanelRestoring(false);
+    }
+  }, [activeThread, searchPanelOpen, view]);
+
+  useEffect(() => () => {
+    if (threadRestoreTimerRef.current !== null) {
+      window.clearTimeout(threadRestoreTimerRef.current);
+    }
+  }, []);
 
   const {
     shellStyle,
@@ -424,14 +532,14 @@ export function App() {
     viewportWidth,
     detailVisibleInGrid,
     showChatDetail,
+    allowDetailExpansion: Boolean(activeThread) && !searchPanelOpen && !threadPanelMaximized,
+    onDetailSnap: maximizeThreadPanel,
     setResizingPanel,
   });
 
   useAppEffects({
     panelSizes,
     setViewportWidth,
-    channelGroupsKey,
-    setChannelGroups,
     workspaceId: workspace?.id,
     setActiveDirectActorId,
     setDirectMessages,
@@ -448,16 +556,29 @@ export function App() {
       <div className="flex h-screen w-screen items-center justify-center bg-[#f5f6fa] text-[#303849]">
         <div className="flex items-center gap-3 rounded-xl border border-[#dfe3ec] bg-white px-4 py-3 text-sm font-semibold shadow-sm">
           <Loader2 className="animate-spin text-[#5843d7]" size={18} />
-          Loading Loom
+          {t("Loading Loom")}
         </div>
       </div>
     );
   }
 
-  if (onboardingActive) {
+  if (isWebMode() && !hasWebConnectionConfig()) {
     return (
       <ErrorBoundary>
-        <OnboardingView
+        <WebConnectionView
+          busy={busy}
+          error={error}
+          onConnect={saveWebConnection}
+        />
+      </ErrorBoundary>
+    );
+  }
+
+  if (onboardingActive) {
+    return (
+      <>
+        <ErrorBoundary>
+          <OnboardingView
         account={account}
         busy={busy}
         connection={connection}
@@ -473,29 +594,37 @@ export function App() {
         onRemoveWorkspace={removeWorkspace}
         onCheckMachines={checkMachines}
         onStartLocalHost={startLocalHost}
+        onCreateAgent={createAgent}
         onFinish={finishOnboarding}
-      />
-      </ErrorBoundary>
+          />
+        </ErrorBoundary>
+        <ServerPasswordDialog
+          prompt={serverPasswordPrompt}
+          onCancel={cancelServerPassword}
+          onSubmit={submitServerPassword}
+        />
+      </>
     );
   }
 
   const shellProps = {
-    shellStyle, showWorkspaceChrome, showChatDetail, resizingPanel, notice,
+    shellStyle, showWorkspaceChrome, showChatDetail, threadPanelMaximized, threadPanelRestoring,
+    restoreThreadPanel, resizingPanel, notice,
     account, busy, connection, workspace, workspaces, selectWorkspace, setView,
     view, visibleChannels, channelGroups, activeChannelId, activeDirectActorId,
     activeThreadId, agentActors, runs, runsList, selectedRun, setSelectedRunId,
     cancelRun, openScope, openMessageContext, messageAnchorId,
     searchPanelOpen, setSearchPanelOpen, machines, threadsByChannel,
     runsLoading, runsError, refreshRuns,
-    createChannelWithTitle, addChannelGroup, moveChannelToGroup, deleteChannel,
-    renameChannel, removeChannelGroup, renameChannelGroup, toggleChannelGroup,
+    createChannelWithTitle, addChannelGroup, moveChannelToGroup, reorderChannelGroup, deleteChannel,
+    renameChannel, updateChannelVisibility, removeChannelGroup, renameChannelGroup, toggleChannelGroup,
     setActiveChannelId, setActiveThreadId, setActiveDirectActorId, setChannelPanelTab,
     resizePanelByKeyboard, startPanelResize, error, target, channelPanelTab,
     activeThread, activeThreadTask, activeScope, activeThreadScope, messages,
     threadMessages, threadStatsById, tasksBySourceMessageId, channelThreads,
     chatEmpty, draft, threadDraft, replyTo, channelAgentActors,
     prepareLocalServerSpace, allThreads, threadMessageTarget, activeDirectActor,
-    activeDirectTarget, directMessages, directDraft, inbox, tasks, workspaceForm,
+    activeDirectScope, activeDirectTarget, directMessages, directDraft, inbox, tasks, workspaceForm,
     agentForm, settingsAgentId, actors, setDraft, setThreadDraft, setDirectDraft,
     setReplyTo, setWorkspaceForm, setAgentForm, sendMessage, sendThreadMessage,
     sendDirectMessage, startThread, toggleMessageReaction, answerAction,
@@ -508,8 +637,15 @@ export function App() {
   };
 
   return (
-    <ErrorBoundary>
-      <WorkspaceShell {...shellProps} />
-    </ErrorBoundary>
+    <>
+      <ErrorBoundary>
+        <WorkspaceShell {...shellProps} />
+      </ErrorBoundary>
+      <ServerPasswordDialog
+        prompt={serverPasswordPrompt}
+        onCancel={cancelServerPassword}
+        onSubmit={submitServerPassword}
+      />
+    </>
   );
 }

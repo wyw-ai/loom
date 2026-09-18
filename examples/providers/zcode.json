@@ -10,23 +10,39 @@
   "models": {
     "choices": [
       {
-        "id": "bigmodel/GLM-5.2",
-        "label": "GLM-5.2 (BigModel)"
+        "id": "bigmodel/glm-5.3",
+        "label": "GLM-5.3 (BigModel)"
       },
       {
-        "id": "bigmodel/GLM-5-Turbo",
+        "id": "bigmodel/glm-5.3-flash",
+        "label": "GLM-5.3 Flash (BigModel)"
+      },
+      {
+        "id": "bigmodel/glm-5.1-highspeed",
+        "label": "GLM-5.1 Highspeed (BigModel)"
+      },
+      {
+        "id": "bigmodel/glm-5-turbo",
         "label": "GLM-5 Turbo (BigModel)"
       },
       {
-        "id": "zai/GLM-5.2",
-        "label": "GLM-5.2 (Z.AI)"
+        "id": "zai/glm-5.3",
+        "label": "GLM-5.3 (Z.AI)"
       },
       {
-        "id": "zai/GLM-5-Turbo",
+        "id": "zai/glm-5.3-flash",
+        "label": "GLM-5.3 Flash (Z.AI)"
+      },
+      {
+        "id": "zai/glm-5.1-highspeed",
+        "label": "GLM-5.1 Highspeed (Z.AI)"
+      },
+      {
+        "id": "zai/glm-5-turbo",
         "label": "GLM-5 Turbo (Z.AI)"
       }
     ],
-    "default": "bigmodel/GLM-5.2"
+    "default": "bigmodel/glm-5.3"
   },
   "modes": {
     "print": {

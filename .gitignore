@@ -18,6 +18,7 @@ __pycache__/
 !/docs/README.md
 !/docs/agent-turn-input-analysis.md
 !/docs/gui-actor-provider-management-design.md
+!/docs/gui-lightweight-and-runtime-visibility-analysis.md
 !/docs/loop-engineering.md
 !/docs/protocol/
 !/docs/protocol/agent-coordination-workflow.md
@@ -27,6 +28,7 @@ __pycache__/
 !/docs/ci/
 !/docs/ci/local-matrix.md
 !/docs/channel-thread-instructions.md
+!/docs/release-preview-workflow.md
 data
 # Desktop GUI (apps/gui-web + Tauri build artifacts)
 /apps/gui-web/node_modules/

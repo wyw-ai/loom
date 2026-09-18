@@ -1,7 +1,7 @@
 {
   "name": "loom-gui-web",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.1.8",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -11,17 +11,18 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.1.1",
+    "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-notification": "^2.3.3",
     "clsx": "^2.1.1",
     "highlight.js": "^11.11.1",
     "lucide-react": "^0.453.0",
+    "qrcode.react": "^4.2.0",
     "re-resizable": "^6.11.2",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-markdown": "^9.0.1",
     "react-textarea-autosize": "^8.5.9",
-    "react-virtuoso": "^4.18.10",
+    "react-virtuoso": "^4.18.11",
     "rehype-highlight": "^7.0.2",
     "remark-gfm": "^4.0.0",
     "zustand": "^4.5.5"
@@ -38,8 +39,8 @@
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.3",
     "autoprefixer": "^10.4.20",
-    "jsdom": "^29.1.1",
-    "postcss": "^8.4.47",
+    "jsdom": "^30.0.0",
+    "postcss": "^8.5.26",
     "tailwindcss": "^3.4.14",
     "typescript": "^5.6.3",
     "vite": "^5.4.10",

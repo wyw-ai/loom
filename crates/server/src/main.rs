@@ -1,4 +1,5 @@
 mod artifacts;
+mod auth;
 mod handlers;
 mod journal;
 mod machine_commands;
@@ -17,6 +18,7 @@ use axum::Router;
 use clap::Parser;
 
 use crate::artifacts::ArtifactStore;
+use crate::auth::ServerAuth;
 use crate::journal::Journal;
 use crate::machine_commands::MachineCommandWaiters;
 use crate::scope_skills::ScopeSkills;
@@ -43,6 +45,21 @@ struct Args {
     /// Directory to use for local file-based JSON RPC instead of sockets.
     #[arg(long, env = "LOOM_FILE_RPC")]
     file_rpc: Option<PathBuf>,
+
+    /// Shared password required by every client transport. Prefer
+    /// --password-file so the secret is not visible in the process list.
+    #[arg(
+        long,
+        env = "LOOM_SERVER_PASSWORD",
+        hide_env_values = true,
+        conflicts_with = "password_file"
+    )]
+    password: Option<String>,
+
+    /// Read the shared server password from a UTF-8 file. One trailing CR/LF
+    /// sequence is ignored so ordinary secret files work as expected.
+    #[arg(long, env = "LOOM_SERVER_PASSWORD_FILE", conflicts_with = "password")]
+    password_file: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -74,12 +91,18 @@ async fn main() -> Result<()> {
     }));
 
     let args = Args::parse();
+    let password = resolve_server_password(args.password, args.password_file.as_deref())?;
+    let auth = Arc::new(match password.as_deref() {
+        Some(password) => ServerAuth::with_password(password).map_err(anyhow::Error::msg)?,
+        None => ServerAuth::disabled(),
+    });
     let data_dir = args.data_dir.unwrap_or_else(default_data_dir);
     tracing::info!(
         data_dir = %data_dir.display(),
         bind = %args.bind,
         unix_socket = %args.unix_socket.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
         file_rpc = %args.file_rpc.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+        password_required = auth.required(),
         "loom-server startup begin"
     );
     let stage_started = std::time::Instant::now();
@@ -126,6 +149,7 @@ async fn main() -> Result<()> {
     );
 
     let state = AppState {
+        auth,
         store: store.clone(),
         subscriptions,
         artifacts,
@@ -163,6 +187,26 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn resolve_server_password(
+    inline: Option<String>,
+    password_file: Option<&std::path::Path>,
+) -> Result<Option<String>> {
+    let mut password = match (inline, password_file) {
+        (Some(password), None) => password,
+        (None, Some(path)) => std::fs::read_to_string(path)
+            .with_context(|| format!("read server password file {}", path.display()))?,
+        (None, None) => return Ok(None),
+        (Some(_), Some(_)) => anyhow::bail!("pass either --password or --password-file, not both"),
+    };
+    while matches!(password.chars().last(), Some('\r' | '\n')) {
+        password.pop();
+    }
+    if password.is_empty() {
+        anyhow::bail!("server password cannot be empty");
+    }
+    Ok(Some(password))
+}
+
 fn default_data_dir() -> PathBuf {
     dirs::data_dir()
         .map(|dir| dir.join("loom").join("server"))
@@ -171,13 +215,25 @@ fn default_data_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::default_data_dir;
+    use super::{default_data_dir, resolve_server_password};
 
     #[test]
     fn default_data_dir_is_not_repo_data_dir() {
         let path = default_data_dir();
         assert!(path.ends_with("loom/server") || path.ends_with(".loom/server-data"));
         assert_ne!(path, std::path::PathBuf::from("./data"));
+    }
+
+    #[test]
+    fn password_file_trims_only_line_endings() {
+        let root = std::env::temp_dir().join(format!(
+            "loom-server-password-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&root, "  secret phrase  \r\n").expect("write password");
+        let password = resolve_server_password(None, Some(&root)).expect("read password");
+        let _ = std::fs::remove_file(&root);
+        assert_eq!(password.as_deref(), Some("  secret phrase  "));
     }
 }
 

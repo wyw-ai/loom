@@ -130,7 +130,7 @@ export function RunDetailView({
               <Badge variant="outline" className={cn("gap-1.5 font-semibold", dotClass.replace("bg-", "text-"))}>
                 <span
                   className={cn("h-2 w-2 rounded-full", dotClass)}
-                  style={animation ? { animationName: animation, animationDuration: "1.5s", animationIterationCount: "infinite", animationTimingFunction: "ease-in-out" } : undefined}
+                  style={animation ? { animationName: animation, animationDuration: "2.2s", animationIterationCount: "infinite", animationTimingFunction: "ease-in-out" } : undefined}
                 />
                 {runStatusLabel[displayRun.status] ?? displayRun.status}
               </Badge>

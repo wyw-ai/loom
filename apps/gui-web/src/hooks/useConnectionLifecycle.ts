@@ -1,9 +1,13 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import * as ipc from "@/ipc/bridge";
 import { machineStatusPollIntervalMs } from "@/lib/constants";
 import { reconnectDelayMs } from "@/lib/format-utils";
-import type { Workspace, StreamUpdate } from "@/ipc/types";
+import type { ConnectionEvent, Workspace, StreamUpdate } from "@/ipc/types";
 import type { ConnectionState } from "@/lib/types";
+import {
+  adoptConnectionEvent,
+  type ConnectionGenerationState,
+} from "@/hooks/connectionGeneration";
 
 export interface ConnectionLifecycleDeps {
   loadConfig: () => Promise<void>;
@@ -25,6 +29,7 @@ export interface ConnectionLifecycleDeps {
   reconnectTimerRef: React.MutableRefObject<number | null>;
   reconnectAttemptRef: React.MutableRefObject<number>;
   clearReconnectTimer: () => void;
+  connectionGenerationRef: React.MutableRefObject<ConnectionGenerationState>;
 }
 
 export function useConnectionLifecycle(deps: ConnectionLifecycleDeps) {
@@ -44,19 +49,23 @@ export function useConnectionLifecycle(deps: ConnectionLifecycleDeps) {
     reconnectTimerRef,
     reconnectAttemptRef,
     clearReconnectTimer,
+    connectionGenerationRef,
   } = deps;
+  const handleStreamRef = useRef(handleStream);
+  handleStreamRef.current = handleStream;
 
   // Stream + connection listener setup
   useEffect(() => {
+    let disposed = false;
     let unlistenStream: (() => void) | null = null;
     let unlistenConnection: (() => void) | null = null;
 
-    void loadConfig();
-    void ipc.onStream((update) => handleStream(update)).then((off) => {
-      unlistenStream = off;
-    });
-    void ipc.onConnection((event) => {
+    const handleConnection = (event: ConnectionEvent) => {
+      if (!adoptConnectionEvent(connectionGenerationRef.current, event)) return;
       if (event.state === "closed") {
+        if (event.reason) {
+          console.warn("Loom WebSocket closed:", event.reason);
+        }
         setConnection("closed");
         if (
           hasOpenedConnectionRef.current &&
@@ -77,15 +86,28 @@ export function useConnectionLifecycle(deps: ConnectionLifecycleDeps) {
         setError(null);
         void loadMachines(true).catch(() => {});
       }
-    }).then((off) => {
-      unlistenConnection = off;
+    };
+
+    const streamRegistration = ipc
+      .onStream((update) => handleStreamRef.current(update))
+      .then((off) => {
+        if (disposed) off();
+        else unlistenStream = off;
+      });
+    const connectionRegistration = ipc.onConnection(handleConnection).then((off) => {
+      if (disposed) off();
+      else unlistenConnection = off;
+    });
+    void Promise.allSettled([streamRegistration, connectionRegistration]).then(() => {
+      if (!disposed) void loadConfig();
     });
 
     return () => {
+      disposed = true;
       unlistenStream?.();
       unlistenConnection?.();
     };
-  }, [loadConfig, loadMachines]);
+  }, [loadConfig, loadMachines, connectionGenerationRef]);
 
   // Keep workspaceRef in sync
   useEffect(() => {

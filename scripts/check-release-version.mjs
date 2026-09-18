@@ -34,6 +34,49 @@ function workspaceVersion() {
   return match[1];
 }
 
+function workspaceMemberNames() {
+  const cargoToml = readText("Cargo.toml");
+  const membersMatch = cargoToml.match(/^members\s*=\s*\[([\s\S]*?)\]/m);
+  if (!membersMatch) {
+    throw new Error("Cargo.toml is missing workspace members");
+  }
+
+  return [...membersMatch[1].matchAll(/"([^"]+)"/g)].map((match) => {
+    const memberPath = match[1];
+    const memberToml = readText(`${memberPath}/Cargo.toml`);
+    const packageSection = memberToml
+      .split(/\r?\n(?=\[)/)
+      .find((part) => part.trimStart().startsWith("[package]"));
+    const name = packageSection?.match(/^name\s*=\s*"([^"]+)"/m)?.[1];
+    if (!name || !/^version\.workspace\s*=\s*true\s*$/m.test(packageSection)) {
+      throw new Error(`${memberPath}/Cargo.toml must inherit its version from the workspace`);
+    }
+    return name;
+  });
+}
+
+function cargoLockVersions(packageNames) {
+  const expectedNames = new Set(packageNames);
+  const versions = [];
+  for (const block of readText("Cargo.lock").split(/(?=^\[\[package\]\]\r?$)/m)) {
+    const name = block.match(/^name\s*=\s*"([^"]+)"/m)?.[1];
+    if (!name || !expectedNames.has(name)) {
+      continue;
+    }
+    const version = block.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
+    if (!version) {
+      throw new Error(`Cargo.lock package ${name} is missing version`);
+    }
+    versions.push([`Cargo.lock (${name})`, version]);
+    expectedNames.delete(name);
+  }
+
+  if (expectedNames.size > 0) {
+    throw new Error(`Cargo.lock is missing workspace packages: ${[...expectedNames].join(", ")}`);
+  }
+  return versions;
+}
+
 function cargoPackageVersion(relativePath, rootVersion) {
   const cargoToml = readText(relativePath);
   const section = cargoToml
@@ -73,6 +116,7 @@ const versions = [
   ["crates/gui/tauri.conf.json", readJson("crates/gui/tauri.conf.json").version],
   ["apps/gui-web/package.json", readJson("apps/gui-web/package.json").version],
   ["pages/portal/release-downloads.js", releaseDownloadsVersion()],
+  ...cargoLockVersions(workspaceMemberNames()),
 ];
 
 const mismatches = versions.filter(([, version]) => version !== rootVersion);

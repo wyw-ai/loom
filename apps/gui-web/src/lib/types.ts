@@ -1,14 +1,20 @@
-import type { Actor, AgentBundleSkillSpec, Channel, MachineAgentProviderInfo, MachineInfo, Thread, WakeSpec } from "@/ipc/types";
+import type { Actor, AgentBundleSkillSpec, Channel, ChannelLayoutSection, MachineAgentProviderInfo, MachineInfo, Thread, WakeSpec } from "@/ipc/types";
 
 export type ConnectionState = "idle" | "connecting" | "open" | "closed" | "error";
-export type View = "chat" | "threads" | "channels" | "direct" | "inbox" | "tasks" | "runs" | "spaces" | "account" | "settings";
+export type View =
+  | "chat"
+  | "threads"
+  | "channels"
+  | "direct"
+  | "inbox"
+  | "tasks"
+  | "runs"
+  | "spaces"
+  | "account"
+  | "system"
+  | "settings";
 export type ChannelPanelTab = "threads" | "members" | "tasks" | "configure";
-export type ChannelGroup = {
-  id: string;
-  title: string;
-  channelIds: string[];
-  collapsed: boolean;
-};
+export type ChannelGroup = ChannelLayoutSection;
 export type ChannelGroupSection = {
   id: string;
   title: string;

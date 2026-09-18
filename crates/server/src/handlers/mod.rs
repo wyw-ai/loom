@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -59,16 +59,31 @@ pub async fn dispatch(
     method: &str,
     params: Option<Value>,
 ) -> HandlerResult {
+    if state.auth.required()
+        && method != method::INITIALIZE
+        && method != method::AUTH_LOGIN
+        && !state.auth.is_authenticated(connection_id)
+    {
+        return Err(
+            ErrorObject::new(ErrorCode::APP_AUTH_REQUIRED, "server password required")
+                .with_data(json!({ "kind": "auth_required", "method": "password" })),
+        );
+    }
     match method {
-        method::INITIALIZE => initialize(params),
+        method::INITIALIZE => initialize(state, params),
+        method::AUTH_LOGIN => auth_login(state, connection_id, params),
         method::CONNECTION_OPEN => connection_open(state, connection_id, params),
         method::CONNECTION_CLOSE => connection_close(state, params),
         method::CONNECTION_LIST => connection_list(state, params),
         method::SCOPE_SUBSCRIBE => scope_subscribe(state, connection_id, params),
         method::SCOPE_UNSUBSCRIBE => scope_unsubscribe(state, connection_id, params),
         method::CHANNEL_CREATE => channel_create(state, connection_id, params),
+        method::CHANNEL_ENSURE_PUBLIC => channel_ensure_public(state, connection_id, params),
         method::CHANNEL_LIST => channel_list(state, connection_id),
-        method::CHANNEL_UPDATE => channel_update(state, params),
+        method::CHANNEL_LOOKUP => channel_lookup(state, connection_id, params),
+        method::CHANNEL_UPDATE => channel_update(state, connection_id, params),
+        method::CHANNEL_LAYOUT_GET => channel_layout_get(state, connection_id, params),
+        method::CHANNEL_LAYOUT_SET => channel_layout_set(state, connection_id, params),
         method::CHANNEL_DELETE => channel_delete(state, connection_id, params),
         method::CHANNEL_INVITE => channel_invite(state, connection_id, params),
         method::CHANNEL_REVOKE => channel_revoke(state, connection_id, params),
@@ -85,12 +100,14 @@ pub async fn dispatch(
         method::CHANNEL_MEMBER_CONFIG_CLEAR => {
             channel_member_config_clear(state, connection_id, params)
         }
+        method::CHANNEL_MEMBER_RESOLVE => channel_member_resolve(state, connection_id, params),
         method::CHANNEL_SET_INSTRUCTION => channel_set_instruction(state, connection_id, params),
         method::CHANNEL_GET_INSTRUCTION => channel_get_instruction(state, connection_id, params),
         method::CHANNEL_CLEAR_INSTRUCTION => {
             channel_clear_instruction(state, connection_id, params)
         }
         method::THREAD_CREATE => thread_create(state, connection_id, params),
+        method::THREAD_GET => thread_get(state, connection_id, params),
         method::THREAD_LIST => thread_list(state, connection_id, params),
         method::THREAD_UPDATE => thread_update(state, connection_id, params),
         method::THREAD_ARCHIVE => thread_archive(state, connection_id, params),
@@ -167,6 +184,9 @@ pub async fn dispatch(
         method::REMINDER_UPDATE => reminder_update(state, params),
         method::INBOX_LIST => inbox_list(state, connection_id, params),
         method::DELIVERY_ACK => delivery_ack(state, connection_id, params),
+        method::INBOX_STATUS => inbox_status(state, connection_id, params),
+        method::DELIVERY_CANCEL => delivery_cancel(state, connection_id, params),
+        method::DELIVERY_EXPEDITE => delivery_expedite(state, connection_id, params),
         method::MACHINE_COMMAND => machine_command(state, connection_id, params).await,
         method::MACHINE_COMMAND_CREATE => {
             machine_command_create(state, connection_id, params).await
@@ -176,7 +196,8 @@ pub async fn dispatch(
         method::MACHINE_COMMAND_ACK => machine_command_ack(state, connection_id, params),
         method::MACHINE_COMMAND_RESULT => machine_command_result(state, connection_id, params),
         method::MACHINE_COMMAND_CANCEL => machine_command_cancel(state, connection_id, params),
-        method::ACTOR_LIST => actor_list(state),
+        method::SERVICE_RUNTIME_LIST => service_runtime_list(state, connection_id, params),
+        method::ACTOR_LIST => actor_list(state, connection_id),
         method::ACTOR_UPSERT => actor_upsert(state, params),
         method::ACTOR_DELETE => actor_delete(state, params),
         method::ACTOR_GROUP_CREATE => actor_group_create(state, connection_id, params),
@@ -194,7 +215,7 @@ pub async fn dispatch(
 
 // ---- initialize ----
 
-fn initialize(params: Option<Value>) -> HandlerResult {
+fn initialize(state: &AppState, params: Option<Value>) -> HandlerResult {
     let _: InitializeParams = parse_params(params.clone()).unwrap_or_default();
     let res = InitializeResult {
         protocol_version: proto::PROTOCOL_VERSION.into(),
@@ -206,9 +227,26 @@ fn initialize(params: Option<Value>) -> HandlerResult {
         server_capabilities: json!({
             "scopes": ["channel", "thread"],
             "extensions": ["agent", "task"],
+            "auth": {
+                "required": state.auth.required(),
+                "methods": if state.auth.required() { vec!["password"] } else { Vec::<&str>::new() },
+            },
         }),
     };
     ok(res)
+}
+
+fn auth_login(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
+    let p: AuthLoginParams = parse_params(params)?;
+    if !state.auth.authenticate(connection_id, &p.password) {
+        return Err(
+            ErrorObject::new(ErrorCode::APP_AUTH_FAILED, "incorrect server password")
+                .with_data(json!({ "kind": "auth_failed", "method": "password" })),
+        );
+    }
+    ok(AuthLoginResult {
+        authenticated: true,
+    })
 }
 
 // ---- connection ----
@@ -248,16 +286,29 @@ fn connection_open(state: &AppState, connection_id: &str, params: Option<Value>)
             "actor-kind mismatch bound as observer",
         );
     }
-    state.subscriptions.bind_actor(
+    let effective_kind = if human_observer {
+        actor.kind
+    } else {
+        claim_kind
+    };
+    let came_online = state.subscriptions.bind_actor(
         connection_id,
         actor_id.clone(),
-        if human_observer {
-            actor.kind
-        } else {
-            claim_kind
-        },
+        effective_kind,
         claim_inbox,
     );
+    // Presence broadcast: agent/service runtimes becoming the canonical
+    // inbox owner is what "online" means for the GUI activity banner.
+    if came_online && matches!(effective_kind, ActorKind::Agent | ActorKind::Service) {
+        state.subscriptions.broadcast_to_authenticated(
+            state.auth.as_ref(),
+            method::STREAM_UPDATE,
+            serde_json::json!({
+                "kind": proto::methods::stream_kind::PRESENCE_CHANGED,
+                "data": { "actorId": actor_id, "online": true },
+            }),
+        );
+    }
     let endpoint_id = format!(
         "ep_{}",
         p.endpoint
@@ -376,23 +427,32 @@ fn caller_actor(state: &AppState, connection_id: &str) -> Result<String, ErrorOb
 fn channel_create(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
     let p: ChannelCreateParams = parse_params(params)?;
     // Prefer an explicit `actorId` from the params (so a tool can create
-    // a private channel on behalf of the operator); fall back to the
-    // connection's bound actor. Only when both are absent (legacy v0
-    // callers) do we fall through to a Public channel.
-    let creator = if p.public {
-        None
-    } else {
-        match p.actor_id {
-            Some(id) => Some(id),
-            None => state.subscriptions.actor_for_connection(connection_id),
-        }
-    };
-    let channel = if p.topic.trim().is_empty() {
-        state.store.create_channel(p.title, creator)
+    // a channel on behalf of the operator); fall back to the connection's
+    // bound actor.  Even an explicitly-public channel retains this creator as
+    // its first member so creator-only administration remains possible.
+    let creator = match p.actor_id {
+        Some(id) => Some(id),
+        None => state.subscriptions.actor_for_connection(connection_id),
+    }
+    .ok_or_else(|| {
+        ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            "channel creation requires a creator; call connection/open first",
+        )
+    })?;
+    let channel = if p.public {
+        state.store.create_channel_with_visibility(
+            p.title,
+            p.topic,
+            Some(creator),
+            ChannelVisibility::Public,
+        )
+    } else if p.topic.trim().is_empty() {
+        state.store.create_channel(p.title, Some(creator))
     } else {
         state
             .store
-            .create_channel_with_topic(p.title, p.topic, creator)
+            .create_channel_with_topic(p.title, p.topic, Some(creator))
     }
     .map_err(map_store_err)?;
     if let Some(actor_id) = channel.members.first() {
@@ -405,6 +465,26 @@ fn channel_create(state: &AppState, connection_id: &str, params: Option<Value>) 
         }
     }
     ok(ChannelCreateResult { channel })
+}
+
+fn channel_ensure_public(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: ChannelEnsurePublicParams = parse_params(params)?;
+    caller_actor(state, connection_id)?;
+    if p.title.trim().is_empty() {
+        return Err(ErrorObject::new(
+            ErrorCode::INVALID_PARAMS,
+            "channel title must not be blank",
+        ));
+    }
+    let (channel, created) = state
+        .store
+        .ensure_public_channel(p.title, p.topic)
+        .map_err(map_store_err)?;
+    ok(ChannelEnsurePublicResult { channel, created })
 }
 
 fn channel_list(state: &AppState, connection_id: &str) -> HandlerResult {
@@ -428,17 +508,70 @@ fn channel_list(state: &AppState, connection_id: &str) -> HandlerResult {
     ok(ChannelListResult { channels })
 }
 
+fn channel_lookup(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
+    let p: ChannelLookupParams = parse_params(params)?;
+    let caller = state.subscriptions.actor_for_connection(connection_id);
+    let channels = state
+        .store
+        .find_channels_by_title(&p.title)
+        .into_iter()
+        .filter(|c| match c.visibility {
+            ChannelVisibility::Public => true,
+            ChannelVisibility::Private => match caller.as_deref() {
+                Some(actor) => c.members.iter().any(|m| m == actor),
+                None => false,
+            },
+        })
+        .collect();
+    ok(ChannelLookupResult { channels })
+}
+
+/// Public visibility grants conversation access, not administrative rights.
+/// Management RPCs use the persisted explicit member list instead of
+/// `Store::is_channel_member`, whose public-channel branch intentionally
+/// returns true for every actor.
+fn require_explicit_channel_member(
+    state: &AppState,
+    channel_id: &str,
+    caller: &str,
+    action: &str,
+) -> Result<Channel, ErrorObject> {
+    let channel = state
+        .store
+        .get_channel(channel_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "channel"))?;
+    if !channel.members.iter().any(|actor_id| actor_id == caller) {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!("actor {caller} cannot {action} channel {channel_id}"),
+        ));
+    }
+    Ok(channel)
+}
+
+fn require_channel_creator(
+    state: &AppState,
+    channel_id: &str,
+    caller: &str,
+    action: &str,
+) -> Result<Channel, ErrorObject> {
+    let channel = state
+        .store
+        .get_channel(channel_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "channel"))?;
+    if channel.members.first().map(String::as_str) != Some(caller) {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!("only the channel creator can {action}"),
+        ));
+    }
+    Ok(channel)
+}
+
 fn channel_invite(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
     let p: ChannelInviteParams = parse_params(params)?;
     let caller = caller_actor(state, connection_id)?;
-    // Only existing members can invite. Public channels make this
-    // vacuously true (everyone is implicitly a member).
-    if !state.store.is_channel_member(&p.channel_id, &caller) {
-        return Err(ErrorObject::new(
-            ErrorCode::APP_INVALID_STATE,
-            format!("actor {caller} cannot invite to channel {}", p.channel_id),
-        ));
-    }
+    require_channel_creator(state, &p.channel_id, &caller, "invite members")?;
     let channel = state
         .store
         .grant_channel(&p.channel_id, &p.actor_id)
@@ -456,26 +589,15 @@ fn channel_invite(state: &AppState, connection_id: &str, params: Option<Value>) 
 fn channel_revoke(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
     let p: ChannelRevokeParams = parse_params(params)?;
     let caller = caller_actor(state, connection_id)?;
-    // Same access rule as invite: must be an existing member.
-    if !state.store.is_channel_member(&p.channel_id, &caller) {
+    let channel_before = require_channel_creator(state, &p.channel_id, &caller, "remove members")?;
+    // The creator is the durable administrator identity. Removing it would
+    // orphan both private and public channels with no actor able to manage
+    // visibility or membership; deletion is the explicit owner action.
+    if channel_before.members.first().map(String::as_str) == Some(p.actor_id.as_str()) {
         return Err(ErrorObject::new(
             ErrorCode::APP_INVALID_STATE,
-            format!("actor {caller} cannot revoke from channel {}", p.channel_id),
+            "cannot revoke the channel creator",
         ));
-    }
-    // Guardrail: refuse to remove the channel's first/creator member when
-    // there are other members. Without this, a clueless invitee could
-    // orphan everyone else from the channel they were welcomed into.
-    if let Some(ch) = state.store.get_channel(&p.channel_id) {
-        if matches!(ch.visibility, ChannelVisibility::Private)
-            && ch.members.first().map(|s| s.as_str()) == Some(p.actor_id.as_str())
-            && ch.members.len() > 1
-        {
-            return Err(ErrorObject::new(
-                ErrorCode::APP_INVALID_STATE,
-                "cannot revoke the channel creator while other members exist",
-            ));
-        }
     }
     let channel = state
         .store
@@ -522,15 +644,10 @@ fn ensure_channel_config_reader(
     channel_id: &str,
 ) -> Result<String, ErrorObject> {
     let caller = caller_actor(state, connection_id)?;
-    if state.store.get_channel(channel_id).is_none() {
-        return Err(ErrorObject::new(ErrorCode::APP_NOT_FOUND, "channel"));
-    }
-    if !state.store.is_channel_member(channel_id, &caller) {
-        return Err(ErrorObject::new(
-            ErrorCode::APP_INVALID_STATE,
-            format!("actor {caller} cannot read member config for channel {channel_id}"),
-        ));
-    }
+    // Workspace directories are operational/private configuration, not
+    // conversation metadata. Public visibility must not expose them to every
+    // implicit reader.
+    require_explicit_channel_member(state, channel_id, &caller, "read member config in")?;
     Ok(caller)
 }
 
@@ -569,16 +686,25 @@ fn channel_member_config_set(
 ) -> HandlerResult {
     let p: ChannelMemberConfigSetParams = parse_params(params)?;
     let caller = ensure_channel_config_reader(state, connection_id, &p.channel_id)?;
-    if p.workspace_dir.trim().is_empty() {
+    if p.workspace_dir.is_none() && p.mention_ids.is_none() {
         return Err(ErrorObject::new(
             ErrorCode::INVALID_PARAMS,
-            "workspaceDir cannot be empty",
+            "workspaceDir or mentionIds is required",
         ));
     }
-    if p.workspace_dir.contains('\0') {
+    if p.workspace_dir
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty() || value.contains('\0'))
+    {
         return Err(ErrorObject::new(
             ErrorCode::INVALID_PARAMS,
-            "workspaceDir cannot contain NUL bytes",
+            "workspaceDir must be non-empty and cannot contain NUL bytes",
+        ));
+    }
+    if p.mention_ids.is_some() && caller != p.actor_id {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            "an actor can only update its own mentionIds",
         ));
     }
     if state.store.get_actor(&p.actor_id).is_none() {
@@ -589,7 +715,7 @@ fn channel_member_config_set(
     }
     let config = state
         .store
-        .set_channel_member_workspace_dir(&p.channel_id, &p.actor_id, p.workspace_dir)
+        .set_channel_member_config(&p.channel_id, &p.actor_id, p.workspace_dir, p.mention_ids)
         .map_err(map_store_err)?;
     tracing::info!(
         channel = %p.channel_id,
@@ -607,6 +733,16 @@ fn channel_member_config_clear(
 ) -> HandlerResult {
     let p: ChannelMemberConfigClearParams = parse_params(params)?;
     let caller = ensure_channel_config_reader(state, connection_id, &p.channel_id)?;
+    if state
+        .store
+        .get_channel_member_config(&p.channel_id, &p.actor_id)
+        .is_some_and(|config| !config.mention_ids.is_empty() && caller != p.actor_id)
+    {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            "an actor can only clear its own mentionIds",
+        ));
+    }
     let cleared = state
         .store
         .clear_channel_member_config(&p.channel_id, &p.actor_id)
@@ -621,13 +757,410 @@ fn channel_member_config_clear(
     ok(ChannelMemberConfigClearResult { cleared })
 }
 
-fn channel_update(state: &AppState, params: Option<Value>) -> HandlerResult {
+fn channel_member_resolve(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: ChannelMemberResolveParams = parse_params(params)?;
+    ensure_channel_config_reader(state, connection_id, &p.channel_id)?;
+    let mut requested = Vec::new();
+    for mention_id in p.mention_ids {
+        let mention_id = mention_id.trim();
+        if !mention_id.is_empty() && !requested.iter().any(|existing| existing == mention_id) {
+            requested.push(mention_id.to_string());
+        }
+    }
+    let matched = state
+        .store
+        .resolve_channel_member_mentions(&p.channel_id, &requested)
+        .map_err(map_store_err)?;
+    let mut resolved_ids = std::collections::HashSet::new();
+    let members = matched
+        .into_iter()
+        .filter_map(|(actor_id, mention_ids)| {
+            let actor = state.store.get_actor(&actor_id)?;
+            resolved_ids.extend(mention_ids.iter().cloned());
+            Some(ResolvedChannelMember { actor, mention_ids })
+        })
+        .collect::<Vec<_>>();
+    let unresolved_mention_ids = requested
+        .into_iter()
+        .filter(|id| !resolved_ids.contains(id))
+        .collect();
+    ok(ChannelMemberResolveResult {
+        members,
+        unresolved_mention_ids,
+    })
+}
+
+fn channel_update(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
     let p: ChannelUpdateParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let existing = state
+        .store
+        .get_channel(&p.channel_id)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "channel"))?;
+
+    // Public means every actor may participate in the conversation, not that
+    // every actor may administer it.  Settings edits always require explicit
+    // membership so a random reader cannot rename a public channel.
+    if !existing.members.iter().any(|actor_id| actor_id == &caller) {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!("actor {caller} cannot update channel {}", p.channel_id),
+        ));
+    }
+
+    let direct_message = is_direct_message_channel(&existing);
+    if direct_message
+        && p.title
+            .as_deref()
+            .is_some_and(|title| title != existing.title)
+    {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            "direct message channel identity cannot be changed",
+        ));
+    }
+
+    if let Some(next_visibility) = p.visibility {
+        if next_visibility != existing.visibility {
+            // The first explicit member is the creator in the current channel
+            // model.  Keep visibility changes creator-only: making a channel
+            // public discloses its history to the whole server, while making
+            // it private removes discovery/access for implicit public users.
+            if existing.members.first().map(String::as_str) != Some(caller.as_str()) {
+                return Err(ErrorObject::new(
+                    ErrorCode::APP_INVALID_STATE,
+                    "only the channel creator can change visibility",
+                ));
+            }
+            if next_visibility == ChannelVisibility::Public && direct_message {
+                return Err(ErrorObject::new(
+                    ErrorCode::APP_INVALID_STATE,
+                    "direct message channels cannot be made public",
+                ));
+            }
+        }
+    }
+
     let channel = state
         .store
         .update_channel(&p.channel_id, p.title, p.topic, p.visibility)
         .map_err(map_store_err)?;
     ok(ChannelUpdateResult { channel })
+}
+
+/// Direct messages are persisted under the reserved, canonical
+/// `dm:<actor>:<actor>` title namespace.  Treat that namespace as durable even
+/// if an old client has corrupted the member list; otherwise it could append a
+/// third member (or revoke the peer), rename the hidden channel, then expose
+/// the complete DM history as public.
+fn is_direct_message_channel(channel: &Channel) -> bool {
+    let Some(pair) = channel.title.strip_prefix("dm:") else {
+        return false;
+    };
+    let Some((left, right)) = pair.split_once(':') else {
+        return false;
+    };
+    !left.is_empty() && !right.is_empty() && !right.contains(':') && left <= right
+}
+
+const MAX_CHANNEL_LAYOUT_SECTIONS: usize = 100;
+const MAX_CHANNEL_LAYOUT_CHANNEL_REFS: usize = 1_000;
+const MAX_CHANNEL_LAYOUT_CHANNELS_PER_SECTION: usize = 500;
+const MAX_CHANNEL_LAYOUT_SECTION_ID_BYTES: usize = 128;
+const MAX_CHANNEL_LAYOUT_SECTION_TITLE_BYTES: usize = 256;
+const MAX_CHANNEL_LAYOUT_CHANNEL_ID_BYTES: usize = 128;
+
+fn channel_layout_get(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let _: ChannelLayoutGetParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let layout = visible_channel_layout(state, &caller, state.store.get_channel_layout(&caller));
+    ok(ChannelLayoutGetResult { layout })
+}
+
+fn channel_layout_set(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: ChannelLayoutSetParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let incoming = normalize_channel_layout_sections(state, &caller, p.sections)?;
+    let sections = if p.merge {
+        let current =
+            visible_channel_layout(state, &caller, state.store.get_channel_layout(&caller));
+        merge_channel_layout_sections(current.sections, incoming)?
+    } else {
+        incoming
+    };
+    validate_channel_layout_size(&sections)?;
+
+    let layout = state
+        .store
+        .set_channel_layout(&caller, sections)
+        .map_err(map_store_err)?;
+    let payload = json!({
+        "kind": stream_kind::CHANNEL_LAYOUT_UPDATED,
+        "data": { "layout": &layout },
+    });
+    state
+        .subscriptions
+        .send_to_actor_connections(&caller, method::STREAM_UPDATE, payload);
+    ok(ChannelLayoutSetResult { layout })
+}
+
+fn channel_visible_in_layout(state: &AppState, actor_id: &str, channel: &Channel) -> bool {
+    !is_direct_message_channel(channel)
+        && match channel.visibility {
+            ChannelVisibility::Public => true,
+            ChannelVisibility::Private => channel.members.iter().any(|member| member == actor_id),
+        }
+        && state.store.get_channel(&channel.id).is_some()
+}
+
+/// Filter persisted data at read time so channel deletion, revocation, or a
+/// public-to-private transition takes effect even when the actor has not saved
+/// their layout again. Empty user-created sections are intentionally retained.
+fn visible_channel_layout(
+    state: &AppState,
+    actor_id: &str,
+    mut layout: ChannelLayout,
+) -> ChannelLayout {
+    let mut section_indexes = HashMap::<String, usize>::new();
+    let mut assigned_channels = HashSet::<String>::new();
+    let mut sections = Vec::<ChannelLayoutSection>::new();
+    for mut section in layout
+        .sections
+        .into_iter()
+        .take(MAX_CHANNEL_LAYOUT_SECTIONS)
+    {
+        let index = match section_indexes.get(&section.id).copied() {
+            Some(index) => index,
+            None => {
+                let index = sections.len();
+                section_indexes.insert(section.id.clone(), index);
+                sections.push(ChannelLayoutSection {
+                    id: section.id,
+                    title: section.title,
+                    channel_ids: Vec::new(),
+                    collapsed: section.collapsed,
+                });
+                index
+            }
+        };
+        for channel_id in section.channel_ids.drain(..) {
+            if assigned_channels.len() >= MAX_CHANNEL_LAYOUT_CHANNEL_REFS
+                || assigned_channels.contains(&channel_id)
+            {
+                continue;
+            }
+            let Some(channel) = state.store.get_channel(&channel_id) else {
+                continue;
+            };
+            if !channel_visible_in_layout(state, actor_id, &channel) {
+                continue;
+            }
+            assigned_channels.insert(channel_id.clone());
+            sections[index].channel_ids.push(channel_id);
+        }
+    }
+    layout.sections = sections;
+    layout
+}
+
+fn normalize_channel_layout_sections(
+    state: &AppState,
+    actor_id: &str,
+    sections: Vec<ChannelLayoutSection>,
+) -> Result<Vec<ChannelLayoutSection>, ErrorObject> {
+    if sections.len() > MAX_CHANNEL_LAYOUT_SECTIONS {
+        return Err(ErrorObject::new(
+            ErrorCode::INVALID_PARAMS,
+            format!("channel layout supports at most {MAX_CHANNEL_LAYOUT_SECTIONS} sections"),
+        ));
+    }
+    let raw_channel_refs = sections.iter().try_fold(0usize, |total, section| {
+        if section.channel_ids.len() > MAX_CHANNEL_LAYOUT_CHANNELS_PER_SECTION {
+            return Err(ErrorObject::new(
+                ErrorCode::INVALID_PARAMS,
+                format!(
+                    "section {} supports at most {MAX_CHANNEL_LAYOUT_CHANNELS_PER_SECTION} channels",
+                    section.id
+                ),
+            ));
+        }
+        total.checked_add(section.channel_ids.len()).ok_or_else(|| {
+            ErrorObject::new(ErrorCode::INVALID_PARAMS, "channel layout is too large")
+        })
+    })?;
+    if raw_channel_refs > MAX_CHANNEL_LAYOUT_CHANNEL_REFS {
+        return Err(ErrorObject::new(
+            ErrorCode::INVALID_PARAMS,
+            format!(
+                "channel layout supports at most {MAX_CHANNEL_LAYOUT_CHANNEL_REFS} channel references"
+            ),
+        ));
+    }
+
+    let mut normalized = Vec::<ChannelLayoutSection>::new();
+    let mut section_indexes = HashMap::<String, usize>::new();
+    let mut assigned_channels = HashSet::<String>::new();
+    for section in sections {
+        let id = normalize_channel_layout_text(
+            &section.id,
+            "section id",
+            MAX_CHANNEL_LAYOUT_SECTION_ID_BYTES,
+        )?;
+        let title = normalize_channel_layout_text(
+            &section.title,
+            "section title",
+            MAX_CHANNEL_LAYOUT_SECTION_TITLE_BYTES,
+        )?;
+        let index = match section_indexes.get(&id).copied() {
+            Some(index) => index,
+            None => {
+                let index = normalized.len();
+                section_indexes.insert(id.clone(), index);
+                normalized.push(ChannelLayoutSection {
+                    id,
+                    title,
+                    channel_ids: Vec::new(),
+                    collapsed: section.collapsed,
+                });
+                index
+            }
+        };
+
+        for raw_channel_id in section.channel_ids {
+            let channel_id = normalize_channel_layout_text(
+                &raw_channel_id,
+                "channel id",
+                MAX_CHANNEL_LAYOUT_CHANNEL_ID_BYTES,
+            )?;
+            if assigned_channels.contains(&channel_id) {
+                continue;
+            }
+            // Local caches legitimately outlive channel deletion, revocation,
+            // and server upgrades that begin hiding DM backing channels. Drop
+            // stale/inaccessible references safely so a one-time merge can
+            // still migrate the rest of the layout. Structural abuse (empty,
+            // oversized, or control-character ids) was rejected above.
+            let Some(channel) = state.store.get_channel(&channel_id) else {
+                continue;
+            };
+            if !channel_visible_in_layout(state, actor_id, &channel) {
+                continue;
+            }
+            assigned_channels.insert(channel_id.clone());
+            normalized[index].channel_ids.push(channel_id);
+        }
+    }
+    Ok(normalized)
+}
+
+fn normalize_channel_layout_text(
+    raw: &str,
+    field: &str,
+    max_bytes: usize,
+) -> Result<String, ErrorObject> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err(ErrorObject::new(
+            ErrorCode::INVALID_PARAMS,
+            format!("{field} cannot be empty"),
+        ));
+    }
+    if value.len() > max_bytes {
+        return Err(ErrorObject::new(
+            ErrorCode::INVALID_PARAMS,
+            format!("{field} exceeds {max_bytes} bytes"),
+        ));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(ErrorObject::new(
+            ErrorCode::INVALID_PARAMS,
+            format!("{field} cannot contain control characters"),
+        ));
+    }
+    Ok(value.to_string())
+}
+
+fn merge_channel_layout_sections(
+    existing: Vec<ChannelLayoutSection>,
+    incoming: Vec<ChannelLayoutSection>,
+) -> Result<Vec<ChannelLayoutSection>, ErrorObject> {
+    let mut merged = existing;
+    let mut section_indexes = merged
+        .iter()
+        .enumerate()
+        .map(|(index, section)| (section.id.clone(), index))
+        .collect::<HashMap<_, _>>();
+    let mut assigned_channels = merged
+        .iter()
+        .flat_map(|section| section.channel_ids.iter().cloned())
+        .collect::<HashSet<_>>();
+
+    for mut section in incoming {
+        if let Some(index) = section_indexes.get(&section.id).copied() {
+            for channel_id in section.channel_ids {
+                if assigned_channels.insert(channel_id.clone()) {
+                    merged[index].channel_ids.push(channel_id);
+                }
+            }
+            continue;
+        }
+
+        section
+            .channel_ids
+            .retain(|channel_id| assigned_channels.insert(channel_id.clone()));
+        section_indexes.insert(section.id.clone(), merged.len());
+        merged.push(section);
+    }
+    validate_channel_layout_size(&merged)?;
+    Ok(merged)
+}
+
+fn validate_channel_layout_size(sections: &[ChannelLayoutSection]) -> Result<(), ErrorObject> {
+    if sections.len() > MAX_CHANNEL_LAYOUT_SECTIONS {
+        return Err(ErrorObject::new(
+            ErrorCode::INVALID_PARAMS,
+            format!(
+                "merged channel layout supports at most {MAX_CHANNEL_LAYOUT_SECTIONS} sections"
+            ),
+        ));
+    }
+    let channel_count = sections
+        .iter()
+        .try_fold(0usize, |total, section| {
+            if section.channel_ids.len() > MAX_CHANNEL_LAYOUT_CHANNELS_PER_SECTION {
+                return Err(ErrorObject::new(
+                    ErrorCode::INVALID_PARAMS,
+                    format!(
+                        "section {} supports at most {MAX_CHANNEL_LAYOUT_CHANNELS_PER_SECTION} channels",
+                        section.id
+                    ),
+                ));
+            }
+            total.checked_add(section.channel_ids.len()).ok_or_else(|| {
+                ErrorObject::new(ErrorCode::INVALID_PARAMS, "channel layout is too large")
+            })
+        })?;
+    if channel_count > MAX_CHANNEL_LAYOUT_CHANNEL_REFS {
+        return Err(ErrorObject::new(
+            ErrorCode::INVALID_PARAMS,
+            format!(
+                "merged channel layout supports at most {MAX_CHANNEL_LAYOUT_CHANNEL_REFS} channels"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn channel_set_instruction(
@@ -637,15 +1170,7 @@ fn channel_set_instruction(
 ) -> HandlerResult {
     let p: ChannelSetInstructionParams = parse_params(params)?;
     let caller = caller_actor(state, connection_id)?;
-    if !state.store.is_channel_member(&p.channel_id, &caller) {
-        return Err(ErrorObject::new(
-            ErrorCode::APP_INVALID_STATE,
-            format!(
-                "actor {caller} cannot set instructions for channel {}",
-                p.channel_id
-            ),
-        ));
-    }
+    require_explicit_channel_member(state, &p.channel_id, &caller, "set instructions for")?;
     let channel = state
         .store
         .set_channel_instructions(&p.channel_id, Some(p.instructions), &caller)
@@ -684,15 +1209,7 @@ fn channel_clear_instruction(
 ) -> HandlerResult {
     let p: ChannelClearInstructionParams = parse_params(params)?;
     let caller = caller_actor(state, connection_id)?;
-    if !state.store.is_channel_member(&p.channel_id, &caller) {
-        return Err(ErrorObject::new(
-            ErrorCode::APP_INVALID_STATE,
-            format!(
-                "actor {caller} cannot clear instructions for channel {}",
-                p.channel_id
-            ),
-        ));
-    }
+    require_explicit_channel_member(state, &p.channel_id, &caller, "clear instructions for")?;
     let existing = state
         .store
         .get_channel(&p.channel_id)
@@ -709,12 +1226,7 @@ fn channel_clear_instruction(
 fn channel_delete(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
     let p: ChannelDeleteParams = parse_params(params)?;
     let caller = caller_actor(state, connection_id)?;
-    if !state.store.is_channel_member(&p.channel_id, &caller) {
-        return Err(ErrorObject::new(
-            ErrorCode::APP_INVALID_STATE,
-            format!("actor {caller} cannot delete channel {}", p.channel_id),
-        ));
-    }
+    require_channel_creator(state, &p.channel_id, &caller, "delete the channel")?;
     let thread_ids = state
         .store
         .list_threads(Some(&p.channel_id))
@@ -800,6 +1312,23 @@ fn thread_list(state: &AppState, connection_id: &str, params: Option<Value>) -> 
         .collect();
     let threads = state.store.attach_thread_activity_meta(threads);
     ok(ThreadListResult { threads })
+}
+
+fn thread_get(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
+    let p: ThreadGetParams = parse_params(params)?;
+    let caller = state.subscriptions.actor_for_connection(connection_id);
+    let thread = state
+        .store
+        .get_thread(&p.thread_id)
+        .filter(|thread| match caller.as_deref() {
+            Some(actor) => state.store.is_channel_member(&thread.channel_id, actor),
+            None => state
+                .store
+                .get_channel(&thread.channel_id)
+                .map(|channel| matches!(channel.visibility, ChannelVisibility::Public))
+                .unwrap_or(false),
+        });
+    ok(ThreadGetResult { thread })
 }
 
 fn thread_update(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
@@ -2071,11 +2600,17 @@ fn run_close(state: &AppState, connection_id: &str, params: Option<Value>) -> Ha
             format!("connection actor {caller} cannot close run {}", p.run_id),
         ));
     }
-    let run = state
+    let (run, acknowledged) = state
         .store
-        .close_run(&p.run_id, p.status)
+        .close_run_with_delivery_acks(&p.run_id, p.status, p.usage, &p.ack_source_ids)
         .map_err(map_store_err)?;
-    ok(RunCloseResult { run })
+    ok(RunCloseResult {
+        run,
+        acked_source_ids: acknowledged
+            .into_iter()
+            .map(|delivery| delivery.source_id)
+            .collect(),
+    })
 }
 
 fn run_cancel(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
@@ -2094,12 +2629,16 @@ fn run_cancel(state: &AppState, connection_id: &str, params: Option<Value>) -> H
     if !state.store.is_channel_member(&channel_id, &caller) {
         return Err(ErrorObject::new(ErrorCode::APP_NOT_FOUND, "run"));
     }
+    let visible_run = state
+        .store
+        .project_run_for_actor(&run, &caller)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "run"))?;
     if matches!(
         run.status,
         RunStatus::Completed | RunStatus::Failed | RunStatus::Canceled
     ) {
         return ok(RunCancelResult {
-            run,
+            run: visible_run,
             cancel_message: None,
         });
     }
@@ -2112,6 +2651,9 @@ fn run_cancel(state: &AppState, connection_id: &str, params: Option<Value>) -> H
     metadata.insert("kind".into(), json!("run.cancel"));
     metadata.insert("runId".into(), json!(run.id.clone()));
     metadata.insert("canceledBy".into(), json!(caller.clone()));
+    if state.store.run_private_actor_ids(&run).is_some() {
+        metadata.insert("privateTo".into(), json!([run.actor_id.clone()]));
+    }
     if let Some(reason) = p.reason.as_ref().filter(|value| !value.trim().is_empty()) {
         metadata.insert("reason".into(), json!(reason));
     }
@@ -2145,8 +2687,12 @@ fn run_cancel(state: &AppState, connection_id: &str, params: Option<Value>) -> H
         .map_err(map_store_err)?;
     let run = state
         .store
-        .close_run(&run.id, RunStatus::Canceled)
+        .close_run(&run.id, RunStatus::Canceled, None)
         .map_err(map_store_err)?;
+    let run = state
+        .store
+        .project_run_for_actor(&run, &caller)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "run"))?;
     ok(RunCancelResult {
         run,
         cancel_message: Some(cancel_message),
@@ -2190,6 +2736,10 @@ fn run_get(state: &AppState, connection_id: &str, params: Option<Value>) -> Hand
     if !state.store.is_channel_member(&channel_id, &caller) {
         return Err(ErrorObject::new(ErrorCode::APP_NOT_FOUND, "run"));
     }
+    let run = state
+        .store
+        .project_run_for_actor(&run, &caller)
+        .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "run"))?;
     ok(RunGetResult { run })
 }
 
@@ -2704,6 +3254,101 @@ fn delivery_ack(state: &AppState, connection_id: &str, params: Option<Value>) ->
         .ack_delivery(&p.actor_id, &p.source_id)
         .map_err(map_store_err)?;
     ok(DeliveryAckResult { delivery })
+}
+
+/// True when `caller` may inspect/manage the delivery queue of `target`:
+/// every actor may manage its own queue, while only humans may manage an
+/// agent/service queue across actor identities. Other humans' inboxes stay
+/// private.
+fn may_manage_actor_inbox(state: &AppState, caller: &str, target: &str) -> bool {
+    if caller == target {
+        return true;
+    }
+
+    let caller_is_human = state
+        .store
+        .get_actor(caller)
+        .map(|actor| actor.kind == ActorKind::Human)
+        .unwrap_or(false);
+    if !caller_is_human {
+        return false;
+    }
+
+    state
+        .store
+        .get_actor(target)
+        .map(|actor| matches!(actor.kind, ActorKind::Agent | ActorKind::Service))
+        .unwrap_or(false)
+}
+
+fn inbox_status(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
+    let p: InboxStatusParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    let entry_limit = p.entry_limit.unwrap_or(50).min(200) as usize;
+    let actors = p
+        .actor_ids
+        .iter()
+        .filter(|target| may_manage_actor_inbox(state, &caller, target))
+        .map(|target| {
+            state
+                .store
+                .inbox_status_for_actor(target, p.include_entries, entry_limit)
+        })
+        .collect();
+    ok(InboxStatusResult { actors })
+}
+
+fn delivery_cancel(state: &AppState, connection_id: &str, params: Option<Value>) -> HandlerResult {
+    let p: DeliveryCancelParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    if !may_manage_actor_inbox(state, &caller, &p.actor_id) {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!(
+                "delivery.cancel: caller actor `{caller}` cannot manage inbox of `{}`",
+                p.actor_id
+            ),
+        ));
+    }
+    if !p.all_pending && p.source_ids.is_empty() {
+        return Err(ErrorObject::new(
+            ErrorCode::INVALID_PARAMS,
+            "delivery.cancel requires sourceIds or allPending",
+        ));
+    }
+    let source_filter = if p.all_pending {
+        None
+    } else {
+        Some(p.source_ids.as_slice())
+    };
+    let cancelled = state
+        .store
+        .cancel_pending_deliveries(&p.actor_id, source_filter)
+        .map_err(map_store_err)?;
+    ok(DeliveryCancelResult { cancelled })
+}
+
+fn delivery_expedite(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: DeliveryExpediteParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    if !may_manage_actor_inbox(state, &caller, &p.actor_id) {
+        return Err(ErrorObject::new(
+            ErrorCode::APP_INVALID_STATE,
+            format!(
+                "delivery.expedite: caller actor `{caller}` cannot manage inbox of `{}`",
+                p.actor_id
+            ),
+        ));
+    }
+    let delivery = state
+        .store
+        .expedite_delivery(&p.actor_id, &p.source_id)
+        .map_err(map_store_err)?;
+    ok(DeliveryExpediteResult { delivery })
 }
 
 async fn machine_command(
@@ -3319,10 +3964,196 @@ fn validate_machine_actor(
 
 // ---- actor / agent ----
 
-fn actor_list(state: &AppState) -> HandlerResult {
-    ok(ActorListResult {
-        actors: state.store.list_actors(),
-    })
+const PUBLIC_MACHINE_META_KEYS: &[&str] = &[
+    "role",
+    "source",
+    "inventoryVersion",
+    "machineId",
+    "name",
+    "kind",
+    "revision",
+    "observedAt",
+];
+
+fn has_machine_inventory_role(actor: &Actor) -> bool {
+    actor
+        ._meta
+        .as_ref()
+        .and_then(|meta| meta.get("role"))
+        .and_then(Value::as_str)
+        == Some("machine")
+}
+
+fn public_machine_meta(meta: &Meta) -> Meta {
+    PUBLIC_MACHINE_META_KEYS
+        .iter()
+        .filter_map(|key| {
+            meta.get(*key)
+                .cloned()
+                .map(|value| ((*key).to_string(), value))
+        })
+        .collect()
+}
+
+fn actor_list(state: &AppState, connection_id: &str) -> HandlerResult {
+    let caller = caller_actor(state, connection_id)?;
+    if is_machine_actor(state, &caller) {
+        return ok(ActorListResult { actors: Vec::new() });
+    }
+    let actors = state
+        .store
+        .list_actors()
+        .into_iter()
+        .map(|mut actor| {
+            if !has_machine_inventory_role(&actor) {
+                return actor;
+            }
+
+            let may_read_full_inventory = actor.id == caller
+                || actor
+                    ._meta
+                    .as_ref()
+                    .and_then(|meta| meta.get("ownerActorId"))
+                    .and_then(Value::as_str)
+                    .filter(|owner| !owner.trim().is_empty())
+                    == Some(caller.as_str());
+            if !may_read_full_inventory {
+                // Missing/malformed ownerActorId intentionally falls through
+                // to this public projection (fail closed).
+                actor._meta = actor
+                    ._meta
+                    .as_ref()
+                    .map(public_machine_meta)
+                    .filter(|meta| !meta.is_empty());
+            }
+            actor
+        })
+        .collect();
+    ok(ActorListResult { actors })
+}
+
+fn service_runtime_list(
+    state: &AppState,
+    connection_id: &str,
+    params: Option<Value>,
+) -> HandlerResult {
+    let p: ServiceRuntimeListParams = parse_params(params)?;
+    let caller = caller_actor(state, connection_id)?;
+    state
+        .store
+        .check_scope_access(&p.scope, &caller)
+        .map_err(map_store_err)?;
+
+    let actors = state.store.list_actors();
+    let online_actor_ids = state
+        .subscriptions
+        .connected_actor_ids(&[])
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let actor_display_names = actors
+        .iter()
+        .filter_map(|actor| {
+            let name = actor.display_name.trim();
+            (!name.is_empty()).then(|| (actor.id.clone(), name.to_string()))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut seen = BTreeSet::new();
+    let mut runtimes = Vec::new();
+    for machine_actor in &actors {
+        if !online_actor_ids.contains(&machine_actor.id) {
+            continue;
+        }
+        let Some(meta) = machine_actor._meta.as_ref() else {
+            continue;
+        };
+        if meta.get("role").and_then(Value::as_str) != Some("machine")
+            || meta.get("source").and_then(Value::as_str) != Some("daemon")
+            || meta.get("inventoryVersion").and_then(Value::as_u64) != Some(2)
+        {
+            continue;
+        }
+        let Some(machine_id) = meta
+            .get("machineId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        let machine_name = meta
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .or_else(|| {
+                let name = machine_actor.display_name.trim();
+                (!name.is_empty()).then_some(name)
+            })
+            .unwrap_or(machine_id)
+            .to_string();
+        let caller_may_read_errors = machine_actor.id == caller
+            || meta
+                .get("ownerActorId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|owner| !owner.is_empty())
+                == Some(caller.as_str());
+        let Some(states) = meta.get("serviceRuntimeStates").and_then(Value::as_array) else {
+            continue;
+        };
+
+        for raw_state in states {
+            // Parse rows independently: one stale or future-version runtime
+            // must not hide valid rows from the same machine inventory.
+            let Ok(runtime) = serde_json::from_value::<ServiceRuntimeState>(raw_state.clone())
+            else {
+                continue;
+            };
+            if runtime.machine_id != machine_id
+                || runtime.runtime_id.trim().is_empty()
+                || !runtime.scopes.iter().any(|scope| scope == &p.scope)
+                || !matches!(
+                    runtime.phase,
+                    ServiceRuntimePhase::Starting
+                        | ServiceRuntimePhase::Running
+                        | ServiceRuntimePhase::Failed
+                )
+            {
+                continue;
+            }
+            if !seen.insert((machine_id.to_string(), runtime.runtime_id.clone())) {
+                continue;
+            }
+
+            runtimes.push(ServiceRuntimeListItem {
+                runtime_id: runtime.runtime_id,
+                machine_id: machine_id.to_string(),
+                machine_actor_id: machine_actor.id.clone(),
+                machine_name: machine_name.clone(),
+                service_id: runtime.service_id,
+                actor_display_name: actor_display_names.get(&runtime.actor_id).cloned(),
+                actor_id: runtime.actor_id,
+                plugin_kind: runtime.plugin_kind,
+                lifecycle: runtime.lifecycle,
+                instance_id: runtime.instance_id,
+                phase: runtime.phase,
+                started_at: runtime.started_at,
+                updated_at: runtime.updated_at,
+                last_error: caller_may_read_errors
+                    .then_some(runtime.last_error)
+                    .flatten(),
+            });
+        }
+    }
+    runtimes.sort_by(|left, right| {
+        (&left.machine_id, &left.service_id, &left.runtime_id).cmp(&(
+            &right.machine_id,
+            &right.service_id,
+            &right.runtime_id,
+        ))
+    });
+    ok(ServiceRuntimeListResult { runtimes })
 }
 
 /// Pre-register or update an actor row. `connection/open` already does an
@@ -3354,15 +4185,7 @@ fn actor_group_create(
 ) -> HandlerResult {
     let p: ActorGroupCreateParams = parse_params(params)?;
     let caller = caller_actor(state, connection_id)?;
-    if !state.store.is_channel_member(&p.channel_id, &caller) {
-        return Err(ErrorObject::new(
-            ErrorCode::APP_INVALID_STATE,
-            format!(
-                "actor {caller} cannot create groups in channel {}",
-                p.channel_id
-            ),
-        ));
-    }
+    require_explicit_channel_member(state, &p.channel_id, &caller, "create groups in")?;
     let group = state
         .store
         .create_actor_group(
@@ -3410,15 +4233,7 @@ fn actor_group_add_member(
         .store
         .get_actor_group(&p.group_id)
         .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "actor group"))?;
-    if !state.store.is_channel_member(&group.channel_id, &caller) {
-        return Err(ErrorObject::new(
-            ErrorCode::APP_INVALID_STATE,
-            format!(
-                "actor {caller} cannot edit groups in channel {}",
-                group.channel_id
-            ),
-        ));
-    }
+    require_explicit_channel_member(state, &group.channel_id, &caller, "edit groups in")?;
     let group = state
         .store
         .add_actor_group_member(&p.group_id, &p.actor_id)
@@ -3437,15 +4252,7 @@ fn actor_group_remove_member(
         .store
         .get_actor_group(&p.group_id)
         .ok_or_else(|| ErrorObject::new(ErrorCode::APP_NOT_FOUND, "actor group"))?;
-    if !state.store.is_channel_member(&group.channel_id, &caller) {
-        return Err(ErrorObject::new(
-            ErrorCode::APP_INVALID_STATE,
-            format!(
-                "actor {caller} cannot edit groups in channel {}",
-                group.channel_id
-            ),
-        ));
-    }
+    require_explicit_channel_member(state, &group.channel_id, &caller, "edit groups in")?;
     let group = state
         .store
         .remove_actor_group_member(&p.group_id, &p.actor_id)
@@ -3462,6 +4269,7 @@ pub fn _ensure_arc<T>(x: Arc<T>) -> Arc<T> {
 mod tests {
     use super::*;
     use crate::artifacts::ArtifactStore;
+    use crate::auth::ServerAuth;
     use crate::journal::Journal;
     use crate::machine_commands::MachineCommandWaiters;
     use crate::scope_skills::ScopeSkills;
@@ -3496,6 +4304,7 @@ mod tests {
             ScopeSkills::new(root.join("workspaces"), root.join("agents")).expect("scope skills"),
         );
         AppState {
+            auth: Arc::new(ServerAuth::disabled()),
             store,
             subscriptions,
             artifacts,
@@ -3521,6 +4330,28 @@ mod tests {
         .expect("connection/open");
     }
 
+    async fn open_conn_with_rx(
+        state: &AppState,
+        connection_id: &str,
+        actor_id: &str,
+    ) -> mpsc::UnboundedReceiver<String> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        state.subscriptions.add_connection(Connection {
+            id: connection_id.into(),
+            actor_id: None,
+            tx,
+        });
+        dispatch(
+            state,
+            connection_id,
+            method::CONNECTION_OPEN,
+            Some(json!({ "actorId": actor_id })),
+        )
+        .await
+        .expect("connection/open");
+        rx
+    }
+
     async fn open_agent_conn(state: &AppState, connection_id: &str, actor_id: &str) {
         let (tx, _rx) = mpsc::unbounded_channel();
         state.subscriptions.add_connection(Connection {
@@ -3539,6 +4370,84 @@ mod tests {
         )
         .await
         .expect("connection/open agent");
+    }
+
+    #[tokio::test]
+    async fn shared_password_is_discovered_and_required_before_connection_open() {
+        let mut state = fresh_state("shared-password-gate");
+        state.auth = Arc::new(ServerAuth::with_password("loom-secret").expect("auth"));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        state.subscriptions.add_connection(Connection {
+            id: "conn_alice".into(),
+            actor_id: None,
+            tx,
+        });
+
+        let initialized = dispatch(
+            &state,
+            "conn_alice",
+            method::INITIALIZE,
+            Some(json!({ "protocolVersion": proto::PROTOCOL_VERSION })),
+        )
+        .await
+        .expect("initialize");
+        assert_eq!(initialized["serverCapabilities"]["auth"]["required"], true);
+        assert_eq!(
+            initialized["serverCapabilities"]["auth"]["methods"],
+            json!(["password"])
+        );
+
+        let blocked = dispatch(
+            &state,
+            "conn_alice",
+            method::CONNECTION_OPEN,
+            Some(json!({ "actorId": "actor_alice" })),
+        )
+        .await
+        .expect_err("connection/open must require auth");
+        assert_eq!(blocked.code, ErrorCode::APP_AUTH_REQUIRED);
+
+        let invalid = dispatch(
+            &state,
+            "conn_alice",
+            method::AUTH_LOGIN,
+            Some(json!({ "password": "wrong" })),
+        )
+        .await
+        .expect_err("wrong password");
+        assert_eq!(invalid.code, ErrorCode::APP_AUTH_FAILED);
+
+        let authenticated = dispatch(
+            &state,
+            "conn_alice",
+            method::AUTH_LOGIN,
+            Some(json!({ "password": "loom-secret" })),
+        )
+        .await
+        .expect("correct password");
+        assert_eq!(authenticated["authenticated"], true);
+
+        dispatch(
+            &state,
+            "conn_alice",
+            method::CONNECTION_OPEN,
+            Some(json!({ "actorId": "actor_alice" })),
+        )
+        .await
+        .expect("connection/open after auth");
+    }
+
+    #[tokio::test]
+    async fn initialize_reports_password_auth_disabled_by_default() {
+        let state = fresh_state("shared-password-disabled");
+        let initialized = dispatch(&state, "conn_any", method::INITIALIZE, None)
+            .await
+            .expect("initialize");
+        assert_eq!(initialized["serverCapabilities"]["auth"]["required"], false);
+        assert_eq!(
+            initialized["serverCapabilities"]["auth"]["methods"],
+            json!([])
+        );
     }
 
     #[tokio::test]
@@ -3604,6 +4513,59 @@ mod tests {
                 .expect_err("legacy method should be rejected");
             assert_eq!(err.code, ErrorCode::METHOD_NOT_FOUND);
         }
+    }
+
+    #[tokio::test]
+    async fn channel_ensure_public_rpc_is_idempotent() {
+        let state = fresh_state("channel_ensure_public_rpc_is_idempotent");
+        open_conn(&state, "conn_alice", "actor_alice").await;
+
+        let first_value = dispatch(
+            &state,
+            "conn_alice",
+            method::CHANNEL_ENSURE_PUBLIC,
+            Some(json!({ "title": "External group" })),
+        )
+        .await
+        .expect("first channel ensure");
+        let first: ChannelEnsurePublicResult =
+            serde_json::from_value(first_value).expect("first result");
+
+        let second_value = dispatch(
+            &state,
+            "conn_alice",
+            method::CHANNEL_ENSURE_PUBLIC,
+            Some(json!({ "title": "External group" })),
+        )
+        .await
+        .expect("second channel ensure");
+        let second: ChannelEnsurePublicResult =
+            serde_json::from_value(second_value).expect("second result");
+
+        assert!(first.created);
+        assert!(!second.created);
+        assert_eq!(second.channel.id, first.channel.id);
+        assert_eq!(second.channel.visibility, ChannelVisibility::Public);
+    }
+
+    #[tokio::test]
+    async fn channel_ensure_public_requires_bound_actor() {
+        let state = fresh_state("channel_ensure_public_requires_bound_actor");
+
+        let error = dispatch(
+            &state,
+            "conn_unbound",
+            method::CHANNEL_ENSURE_PUBLIC,
+            Some(json!({ "title": "External group" })),
+        )
+        .await
+        .expect_err("unbound callers must not create public channels");
+
+        assert_eq!(error.code, ErrorCode::APP_INVALID_STATE);
+        assert!(state
+            .store
+            .find_channels_by_title("External group")
+            .is_empty());
     }
 
     #[tokio::test]
@@ -3699,6 +4661,166 @@ mod tests {
             .store
             .get_channel_member_config(&created.channel.id, "actor_agent")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn channel_member_mentions_are_self_published_and_resolved_within_channel() {
+        let state = fresh_state("channel_member_mentions_are_self_published_and_resolved");
+        open_conn(&state, "conn_owner", "actor_owner").await;
+        open_agent_conn(&state, "conn_agent_a", "actor_agent_a").await;
+        open_agent_conn(&state, "conn_agent_b", "actor_agent_b").await;
+
+        let channel_value = dispatch(
+            &state,
+            "conn_owner",
+            method::CHANNEL_CREATE,
+            Some(json!({ "title": "external-group" })),
+        )
+        .await
+        .expect("channel/create");
+        let created: ChannelCreateResult =
+            serde_json::from_value(channel_value).expect("channel create result");
+        for actor_id in ["actor_agent_a", "actor_agent_b"] {
+            dispatch(
+                &state,
+                "conn_owner",
+                method::CHANNEL_INVITE,
+                Some(json!({
+                    "channelId": &created.channel.id,
+                    "actorId": actor_id,
+                })),
+            )
+            .await
+            .expect("channel/invite");
+        }
+
+        dispatch(
+            &state,
+            "conn_agent_a",
+            method::CHANNEL_MEMBER_CONFIG_SET,
+            Some(json!({
+                "channelId": &created.channel.id,
+                "actorId": "actor_agent_a",
+                "mentionIds": ["external-a"],
+            })),
+        )
+        .await
+        .expect("agent a publishes mention ids");
+        dispatch(
+            &state,
+            "conn_agent_b",
+            method::CHANNEL_MEMBER_CONFIG_SET,
+            Some(json!({
+                "channelId": &created.channel.id,
+                "actorId": "actor_agent_b",
+                "mentionIds": ["external-b", " external-b "],
+            })),
+        )
+        .await
+        .expect("agent b publishes mention ids");
+
+        let resolved_value = dispatch(
+            &state,
+            "conn_agent_a",
+            method::CHANNEL_MEMBER_RESOLVE,
+            Some(json!({
+                "channelId": &created.channel.id,
+                "mentionIds": ["external-b", "unknown", "external-a"],
+            })),
+        )
+        .await
+        .expect("resolve channel mentions");
+        let resolved: ChannelMemberResolveResult =
+            serde_json::from_value(resolved_value).expect("resolve result");
+        assert_eq!(resolved.members.len(), 2);
+        assert_eq!(resolved.members[0].actor.id, "actor_agent_a");
+        assert_eq!(resolved.members[0].mention_ids, vec!["external-a"]);
+        assert_eq!(resolved.members[1].actor.id, "actor_agent_b");
+        assert_eq!(resolved.members[1].mention_ids, vec!["external-b"]);
+        assert_eq!(resolved.unresolved_mention_ids, vec!["unknown"]);
+
+        let spoof_err = dispatch(
+            &state,
+            "conn_agent_a",
+            method::CHANNEL_MEMBER_CONFIG_SET,
+            Some(json!({
+                "channelId": &created.channel.id,
+                "actorId": "actor_agent_b",
+                "mentionIds": ["spoofed"],
+            })),
+        )
+        .await
+        .expect_err("mention ids cannot be published for another actor");
+        assert_eq!(spoof_err.code, ErrorCode::APP_INVALID_STATE);
+
+        let conflict_err = dispatch(
+            &state,
+            "conn_agent_b",
+            method::CHANNEL_MEMBER_CONFIG_SET,
+            Some(json!({
+                "channelId": &created.channel.id,
+                "actorId": "actor_agent_b",
+                "mentionIds": ["external-a"],
+            })),
+        )
+        .await
+        .expect_err("one mention id cannot route to two actors");
+        assert_eq!(conflict_err.code, ErrorCode::APP_CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn public_channel_agent_can_publish_its_own_mentions_without_explicit_invite() {
+        let state = fresh_state("public_channel_agent_can_publish_its_own_mentions");
+        open_agent_conn(&state, "conn_agent", "actor_agent").await;
+        let channel_value = dispatch(
+            &state,
+            "conn_agent",
+            method::CHANNEL_CREATE,
+            Some(json!({ "title": "public-external-group", "public": true })),
+        )
+        .await
+        .expect("public channel/create");
+        let created: ChannelCreateResult =
+            serde_json::from_value(channel_value).expect("channel create result");
+        assert_eq!(created.channel.members, vec!["actor_agent"]);
+
+        let first_value = dispatch(
+            &state,
+            "conn_agent",
+            method::CHANNEL_MEMBER_CONFIG_SET,
+            Some(json!({
+                "channelId": &created.channel.id,
+                "actorId": "actor_agent",
+                "mentionIds": ["external-agent"],
+            })),
+        )
+        .await
+        .expect("implicit public member publishes mention ids");
+        let first: ChannelMemberConfigSetResult =
+            serde_json::from_value(first_value).expect("first set result");
+        let second_value = dispatch(
+            &state,
+            "conn_agent",
+            method::CHANNEL_MEMBER_CONFIG_SET,
+            Some(json!({
+                "channelId": &created.channel.id,
+                "actorId": "actor_agent",
+                "mentionIds": ["external-agent"],
+            })),
+        )
+        .await
+        .expect("identical mention ids are idempotent");
+        let second: ChannelMemberConfigSetResult =
+            serde_json::from_value(second_value).expect("second set result");
+        assert_eq!(first.config.updated_at, second.config.updated_at);
+
+        assert_eq!(
+            state
+                .store
+                .get_channel_member_config(&created.channel.id, "actor_agent")
+                .map(|config| config.mention_ids),
+            Some(vec!["external-agent".into()])
+        );
     }
 
     #[tokio::test]
@@ -4262,8 +5384,9 @@ mod tests {
             Some(json!({
                 "actorId": "actor_agent_bot",
                 "scope": { "kind": "channel", "id": channel.channel.id },
-                "startReason": "manual",
+                "startReason": "worker diagnostic that may contain private state",
                 "agentConfigVersionId": config.version.id,
+                "metadata": { "noReplyReason": "prompt-derived secret state" },
             })),
         )
         .await
@@ -4443,7 +5566,8 @@ mod tests {
         .expect_err("invisible run must be not-found");
         assert_eq!(err.code, ErrorCode::APP_NOT_FOUND);
 
-        // After joining the channel, Alice sees the same canonical run.
+        // After joining the channel, Alice sees the run lifecycle without any
+        // worker-controlled diagnostic text.
         dispatch(
             &state,
             "conn_agent",
@@ -4465,6 +5589,8 @@ mod tests {
         .expect("run.get alice");
         let got: RunGetResult = serde_json::from_value(get_value).expect("alice run get result");
         assert_eq!(got.run.id, opened.run.id);
+        assert!(got.run.metadata.is_empty());
+        assert!(got.run.start_reason.is_none());
 
         // Limit is applied after canonical `(openedAt DESC, id DESC)`
         // sorting, so a one-row page always returns the canonical head.
@@ -4508,6 +5634,136 @@ mod tests {
         .await
         .expect_err("missing run must be not-found");
         assert_eq!(err.code, ErrorCode::APP_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn run_rpc_does_not_expose_private_trigger_metadata_to_scope_observers() {
+        let state = fresh_state("run-rpc-private-trigger");
+        open_conn(&state, "conn_player", "actor_player").await;
+        open_agent_conn(&state, "conn_host", "actor_agent_host").await;
+        open_conn(&state, "conn_observer", "actor_observer").await;
+        let channel = state
+            .store
+            .create_channel("public game".into(), None)
+            .expect("channel");
+        for actor_id in ["actor_player", "actor_agent_host", "actor_observer"] {
+            state.store.grant_channel(&channel.id, actor_id).unwrap();
+        }
+
+        let mut message_metadata = Meta::default();
+        message_metadata.insert("privateTo".into(), json!(["actor_agent_host"]));
+        let private_message = state
+            .store
+            .append_message(
+                "actor_player".into(),
+                format!("#{}", channel.id),
+                MessageKind::Human,
+                "secret night action".into(),
+                Vec::new(),
+                vec![AudienceRef {
+                    kind: AudienceKind::Actor,
+                    id: "actor_agent_host".into(),
+                    display: None,
+                }],
+                MessageIntent::RequestAction,
+                DeliveryPolicy::WakeAgent,
+                None,
+                None,
+                Vec::new(),
+                message_metadata,
+                None,
+            )
+            .expect("private trigger");
+        let config = state
+            .store
+            .publish_agent_config_version(
+                "actor_agent_host".into(),
+                Some("v1".into()),
+                String::new(),
+                "test-model".into(),
+                "test-adapter".into(),
+                Value::Null,
+                Vec::new(),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                "actor_agent_host".into(),
+                Meta::default(),
+            )
+            .expect("config");
+        let mut run_metadata = Meta::default();
+        run_metadata.insert("noReplyReason".into(), json!("all players' secret roles"));
+        let run = state
+            .store
+            .open_run(
+                "actor_agent_host".into(),
+                private_message.scope.clone(),
+                Some(private_message.id.clone()),
+                Some(private_message.id),
+                config.id,
+                run_metadata,
+            )
+            .expect("run");
+
+        let observer_list: RunListResult = serde_json::from_value(
+            dispatch(&state, "conn_observer", method::RUN_LIST, Some(json!({})))
+                .await
+                .expect("observer list"),
+        )
+        .expect("observer list result");
+        assert!(observer_list.runs.is_empty());
+        for rpc_method in [method::RUN_GET, method::RUN_CANCEL] {
+            let error = dispatch(
+                &state,
+                "conn_observer",
+                rpc_method,
+                Some(json!({ "runId": run.id })),
+            )
+            .await
+            .expect_err("observer cannot inspect or mutate private run");
+            assert_eq!(error.code, ErrorCode::APP_NOT_FOUND);
+        }
+
+        let player_get: RunGetResult = serde_json::from_value(
+            dispatch(
+                &state,
+                "conn_player",
+                method::RUN_GET,
+                Some(json!({ "runId": run.id })),
+            )
+            .await
+            .expect("private sender gets lifecycle projection"),
+        )
+        .expect("player run result");
+        assert!(player_get.run.metadata.is_empty());
+        assert!(player_get.run.start_reason.is_none());
+
+        let canceled: RunCancelResult = serde_json::from_value(
+            dispatch(
+                &state,
+                "conn_player",
+                method::RUN_CANCEL,
+                Some(json!({ "runId": run.id, "reason": "stop private turn" })),
+            )
+            .await
+            .expect("private sender cancels run"),
+        )
+        .expect("cancel result");
+        assert_eq!(canceled.run.status, RunStatus::Canceled);
+        assert!(canceled.run.metadata.is_empty());
+        let cancel_message = canceled.cancel_message.expect("cancel message");
+        assert!(Store::message_visible_to_actor(
+            &cancel_message,
+            "actor_player"
+        ));
+        assert!(Store::message_visible_to_actor(
+            &cancel_message,
+            "actor_agent_host"
+        ));
+        assert!(!Store::message_visible_to_actor(
+            &cancel_message,
+            "actor_observer"
+        ));
     }
 
     #[tokio::test]
@@ -5932,6 +7188,798 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn channel_layout_is_actor_scoped_and_streams_to_every_actor_connection() {
+        let state = fresh_state("channel-layout-identity-stream");
+        let mut alice_primary =
+            open_conn_with_rx(&state, "conn_alice_primary", "actor_alice").await;
+        let mut alice_secondary =
+            open_conn_with_rx(&state, "conn_alice_secondary", "actor_alice").await;
+        let mut bob_rx = open_conn_with_rx(&state, "conn_bob", "actor_bob").await;
+        let channel = state
+            .store
+            .create_channel("Alice".into(), Some("actor_alice".into()))
+            .expect("create Alice channel");
+
+        let value = dispatch(
+            &state,
+            "conn_alice_primary",
+            method::CHANNEL_LAYOUT_SET,
+            Some(json!({
+                "sections": [{
+                    "id": "local-work",
+                    "title": "Work",
+                    "channelIds": [channel.id],
+                    "collapsed": false,
+                }],
+            })),
+        )
+        .await
+        .expect("channel.layout.set");
+        let result: ChannelLayoutSetResult =
+            serde_json::from_value(value).expect("layout set result");
+        assert_eq!(result.layout.actor_id, "actor_alice");
+        assert_eq!(result.layout.revision, 1);
+
+        for frame in [
+            alice_primary.try_recv().expect("primary layout stream"),
+            alice_secondary.try_recv().expect("secondary layout stream"),
+        ] {
+            let notification: Value = serde_json::from_str(&frame).expect("stream json");
+            assert_eq!(notification["method"], method::STREAM_UPDATE);
+            assert_eq!(
+                notification["params"]["kind"],
+                stream_kind::CHANNEL_LAYOUT_UPDATED,
+            );
+            assert!(notification["params"].get("scope").is_none());
+            assert_eq!(
+                notification["params"]["data"]["layout"]["actorId"],
+                "actor_alice",
+            );
+            assert_eq!(notification["params"]["data"]["layout"]["revision"], 1);
+        }
+        assert!(
+            bob_rx.try_recv().is_err(),
+            "another actor must not receive Alice's layout update",
+        );
+
+        let alice_get = dispatch(
+            &state,
+            "conn_alice_secondary",
+            method::CHANNEL_LAYOUT_GET,
+            Some(json!({})),
+        )
+        .await
+        .expect("Alice layout get");
+        let alice_get: ChannelLayoutGetResult = serde_json::from_value(alice_get).unwrap();
+        assert_eq!(alice_get.layout, result.layout);
+
+        let bob_get = dispatch(
+            &state,
+            "conn_bob",
+            method::CHANNEL_LAYOUT_GET,
+            Some(json!({})),
+        )
+        .await
+        .expect("Bob layout get");
+        let bob_get: ChannelLayoutGetResult = serde_json::from_value(bob_get).unwrap();
+        assert_eq!(bob_get.layout.actor_id, "actor_bob");
+        assert_eq!(bob_get.layout.revision, 0);
+        assert!(bob_get.layout.sections.is_empty());
+
+        let spoof = dispatch(
+            &state,
+            "conn_bob",
+            method::CHANNEL_LAYOUT_GET,
+            Some(json!({ "actorId": "actor_alice" })),
+        )
+        .await
+        .expect_err("layout actor identity cannot be supplied by caller");
+        assert_eq!(spoof.code, ErrorCode::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn channel_layout_normalizes_duplicates_and_drops_stale_inaccessible_or_dm_channels() {
+        let state = fresh_state("channel-layout-normalization");
+        open_conn(&state, "conn_alice", "actor_alice").await;
+        open_conn(&state, "conn_bob", "actor_bob").await;
+        let alice_private = state
+            .store
+            .create_channel("Alice private".into(), Some("actor_alice".into()))
+            .expect("Alice channel");
+        let bob_private = state
+            .store
+            .create_channel("Bob private".into(), Some("actor_bob".into()))
+            .expect("Bob channel");
+        let public = state
+            .store
+            .create_channel_with_visibility(
+                "Public".into(),
+                String::new(),
+                Some("actor_bob".into()),
+                ChannelVisibility::Public,
+            )
+            .expect("public channel");
+        dispatch(
+            &state,
+            "conn_alice",
+            method::MESSAGE_SEND,
+            Some(json!({ "target": "dm:@actor_bob", "body": "secret" })),
+        )
+        .await
+        .expect("create DM backing channel");
+        let direct = state
+            .store
+            .list_channels()
+            .into_iter()
+            .find(|channel| channel.title.starts_with("dm:"))
+            .expect("DM channel");
+
+        let set = dispatch(
+            &state,
+            "conn_alice",
+            method::CHANNEL_LAYOUT_SET,
+            Some(json!({
+                "sections": [
+                    {
+                        "id": " work ",
+                        "title": " Work ",
+                        "channelIds": [
+                            alice_private.id,
+                            alice_private.id,
+                            bob_private.id,
+                            direct.id,
+                            "chan_deleted_from_local_cache"
+                        ],
+                        "collapsed": false
+                    },
+                    {
+                        "id": "work",
+                        "title": "Ignored duplicate metadata",
+                        "channelIds": [public.id, alice_private.id],
+                        "collapsed": true
+                    },
+                    {
+                        "id": "later",
+                        "title": "Later",
+                        "channelIds": [public.id],
+                        "collapsed": true
+                    }
+                ]
+            })),
+        )
+        .await
+        .expect("stale local cache migration is accepted");
+        let set: ChannelLayoutSetResult = serde_json::from_value(set).unwrap();
+        assert_eq!(set.layout.revision, 1);
+        assert_eq!(set.layout.sections.len(), 2);
+        assert_eq!(set.layout.sections[0].id, "work");
+        assert_eq!(set.layout.sections[0].title, "Work");
+        assert!(!set.layout.sections[0].collapsed);
+        assert_eq!(
+            set.layout.sections[0].channel_ids,
+            vec![alice_private.id.clone(), public.id.clone()],
+        );
+        assert_eq!(set.layout.sections[1].id, "later");
+        assert!(set.layout.sections[1].channel_ids.is_empty());
+
+        // Access changes and deletion are reflected by get without requiring
+        // another client write or leaking stale ids back to the caller.
+        state
+            .store
+            .update_channel(&public.id, None, None, Some(ChannelVisibility::Private))
+            .expect("public becomes Bob-private");
+        state
+            .store
+            .delete_channel(&alice_private.id, false)
+            .expect("delete Alice channel");
+        let filtered = dispatch(
+            &state,
+            "conn_alice",
+            method::CHANNEL_LAYOUT_GET,
+            Some(json!({})),
+        )
+        .await
+        .expect("filtered layout get");
+        let filtered: ChannelLayoutGetResult = serde_json::from_value(filtered).unwrap();
+        assert_eq!(filtered.layout.revision, 1);
+        assert_eq!(filtered.layout.sections.len(), 2);
+        assert!(filtered
+            .layout
+            .sections
+            .iter()
+            .all(|section| section.channel_ids.is_empty()));
+
+        let bad_text = dispatch(
+            &state,
+            "conn_alice",
+            method::CHANNEL_LAYOUT_SET,
+            Some(json!({
+                "sections": [{
+                    "id": "bad\nsection",
+                    "title": "Bad",
+                    "channelIds": []
+                }]
+            })),
+        )
+        .await
+        .expect_err("control characters are rejected");
+        assert_eq!(bad_text.code, ErrorCode::INVALID_PARAMS);
+
+        let too_many = (0..=MAX_CHANNEL_LAYOUT_SECTIONS)
+            .map(|index| {
+                json!({
+                    "id": format!("section-{index}"),
+                    "title": format!("Section {index}"),
+                    "channelIds": []
+                })
+            })
+            .collect::<Vec<_>>();
+        let too_large = dispatch(
+            &state,
+            "conn_alice",
+            method::CHANNEL_LAYOUT_SET,
+            Some(json!({ "sections": too_many })),
+        )
+        .await
+        .expect_err("section count is bounded");
+        assert_eq!(too_large.code, ErrorCode::INVALID_PARAMS);
+        assert_eq!(state.store.get_channel_layout("actor_alice").revision, 1);
+    }
+
+    #[tokio::test]
+    async fn channel_layout_merge_preserves_server_sections_and_full_set_replaces_them() {
+        let state = fresh_state("channel-layout-merge");
+        open_conn(&state, "conn_alice", "actor_alice").await;
+        let channels = (0..4)
+            .map(|index| {
+                state
+                    .store
+                    .create_channel(format!("Channel {index}"), Some("actor_alice".into()))
+                    .expect("create channel")
+            })
+            .collect::<Vec<_>>();
+
+        let initial = dispatch(
+            &state,
+            "conn_alice",
+            method::CHANNEL_LAYOUT_SET,
+            Some(json!({
+                "sections": [
+                    {
+                        "id": "work",
+                        "title": "Server Work",
+                        "channelIds": [channels[0].id],
+                        "collapsed": true
+                    },
+                    {
+                        "id": "stable",
+                        "title": "Stable",
+                        "channelIds": [channels[1].id],
+                        "collapsed": false
+                    }
+                ]
+            })),
+        )
+        .await
+        .expect("initial layout");
+        let initial: ChannelLayoutSetResult = serde_json::from_value(initial).unwrap();
+        assert_eq!(initial.layout.revision, 1);
+
+        let merged = dispatch(
+            &state,
+            "conn_alice",
+            method::CHANNEL_LAYOUT_SET,
+            Some(json!({
+                "merge": true,
+                "sections": [
+                    {
+                        "id": "work",
+                        "title": "Local Work",
+                        "channelIds": [channels[1].id, channels[2].id],
+                        "collapsed": false
+                    },
+                    {
+                        "id": "later",
+                        "title": "Later",
+                        "channelIds": [channels[0].id, channels[3].id],
+                        "collapsed": false
+                    }
+                ]
+            })),
+        )
+        .await
+        .expect("merge layout");
+        let merged: ChannelLayoutSetResult = serde_json::from_value(merged).unwrap();
+        assert_eq!(merged.layout.revision, 2);
+        assert_eq!(
+            merged
+                .layout
+                .sections
+                .iter()
+                .map(|section| section.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["work", "stable", "later"],
+        );
+        assert_eq!(merged.layout.sections[0].title, "Server Work");
+        assert!(merged.layout.sections[0].collapsed);
+        assert_eq!(
+            merged.layout.sections[0].channel_ids,
+            vec![channels[0].id.clone(), channels[2].id.clone()],
+        );
+        assert_eq!(
+            merged.layout.sections[1].channel_ids,
+            vec![channels[1].id.clone()],
+        );
+        assert_eq!(
+            merged.layout.sections[2].channel_ids,
+            vec![channels[3].id.clone()],
+        );
+
+        let replaced = dispatch(
+            &state,
+            "conn_alice",
+            method::CHANNEL_LAYOUT_SET,
+            Some(json!({
+                "sections": [{
+                    "id": "later",
+                    "title": "Only",
+                    "channelIds": [channels[3].id],
+                    "collapsed": true
+                }]
+            })),
+        )
+        .await
+        .expect("full replacement");
+        let replaced: ChannelLayoutSetResult = serde_json::from_value(replaced).unwrap();
+        assert_eq!(replaced.layout.revision, 3);
+        assert_eq!(replaced.layout.sections.len(), 1);
+        assert_eq!(replaced.layout.sections[0].title, "Only");
+        assert!(replaced.layout.sections[0].collapsed);
+    }
+
+    #[tokio::test]
+    async fn channel_create_defaults_private_and_explicit_public_keeps_creator() {
+        let state = fresh_state("channel-create-visibility-default");
+        for params in [
+            json!({ "title": "unowned private" }),
+            json!({ "title": "unowned public", "public": true }),
+        ] {
+            let error = dispatch(&state, "conn_unbound", method::CHANNEL_CREATE, Some(params))
+                .await
+                .expect_err("unbound caller cannot create an unowned channel");
+            assert_eq!(error.code, ErrorCode::APP_INVALID_STATE);
+        }
+        assert!(state.store.list_channels().is_empty());
+
+        open_conn(&state, "conn_owner", "actor_owner").await;
+        open_conn(&state, "conn_guest", "actor_guest").await;
+
+        let private_value = dispatch(
+            &state,
+            "conn_owner",
+            method::CHANNEL_CREATE,
+            Some(json!({ "title": "private by default" })),
+        )
+        .await
+        .expect("default channel/create");
+        let private: ChannelCreateResult =
+            serde_json::from_value(private_value).expect("private result");
+        assert_eq!(private.channel.visibility, ChannelVisibility::Private);
+        assert_eq!(private.channel.members, vec!["actor_owner"]);
+
+        let public_value = dispatch(
+            &state,
+            "conn_owner",
+            method::CHANNEL_CREATE,
+            Some(json!({ "title": "shared", "public": true })),
+        )
+        .await
+        .expect("explicit public channel/create");
+        let public: ChannelCreateResult =
+            serde_json::from_value(public_value).expect("public result");
+        assert_eq!(public.channel.visibility, ChannelVisibility::Public);
+        assert_eq!(
+            public.channel.members.first().map(String::as_str),
+            Some("actor_owner"),
+            "an explicitly-public channel must retain an administrator",
+        );
+
+        let guest_list = dispatch(&state, "conn_guest", method::CHANNEL_LIST, None)
+            .await
+            .expect("guest channel/list");
+        let guest_list: ChannelListResult =
+            serde_json::from_value(guest_list).expect("channel list result");
+        assert!(guest_list
+            .channels
+            .iter()
+            .any(|channel| channel.id == public.channel.id));
+        assert!(!guest_list
+            .channels
+            .iter()
+            .any(|channel| channel.id == private.channel.id));
+    }
+
+    #[tokio::test]
+    async fn channel_update_requires_identity_and_creator_controls_visibility_round_trip() {
+        let state = fresh_state("channel-update-visibility-acl");
+        open_conn(&state, "conn_owner", "actor_owner").await;
+        open_conn(&state, "conn_collaborator", "actor_collaborator").await;
+        open_conn(&state, "conn_guest", "actor_guest").await;
+        let channel = state
+            .store
+            .create_channel("private".into(), Some("actor_owner".into()))
+            .expect("create channel");
+        state
+            .store
+            .grant_channel(&channel.id, "actor_collaborator")
+            .expect("grant collaborator");
+        let root_message_id = append_channel_root(
+            &state,
+            &channel.id,
+            "actor_owner",
+            "history becomes visible only while public",
+        );
+
+        let unbound = dispatch(
+            &state,
+            "conn_missing",
+            method::CHANNEL_UPDATE,
+            Some(json!({ "channelId": channel.id, "title": "stolen" })),
+        )
+        .await
+        .expect_err("unbound channel/update must fail");
+        assert_eq!(unbound.code, ErrorCode::APP_INVALID_STATE);
+
+        let non_member = dispatch(
+            &state,
+            "conn_guest",
+            method::CHANNEL_UPDATE,
+            Some(json!({ "channelId": channel.id, "title": "stolen" })),
+        )
+        .await
+        .expect_err("non-member channel/update must fail");
+        assert_eq!(non_member.code, ErrorCode::APP_INVALID_STATE);
+
+        let collaborator = dispatch(
+            &state,
+            "conn_collaborator",
+            method::CHANNEL_UPDATE,
+            Some(json!({ "channelId": channel.id, "visibility": "public" })),
+        )
+        .await
+        .expect_err("non-creator visibility update must fail");
+        assert_eq!(collaborator.code, ErrorCode::APP_INVALID_STATE);
+        assert!(collaborator.message.contains("creator"));
+
+        let made_public = dispatch(
+            &state,
+            "conn_owner",
+            method::CHANNEL_UPDATE,
+            Some(json!({ "channelId": channel.id, "visibility": "public" })),
+        )
+        .await
+        .expect("creator makes channel public");
+        let made_public: ChannelUpdateResult =
+            serde_json::from_value(made_public).expect("public update result");
+        assert_eq!(made_public.channel.visibility, ChannelVisibility::Public);
+        assert_eq!(
+            made_public.channel.members.first().map(String::as_str),
+            Some("actor_owner"),
+        );
+
+        let guest_list = dispatch(&state, "conn_guest", method::CHANNEL_LIST, None)
+            .await
+            .expect("guest sees public channel");
+        let guest_list: ChannelListResult = serde_json::from_value(guest_list).unwrap();
+        assert!(guest_list
+            .channels
+            .iter()
+            .any(|candidate| candidate.id == channel.id));
+        let guest_history = dispatch(
+            &state,
+            "conn_guest",
+            method::MESSAGE_LIST,
+            Some(json!({
+                "target": format!("#{}", channel.id),
+                "limit": 10,
+            })),
+        )
+        .await
+        .expect("guest reads public history");
+        let guest_history: MessageListResult = serde_json::from_value(guest_history).unwrap();
+        assert!(guest_history
+            .messages
+            .iter()
+            .any(|message| message.id == root_message_id));
+
+        // Public conversation access must not turn every reader into an
+        // administrator.
+        let public_reader_update = dispatch(
+            &state,
+            "conn_guest",
+            method::CHANNEL_UPDATE,
+            Some(json!({ "channelId": channel.id, "topic": "stolen" })),
+        )
+        .await
+        .expect_err("implicit public reader cannot update settings");
+        assert_eq!(public_reader_update.code, ErrorCode::APP_INVALID_STATE);
+
+        let made_private = dispatch(
+            &state,
+            "conn_owner",
+            method::CHANNEL_UPDATE,
+            Some(json!({ "channelId": channel.id, "visibility": "private" })),
+        )
+        .await
+        .expect("creator makes channel private");
+        let made_private: ChannelUpdateResult =
+            serde_json::from_value(made_private).expect("private update result");
+        assert_eq!(made_private.channel.visibility, ChannelVisibility::Private);
+
+        let guest_list = dispatch(&state, "conn_guest", method::CHANNEL_LIST, None)
+            .await
+            .expect("guest list after private");
+        let guest_list: ChannelListResult = serde_json::from_value(guest_list).unwrap();
+        assert!(!guest_list
+            .channels
+            .iter()
+            .any(|candidate| candidate.id == channel.id));
+        let guest_read_error = dispatch(
+            &state,
+            "conn_guest",
+            method::MESSAGE_LIST,
+            Some(json!({ "target": format!("#{}", channel.id) })),
+        )
+        .await
+        .expect_err("guest loses private history access");
+        assert_eq!(guest_read_error.code, ErrorCode::APP_INVALID_STATE);
+    }
+
+    #[tokio::test]
+    async fn public_channel_readers_cannot_use_channel_management_rpcs() {
+        let state = fresh_state("public-channel-management-acl");
+        open_conn(&state, "conn_owner", "actor_owner").await;
+        open_agent_conn(&state, "conn_member", "actor_member").await;
+        open_conn(&state, "conn_guest", "actor_guest").await;
+        open_conn(&state, "conn_other", "actor_other").await;
+
+        let created = dispatch(
+            &state,
+            "conn_owner",
+            method::CHANNEL_CREATE,
+            Some(json!({ "title": "public managed", "public": true })),
+        )
+        .await
+        .expect("create public channel");
+        let created: ChannelCreateResult = serde_json::from_value(created).unwrap();
+        let channel_id = created.channel.id;
+        dispatch(
+            &state,
+            "conn_owner",
+            method::CHANNEL_INVITE,
+            Some(json!({ "channelId": channel_id, "actorId": "actor_member" })),
+        )
+        .await
+        .expect("creator invites explicit member");
+        dispatch(
+            &state,
+            "conn_owner",
+            method::CHANNEL_MEMBER_CONFIG_SET,
+            Some(json!({
+                "channelId": channel_id,
+                "actorId": "actor_member",
+                "workspaceDir": "F:/work/public-managed",
+            })),
+        )
+        .await
+        .expect("creator seeds member config");
+        dispatch(
+            &state,
+            "conn_owner",
+            method::CHANNEL_SET_INSTRUCTION,
+            Some(json!({ "channelId": channel_id, "instructions": "shared rules" })),
+        )
+        .await
+        .expect("creator seeds instructions");
+        let group = dispatch(
+            &state,
+            "conn_owner",
+            method::ACTOR_GROUP_CREATE,
+            Some(json!({
+                "channelId": channel_id,
+                "name": "reviewers",
+                "memberActorIds": ["actor_member"],
+            })),
+        )
+        .await
+        .expect("creator seeds group");
+        let group: ActorGroupCreateResult = serde_json::from_value(group).unwrap();
+
+        // An implicit public reader may inspect ordinary channel metadata.
+        for (method_name, params) in [
+            (method::CHANNEL_MEMBERS, json!({ "channelId": channel_id })),
+            (
+                method::CHANNEL_GET_INSTRUCTION,
+                json!({ "channelId": channel_id }),
+            ),
+            (method::ACTOR_GROUP_LIST, json!({ "channelId": channel_id })),
+        ] {
+            dispatch(&state, "conn_guest", method_name, Some(params))
+                .await
+                .unwrap_or_else(|error| panic!("public read {method_name} failed: {error:?}"));
+        }
+
+        // Visibility is not an administration capability, and member workspace
+        // paths are private operational config rather than public metadata.
+        for (method_name, params) in [
+            (
+                method::CHANNEL_MEMBER_CONFIG_GET,
+                json!({ "channelId": channel_id, "actorId": "actor_member" }),
+            ),
+            (
+                method::CHANNEL_MEMBER_CONFIG_LIST,
+                json!({ "channelId": channel_id }),
+            ),
+            (
+                method::CHANNEL_INVITE,
+                json!({ "channelId": channel_id, "actorId": "actor_other" }),
+            ),
+            (
+                method::CHANNEL_REVOKE,
+                json!({ "channelId": channel_id, "actorId": "actor_member" }),
+            ),
+            (
+                method::CHANNEL_DELETE,
+                json!({ "channelId": channel_id, "cascade": true }),
+            ),
+            (
+                method::CHANNEL_SET_INSTRUCTION,
+                json!({ "channelId": channel_id, "instructions": "hijacked" }),
+            ),
+            (
+                method::CHANNEL_CLEAR_INSTRUCTION,
+                json!({ "channelId": channel_id }),
+            ),
+            (
+                method::CHANNEL_MEMBER_CONFIG_SET,
+                json!({
+                    "channelId": channel_id,
+                    "actorId": "actor_member",
+                    "workspaceDir": "F:/stolen",
+                }),
+            ),
+            (
+                method::CHANNEL_MEMBER_CONFIG_CLEAR,
+                json!({ "channelId": channel_id, "actorId": "actor_member" }),
+            ),
+            (
+                method::ACTOR_GROUP_CREATE,
+                json!({ "channelId": channel_id, "name": "hijacked" }),
+            ),
+            (
+                method::ACTOR_GROUP_ADD_MEMBER,
+                json!({ "groupId": group.group.id, "actorId": "actor_other" }),
+            ),
+            (
+                method::ACTOR_GROUP_REMOVE_MEMBER,
+                json!({ "groupId": group.group.id, "actorId": "actor_member" }),
+            ),
+        ] {
+            let error = dispatch(&state, "conn_guest", method_name, Some(params))
+                .await
+                .expect_err("public reader must not manage channel state");
+            assert_eq!(
+                error.code,
+                ErrorCode::APP_INVALID_STATE,
+                "unexpected error for {method_name}: {error:?}",
+            );
+        }
+
+        // Explicit members may edit collaborative config/instructions/groups,
+        // but ownership operations remain creator-only.
+        dispatch(
+            &state,
+            "conn_member",
+            method::CHANNEL_SET_INSTRUCTION,
+            Some(json!({ "channelId": channel_id, "instructions": "member edit" })),
+        )
+        .await
+        .expect("explicit member edits instructions");
+        dispatch(
+            &state,
+            "conn_member",
+            method::ACTOR_GROUP_REMOVE_MEMBER,
+            Some(json!({ "groupId": group.group.id, "actorId": "actor_member" })),
+        )
+        .await
+        .expect("explicit member edits group");
+        for (method_name, params) in [
+            (
+                method::CHANNEL_INVITE,
+                json!({ "channelId": channel_id, "actorId": "actor_other" }),
+            ),
+            (
+                method::CHANNEL_DELETE,
+                json!({ "channelId": channel_id, "cascade": true }),
+            ),
+        ] {
+            let error = dispatch(&state, "conn_member", method_name, Some(params))
+                .await
+                .expect_err("non-creator ownership operation must fail");
+            assert_eq!(error.code, ErrorCode::APP_INVALID_STATE);
+        }
+
+        let self_revoke = dispatch(
+            &state,
+            "conn_owner",
+            method::CHANNEL_REVOKE,
+            Some(json!({ "channelId": channel_id, "actorId": "actor_owner" })),
+        )
+        .await
+        .expect_err("creator identity cannot be revoked");
+        assert_eq!(self_revoke.code, ErrorCode::APP_INVALID_STATE);
+        assert_eq!(
+            state
+                .store
+                .get_channel(&channel_id)
+                .expect("channel remains")
+                .members
+                .first()
+                .map(String::as_str),
+            Some("actor_owner"),
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_message_channel_cannot_be_renamed_or_made_public() {
+        let state = fresh_state("channel-update-dm-visibility");
+        open_conn(&state, "conn_alice", "actor_alice").await;
+        open_conn(&state, "conn_bob", "actor_bob").await;
+
+        dispatch(
+            &state,
+            "conn_alice",
+            method::MESSAGE_SEND,
+            Some(json!({
+                "target": "dm:@actor_bob",
+                "body": "secret",
+            })),
+        )
+        .await
+        .expect("create direct message");
+        let direct = state
+            .store
+            .list_channels()
+            .into_iter()
+            .find(|candidate| candidate.title == "dm:actor_alice:actor_bob")
+            .expect("hidden direct channel");
+
+        let public_error = dispatch(
+            &state,
+            "conn_alice",
+            method::CHANNEL_UPDATE,
+            Some(json!({ "channelId": direct.id, "visibility": "public" })),
+        )
+        .await
+        .expect_err("DM must stay private");
+        assert_eq!(public_error.code, ErrorCode::APP_INVALID_STATE);
+        assert!(public_error.message.contains("direct message"));
+
+        let rename_error = dispatch(
+            &state,
+            "conn_alice",
+            method::CHANNEL_UPDATE,
+            Some(json!({ "channelId": direct.id, "title": "not-a-dm" })),
+        )
+        .await
+        .expect_err("DM identity must stay hidden/canonical");
+        assert_eq!(rename_error.code, ErrorCode::APP_INVALID_STATE);
+        let unchanged = state.store.get_channel(&direct.id).expect("DM remains");
+        assert_eq!(unchanged.visibility, ChannelVisibility::Private);
+        assert_eq!(unchanged.title, direct.title);
+    }
+
+    #[tokio::test]
     async fn channel_delete_refuses_non_member() {
         let state = fresh_state("channel-delete-non-member");
         let channel = state
@@ -5953,6 +8001,38 @@ mod tests {
         assert_eq!(err.code, ErrorCode::APP_INVALID_STATE);
         assert!(state.store.get_channel(&channel.id).is_some());
         assert_eq!(state.store.list_threads(Some(&channel.id)).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn channel_lookup_filters_by_exact_title_and_visibility() {
+        let state = fresh_state("channel-lookup-title");
+        let public_match = state
+            .store
+            .create_channel("External cid-1".into(), None)
+            .expect("create public match");
+        state
+            .store
+            .create_channel("External cid-2".into(), None)
+            .expect("create public non-match");
+        state
+            .store
+            .create_channel("External cid-1".into(), Some("actor_owner".into()))
+            .expect("create private match");
+        open_conn(&state, "conn_caller", "actor_caller").await;
+
+        let value = dispatch(
+            &state,
+            "conn_caller",
+            method::CHANNEL_LOOKUP,
+            Some(json!({ "title": "External cid-1" })),
+        )
+        .await
+        .expect("lookup should succeed");
+        let result: ChannelLookupResult = serde_json::from_value(value).expect("lookup result");
+
+        assert_eq!(result.channels.len(), 1);
+        assert_eq!(result.channels[0].id, public_match.id);
+        assert_eq!(result.channels[0].title, "External cid-1");
     }
 
     #[tokio::test]
@@ -6080,6 +8160,86 @@ mod tests {
         assert!(
             titles.contains(&"in-a") && !titles.contains(&"in-b"),
             "alice must see in-a but not in-b; got {titles:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_get_returns_visible_archived_thread_without_activity_projection() {
+        let state = fresh_state("thread-get-visible");
+        let channel = state
+            .store
+            .create_channel("private".into(), Some("actor_alice".into()))
+            .expect("create channel");
+        let thread = create_thread_under(&state, &channel.id, "actor_alice", "visible");
+        state
+            .store
+            .archive_thread(&thread.id, true)
+            .expect("archive thread");
+        open_conn(&state, "conn_alice", "actor_alice").await;
+
+        let value = dispatch(
+            &state,
+            "conn_alice",
+            method::THREAD_GET,
+            Some(json!({ "threadId": thread.id })),
+        )
+        .await
+        .expect("thread/get");
+        let result: ThreadGetResult = serde_json::from_value(value).expect("get result");
+        let resolved = result.thread.expect("visible thread");
+
+        assert_eq!(resolved.id, thread.id);
+        assert_eq!(resolved.channel_id, channel.id);
+        assert!(resolved.archived_at.is_some());
+        assert!(resolved._meta.is_none());
+    }
+
+    #[tokio::test]
+    async fn thread_get_hides_private_thread_like_missing_thread() {
+        let state = fresh_state("thread-get-hidden");
+        let channel = state
+            .store
+            .create_channel("private".into(), Some("actor_alice".into()))
+            .expect("create channel");
+        let thread = create_thread_under(&state, &channel.id, "actor_alice", "hidden");
+        open_conn(&state, "conn_intruder", "actor_intruder").await;
+
+        for thread_id in [thread.id.as_str(), "thread_missing"] {
+            let value = dispatch(
+                &state,
+                "conn_intruder",
+                method::THREAD_GET,
+                Some(json!({ "threadId": thread_id })),
+            )
+            .await
+            .expect("thread/get");
+            let result: ThreadGetResult = serde_json::from_value(value).expect("get result");
+            assert!(result.thread.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn thread_get_allows_unbound_client_to_resolve_public_thread() {
+        let state = fresh_state("thread-get-public");
+        let channel = state
+            .store
+            .create_channel("public".into(), None)
+            .expect("create channel");
+        let thread = create_thread_under(&state, &channel.id, "actor_alice", "public");
+
+        let value = dispatch(
+            &state,
+            "conn_unbound",
+            method::THREAD_GET,
+            Some(json!({ "threadId": thread.id })),
+        )
+        .await
+        .expect("thread/get");
+        let result: ThreadGetResult = serde_json::from_value(value).expect("get result");
+
+        assert_eq!(
+            result.thread.map(|resolved| resolved.channel_id),
+            Some(channel.id)
         );
     }
 
@@ -6513,6 +8673,573 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn actor_inbox_cross_actor_management_is_human_only() {
+        let state = fresh_state("actor-inbox-human-only");
+        let channel = state
+            .store
+            .create_channel("actor queue".into(), None)
+            .expect("channel");
+        state
+            .store
+            .grant_channel(&channel.id, "svc_writer")
+            .expect("grant writer");
+        state
+            .store
+            .grant_channel(&channel.id, "actor_target")
+            .expect("grant target");
+        let source_id = append_directed_message(&state, &channel.id, "svc_writer", "actor_target");
+
+        state
+            .store
+            .upsert_actor(Actor {
+                id: "actor_service_target".into(),
+                kind: ActorKind::Service,
+                display_name: "Target service".into(),
+                capabilities: None,
+                _meta: None,
+            })
+            .expect("upsert target service");
+        state
+            .store
+            .upsert_actor(Actor {
+                id: "actor_other_human".into(),
+                kind: ActorKind::Human,
+                display_name: "Other human".into(),
+                capabilities: None,
+                _meta: None,
+            })
+            .expect("upsert other human");
+
+        open_conn(&state, "conn_human", "actor_human").await;
+        open_agent_conn(&state, "conn_agent", "actor_agent_manager").await;
+        let _service_rx = open_service_conn(&state, "conn_service", "actor_service_manager").await;
+
+        // Agent and service callers retain access to their own queue, but
+        // inbox.status silently omits every cross-actor target.
+        let agent_status: InboxStatusResult = serde_json::from_value(
+            dispatch(
+                &state,
+                "conn_agent",
+                method::INBOX_STATUS,
+                Some(json!({
+                    "actorIds": [
+                        "actor_agent_manager",
+                        "actor_target",
+                        "actor_service_target",
+                        "actor_other_human"
+                    ]
+                })),
+            )
+            .await
+            .expect("agent may inspect itself"),
+        )
+        .expect("decode agent status");
+        assert_eq!(
+            agent_status
+                .actors
+                .iter()
+                .map(|status| status.actor_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["actor_agent_manager"]
+        );
+
+        let service_status: InboxStatusResult = serde_json::from_value(
+            dispatch(
+                &state,
+                "conn_service",
+                method::INBOX_STATUS,
+                Some(json!({
+                    "actorIds": [
+                        "actor_service_manager",
+                        "actor_target",
+                        "actor_service_target"
+                    ]
+                })),
+            )
+            .await
+            .expect("service may inspect itself"),
+        )
+        .expect("decode service status");
+        assert_eq!(
+            service_status
+                .actors
+                .iter()
+                .map(|status| status.actor_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["actor_service_manager"]
+        );
+
+        let agent_cancel_err = dispatch(
+            &state,
+            "conn_agent",
+            method::DELIVERY_CANCEL,
+            Some(json!({ "actorId": "actor_target", "allPending": true })),
+        )
+        .await
+        .expect_err("agent must not cancel another actor's queue");
+        assert_eq!(agent_cancel_err.code, ErrorCode::APP_INVALID_STATE);
+
+        let service_expedite_err = dispatch(
+            &state,
+            "conn_service",
+            method::DELIVERY_EXPEDITE,
+            Some(json!({
+                "actorId": "actor_target",
+                "sourceId": source_id.clone()
+            })),
+        )
+        .await
+        .expect_err("service must not expedite another actor's queue");
+        assert_eq!(service_expedite_err.code, ErrorCode::APP_INVALID_STATE);
+
+        assert_eq!(
+            state
+                .store
+                .list_deliveries("actor_target", Some(DeliveryState::Pending), 10, None,)
+                .len(),
+            1,
+            "rejected mutations must leave the target queue unchanged"
+        );
+
+        // A human may inspect Agent/Service queues, but not another human's
+        // inbox. The same human may then manage the target Agent queue.
+        let human_status: InboxStatusResult = serde_json::from_value(
+            dispatch(
+                &state,
+                "conn_human",
+                method::INBOX_STATUS,
+                Some(json!({
+                    "actorIds": [
+                        "actor_human",
+                        "actor_target",
+                        "actor_service_target",
+                        "actor_other_human"
+                    ],
+                    "includeEntries": true
+                })),
+            )
+            .await
+            .expect("human status"),
+        )
+        .expect("decode human status");
+        assert_eq!(
+            human_status
+                .actors
+                .iter()
+                .map(|status| status.actor_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["actor_human", "actor_target", "actor_service_target"]
+        );
+        assert_eq!(human_status.actors[1].pending, 1);
+        assert_eq!(human_status.actors[1].entries[0].source_id, source_id);
+
+        let expedited: DeliveryExpediteResult = serde_json::from_value(
+            dispatch(
+                &state,
+                "conn_human",
+                method::DELIVERY_EXPEDITE,
+                Some(json!({
+                    "actorId": "actor_target",
+                    "sourceId": source_id.clone()
+                })),
+            )
+            .await
+            .expect("human expedites agent queue"),
+        )
+        .expect("decode expedited delivery");
+        assert_eq!(expedited.delivery.source_id, source_id);
+
+        let cancelled: DeliveryCancelResult = serde_json::from_value(
+            dispatch(
+                &state,
+                "conn_human",
+                method::DELIVERY_CANCEL,
+                Some(json!({
+                    "actorId": "actor_target",
+                    "sourceIds": [source_id]
+                })),
+            )
+            .await
+            .expect("human cancels agent queue"),
+        )
+        .expect("decode cancelled deliveries");
+        assert_eq!(cancelled.cancelled.len(), 1);
+        assert!(matches!(
+            cancelled.cancelled[0].state,
+            DeliveryState::Cancelled
+        ));
+
+        let service_cancel: DeliveryCancelResult = serde_json::from_value(
+            dispatch(
+                &state,
+                "conn_human",
+                method::DELIVERY_CANCEL,
+                Some(json!({
+                    "actorId": "actor_service_target",
+                    "allPending": true
+                })),
+            )
+            .await
+            .expect("human may manage service queue"),
+        )
+        .expect("decode service cancel");
+        assert!(service_cancel.cancelled.is_empty());
+    }
+
+    fn machine_inventory_actor(
+        actor_id: &str,
+        owner_actor_id: Option<&str>,
+        machine_id: &str,
+        runtimes: Value,
+    ) -> Actor {
+        let mut meta = serde_json::from_value::<Meta>(json!({
+            "role": "machine",
+            "source": "daemon",
+            "inventoryVersion": 2,
+            "machineId": machine_id,
+            "name": format!("Host {machine_id}"),
+            "kind": "remote",
+            "revision": 7,
+            "observedAt": "2026-08-09T10:00:00Z",
+            "dataRoot": "C:/secret/data",
+            "configDir": "C:/secret/config",
+            "providers": [{ "id": "secret-provider" }],
+            "agentSpecs": [{ "id": "secret-agent" }],
+            "serviceSpecs": [{ "id": "secret-service" }],
+            "serviceRuntimeStates": runtimes,
+            "capabilities": ["machine.command"],
+            "privateFutureField": "must-not-leak"
+        }))
+        .expect("machine metadata");
+        if let Some(owner_actor_id) = owner_actor_id {
+            meta.insert("ownerActorId".into(), json!(owner_actor_id));
+        }
+        Actor {
+            id: actor_id.into(),
+            kind: ActorKind::Service,
+            display_name: format!("Machine {machine_id}"),
+            capabilities: Some(json!(["machine"])),
+            _meta: Some(meta),
+        }
+    }
+
+    fn actor_by_id<'a>(result: &'a ActorListResult, actor_id: &str) -> &'a Actor {
+        result
+            .actors
+            .iter()
+            .find(|actor| actor.id == actor_id)
+            .expect("actor in list")
+    }
+
+    #[tokio::test]
+    async fn actor_list_requires_identity_and_redacts_non_owner_machine_inventory() {
+        let state = fresh_state("actor-list-machine-redaction");
+        let owner_machine = machine_inventory_actor(
+            "actor_machine_owned",
+            Some("actor_owner"),
+            "machine_owned",
+            json!([]),
+        );
+        let owner_machine_id = owner_machine.id.clone();
+        state
+            .store
+            .upsert_actor(owner_machine)
+            .expect("owned machine");
+        state
+            .store
+            .upsert_actor(machine_inventory_actor(
+                "actor_machine_ownerless",
+                None,
+                "machine_ownerless",
+                json!([]),
+            ))
+            .expect("ownerless machine");
+        state
+            .store
+            .upsert_actor(Actor {
+                id: "actor_agent_public".into(),
+                kind: ActorKind::Agent,
+                display_name: "Public agent".into(),
+                capabilities: Some(json!(["chat"])),
+                _meta: Some(
+                    serde_json::from_value(json!({
+                        "ordinaryPublicField": "preserved"
+                    }))
+                    .expect("ordinary metadata"),
+                ),
+            })
+            .expect("ordinary actor");
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        state.subscriptions.add_connection(Connection {
+            id: "conn_unbound".into(),
+            actor_id: None,
+            tx,
+        });
+        let unbound = dispatch(&state, "conn_unbound", method::ACTOR_LIST, None)
+            .await
+            .expect_err("actor/list requires a bound caller");
+        assert_eq!(unbound.code, ErrorCode::APP_INVALID_STATE);
+
+        open_conn(&state, "conn_owner", "actor_owner").await;
+        open_conn(&state, "conn_other", "actor_other").await;
+        let _machine_rx = open_service_conn(&state, "conn_machine", &owner_machine_id).await;
+
+        let owner: ActorListResult = serde_json::from_value(
+            dispatch(&state, "conn_owner", method::ACTOR_LIST, None)
+                .await
+                .expect("owner actor/list"),
+        )
+        .expect("decode owner list");
+        let owner_meta = actor_by_id(&owner, "actor_machine_owned")
+            ._meta
+            .as_ref()
+            .expect("owner sees metadata");
+        for key in [
+            "dataRoot",
+            "configDir",
+            "providers",
+            "agentSpecs",
+            "serviceSpecs",
+            "serviceRuntimeStates",
+        ] {
+            assert!(owner_meta.contains_key(key), "owner should see {key}");
+        }
+
+        let other: ActorListResult = serde_json::from_value(
+            dispatch(&state, "conn_other", method::ACTOR_LIST, None)
+                .await
+                .expect("non-owner actor/list"),
+        )
+        .expect("decode non-owner list");
+        for machine_id in ["actor_machine_owned", "actor_machine_ownerless"] {
+            let public_meta = actor_by_id(&other, machine_id)
+                ._meta
+                .as_ref()
+                .expect("public machine summary");
+            assert_eq!(
+                public_meta.keys().cloned().collect::<Vec<_>>(),
+                PUBLIC_MACHINE_META_KEYS
+                    .iter()
+                    .filter(|key| public_meta.contains_key(**key))
+                    .map(|key| (*key).to_string())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            );
+            for forbidden in [
+                "ownerActorId",
+                "dataRoot",
+                "configDir",
+                "providers",
+                "agentSpecs",
+                "serviceSpecs",
+                "serviceRuntimeStates",
+                "capabilities",
+                "privateFutureField",
+            ] {
+                assert!(
+                    !public_meta.contains_key(forbidden),
+                    "public summary leaked {forbidden}"
+                );
+            }
+        }
+        assert_eq!(
+            actor_by_id(&other, "actor_agent_public")
+                ._meta
+                .as_ref()
+                .and_then(|meta| meta.get("ordinaryPublicField"))
+                .and_then(Value::as_str),
+            Some("preserved")
+        );
+
+        let machine_self: ActorListResult = serde_json::from_value(
+            dispatch(&state, "conn_machine", method::ACTOR_LIST, None)
+                .await
+                .expect("machine self actor/list"),
+        )
+        .expect("decode machine self list");
+        assert!(
+            machine_self.actors.is_empty(),
+            "machine polling must not return the global actor inventory"
+        );
+    }
+
+    #[tokio::test]
+    async fn service_runtime_list_enforces_scope_and_projects_only_online_exact_rows() {
+        let state = fresh_state("service-runtime-list");
+        open_conn(&state, "conn_owner", "actor_owner").await;
+        open_conn(&state, "conn_member", "actor_member").await;
+        open_conn(&state, "conn_intruder", "actor_intruder").await;
+        let channel = state
+            .store
+            .create_channel("private runtime".into(), Some("actor_owner".into()))
+            .expect("private channel");
+        state
+            .store
+            .grant_channel(&channel.id, "actor_member")
+            .expect("grant member");
+        let other_channel = state
+            .store
+            .create_channel("other runtime".into(), None)
+            .expect("other channel");
+        state
+            .store
+            .upsert_actor(Actor {
+                id: "actor_service_indexer".into(),
+                kind: ActorKind::Service,
+                display_name: "Search Indexer".into(),
+                capabilities: None,
+                _meta: None,
+            })
+            .expect("service actor");
+
+        let exact_scope = json!({ "kind": "channel", "id": channel.id });
+        let other_scope = json!({ "kind": "channel", "id": other_channel.id });
+        let online_runtimes = json!([
+            {
+                "runtimeId": "runtime_exact",
+                "machineId": "machine_online",
+                "serviceId": "indexer",
+                "actorId": "actor_service_indexer",
+                "pluginKind": "scheduler",
+                "lifecycle": "channel_singleton",
+                "scopes": [exact_scope.clone()],
+                "phase": "failed",
+                "startedAt": "2026-08-09T10:00:00Z",
+                "updatedAt": "2026-08-09T10:01:00Z",
+                "lastError": "owner-only diagnostic"
+            },
+            {
+                "runtimeId": "runtime_exact",
+                "machineId": "machine_online",
+                "serviceId": "duplicate-must-be-ignored",
+                "actorId": "actor_service_indexer",
+                "pluginKind": "scheduler",
+                "lifecycle": "channel_singleton",
+                "scopes": [exact_scope.clone()],
+                "phase": "running",
+                "updatedAt": "2026-08-09T10:02:00Z"
+            },
+            {
+                "runtimeId": "runtime_other_scope",
+                "machineId": "machine_online",
+                "serviceId": "indexer",
+                "actorId": "actor_service_indexer",
+                "pluginKind": "scheduler",
+                "lifecycle": "channel_singleton",
+                "scopes": [other_scope],
+                "phase": "running",
+                "updatedAt": "2026-08-09T10:03:00Z"
+            },
+            {
+                "runtimeId": "runtime_wrong_machine",
+                "machineId": "machine_spoofed",
+                "serviceId": "indexer",
+                "actorId": "actor_service_indexer",
+                "pluginKind": "scheduler",
+                "lifecycle": "channel_singleton",
+                "scopes": [exact_scope.clone()],
+                "phase": "running",
+                "updatedAt": "2026-08-09T10:04:00Z"
+            },
+            {
+                "runtimeId": "runtime_future_phase",
+                "machineId": "machine_online",
+                "serviceId": "indexer",
+                "actorId": "actor_service_indexer",
+                "pluginKind": "scheduler",
+                "lifecycle": "channel_singleton",
+                "scopes": [exact_scope.clone()],
+                "phase": "stopped",
+                "updatedAt": "2026-08-09T10:05:00Z"
+            }
+        ]);
+        state
+            .store
+            .upsert_actor(machine_inventory_actor(
+                "actor_machine_online",
+                Some("actor_owner"),
+                "machine_online",
+                online_runtimes,
+            ))
+            .expect("online machine");
+        let _machine_rx = open_service_conn(&state, "conn_machine", "actor_machine_online").await;
+
+        state
+            .store
+            .upsert_actor(machine_inventory_actor(
+                "actor_machine_offline",
+                Some("actor_owner"),
+                "machine_offline",
+                json!([{
+                    "runtimeId": "runtime_offline",
+                    "machineId": "machine_offline",
+                    "serviceId": "indexer",
+                    "actorId": "actor_service_indexer",
+                    "pluginKind": "scheduler",
+                    "lifecycle": "channel_singleton",
+                    "scopes": [exact_scope.clone()],
+                    "phase": "running",
+                    "updatedAt": "2026-08-09T10:06:00Z"
+                }]),
+            ))
+            .expect("offline machine");
+
+        let intruder = dispatch(
+            &state,
+            "conn_intruder",
+            method::SERVICE_RUNTIME_LIST,
+            Some(json!({ "scope": exact_scope.clone() })),
+        )
+        .await
+        .expect_err("private scope rejects non-member");
+        assert_eq!(intruder.code, ErrorCode::APP_INVALID_STATE);
+
+        let owner: ServiceRuntimeListResult = serde_json::from_value(
+            dispatch(
+                &state,
+                "conn_owner",
+                method::SERVICE_RUNTIME_LIST,
+                Some(json!({ "scope": exact_scope.clone() })),
+            )
+            .await
+            .expect("owner runtime list"),
+        )
+        .expect("decode owner runtime list");
+        assert_eq!(owner.runtimes.len(), 1, "exact scope + online + dedupe");
+        let runtime = &owner.runtimes[0];
+        assert_eq!(runtime.runtime_id, "runtime_exact");
+        assert_eq!(runtime.machine_id, "machine_online");
+        assert_eq!(runtime.machine_actor_id, "actor_machine_online");
+        assert_eq!(runtime.machine_name, "Host machine_online");
+        assert_eq!(runtime.service_id, "indexer");
+        assert_eq!(runtime.actor_id, "actor_service_indexer");
+        assert_eq!(
+            runtime.actor_display_name.as_deref(),
+            Some("Search Indexer")
+        );
+        assert_eq!(runtime.last_error.as_deref(), Some("owner-only diagnostic"));
+
+        let member_value = dispatch(
+            &state,
+            "conn_member",
+            method::SERVICE_RUNTIME_LIST,
+            Some(json!({ "scope": exact_scope })),
+        )
+        .await
+        .expect("authorized non-owner runtime list");
+        assert!(
+            member_value["runtimes"][0].get("lastError").is_none(),
+            "non-owner response must omit lastError from the wire"
+        );
+        let member: ServiceRuntimeListResult =
+            serde_json::from_value(member_value).expect("decode member runtime list");
+        assert_eq!(member.runtimes.len(), 1);
+        assert!(member.runtimes[0].last_error.is_none());
+    }
+
+    #[tokio::test]
     async fn machine_command_create_persists_for_daemon_pull() {
         let state = fresh_state("machine-command-durable");
         open_conn(&state, "conn_human", "actor_human").await;
@@ -6652,6 +9379,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn machine_actor_list_heartbeat_does_not_return_global_actor_inventory() {
+        let state = fresh_state("machine-actor-list");
+        open_conn(&state, "conn_human", "actor_human").await;
+        dispatch(
+            &state,
+            "conn_human",
+            method::ACTOR_UPSERT,
+            Some(json!({
+                "actor": {
+                    "id": "actor_service_machine_remote",
+                    "kind": "service",
+                    "displayName": "Remote Machine",
+                    "_meta": {
+                        "role": "machine",
+                        "machineId": "machine_remote"
+                    }
+                }
+            })),
+        )
+        .await
+        .expect("actor/upsert machine");
+        open_service_conn(&state, "conn_machine", "actor_service_machine_remote").await;
+
+        let machine_value = dispatch(&state, "conn_machine", method::ACTOR_LIST, None)
+            .await
+            .expect("machine actor/list");
+        let machine_result: ActorListResult =
+            serde_json::from_value(machine_value).expect("decode machine actor/list");
+        assert!(machine_result.actors.is_empty());
+
+        let human_value = dispatch(&state, "conn_human", method::ACTOR_LIST, None)
+            .await
+            .expect("human actor/list");
+        let human_result: ActorListResult =
+            serde_json::from_value(human_value).expect("decode human actor/list");
+        assert!(human_result
+            .actors
+            .iter()
+            .any(|actor| actor.id == "actor_service_machine_remote"));
+    }
+
+    #[tokio::test]
     async fn human_connection_reusing_machine_actor_id_is_observer_only() {
         let state = fresh_state("machine-human-observer");
         open_conn(&state, "conn_owner", "actor_human").await;
@@ -6739,6 +9508,49 @@ mod tests {
             connections.actor_ids,
             vec!["actor_service_machine_remote".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn agent_observer_connection_creates_agent_without_claiming_inbox() {
+        let state = fresh_state("agent-observer");
+        open_conn(&state, "conn_owner", "actor_human").await;
+
+        let (observer_tx, _observer_rx) = mpsc::unbounded_channel();
+        state.subscriptions.add_connection(Connection {
+            id: "conn_agent_observer".into(),
+            actor_id: None,
+            tx: observer_tx,
+        });
+        dispatch(
+            &state,
+            "conn_agent_observer",
+            method::CONNECTION_OPEN,
+            Some(json!({
+                "actorId": "actor_agent",
+                "actorKind": "agent",
+                "claimInbox": false
+            })),
+        )
+        .await
+        .expect("agent observer connection/open");
+
+        let actor = state
+            .store
+            .get_actor("actor_agent")
+            .expect("agent actor created");
+        assert_eq!(actor.kind, ActorKind::Agent);
+
+        let value = dispatch(
+            &state,
+            "conn_owner",
+            method::CONNECTION_LIST,
+            Some(json!({ "actorIds": ["actor_agent"] })),
+        )
+        .await
+        .expect("connection/list without inbox owner");
+        let connections: ConnectionListResult =
+            serde_json::from_value(value).expect("decode connection/list");
+        assert!(connections.actor_ids.is_empty());
     }
 
     #[tokio::test]
@@ -6867,12 +9679,19 @@ mod tests {
             .await
         });
 
-        let frame = service_rx
-            .recv()
-            .await
-            .expect("machine command notification");
-        let notification: proto::Notification =
-            serde_json::from_str(&frame).expect("notification frame");
+        // Skip any presence.changed stream frames that precede the machine
+        // command notification (the service actor binding broadcasts one).
+        let notification: proto::Notification = loop {
+            let frame = service_rx
+                .recv()
+                .await
+                .expect("machine command notification");
+            let notification: proto::Notification =
+                serde_json::from_str(&frame).expect("notification frame");
+            if notification.method != method::STREAM_UPDATE {
+                break notification;
+            }
+        };
         assert_eq!(notification.method, method::MACHINE_COMMAND_NOTIFY);
         let params = notification.params.expect("notification params");
         let command_id = params

@@ -27,6 +27,28 @@ use super::runtime::ServiceRuntime;
 /// process-wide shutdown.
 pub type ShutdownSignal = watch::Receiver<bool>;
 
+/// Readiness hook supplied by the service host. Plugins call it after their
+/// configuration has been parsed and their long-lived loop is ready to
+/// operate. Calling it more than once is harmless.
+#[derive(Clone, Default)]
+pub struct ServiceReadiness {
+    on_ready: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl ServiceReadiness {
+    pub(crate) fn new(on_ready: Arc<dyn Fn() + Send + Sync>) -> Self {
+        Self {
+            on_ready: Some(on_ready),
+        }
+    }
+
+    pub fn mark_running(&self) {
+        if let Some(on_ready) = self.on_ready.as_ref() {
+            on_ready();
+        }
+    }
+}
+
 /// What the host hands to [`ServicePlugin::run`]. Cheap to clone the
 /// inner pieces — `runtime` is an `Arc` and `shutdown` is a
 /// `watch::Receiver`.
@@ -50,6 +72,10 @@ pub struct ServiceContext {
     /// `None` for the channel-level singleton path. Plugins that
     /// honor `params` / `scope.thread_id` placeholders read it here.
     pub instance: Option<InstanceRequest>,
+    /// The host has already connected and upserted the actor when this hook
+    /// is delivered. Plugins mark it running only after plugin-level config
+    /// validation succeeds.
+    pub readiness: ServiceReadiness,
 }
 
 #[async_trait]

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type {
   Channel,
+  ChannelVisibility,
   MachineInfo,
   Message,
   Workspace,
@@ -25,6 +26,7 @@ import { ErrorBanner, NoSpaceConnectionGuide } from "@/components/shared/PageCom
 import { ChatHeader } from "@/components/layout/ChatHeader";
 import { MessageFeed } from "@/components/chat/MessageFeed";
 import { Composer } from "@/components/chat/Composer";
+import { ActorActivityBanner } from "@/components/chat/ActorActivityBanner";
 import { RemoteFilePanel } from "@/components/chat/RemoteFilePanel";
 import { ThreadsView } from "@/components/views/ThreadsView";
 import { ChannelsView } from "@/components/views/ChannelsView";
@@ -35,10 +37,15 @@ import { RunsView } from "@/components/views/RunsView";
 import { RunDetailView } from "@/components/views/RunDetailView";
 import { SpacesView } from "@/components/views/SpacesView";
 import { AccountView } from "@/components/views/AccountView";
+import { SystemSettingsView } from "@/components/views/SystemSettingsView";
 import { SettingsView } from "@/components/views/SettingsView";
+import { CoachMarkTooltip } from "@/components/ui/CoachMark";
+import { useCoachMark } from "@/hooks/useCoachMark";
+import { useUIStore } from "@/store/uiStore";
 import { actorName } from "@/lib/format-utils";
 import { channelFromMessage, threadIdForMessage } from "@/lib/message-utils";
 import { directPeerForMessage } from "@/lib/channel-utils";
+import { useI18n } from "@/lib/i18n";
 
 export interface MainContentProps {
   view: View;
@@ -75,6 +82,7 @@ export interface MainContentProps {
   // Direct view
   agentActors: Actor[];
   activeDirectActor: Actor | null;
+  activeDirectScope: ScopeRef | null;
   activeDirectTarget: string | null;
   directMessages: Message[];
   directDraft: string;
@@ -129,6 +137,7 @@ export interface MainContentProps {
   createChannelWithTitle: (title: string) => Promise<void>;
   deleteChannel: (channel: Channel) => Promise<void>;
   renameChannel: (channel: Channel, title: string) => Promise<void>;
+  updateChannelVisibility: (channel: Channel, visibility: ChannelVisibility) => Promise<boolean>;
   addWorkspace: () => Promise<Workspace | null>;
   removeWorkspace: (id: string) => Promise<void>;
   selectWorkspace: (id: string) => Promise<Workspace | null>;
@@ -146,11 +155,19 @@ export interface MainContentProps {
 }
 
 export function MainContent(props: MainContentProps) {
+  const { t } = useI18n();
   const p = props;
   const [remoteFilePanel, setRemoteFilePanel] = useState<{
     channelId: string;
     target: string;
   } | null>(null);
+  const settingsSection = useUIStore((state) => state.settingsSection);
+  const setSettingsSection = useUIStore((state) => state.setSettingsSection);
+  const actorsCoach = useCoachMark("actors", p.view === "settings");
+  const channelCoach = useCoachMark(
+    "channel",
+    p.view === "chat" && Boolean(p.activeChannel),
+  );
 
   if (p.view === "chat") {
     return (
@@ -167,17 +184,14 @@ export function MainContent(props: MainContentProps) {
           }}
           searchOpen={p.searchPanelOpen}
           onToggleSearch={() => p.setSearchPanelOpen((open) => !open)}
-          onStopRun={(runId) => void p.cancelRun(runId)}
-          busy={p.busy}
-          runs={p.runs}
-          agentActors={p.agentActors}
-          runScope={p.activeThreadScope ?? p.activeScope}
           scopeId={p.activeScope?.id}
           actors={p.actors}
+          currentActorId={p.workspace?.actorId ?? null}
+          onUpdateVisibility={p.updateChannelVisibility}
           onOpenFolder={() => {
             const ch = p.activeChannel;
             if (!ch) {
-              p.setError("No active channel");
+              p.setError(t("No active channel"));
               return;
             }
             const localMachine = p.machines.find((m) => m.canOpenLocalPath);
@@ -198,6 +212,17 @@ export function MainContent(props: MainContentProps) {
             {p.error}
           </div>
         )}
+        {channelCoach.visible && (
+          <div className="border-b border-[#edf0f5] bg-white px-5 py-3">
+            <CoachMarkTooltip
+              title={t("Channel tip")}
+              onDismiss={channelCoach.dismiss}
+              className="mx-auto max-w-4xl"
+            >
+              {t("@ mention an agent in the composer to wake it for this channel.")}
+            </CoachMarkTooltip>
+          </div>
+        )}
         <MessageFeed
           actors={p.actors}
           feedKey={p.target ?? "channel:none"}
@@ -209,8 +234,17 @@ export function MainContent(props: MainContentProps) {
           threadStatsById={p.threadStatsById}
           emptyText={p.chatEmpty}
           emptyAction={
-            p.connection === "open" ? null : (
-              <NoSpaceConnectionGuide onUseLocalServer={p.prepareLocalServerSpace} />
+            p.activeChannel ? (
+              <>
+                <ChannelEmptyGuide />
+                {p.connection === "open" ? null : (
+                  <NoSpaceConnectionGuide onUseLocalServer={p.prepareLocalServerSpace} />
+                )}
+              </>
+            ) : (
+              p.connection === "open" ? null : (
+                <NoSpaceConnectionGuide onUseLocalServer={p.prepareLocalServerSpace} />
+              )
             )
           }
           onReply={p.setReplyTo}
@@ -221,6 +255,14 @@ export function MainContent(props: MainContentProps) {
           currentActorId={p.workspace?.actorId ?? null}
           busy={p.busy}
           anchorMessageId={p.messageAnchorId}
+        />
+        <ActorActivityBanner
+          actors={p.actors}
+          actorIds={p.channelAgentActors.map((actor) => actor.id)}
+          machines={p.machines}
+          runs={p.runs}
+          scope={p.activeScope}
+          enabled={p.connection === "open"}
         />
         <Composer
           draft={p.draft}
@@ -338,6 +380,7 @@ export function MainContent(props: MainContentProps) {
           machines={p.machines}
           runs={p.runs}
           messages={p.directMessages}
+          directScope={p.activeDirectScope}
           anchorMessageId={p.messageAnchorId}
           selectedAgent={p.activeDirectActor}
           setDraft={p.setDirectDraft}
@@ -455,6 +498,7 @@ export function MainContent(props: MainContentProps) {
         <ErrorBanner error={p.error} />
         <AccountView
           account={p.account}
+          workspace={p.workspace}
           busy={p.busy}
           onLogout={p.logout}
           onAvatarChange={p.updateAccountAvatar}
@@ -463,10 +507,30 @@ export function MainContent(props: MainContentProps) {
     );
   }
 
+  if (p.view === "system") {
+    return (
+      <>
+        <ErrorBanner error={p.error} />
+        <SystemSettingsView />
+      </>
+    );
+  }
+
   // settings (default)
   return (
     <>
       <ErrorBanner error={p.error} />
+      {actorsCoach.visible && (
+        <div className="border-b border-[#edf0f5] bg-white px-5 py-3">
+          <CoachMarkTooltip
+            title={t("Actors")}
+            onDismiss={actorsCoach.dismiss}
+            className="mx-auto max-w-5xl"
+          >
+            {t("Configure agent wake strategies and providers here.")}
+          </CoachMarkTooltip>
+        </div>
+      )}
       <SettingsView
         actors={p.actors}
         busy={p.busy}
@@ -476,6 +540,8 @@ export function MainContent(props: MainContentProps) {
         runs={p.runs}
         targetAgentId={p.settingsAgentId}
         onConsumeTargetAgent={p.consumeSettingsAgentTarget}
+        activeSection={settingsSection}
+        onSectionChange={setSettingsSection}
         onCheckMachines={p.checkMachines}
         onCreateMachine={p.createMachine}
         onRemoveMachine={p.removeMachine}
@@ -486,5 +552,26 @@ export function MainContent(props: MainContentProps) {
         onOpenLocalPath={p.openLocalPath}
       />
     </>
+  );
+}
+
+function ChannelEmptyGuide() {
+  const { t } = useI18n();
+  const steps = [
+    t("① Type @ in the composer below and say hello to your agent."),
+    t("② The agent wakes up and replies in this channel."),
+    t("③ When needed, you will be able to stop or jump in from the banner above the composer."),
+  ];
+  return (
+    <div className="mt-5 grid gap-3 text-left">
+      {steps.map((step) => (
+        <div
+          key={step}
+          className="rounded-lg border border-[#e6e9f0] bg-white px-4 py-3 text-sm font-medium leading-6 text-[#485063] shadow-sm"
+        >
+          {step}
+        </div>
+      ))}
+    </div>
   );
 }

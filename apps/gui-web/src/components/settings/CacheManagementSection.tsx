@@ -6,6 +6,7 @@ import { errorText, formatBytes } from "@/lib/format-utils";
 import { useDownloadedArtifacts } from "@/hooks/useDownloadedArtifacts";
 import { clearAllObjectUrls } from "@/hooks/useAutoDownloadImage";
 import { SettingsSection } from "@/components/settings/SettingsSection";
+import { useI18n } from "@/lib/i18n";
 
 interface CacheBreakdown {
   images: { size: number; count: number };
@@ -25,6 +26,7 @@ type ClearTarget = "images" | "other" | "all";
  * - On clear: deletes disk files + syncs localStorage (clearedIds) + clears ObjectURLs
  */
 export function CacheManagementSection() {
+  const { t } = useI18n();
   const { clearDownloadedByIds, reconcileDownloaded } = useDownloadedArtifacts();
   const [breakdown, setBreakdown] = useState<CacheBreakdown | null>(null);
   const [loading, setLoading] = useState(false);
@@ -96,29 +98,29 @@ export function CacheManagementSection() {
 
   return (
     <SettingsSection
-      title="Cache Management"
-      detail="Downloaded attachments cached on disk for fast display."
+      title={t("Cache Management")}
+      detail={t("Downloaded attachments cached on disk for fast display.")}
       action={
         <div className="flex items-center gap-2">
           <button
             type="button"
             className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-[#dfe3ec] bg-white px-2.5 text-xs font-bold text-[#596174] hover:bg-[#f7f7fb]"
-            title="Open cache folder in file manager"
+            title={t("Open cache folder in file manager")}
             onClick={() => void handleOpenFolder()}
             disabled={opening}
           >
             {opening ? <Loader2 className="animate-spin" size={13} /> : <FolderOpen size={13} />}
-            {opening ? "Opening…" : "Open Folder"}
+            {opening ? t("Opening…") : t("Open Folder")}
           </button>
           <button
             type="button"
             className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-[#dfe3ec] bg-white px-2.5 text-xs font-bold text-[#596174] hover:bg-[#f7f7fb]"
-            title="Refresh cache info"
+            title={t("Refresh cache info")}
             onClick={() => void refresh()}
             disabled={loading}
           >
             {loading ? <Loader2 className="animate-spin" size={13} /> : <HardDrive size={13} />}
-            {loading ? "Checking…" : `${totalSize !== null ? formatBytes(totalSize) : "—"}`}
+            {loading ? t("Checking…") : `${totalSize !== null ? formatBytes(totalSize) : "—"}`}
           </button>
         </div>
       }
@@ -133,7 +135,7 @@ export function CacheManagementSection() {
       <div className="space-y-2">
         <CategoryRow
           icon={<ImageIcon size={15} />}
-          label="Images"
+          label={t("Images")}
           size={breakdown?.images.size ?? null}
           count={breakdown?.images.count ?? null}
           percent={calcPercent(breakdown?.images.size ?? null, totalSize)}
@@ -146,7 +148,7 @@ export function CacheManagementSection() {
         />
         <CategoryRow
           icon={<FileIcon size={15} />}
-          label="Other Files"
+          label={t("Other Files")}
           size={breakdown?.other.size ?? null}
           count={breakdown?.other.count ?? null}
           percent={calcPercent(breakdown?.other.size ?? null, totalSize)}
@@ -164,7 +166,7 @@ export function CacheManagementSection() {
         {confirming === "all" ? (
           <div className="flex items-center gap-3">
             <span className="text-sm text-[#667085]">
-              Clear all cached files? They will be re-downloaded when viewed again.
+              {t("Clear all cached files? They will be re-downloaded when viewed again.")}
             </span>
             <button
               type="button"
@@ -173,7 +175,7 @@ export function CacheManagementSection() {
               disabled={clearing !== null}
             >
               {clearing === "all" ? <Loader2 className="animate-spin" size={13} /> : <Trash2 size={13} />}
-              {clearing === "all" ? "Clearing…" : "Confirm Clear All"}
+              {clearing === "all" ? t("Clearing…") : t("Confirm Clear All")}
             </button>
             <button
               type="button"
@@ -181,7 +183,7 @@ export function CacheManagementSection() {
               onClick={() => setConfirming(null)}
               disabled={clearing !== null}
             >
-              Cancel
+              {t("Cancel")}
             </button>
           </div>
         ) : (
@@ -192,7 +194,7 @@ export function CacheManagementSection() {
             disabled={!hasCache || clearing !== null}
           >
             <Trash2 size={15} />
-            Clear All Cache
+            {t("Clear All Cache")}
           </button>
         )}
       </div>
@@ -225,6 +227,7 @@ function CategoryRow({
   onConfirm: () => void;
   onCancel: () => void;
 }) {
+  const { t } = useI18n();
   return (
     <div className="flex items-center gap-3 rounded-lg border border-[#edf0f5] bg-[#fbfbfd] px-3 py-2.5">
       <span className="text-[#667085]">{icon}</span>
@@ -233,7 +236,9 @@ function CategoryRow({
         <div className="text-xs text-[#667085]">
           {size !== null ? formatBytes(size) : "—"}
           {percent !== null ? ` · ${percent}%` : ""}
-          {count !== null && count > 0 ? ` · ${count} file${count !== 1 ? "s" : ""}` : ""}
+          {count !== null && count > 0
+            ? ` · ${t(count === 1 ? "{{count}} file" : "{{count}} files", { count })}`
+            : ""}
         </div>
       </div>
       {confirming ? (
@@ -245,7 +250,7 @@ function CategoryRow({
             disabled={clearing}
           >
             {clearing ? <Loader2 className="animate-spin" size={12} /> : <Trash2 size={12} />}
-            {clearing ? "…" : "Clear"}
+            {clearing ? "…" : t("Clear")}
           </button>
           <button
             type="button"
@@ -253,7 +258,7 @@ function CategoryRow({
             onClick={onCancel}
             disabled={clearing}
           >
-            Cancel
+            {t("Cancel")}
           </button>
         </div>
       ) : (
@@ -262,10 +267,10 @@ function CategoryRow({
           className="inline-flex h-7 items-center gap-1 rounded-md border border-[#dfe3ec] bg-white px-2.5 text-xs font-bold text-[#596174] hover:bg-[#f7f7fb] disabled:opacity-40"
           onClick={onClear}
           disabled={disabled}
-          title={`Clear ${label.toLowerCase()}`}
+          title={t("Clear {{category}}", { category: label.toLocaleLowerCase() })}
         >
           <Trash2 size={12} />
-          Clear
+          {t("Clear")}
         </button>
       )}
     </div>

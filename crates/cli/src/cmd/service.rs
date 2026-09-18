@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use crate::config;
 use crate::service::scheduler::SchedulerPlugin;
-use crate::service::{state, ServiceHost};
+use crate::service::{state, ServiceHost, ServiceRuntimeRegistry};
 
 pub(crate) fn default_specs_dir() -> PathBuf {
     if let Ok(s) = std::env::var("LOOM_SERVICE_SPECS") {
@@ -95,6 +95,34 @@ pub async fn serve(
     server_url: String,
     allow_services: Vec<String>,
 ) -> Result<()> {
+    serve_inner(specs_dir, server_url, allow_services, None).await
+}
+
+/// Daemon-owned variant of [`serve`] that projects concrete runtime state into
+/// the daemon's machine inventory. Kept crate-private so the standalone CLI
+/// surface and its existing arguments stay compatible.
+pub(crate) async fn serve_with_runtime_reporting(
+    specs_dir: Option<PathBuf>,
+    server_url: String,
+    allow_services: Vec<String>,
+    machine_id: String,
+    registry: ServiceRuntimeRegistry,
+) -> Result<()> {
+    serve_inner(
+        specs_dir,
+        server_url,
+        allow_services,
+        Some((machine_id, registry)),
+    )
+    .await
+}
+
+async fn serve_inner(
+    specs_dir: Option<PathBuf>,
+    server_url: String,
+    allow_services: Vec<String>,
+    runtime_reporting: Option<(String, ServiceRuntimeRegistry)>,
+) -> Result<()> {
     let dir = specs_dir.unwrap_or_else(default_specs_dir);
     let mut specs =
         load_specs(&dir).with_context(|| format!("load ServiceSpecs from {}", dir.display()))?;
@@ -117,6 +145,9 @@ pub async fn serve(
     );
     let data_root = state::default_data_root();
     let mut host = ServiceHost::new(server_url, data_root).with_specs_dir(dir.clone());
+    if let Some((machine_id, registry)) = runtime_reporting {
+        host = host.with_runtime_reporting(machine_id, registry);
+    }
     // The scheduler is the reference long-process plugin under the host.
     host.register(Arc::new(SchedulerPlugin::default()));
     host.serve(specs).await
@@ -167,8 +198,8 @@ pub fn validate(path: PathBuf) -> Result<()> {
 ///
 /// Looks up the ServiceSpec, asserts `lifecycle = thread_bound`, and
 /// writes a per-instance `request.json` under the host data root.
-/// Idempotent — re-running with the same scope overwrites the params,
-/// which the host watcher debounces by file mtime / content hash.
+/// Idempotent — re-running with the same effective scope/params is a no-op for
+/// the active task; changing either causes the host to restart that instance.
 pub fn start(
     spec_id: String,
     thread: String,

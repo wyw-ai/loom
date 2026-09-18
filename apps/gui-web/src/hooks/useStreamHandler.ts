@@ -1,6 +1,7 @@
 import { useCallback, useRef } from "react";
 import type {
   Channel,
+  ChannelLayout,
   Message,
   Run,
   StreamUpdate,
@@ -8,12 +9,15 @@ import type {
   Thread,
   ScopeRef,
   InboxListEntry,
+  PresenceChangedData,
 } from "@/ipc/types";
-import { applyMessageToUsageStore } from "@/store/usageStore";
+import { applyMessageToUsageStore, applyRunToUsageStore } from "@/store/usageStore";
+import { applyPresenceChanged, bumpDeliveryTick } from "@/store/presenceStore";
 import {
   directChannelPeerId,
   isDirectChannel,
   messageBelongsToDirectActor,
+  normalizeChannelLayout,
   sameScope,
   sortChannels,
 } from "@/lib/channel-utils";
@@ -25,7 +29,13 @@ import {
   upsertThreadStatsMessage,
 } from "@/lib/message-utils";
 import { sortTasks, sortThreads, upsert } from "@/lib/format-utils";
-import type { ChannelGroup, ChannelPanelTab, ThreadActivityStats } from "@/lib/types";
+import type { ChannelPanelTab, ThreadActivityStats } from "@/lib/types";
+
+export function channelLayoutFromStreamUpdate(update: StreamUpdate) {
+  return update.kind === "channel.layout.updated"
+    ? normalizeChannelLayout(update.data.layout)
+    : null;
+}
 
 export interface StreamHandlerDeps {
   setChannels: (updater: (current: Channel[]) => Channel[]) => void;
@@ -59,7 +69,8 @@ export interface StreamHandlerDeps {
   setReplyTo: (reply: import("@/ipc/types").Message | null) => void;
   setActiveChannelId: (updater: (current: string | null) => string | null) => void;
   setActiveThreadId: (updater: (current: string | null) => string | null) => void;
-  updateChannelGroups: (updater: (current: ChannelGroup[]) => ChannelGroup[]) => void;
+  removeChannelFromGroupsLocally: (channelId: string) => void;
+  applyRemoteChannelLayout: (layout: ChannelLayout) => void;
   refreshInbox: (actorId: string) => Promise<void>;
 }
 
@@ -98,12 +109,7 @@ export function useStreamHandler(deps: StreamHandlerDeps) {
         for (const thread of deletedThreads) delete next[thread.id];
         return next;
       });
-      d.updateChannelGroups((current) =>
-        current.map((group) => ({
-          ...group,
-          channelIds: group.channelIds.filter((id) => id !== channelId),
-        })),
-      );
+      d.removeChannelFromGroupsLocally(channelId);
       d.setActiveChannelId((current) =>
         current === channelId ? fallbackChannelId : current,
       );
@@ -126,6 +132,11 @@ export function useStreamHandler(deps: StreamHandlerDeps) {
     (update: StreamUpdate) => {
       const d = depsRef.current;
       switch (update.kind) {
+        case "channel.layout.updated": {
+          const layout = channelLayoutFromStreamUpdate(update);
+          if (layout) d.applyRemoteChannelLayout(layout);
+          return;
+        }
         case "channel.created":
         case "channel.updated":
         case "channel.invited": {
@@ -265,7 +276,17 @@ export function useStreamHandler(deps: StreamHandlerDeps) {
         }
         case "run.updated": {
           const run = update.data.run as Run | undefined;
-          if (run) d.setRuns((current) => ({ ...current, [run.id]: run }));
+          if (run) {
+            applyRunToUsageStore(run);
+            d.setRuns((current) => ({ ...current, [run.id]: run }));
+          }
+          return;
+        }
+        case "presence.changed": {
+          const data = update.data as Partial<PresenceChangedData>;
+          if (typeof data.actorId === "string" && typeof data.online === "boolean") {
+            applyPresenceChanged({ actorId: data.actorId, online: data.online });
+          }
           return;
         }
         case "task.changed": {
@@ -279,6 +300,7 @@ export function useStreamHandler(deps: StreamHandlerDeps) {
           return;
         }
         case "delivery.updated": {
+          bumpDeliveryTick();
           const actorId = d.actorIdRef.current;
           if (actorId) void d.refreshInbox(actorId).catch(() => {});
           return;

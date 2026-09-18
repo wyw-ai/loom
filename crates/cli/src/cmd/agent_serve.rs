@@ -30,21 +30,21 @@ use proto::methods::{
     BundleInstallMode, ChannelListResult, ChannelMemberConfigGetResult, ChannelMembersResult,
     InboxListResult, MessageListResult, MessageSendResult, OnHumanMessageWhileBusy,
     PromptTemplateSpec, ReplyReminderMode, RunAppendResult, RunCloseResult, RunOpenResult,
-    RuntimeAwareness, TaskAssignmentContextResult, TaskAssignmentUpdateResult, ThreadListResult,
-    TriggerPrefixApplyOn,
+    RuntimeAwareness, TaskAssignmentContextResult, TaskAssignmentUpdateResult, ThreadGetResult,
+    TriggerPrefixApplyOn, TurnInputStyle,
 };
 use proto::types::trace::TraceKind;
 use proto::types::{
-    ActorKind, AudienceKind, DeliveryPolicy, Message, MessageIntent, MessageKind, Meta, Run,
-    RunStatus, ScopeKind, ScopeRef, TaskAssignmentStatus, Timestamp,
+    ActorKind, AudienceKind, Delivery, DeliveryPolicy, DeliveryState, Message, MessageIntent,
+    MessageKind, Meta, Run, RunStatus, ScopeKind, ScopeRef, TaskAssignmentStatus, Timestamp,
 };
 use proto::types::{Event, RefKind, RelationKind};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::error::TryRecvError;
-use tokio::sync::{mpsc, oneshot};
-use tokio::time::{interval, sleep, Duration};
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::time::{interval, interval_at, sleep, Duration, Instant, MissedTickBehavior};
 
 use agent_runtime::acp::{create_dir_all_unc, normalize_path_separators, AcpAdapter, AcpConfig};
 use agent_runtime::command::{CommandAdapter, CommandConfig};
@@ -62,6 +62,9 @@ use crate::daemon_ipc;
 
 const RECONNECT_BASE_DELAY_SECS: u64 = 2;
 const RECONNECT_MAX_DELAY_SECS: u64 = 30;
+const MACHINE_COMMAND_POLL_INTERVAL_SECS: u64 = 60;
+const MACHINE_COMMAND_POLL_BASE_DELAY_SECS: u64 = 15;
+const MACHINE_COMMAND_POLL_JITTER_SECS: u64 = 30;
 const LOOM_CLI_ENV: &str = "LOOM_CLI";
 const LOOM_NO_REPLY_FILE_ENV: &str = "LOOM_NO_REPLY_FILE";
 const LOCAL_ACTOR_INBOX_DELIVERY_META: &str = "__loom_local_actor_inbox_delivery";
@@ -506,6 +509,9 @@ pub struct MachineHostSpec {
     pub actor_id: String,
     pub display_name: String,
     pub metadata: Arc<Mutex<Value>>,
+    /// Revision signal for inventory changes. The daemon updates `metadata`
+    /// before advancing this receiver, so the host can publish immediately.
+    pub metadata_changed: watch::Receiver<u64>,
     pub command_tx: Option<mpsc::UnboundedSender<MachineCommandTask>>,
 }
 
@@ -550,14 +556,24 @@ async fn run_machine_host_once(host: &MachineHostSpec, server_url: &str) -> Resu
     );
 
     let mut notifications = client.notifications.lock().await;
-    let mut heartbeat = interval(Duration::from_secs(15));
+    let mut metadata_changed = host.metadata_changed.clone();
     let mut in_progress = HashSet::new();
+    drain_machine_commands(&client, host, &mut in_progress).await?;
+    let mut command_poll = interval_at(
+        Instant::now() + machine_command_poll_initial_delay(&host.machine_id),
+        Duration::from_secs(MACHINE_COMMAND_POLL_INTERVAL_SECS),
+    );
+    command_poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tokio::select! {
-            _ = heartbeat.tick() => {
-                upsert_machine_actor(&client, host).await?;
+            _ = command_poll.tick() => {
                 drain_machine_commands(&client, host, &mut in_progress).await?;
-                let _: Value = client.call_raw(method::ACTOR_LIST, None).await?;
+            }
+            changed = metadata_changed.changed() => {
+                if changed.is_err() {
+                    return Err(anyhow!("machine inventory publisher closed"));
+                }
+                upsert_machine_actor(&client, host).await?;
             }
             maybe_notification = notifications.recv() => {
                 let Some(notification) = maybe_notification else {
@@ -571,6 +587,15 @@ async fn run_machine_host_once(host: &MachineHostSpec, server_url: &str) -> Resu
             }
         }
     }
+}
+
+fn machine_command_poll_initial_delay(machine_id: &str) -> Duration {
+    let hash = machine_id.bytes().fold(0u64, |acc, byte| {
+        acc.wrapping_mul(1099511628211).wrapping_add(byte as u64)
+    });
+    Duration::from_secs(
+        MACHINE_COMMAND_POLL_BASE_DELAY_SECS + hash % MACHINE_COMMAND_POLL_JITTER_SECS,
+    )
 }
 
 async fn drain_machine_commands(
@@ -1003,6 +1028,7 @@ impl AgentPaths {
         scope_ref: &ScopeRef,
         workspace_override: Option<&Path>,
         agents_md_context: &agent_runtime::AgentsMdContext,
+        claude_project_memory: bool,
         runtime_awareness: RuntimeAwareness,
     ) -> std::io::Result<ScopePaths> {
         let scope =
@@ -1069,6 +1095,27 @@ impl AgentPaths {
                         e
                     },
                 )?;
+                if claude_project_memory {
+                    agent_runtime::ensure_claude_md_bridge(&scope.workspace).map_err(|e| {
+                        tracing::error!(
+                            actor = %actor_id,
+                            workspace = %scope.workspace.display(),
+                            %e,
+                            "ensure_scope: ensure Claude AGENTS.md bridge failed"
+                        );
+                        e
+                    })?;
+                } else {
+                    agent_runtime::remove_claude_md_bridge(&scope.workspace).map_err(|e| {
+                        tracing::error!(
+                            actor = %actor_id,
+                            workspace = %scope.workspace.display(),
+                            %e,
+                            "ensure_scope: remove stale Claude AGENTS.md bridge failed"
+                        );
+                        e
+                    })?;
+                }
             }
             RuntimeAwareness::Hidden => {
                 agent_runtime::remove_agents_md(&scope.workspace).map_err(|e| {
@@ -1077,6 +1124,15 @@ impl AgentPaths {
                         workspace = %scope.workspace.display(),
                         %e,
                         "ensure_scope: remove_agents_md failed"
+                    );
+                    e
+                })?;
+                agent_runtime::remove_claude_md_bridge(&scope.workspace).map_err(|e| {
+                    tracing::error!(
+                        actor = %actor_id,
+                        workspace = %scope.workspace.display(),
+                        %e,
+                        "ensure_scope: remove Claude AGENTS.md bridge failed"
                     );
                     e
                 })?;
@@ -1249,6 +1305,9 @@ impl AgentPaths {
             if let Some(path) = active.no_reply_file.as_ref() {
                 env.insert(LOOM_NO_REPLY_FILE_ENV.into(), path.display().to_string());
             }
+            if let Some(assignment_id) = active.assignment_id.as_ref() {
+                env.insert("LOOM_ASSIGNMENT_ID".into(), assignment_id.clone());
+            }
         }
         env.insert(
             "LOOM_AGENT_PROFILE".into(),
@@ -1335,6 +1394,21 @@ impl AgentPaths {
             .map(|parent| parent.join("agents"))
             .unwrap_or_else(|| self.data_root.join("agents"))
     }
+}
+
+fn transport_uses_claude_project_memory(transport: &AgentTransport) -> bool {
+    transport
+        .provider
+        .as_ref()
+        .is_some_and(|provider| provider.kind.eq_ignore_ascii_case("claude"))
+        || matches!(
+            transport.output_format,
+            Some(proto::methods::CommandOutputFormat::ClaudeStreamJson)
+        ) && transport
+            .decoder
+            .as_ref()
+            .and_then(|decoder| decoder.name.as_deref())
+            == Some("claude_stream_json")
 }
 
 fn scope_kind_name(kind: ScopeKind) -> &'static str {
@@ -2461,6 +2535,9 @@ struct WorkerState {
     actor_id: String,
     /// Cached copy of the on-disk spec. Reads only; specs are load-once in v1.
     spec: AgentSpec,
+    /// Provider-native project-memory compatibility selected from the resolved
+    /// transport, including local providers that extend a built-in provider.
+    claude_project_memory: bool,
     /// Resolved profile dir — same one `AgentPaths.profile` points at. Copied
     /// here so prompt-envelope code can read legacy profile fields and memory without
     /// threading `paths` through every call.
@@ -2488,15 +2565,19 @@ struct WorkerState {
     /// Provider session usage accumulated per scope. ACP, command, and
     /// interactive transports all use scope as the session boundary here.
     usage_totals: Mutex<HashMap<String, TokenUsage>>,
+    /// Last raw usage snapshot reported by the provider per scope. Used to
+    /// recover per-turn increments from providers whose usage-manifest
+    /// semantics declare `report = "session_cumulative"`.
+    last_provider_usage: Mutex<HashMap<String, TokenUsage>>,
     /// Last rendered provider prompt per scope, used only for duplicate
     /// injection telemetry. The value is overwritten every turn.
     last_prompt_by_scope: Mutex<HashMap<String, String>>,
     /// Per-scope first-turn set used by prompt templates that distinguish the
     /// first turn in a scope from later resumed turns.
     seeded: Mutex<HashSet<String>>,
-    /// thread_id → channel_id cache. Populated on miss by a single
-    /// `thread/list` RPC and reused from then on. Channel scopes don't need
-    /// resolution (scope.id IS the channel id) so those don't populate it.
+    /// thread_id → channel_id cache. Populated on miss by an exact `thread/get`
+    /// RPC and reused from then on. Channel scopes don't need resolution
+    /// (scope.id IS the channel id) so those don't populate it.
     scope_channel_cache: Mutex<HashMap<String, String>>,
     /// Trigger source ids already received from the server notification stream.
     /// The same source can arrive through both scope broadcast and actor-inbox
@@ -2510,6 +2591,11 @@ struct WorkerState {
     /// Runtime warning de-dupe by `run_id:category`. These warnings surface
     /// system/RPC failures without blocking the active turn or flooding chat.
     reported_runtime_warnings: Mutex<HashSet<String>>,
+    /// Adapter events that raced ahead of provider-start confirmation.
+    prestart_events: Mutex<HashMap<String, VecDeque<AdapterEvent>>>,
+    /// Run ids whose provider-start acknowledgement has been published. Until
+    /// a run appears here, scoped adapter events remain behind the start gate.
+    provider_event_released_runs: Mutex<HashSet<String>>,
     /// Currently selected model id for this actor. Loaded from profile state
     /// first, then from `spec.models.default`.
     selected_model: Mutex<Option<String>>,
@@ -2559,6 +2645,9 @@ struct ActiveTurn {
     /// Finished(cancelled) arrives so that stale completion cannot close the
     /// next turn in the same scope.
     cancel_requested: bool,
+    /// Set only after Adapter::send_prompt confirms that the provider accepted
+    /// this prompt's execution boundary.
+    provider_started: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2694,9 +2783,11 @@ impl WorkerState {
         let selected_model = load_model_state(&profile_dir)
             .filter(|model| persisted_model_is_allowed(&spec, &transport, model))
             .or_else(|| default_model_for_spec(&spec));
+        let claude_project_memory = transport_uses_claude_project_memory(&transport);
         Self {
             actor_id,
             spec,
+            claude_project_memory,
             profile_dir,
             paths,
             agent_server_url,
@@ -2706,6 +2797,7 @@ impl WorkerState {
             pending_triggers: Mutex::new(HashMap::new()),
             text_buffer: Mutex::new(HashMap::new()),
             usage_totals: Mutex::new(HashMap::new()),
+            last_provider_usage: Mutex::new(HashMap::new()),
             last_prompt_by_scope: Mutex::new(HashMap::new()),
             seeded: Mutex::new(HashSet::new()),
             scope_channel_cache: Mutex::new(HashMap::new()),
@@ -2713,6 +2805,8 @@ impl WorkerState {
             action_map: Mutex::new(HashMap::new()),
             model_action_map: Mutex::new(HashMap::new()),
             reported_runtime_warnings: Mutex::new(HashSet::new()),
+            prestart_events: Mutex::new(HashMap::new()),
+            provider_event_released_runs: Mutex::new(HashSet::new()),
             selected_model: Mutex::new(selected_model),
         }
     }
@@ -2734,6 +2828,74 @@ impl WorkerState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(turn.scope.id.clone(), turn);
+    }
+
+    fn confirm_provider_started(&self, scope_id: &str, run_id: &str) -> Option<ActiveTurn> {
+        let mut active = self.active_turns.lock().unwrap_or_else(|e| e.into_inner());
+        let turn = active.get_mut(scope_id)?;
+        if turn.run_id != run_id || turn.cancel_requested || turn.provider_started {
+            return None;
+        }
+        turn.provider_started = true;
+        Some(turn.clone())
+    }
+
+    fn defer_prestart_event(&self, scope_id: &str, event: &AdapterEvent) -> bool {
+        let active = self.active_turns.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(turn) = active.get(scope_id) else {
+            return false;
+        };
+        if turn.cancel_requested
+            || self
+                .provider_event_released_runs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&turn.run_id)
+        {
+            return false;
+        }
+        self.prestart_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(scope_id.to_string())
+            .or_default()
+            .push_back(event.clone());
+        true
+    }
+
+    /// Drain every event that arrived before the provider-start acknowledgement
+    /// became visible. The gate is released only while both the active-turn and
+    /// deferred-event locks prove the queue empty, so a fast Finished event
+    /// cannot overtake run.started.
+    fn drain_prestart_events_or_release(
+        &self,
+        scope_id: &str,
+        run_id: &str,
+    ) -> Option<VecDeque<AdapterEvent>> {
+        let active = self.active_turns.lock().unwrap_or_else(|e| e.into_inner());
+        let turn = active.get(scope_id)?;
+        if turn.run_id != run_id || turn.cancel_requested || !turn.provider_started {
+            return None;
+        }
+        let mut released = self
+            .provider_event_released_runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if released.contains(run_id) {
+            return None;
+        }
+        let mut deferred = self
+            .prestart_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(events) = deferred
+            .remove(scope_id)
+            .filter(|events| !events.is_empty())
+        {
+            return Some(events);
+        }
+        released.insert(run_id.to_string());
+        None
     }
 
     fn mark_cancel_requested(&self, scope_id: &str, turn_id: &str) -> Option<ActiveTurn> {
@@ -2851,6 +3013,41 @@ impl WorkerState {
         }
     }
 
+    /// Drop a queued (not yet dispatched) trigger after its delivery was
+    /// cancelled server-side. Returns true when a trigger was removed.
+    fn remove_pending_trigger(&self, source_id: &str) -> bool {
+        let mut pending = self
+            .pending_triggers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut removed = false;
+        pending.retain(|_, queue| {
+            let before = queue.len();
+            queue.retain(|t| t.id() != source_id);
+            removed = removed || queue.len() != before;
+            !queue.is_empty()
+        });
+        removed
+    }
+
+    /// Move a queued trigger to the front of its queue (delivery.expedite).
+    /// Returns true when the trigger was found and promoted.
+    fn promote_pending_trigger(&self, source_id: &str) -> bool {
+        let mut pending = self
+            .pending_triggers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for queue in pending.values_mut() {
+            if let Some(idx) = queue.iter().position(|t| t.id() == source_id) {
+                if let Some(trigger) = queue.remove(idx) {
+                    queue.push_front(trigger);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
     /// Atomically decide whether to dispatch `trigger` now or queue it. Returns
     /// `true` if the caller acquired the turn key and must dispatch; `false` if
     /// the conversation was already busy and the trigger was enqueued. The
@@ -2889,15 +3086,24 @@ impl WorkerState {
     /// into one batch so a burst becomes a single turn instead of one full
     /// provider turn per message.
     fn finish_and_next_batch(&self, scope_id: &str, coalesce: bool) -> Vec<AgentTrigger> {
-        let Some(turn_key) = self
+        let Some(turn) = self
             .active_turns
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(scope_id)
-            .map(|turn| turn.turn_key)
         else {
             return Vec::new();
         };
+        // Match defer/drain lock order: release marker before deferred queue.
+        self.provider_event_released_runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&turn.run_id);
+        self.prestart_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(scope_id);
+        let turn_key = turn.turn_key;
         let mut busy = self
             .busy_turn_keys
             .lock()
@@ -2911,6 +3117,71 @@ impl WorkerState {
             busy.remove(&turn_key);
         }
         batch
+    }
+
+    /// Release every in-memory reservation for a dispatch that failed before
+    /// the provider accepted its prompt. The durable inbox rows deliberately
+    /// remain Pending; forgetting their local de-dup markers lets a later
+    /// inbox reconciliation retry them instead of treating them as handled.
+    fn abandon_unexecuted_dispatch(
+        &self,
+        turn_key: &str,
+        scope_id: &str,
+        source_ids: &[String],
+        restore_first_turn: bool,
+    ) -> Vec<String> {
+        let mut retry_source_ids = source_ids.to_vec();
+        let active = self
+            .active_turns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(scope_id);
+        if let Some(active) = active {
+            if active.turn_key == turn_key {
+                retry_source_ids.extend(turn_source_ids(&active).into_iter().map(str::to_owned));
+                let _ = self.take_text(&active.id);
+            } else {
+                // This should be unreachable while `turn_key` is reserved,
+                // but do not tear down an unrelated live turn if state was
+                // replaced concurrently.
+                self.active_turns
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(scope_id.to_string(), active);
+            }
+        }
+
+        let mut busy = self
+            .busy_turn_keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut pending = self
+            .pending_triggers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(queued) = pending.remove(turn_key) {
+            retry_source_ids.extend(queued.into_iter().map(|trigger| trigger.id().to_string()));
+        }
+        drop(pending);
+
+        let mut unique = HashSet::new();
+        retry_source_ids.retain(|source_id| unique.insert(source_id.clone()));
+        let mut seen = self.seen_sources.lock().unwrap_or_else(|e| e.into_inner());
+        for source_id in &retry_source_ids {
+            seen.remove(source_id);
+        }
+        drop(seen);
+        if restore_first_turn {
+            self.seeded
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(scope_id);
+        }
+        // Release the busy gate last so a new notification cannot begin a
+        // retry between restoring first-turn/de-dup state and this cleanup.
+        busy.remove(turn_key);
+        drop(busy);
+        retry_source_ids
     }
 
     fn drop_pending_sources(&self, source_ids: &[String]) {
@@ -3096,6 +3367,35 @@ impl WorkerState {
     fn take_text(&self, turn_id: &str) -> Option<String> {
         let mut buf = self.text_buffer.lock().unwrap_or_else(|e| e.into_inner());
         buf.remove(turn_id).filter(|s| !s.is_empty())
+    }
+
+    /// Non-consuming view of the buffered assistant text for a turn. Used to
+    /// derive an estimated usage increment before the buffer is drained by
+    /// one of the `Finished` branches.
+    fn peek_text(&self, turn_id: &str) -> Option<String> {
+        let buf = self.text_buffer.lock().unwrap_or_else(|e| e.into_inner());
+        buf.get(turn_id).filter(|s| !s.is_empty()).cloned()
+    }
+
+    /// Convert the provider-reported usage for a finished turn into a
+    /// per-turn increment. For providers whose usage-manifest semantics
+    /// declare `report = "session_cumulative"`, consecutive snapshots per
+    /// scope are diffed; delta providers pass through unchanged.
+    fn turn_usage_increment(&self, scope_id: &str, reported: TokenUsage) -> TokenUsage {
+        let provider = usage_provider_hint(&self.spec.provider_ref.id);
+        let semantics = usage::usage_semantics(provider.as_deref());
+        if semantics.report != usage::UsageReportKind::SessionCumulative {
+            return reported;
+        }
+        let mut last = self
+            .last_provider_usage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = last.insert(scope_id.to_string(), reported.clone());
+        match previous {
+            Some(previous) => usage::diff_usage(&reported, &previous),
+            None => reported,
+        }
     }
 
     fn accumulate_usage(&self, scope_id: &str, increment: &TokenUsage) -> TokenUsage {
@@ -3589,6 +3889,18 @@ async fn publish_runtime_agent_config(
     Ok(activated.version.id)
 }
 
+/// Normalize the provider-catalog id from `AgentSpec.provider_ref` into the
+/// key space of the usage manifest (`[providers.<id>]`). Empty ids yield
+/// `None` so extraction falls back to the manifest defaults.
+fn usage_provider_hint(provider_ref_id: &str) -> Option<String> {
+    let id = provider_ref_id.trim().to_ascii_lowercase();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id)
+    }
+}
+
 fn build_adapter(
     spec: &AgentSpec,
     transport: &AgentTransport,
@@ -3689,7 +4001,7 @@ fn build_adapter(
             Ok(Arc::new(AcpAdapter::new(cfg)))
         }
         "command" => {
-            let cfg = CommandConfig::from_transport(
+            let mut cfg = CommandConfig::from_transport(
                 spec.actor.id.clone(),
                 transport.command.clone(),
                 transport.args.clone(),
@@ -3697,6 +4009,7 @@ fn build_adapter(
                 transport,
                 paths.sessions.clone(),
             );
+            cfg.usage_provider = usage_provider_hint(&spec.provider_ref.id);
             Ok(Arc::new(CommandAdapter::new(cfg)))
         }
         "interactive_command" => {
@@ -3706,7 +4019,7 @@ fn build_adapter(
                 .as_ref()
                 .and_then(|m| m.default.clone())
                 .or_else(|| transport.model.clone());
-            let cfg = InteractiveCommandConfig::new(
+            let mut cfg = InteractiveCommandConfig::new(
                 spec.actor.id.clone(),
                 transport.command.clone(),
                 &transport.args,
@@ -3718,6 +4031,7 @@ fn build_adapter(
                 paths.sessions.clone(),
                 paths.profile.clone(),
             );
+            cfg.usage_provider = usage_provider_hint(&spec.provider_ref.id);
             Ok(Arc::new(InteractiveCommandAdapter::new(cfg)))
         }
         other => Err(anyhow!(
@@ -3735,7 +4049,18 @@ async fn notification_loop(
     actor_id: &str,
 ) -> Result<()> {
     let mut started = false;
-    let inbox_poll_every = Duration::from_secs(15);
+    // Durable-inbox polling is a reconciliation safety net behind the WS
+    // notification stream, not the primary wake path, so a relaxed default
+    // keeps N idle agents from generating constant background load on the
+    // server. Override with LOOM_INBOX_POLL_SECS (min 5s) when a deployment
+    // needs tighter recovery after missed notifications.
+    let inbox_poll_every = Duration::from_secs(
+        std::env::var("LOOM_INBOX_POLL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|v| v.max(5))
+            .unwrap_or(60),
+    );
     let mut inbox_poll = interval(inbox_poll_every);
     if let Err(e) =
         drain_pending_inbox(&client, &state, &adapter, &event_tx, &mut started, actor_id).await
@@ -3869,6 +4194,73 @@ async fn notification_loop(
             };
             if run.actor_id == actor_id && run_requests_no_reply(&run) {
                 let _ = state.mark_no_reply_requested(&run.id);
+            }
+            continue;
+        }
+        if kind == stream_kind::DELIVERY_UPDATED {
+            let Some(delivery_value) = params.get("data").and_then(|d| d.get("delivery")).cloned()
+            else {
+                continue;
+            };
+            let Ok(delivery) = serde_json::from_value::<Delivery>(delivery_value) else {
+                continue;
+            };
+            if delivery.actor_id != actor_id {
+                continue;
+            }
+            match delivery.state {
+                DeliveryState::Cancelled => {
+                    // A human withdrew this wake from the GUI before we
+                    // consumed it. Drop the queued trigger; an actively
+                    // running turn is run.cancel's job, not ours.
+                    if state.remove_pending_trigger(&delivery.source_id) {
+                        tracing::info!(
+                            actor = %actor_id,
+                            source = %delivery.source_id,
+                            "queued trigger dropped after delivery.cancel"
+                        );
+                    }
+                }
+                DeliveryState::Pending => {
+                    let expedited = delivery
+                        ._meta
+                        .as_ref()
+                        .and_then(|meta| meta.get("expedite"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if !expedited {
+                        continue;
+                    }
+                    if state.promote_pending_trigger(&delivery.source_id) {
+                        tracing::info!(
+                            actor = %actor_id,
+                            source = %delivery.source_id,
+                            "queued trigger promoted after delivery.expedite"
+                        );
+                    } else {
+                        // Not queued locally (missed notification or worker
+                        // restart): a drain picks the delivery up now.
+                        if let Err(e) = drain_pending_inbox(
+                            &client,
+                            &state,
+                            &adapter,
+                            &event_tx,
+                            &mut started,
+                            actor_id,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                actor = %actor_id,
+                                source = %delivery.source_id,
+                                %e,
+                                "expedite-triggered inbox drain failed"
+                            );
+                        }
+                        state.promote_pending_trigger(&delivery.source_id);
+                    }
+                }
+                _ => {}
             }
             continue;
         }
@@ -5036,9 +5428,10 @@ async fn rebase_queued_batch_or_release(
 
 /// Open a turn, mark the scope busy, send the prompt to the adapter. Used by
 /// both the initial trigger and the Finished handler when it pops the next
-/// queued batch. On `send_prompt` failure we iteratively drain the queue
-/// (rather than spawn-recursing) so a single bad prompt can't strand the rest
-/// and the future stays Send for `tokio::spawn`.
+/// queued batch. On `send_prompt` failure we leave the durable delivery pending
+/// for a later inbox retry and iteratively drain the local queue (rather than
+/// spawn-recursing) so a single bad prompt can't strand the rest and the future
+/// stays Send for `tokio::spawn`.
 ///
 /// `batch` holds one or more triggers merged into a single turn. All batch
 /// members share the same scope, reply target, and visibility (see
@@ -5068,18 +5461,43 @@ async fn dispatch_trigger_batch(
         if batch.len() > 1 {
             run_metadata["coalescedSourceIds"] = json!(source_ids);
         }
-        let run_res: RunOpenResult = client
+        let run_res: RunOpenResult = match client
             .call(
                 method::RUN_OPEN,
                 json!({
                     "actorId": state.actor_id,
                     "scope": primary.scope(),
+                    "deliveryId": primary.id(),
                     "startReason": primary.id(),
                     "agentConfigVersionId": state.agent_config_version_id.clone(),
                     "metadata": run_metadata,
                 }),
             )
-            .await?;
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                let retry_ids = state.abandon_unexecuted_dispatch(
+                    &turn_key,
+                    &primary.scope().id,
+                    &source_ids,
+                    false,
+                );
+                tracing::warn!(
+                    actor = %state.actor_id,
+                    scope = %primary.scope().id,
+                    retry_sources = retry_ids.len(),
+                    %err,
+                    "run.open failed before provider execution; released slot and kept deliveries pending"
+                );
+                return Err(err).with_context(|| {
+                    format!(
+                        "run.open before provider execution for scope {}",
+                        primary.scope().id
+                    )
+                });
+            }
+        };
         let first_turn = state.take_seed_slot(&primary.scope().id);
         let turn_input =
             render_trigger_prompt(client, state, &batch, first_turn, &run_res.run.id).await;
@@ -5114,14 +5532,11 @@ async fn dispatch_trigger_batch(
             no_reply_file,
             no_reply_requested: false,
             cancel_requested: false,
+            provider_started: false,
         };
         state.set_turn(active.clone());
-        mark_assignment_running_if_needed(client, state, &primary).await;
-        if run_started_ack_enabled() {
-            append_run_started_ack(client, state, &active, &primary).await;
-        }
 
-        let adapter_prompt = build_adapter_prompt(
+        let adapter_prompt = match build_adapter_prompt(
             client,
             state,
             primary.scope(),
@@ -5129,10 +5544,93 @@ async fn dispatch_trigger_batch(
             Some(&active),
             Some(&primary),
         )
-        .await?;
+        .await
+        {
+            Ok(prompt) => prompt,
+            Err(err) => {
+                // No provider work ran, so terminate the bookkeeping run but
+                // deliberately send no ack ids. Canceled runs do not infer a
+                // legacy trigger ack on the server; the durable deliveries
+                // remain Pending and can be retried after local reconciliation.
+                if let Err(close_err) =
+                    close_run(client, &active.run_id, RunStatus::Canceled, None, &[]).await
+                {
+                    tracing::warn!(
+                        actor = %state.actor_id,
+                        run = %active.run_id,
+                        scope = %active.scope.id,
+                        %close_err,
+                        "failed to close pre-provider run; releasing local slot anyway"
+                    );
+                }
+                let retry_ids = state.abandon_unexecuted_dispatch(
+                    &turn_key,
+                    &active.scope.id,
+                    &source_ids,
+                    first_turn,
+                );
+                tracing::warn!(
+                    actor = %state.actor_id,
+                    run = %active.run_id,
+                    scope = %active.scope.id,
+                    retry_sources = retry_ids.len(),
+                    %err,
+                    "prompt preparation failed before provider execution; deliveries remain pending"
+                );
+                publish_runtime_warning_once(
+                    client,
+                    state,
+                    &active,
+                    &state.actor_id,
+                    "prompt.prepare",
+                    "failed to prepare the provider prompt; pending work will be retried",
+                    &err,
+                )
+                .await;
+                return Err(err).with_context(|| {
+                    format!(
+                        "prepare provider prompt for run={} scope={}",
+                        active.run_id, active.scope.id
+                    )
+                });
+            }
+        };
 
         match adapter.send_prompt(adapter_prompt).await {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                let Some(confirmed) =
+                    state.confirm_provider_started(&active.scope.id, &active.run_id)
+                else {
+                    return Ok(());
+                };
+                mark_assignment_running_if_needed(client, state, &primary).await;
+                if run_started_ack_enabled() {
+                    append_run_started_ack(client, state, &confirmed, &primary).await;
+                }
+                while let Some(mut deferred) =
+                    state.drain_prestart_events_or_release(&active.scope.id, &active.run_id)
+                {
+                    while let Some(event) = deferred.pop_front() {
+                        if let Err(error) = Box::pin(translate_one_with_gate(
+                            client,
+                            state,
+                            adapter,
+                            &state.actor_id,
+                            event,
+                            false,
+                        ))
+                        .await
+                        {
+                            tracing::error!(
+                                actor = %state.actor_id,
+                                %error,
+                                "failed to translate deferred provider event"
+                            );
+                        }
+                    }
+                }
+                return Ok(());
+            }
             Err(e) => {
                 publish_failed_turn_notice(
                     client,
@@ -5143,19 +5641,12 @@ async fn dispatch_trigger_batch(
                     None,
                 )
                 .await;
-                let _ = close_run(client, &active.run_id, RunStatus::Failed).await;
-                for source_id in &source_ids {
-                    if let Err(ack_err) =
-                        record_delivery_seen_by_id(client, &state.actor_id, source_id).await
-                    {
-                        tracing::warn!(
-                            actor = %state.actor_id,
-                            event = %source_id,
-                            %ack_err,
-                            "failed to record delivery ack for failed trigger dispatch"
-                        );
-                    }
-                }
+                let _ = close_run(client, &active.run_id, RunStatus::Failed, None, &[]).await;
+                tracing::warn!(
+                    actor = %state.actor_id,
+                    sources = ?source_ids,
+                    "provider did not accept prompt; leaving delivery pending for retry"
+                );
                 let scope_id = primary.scope().id.clone();
                 let next =
                     state.finish_and_next_batch(&scope_id, wake_coalesce_enabled(&state.spec));
@@ -5252,6 +5743,7 @@ async fn build_adapter_prompt(
         scope,
         workspace_override.as_deref(),
         &agents_md_context,
+        state.claude_project_memory,
         state.spec.runtime_awareness,
     )?;
     let skill_targets = current_scope_skill_targets(client, state, &channel_id, thread_id).await;
@@ -5628,18 +6120,12 @@ fn render_agent_prompt_output(
 fn agent_prompt_preset_parts(preset: &str) -> Result<Vec<&'static str>> {
     match preset {
         "loom_system" => Ok(vec!["bootstrap_memory", PROFILE_PROMPT_FILES_PART_KEY]),
-        "loom_turn" => Ok(vec![
-            "turn_memory",
-            "runtime_context",
-            "assignment_context",
-            "user_message",
-        ]),
+        "loom_turn" => Ok(vec!["turn_memory", "runtime_context", "user_message"]),
         "loom_full" => Ok(vec![
             "bootstrap_memory",
             PROFILE_PROMPT_FILES_PART_KEY,
             "turn_memory",
             "runtime_context",
-            "assignment_context",
             "user_message",
         ]),
         other => Err(anyhow!("unknown prompt preset `{other}`")),
@@ -5914,16 +6400,25 @@ async fn render_trigger_prompt(
                 ack_source_ids: Vec::new(),
             }
         });
-    let latest_message = render_turn_input_contract_with_names(
-        &state.actor_id,
-        &state.spec.actor.display_name,
-        batch,
-        &actor_names,
-        reminder,
-        run_id,
-        first_turn,
-        &delivery_context.unread_gap,
-    );
+    let latest_message = match turn_input_style_for_spec(&state.spec) {
+        TurnInputStyle::Minimal => render_minimal_turn_input(
+            &state.actor_id,
+            batch,
+            &actor_names,
+            reminder,
+            &delivery_context.unread_gap,
+        ),
+        TurnInputStyle::Structured => render_turn_input_contract_with_names(
+            &state.actor_id,
+            &state.spec.actor.display_name,
+            batch,
+            &actor_names,
+            reminder,
+            run_id,
+            first_turn,
+            &delivery_context.unread_gap,
+        ),
+    };
     let assignment_context = assignment_context_for_prompt(client, primary)
         .await
         .unwrap_or_default();
@@ -6490,7 +6985,7 @@ fn format_recent_conversation_context(
             message.metadata.get("kind").and_then(Value::as_str) != Some("run.started_ack")
         })
         .filter_map(|message| {
-            let body = compact_message_body(&message.body);
+            let body = compact_message_body(&message.body).text;
             if body.is_empty() {
                 return None;
             }
@@ -6538,7 +7033,7 @@ fn format_hidden_visible_history(
         })
         .filter(|message| message_visible_to_actor_for_prompt(message, local_actor_id))
     {
-        let body = compact_message_body(&message_body_for_prompt(message));
+        let body = compact_message_body(&message_body_for_prompt(message)).text;
         if body.is_empty() {
             continue;
         }
@@ -6588,12 +7083,32 @@ fn render_hidden_history_lines(header: &str, newest_first: &[String]) -> String 
     out
 }
 
-fn compact_message_body(body: &str) -> String {
+struct CompactBody {
+    text: String,
+    /// Original char count when the body was truncated to
+    /// `CONTEXT_MESSAGE_BODY_MAX_CHARS`.
+    truncated_from: Option<usize>,
+}
+
+fn compact_message_body(body: &str) -> CompactBody {
     let compact = body.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.chars().count() <= 800 {
-        compact
+    let total = compact.chars().count();
+    if total <= CONTEXT_MESSAGE_BODY_MAX_CHARS {
+        CompactBody {
+            text: compact,
+            truncated_from: None,
+        }
     } else {
-        format!("{}...", compact.chars().take(800).collect::<String>())
+        CompactBody {
+            text: format!(
+                "{}...",
+                compact
+                    .chars()
+                    .take(CONTEXT_MESSAGE_BODY_MAX_CHARS)
+                    .collect::<String>()
+            ),
+            truncated_from: Some(total),
+        }
     }
 }
 
@@ -6679,6 +7194,7 @@ const RESPONSE_DELIVERY_POINTER: &str =
 with Loom CLI before ending. Use `$LOOM_REPLY_TARGET` by default for the current workflow; \
 use bare `#channel` only for intentional channel-level updates outside the active thread. \
 For multiline messages, omit `--text` and pipe stdin/heredoc; quoted `\\n` is stored literally. \
+To send a file or image, run `loom --json attachment upload --target \"$LOOM_REPLY_TARGET\" --path <path>`, then include the returned artifact id on the visible reply with `--attachment-id <art_id>`; upload alone and artifact URI text are not chat attachments. \
 In coordinated workflows, wake the requester/coordinator with your result unless you own or were delegated the next handoff. \
 Short requested answers like joining, choosing, voting, approving, or completing a step are actionable; wake the collector instead of notify-only. \
 When you own the handoff, or no coordinator exists and another actor or group must continue, use `message ask` \
@@ -6820,6 +7336,121 @@ a step for that requester/coordinator and they must continue after your reply, w
         "Use plain `message send --target \"$LOOM_REPLY_TARGET\"` only when your public reply \
 does not require any actor to act next.\n",
     );
+}
+
+fn turn_input_style_for_spec(spec: &AgentSpec) -> TurnInputStyle {
+    spec.wake
+        .as_ref()
+        .and_then(|wake| wake.turn_input_style)
+        .unwrap_or_default()
+}
+
+fn message_kind_label(kind: MessageKind) -> &'static str {
+    match kind {
+        MessageKind::Human => "Human",
+        MessageKind::Agent => "Agent",
+        MessageKind::System => "System",
+        MessageKind::Attention => "Attention",
+        MessageKind::TaskUpdate => "TaskUpdate",
+        MessageKind::Artifact => "Artifact",
+    }
+}
+
+/// Minimal plain-text turn input (`WakeSpec.turnInputStyle = minimal`,
+/// default). One line of metadata + capped body per delivered message, a
+/// one-line scope/queue summary, and a short rule footer — no JSON header,
+/// no fenced blocks. Full bodies stay one `loom message get <id>` away.
+fn render_minimal_turn_input(
+    local_actor_id: &str,
+    batch: &[AgentTrigger],
+    actor_names: &HashMap<String, String>,
+    reminder: ReminderRender,
+    unread_gap: &TurnUnreadGap,
+) -> String {
+    let Some(primary) = batch.last() else {
+        return String::new();
+    };
+    let mut out = String::new();
+    if batch.len() > 1 {
+        out.push_str("Pending message digest (oldest first):\n");
+    } else {
+        out.push_str("New message:\n");
+    }
+    for trigger in batch {
+        match trigger {
+            AgentTrigger::Message(message) => {
+                let display = actor_names
+                    .get(&message.author_actor_id)
+                    .map(String::as_str)
+                    .unwrap_or(message.author_actor_id.as_str());
+                let at = message
+                    .created_at
+                    .with_timezone(&Local)
+                    .format("%Y-%m-%d %H:%M:%S");
+                out.push_str(&format!(
+                    "[unread] {at} {display}({})[id={}][msgId={}]:\n",
+                    message_kind_label(message.kind),
+                    message.author_actor_id,
+                    message.id,
+                ));
+                let compact = compact_message_body(&message_body_for_prompt(message));
+                out.push_str(&compact.text);
+                if compact.truncated_from.is_some() {
+                    out.push_str(&format!(
+                        "（消息最多展示{CONTEXT_MESSAGE_BODY_MAX_CHARS}个字符，全文用 `loom --json message get {}` 查看）",
+                        message.id
+                    ));
+                }
+                out.push('\n');
+            }
+            AgentTrigger::Event(event) => {
+                let display = actor_names
+                    .get(&event.actor_id)
+                    .map(String::as_str)
+                    .unwrap_or(event.actor_id.as_str());
+                let at = event
+                    .occurred_at
+                    .with_timezone(&Local)
+                    .format("%Y-%m-%d %H:%M:%S");
+                let payload = serde_json::to_string(&event.payload).unwrap_or_default();
+                let (payload, truncated) = truncate_chars(&payload, CONTEXT_MESSAGE_BODY_MAX_CHARS);
+                out.push_str(&format!(
+                    "[event] {at} {display}[id={}][eventId={}] {}:\n{payload}",
+                    event.actor_id, event.id, event.kind,
+                ));
+                if truncated.is_some() {
+                    out.push_str("…");
+                }
+                out.push('\n');
+            }
+        }
+    }
+    let scope_label = primary
+        .reply_target()
+        .unwrap_or_else(|| primary.scope().id.clone());
+    out.push_str(&format!(
+        "Scope {scope_label}: {} message(s) delivered this turn, {} more pending",
+        batch.len(),
+        unread_gap.count,
+    ));
+    if let Some(hint) = unread_gap.hint.as_deref() {
+        out.push_str(&format!(" ({hint})"));
+    }
+    out.push_str(".\n");
+    match reminder {
+        ReminderRender::Full | ReminderRender::Pointer => {
+            out.push_str(
+                "Rules: handle all messages above in this one turn; reply with \
+                 `loom --json message send --target \"$LOOM_REPLY_TARGET\" --text \"...\"`; \
+                 if no visible reply is needed run `loom --json run ignore --reason \"...\"`. \
+                 Full operating rules: AGENTS.md#loom-operating-rules.\n",
+            );
+        }
+        ReminderRender::Skip => {}
+    }
+    push_private_reply_instruction(&mut out, local_actor_id, batch);
+    push_public_wake_back_instruction(&mut out, local_actor_id, batch);
+    out
 }
 
 fn render_turn_input_contract_with_names(
@@ -7152,19 +7783,74 @@ fn body_ref_for_trigger(trigger: &AgentTrigger) -> String {
     }
 }
 
+/// Hard per-block caps for prompt injection. Every fenced body a turn input
+/// can carry is bounded so a single oversized message / event payload /
+/// assignment contract can no longer blow up the prompt (analysis doc
+/// `gui-lightweight-and-runtime-visibility-analysis.md` §2). Truncated
+/// blocks end with a pointer to the CLI so the agent can fetch the full
+/// fact on demand.
+const TRIGGER_MESSAGE_BODY_MAX_CHARS: usize = 4_000;
+const CONTEXT_MESSAGE_BODY_MAX_CHARS: usize = 500;
+const EVENT_PAYLOAD_MAX_CHARS: usize = 2_000;
+const ASSIGNMENT_CONTEXT_MAX_CHARS: usize = 4_000;
+
+/// Truncate `text` to `max_chars` characters. Returns the (possibly
+/// truncated) text and the original char count when truncation happened.
+fn truncate_chars(text: &str, max_chars: usize) -> (String, Option<usize>) {
+    let total = text.chars().count();
+    if total <= max_chars {
+        return (text.to_string(), None);
+    }
+    (text.chars().take(max_chars).collect(), Some(total))
+}
+
+fn truncation_note(kind: &str, shown: usize, total: usize, fetch_hint: &str) -> String {
+    format!("({kind} truncated: showing {shown} of {total} chars; {fetch_hint})")
+}
+
 fn render_trigger_body_block(trigger: &AgentTrigger) -> String {
     match trigger {
-        AgentTrigger::Message(message) => fenced_block(
-            &format!("loom-message id={}", fence_info_id(&message.id)),
-            &message_body_for_prompt(message),
-        ),
+        AgentTrigger::Message(message) => {
+            let (body, truncated_from) = truncate_chars(
+                &message_body_for_prompt(message),
+                TRIGGER_MESSAGE_BODY_MAX_CHARS,
+            );
+            let mut out = fenced_block(
+                &format!("loom-message id={}", fence_info_id(&message.id)),
+                &body,
+            );
+            if let Some(total) = truncated_from {
+                out.push('\n');
+                out.push_str(&truncation_note(
+                    "message body",
+                    TRIGGER_MESSAGE_BODY_MAX_CHARS,
+                    total,
+                    &format!(
+                        "run `loom --json message get {}` for the full text",
+                        message.id
+                    ),
+                ));
+            }
+            out
+        }
         AgentTrigger::Event(event) => {
             let payload = serde_json::to_string_pretty(&event.payload)
                 .unwrap_or_else(|_| event.payload.to_string());
-            fenced_block(
+            let (payload, truncated_from) = truncate_chars(&payload, EVENT_PAYLOAD_MAX_CHARS);
+            let mut out = fenced_block(
                 &format!("loom-event id={}", fence_info_id(&event.id)),
                 &payload,
-            )
+            );
+            if let Some(total) = truncated_from {
+                out.push('\n');
+                out.push_str(&truncation_note(
+                    "event payload",
+                    EVENT_PAYLOAD_MAX_CHARS,
+                    total,
+                    "query the scope via the Loom CLI for the full payload",
+                ));
+            }
+            out
         }
     }
 }
@@ -7186,17 +7872,30 @@ fn render_context_message_block(
         out.push_str(&visibility);
         out.push('\n');
     }
-    let body = compact_message_body(&message_body_for_prompt(message));
+    let compact = compact_message_body(&message_body_for_prompt(message));
     out.push_str(&fenced_block(
         &format!("loom-message id={}", fence_info_id(&message.id)),
-        &body,
+        &compact.text,
     ));
+    if let Some(total) = compact.truncated_from {
+        out.push('\n');
+        out.push_str(&truncation_note(
+            "message body",
+            CONTEXT_MESSAGE_BODY_MAX_CHARS,
+            total,
+            &format!(
+                "run `loom --json message get {}` for the full text",
+                message.id
+            ),
+        ));
+    }
     out
 }
 
 fn render_context_event_block(event: &Event, actor_names: &HashMap<String, String>) -> String {
     let payload =
         serde_json::to_string_pretty(&event.payload).unwrap_or_else(|_| event.payload.to_string());
+    let (payload, truncated_from) = truncate_chars(&payload, EVENT_PAYLOAD_MAX_CHARS);
     let mut out = format!(
         "Event id: {}\nAt: {}\nFrom: {}\nType: {}\n",
         event.id,
@@ -7208,6 +7907,15 @@ fn render_context_event_block(event: &Event, actor_names: &HashMap<String, Strin
         &format!("loom-event id={}", fence_info_id(&event.id)),
         &payload,
     ));
+    if let Some(total) = truncated_from {
+        out.push('\n');
+        out.push_str(&truncation_note(
+            "event payload",
+            EVENT_PAYLOAD_MAX_CHARS,
+            total,
+            "query the scope via the Loom CLI for the full payload",
+        ));
+    }
     out
 }
 
@@ -7409,6 +8117,22 @@ async fn assignment_context_for_prompt(
         Ok(context) => {
             let body = serde_json::to_string_pretty(&context)
                 .unwrap_or_else(|_| "{\"error\":\"failed to render assignment context\"}".into());
+            let (body, truncated_from) = truncate_chars(&body, ASSIGNMENT_CONTEXT_MAX_CHARS);
+            let note = truncated_from
+                .map(|total| {
+                    format!(
+                        "\n{}",
+                        truncation_note(
+                            "assignment context",
+                            ASSIGNMENT_CONTEXT_MAX_CHARS,
+                            total,
+                            &format!(
+                                "run `loom --json task assignment context {assignment_id}` for the full contract"
+                            ),
+                        )
+                    )
+                })
+                .unwrap_or_default();
             Some(format!(
                 "=== Loom assignment context ===\n\
                  This JSON is the authoritative task input. Read it before acting; use preflight before external side effects.\n\
@@ -7417,7 +8141,7 @@ async fn assignment_context_for_prompt(
                  - Record durable evidence with `loom task fact append`; do not use plain messages as gate evidence.\n\
                  - Finish this assignment with `loom task assignment update <assignment_id> --status completed --result <summary> --result-artifact-id <art_id> ... --result-fact-id <fact_id> ...`.\n\
                  - Do not route to another actor directly to finish an assignment; the assignment update returns the task to the assigning actor.\n\
-                 ```json\n{body}\n```"
+                 ```json\n{body}\n```{note}"
             ))
         }
         Err(err) => Some(format!(
@@ -8085,14 +8809,23 @@ fn prompt_section_label(name: &str) -> &str {
     }
 }
 
+async fn get_thread_by_id(
+    client: &Arc<Client>,
+    thread_id: &str,
+) -> Result<Option<proto::types::Thread>> {
+    let res: ThreadGetResult = client
+        .call(method::THREAD_GET, json!({ "threadId": thread_id }))
+        .await
+        .context("thread/get")?;
+    Ok(res.thread)
+}
+
 /// Resolve a scope → channel_id. Channel scopes are identity — they are the
-/// channel. Thread scopes need a one-time `thread/list` sweep; the result is
-/// cached on `WorkerState` so we don't hit the server per turn. Archived
-/// threads are queried as a fallback because explicit routed messages can arrive from
-/// historical threads that are no longer in the active list. A lookup
-/// failure (network error, thread not visible, etc.) returns `None`, which
-/// the memory selector interprets as "no channel scope available" and falls
-/// open — slightly leakier but never-wedging.
+/// channel. Thread scopes use an exact `thread/get` lookup, then cache the
+/// result on `WorkerState` so we don't hit the server per turn. The lookup
+/// includes archived threads. A failure (network error, thread not visible,
+/// etc.) returns `None`, which the memory selector interprets as "no channel
+/// scope available" and falls open — slightly leakier but never-wedging.
 async fn resolve_channel_for_scope(
     client: &Arc<Client>,
     state: &Arc<WorkerState>,
@@ -8109,22 +8842,13 @@ async fn resolve_channel_for_scope(
             {
                 return Some(cached);
             }
-            for params in [json!({}), json!({ "archived": true })] {
-                let res: proto::methods::ThreadListResult =
-                    client.call(method::THREAD_LIST, params).await.ok()?;
-                let mut cache = state.scope_channel_cache.lock().ok()?;
-                let mut found: Option<String> = None;
-                for t in res.threads {
-                    if t.id == scope.id {
-                        found = Some(t.channel_id.clone());
-                    }
-                    cache.insert(t.id, t.channel_id);
-                }
-                if found.is_some() {
-                    return found;
-                }
-            }
-            None
+            let channel_id = get_thread_by_id(client, &scope.id).await.ok()??.channel_id;
+            state
+                .scope_channel_cache
+                .lock()
+                .ok()?
+                .insert(scope.id.clone(), channel_id.clone());
+            Some(channel_id)
         }
     }
 }
@@ -8165,6 +8889,17 @@ async fn translate_one(
     actor_id: &str,
     ev: AdapterEvent,
 ) -> Result<()> {
+    translate_one_with_gate(client, state, adapter, actor_id, ev, true).await
+}
+
+async fn translate_one_with_gate(
+    client: &Arc<Client>,
+    state: &Arc<WorkerState>,
+    adapter: &Arc<dyn Adapter>,
+    actor_id: &str,
+    ev: AdapterEvent,
+    apply_start_gate: bool,
+) -> Result<()> {
     // Resolve the scope this event belongs to and look up the active turn for
     // it. Per-scope variants (Text/ToolUse/ActionRequest/Finished) require a
     // scope tag; agent-wide ones (StatusChange/Error with `scope: None`) are
@@ -8173,6 +8908,13 @@ async fn translate_one(
     let active = scope_for_event
         .as_ref()
         .and_then(|s| state.current_turn(&s.id));
+    if apply_start_gate {
+        if let Some(scope) = scope_for_event.as_ref() {
+            if state.defer_prestart_event(&scope.id, &ev) {
+                return Ok(());
+            }
+        }
+    }
 
     match ev {
         AdapterEvent::Text {
@@ -8364,13 +9106,39 @@ async fn translate_one(
                 );
                 return Ok(());
             };
+            // Resolve the per-turn usage increment once, up front: apply the
+            // session-cumulative diff for providers that report running
+            // totals, and fall back to an estimate from the buffered
+            // assistant text when the provider reported nothing. Every
+            // downstream consumer (message meta, failure notice, final trace
+            // frame, run.close) uses this same increment so the channels
+            // cannot drift apart.
+            let usage = usage.map(|u| state.turn_usage_increment(&active.scope.id, u));
+            let close_usage = usage.clone().or_else(|| {
+                state.peek_text(&active.id).map(|text| {
+                    usage::estimated_usage(active.prompt_stats.approx_token_count, &text)
+                })
+            });
             if active.cancel_requested || turn_no_reply_requested(&active) {
                 let _ = state.take_text(&active.id);
             } else if agent_text_auto_publish_enabled() {
                 if let Some(text) = state.take_text(&active.id) {
                     if let Some(text) = visible_agent_text_for_turn(&active, &text) {
                         let meta = build_turn_meta(state, &active, usage.as_ref(), &text);
-                        flush_text(client, actor_id, &active, text, Some(meta)).await?;
+                        if let Err(err) =
+                            flush_text(client, actor_id, &active, text, Some(meta)).await
+                        {
+                            publish_runtime_warning_once(
+                                client,
+                                state,
+                                &active,
+                                actor_id,
+                                "final-output",
+                                "failed to publish final agent output; run finalization will continue",
+                                &err,
+                            )
+                            .await;
+                        }
                     }
                 }
             } else {
@@ -8417,7 +9185,7 @@ async fn translate_one(
             }
             if !effective_success {
                 if let Some(text) = failed_turn_text(&effective_summary) {
-                    append_trace_or_report(
+                    let _ = append_trace_or_report(
                         client,
                         state,
                         &active,
@@ -8426,7 +9194,7 @@ async fn translate_one(
                         TraceKind::Error,
                         json!({ "message": text }),
                     )
-                    .await?;
+                    .await;
                 }
             }
             // U4 finalization: emit a terminal `agent.usage` trace frame so
@@ -8435,7 +9203,7 @@ async fn translate_one(
             // mirroring the dual-write into the message metadata. Skip when
             // the adapter did not report any usage for this turn.
             if let Some(final_usage) = usage.as_ref() {
-                append_trace_or_report(
+                let _ = append_trace_or_report(
                     client,
                     state,
                     &active,
@@ -8448,7 +9216,7 @@ async fn translate_one(
                         "isFinal": true,
                     }),
                 )
-                .await?;
+                .await;
             }
             let run_status = if active.cancel_requested {
                 RunStatus::Canceled
@@ -8457,27 +9225,53 @@ async fn translate_one(
             } else {
                 RunStatus::Failed
             };
-            if let Err(e) = close_run(client, &active.run_id, run_status).await {
-                tracing::warn!(
-                    actor = %actor_id,
-                    run = %active.run_id,
-                    scope = %active.scope.id,
-                    %e,
-                    "run.close RPC failed; clearing slot anyway so the queue can drain"
-                );
-                publish_runtime_warning_once(
-                    client,
-                    state,
-                    &active,
-                    actor_id,
-                    "run.close",
-                    "failed to close run; queue will continue",
-                    &e,
-                )
-                .await;
-            }
+            let ack_source_ids = if active.ack_on_finish {
+                turn_source_ids(&active)
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            let atomically_acked = match close_run(
+                client,
+                &active.run_id,
+                run_status,
+                close_usage.as_ref(),
+                &ack_source_ids,
+            )
+            .await
+            {
+                Ok(acked) => acked,
+                Err(e) => {
+                    tracing::warn!(
+                        actor = %actor_id,
+                        run = %active.run_id,
+                        scope = %active.scope.id,
+                        %e,
+                        "run.close RPC failed; clearing slot anyway so the queue can drain"
+                    );
+                    publish_runtime_warning_once(
+                        client,
+                        state,
+                        &active,
+                        actor_id,
+                        "run.close",
+                        "failed to close run; queue will continue",
+                        &e,
+                    )
+                    .await;
+                    HashSet::new()
+                }
+            };
             if active.ack_on_finish {
-                for source_id in turn_source_ids(&active) {
+                for source_id in &ack_source_ids {
+                    // New servers finalize run + deliveries atomically. Empty
+                    // results identify an older server, where the legacy
+                    // individual acks remain the compatibility fallback.
+                    if atomically_acked.contains(source_id) {
+                        continue;
+                    }
                     if let Err(e) = record_delivery_seen_by_id(client, actor_id, source_id).await {
                         tracing::warn!(
                             actor = %actor_id,
@@ -9237,14 +10031,8 @@ async fn message_target_for_scope(client: &Arc<Client>, scope: &ScopeRef) -> Res
     match scope.kind {
         ScopeKind::Channel => Ok(format!("#{}", scope.id)),
         ScopeKind::Thread => {
-            let res: ThreadListResult = client
-                .call(method::THREAD_LIST, json!({ "archived": false }))
-                .await
-                .context("thread/list")?;
-            let thread = res
-                .threads
-                .into_iter()
-                .find(|thread| thread.id == scope.id)
+            let thread = get_thread_by_id(client, &scope.id)
+                .await?
                 .ok_or_else(|| anyhow!("thread {} not found", scope.id))?;
             Ok(format!("#{}:{}", thread.channel_id, thread.root_message_id))
         }
@@ -9395,15 +10183,26 @@ async fn flush_text(
     })
 }
 
-async fn close_run(client: &Arc<Client>, run_id: &str, status: RunStatus) -> Result<()> {
-    let _: RunCloseResult = client
-        .call(
-            method::RUN_CLOSE,
-            json!({ "runId": run_id, "status": status }),
-        )
+async fn close_run(
+    client: &Arc<Client>,
+    run_id: &str,
+    status: RunStatus,
+    usage: Option<&TokenUsage>,
+    ack_source_ids: &[String],
+) -> Result<HashSet<String>> {
+    let mut params = json!({ "runId": run_id, "status": status });
+    if let Some(usage) = usage {
+        // Additive field: servers that predate `run.close.usage` ignore it.
+        params["usage"] = serde_json::to_value(usage).unwrap_or(Value::Null);
+    }
+    if !ack_source_ids.is_empty() {
+        params["ackSourceIds"] = json!(ack_source_ids);
+    }
+    let result: RunCloseResult = client
+        .call(method::RUN_CLOSE, params)
         .await
         .with_context(|| format!("run.close run={run_id}"))?;
-    Ok(())
+    Ok(result.acked_source_ids.into_iter().collect())
 }
 
 #[cfg(test)]
@@ -9412,9 +10211,53 @@ mod tests {
     use proto::methods::{
         AgentBundleSkillSpec, AgentBundleSpec, AgentModelChoice, AgentModelSpec,
         AgentPromptAssemblySpec, AgentPromptFileSpec, AgentPromptOutputSpec, AgentPromptRoleHint,
-        AgentProviderRef, ProviderPromptOutputSpec, ProviderPromptSpec, TriggerSpec,
+        AgentProviderRef, CommandOutputFormat, InteractiveProviderSpec, ProviderDecoderSpec,
+        ProviderPromptOutputSpec, ProviderPromptSpec, TriggerSpec,
     };
     use proto::types::{Actor, ActorKind, MessageKind, Ref, Relation};
+
+    #[test]
+    fn machine_command_poll_delay_is_stable_and_jittered() {
+        let first = machine_command_poll_initial_delay("machine-alpha");
+        let repeated = machine_command_poll_initial_delay("machine-alpha");
+        let distinct_delays = (0..64)
+            .map(|index| machine_command_poll_initial_delay(&format!("machine-{index}")))
+            .collect::<HashSet<_>>();
+
+        assert_eq!(first, repeated);
+        assert!(first >= Duration::from_secs(MACHINE_COMMAND_POLL_BASE_DELAY_SECS));
+        assert!(
+            first
+                < Duration::from_secs(
+                    MACHINE_COMMAND_POLL_BASE_DELAY_SECS + MACHINE_COMMAND_POLL_JITTER_SECS
+                )
+        );
+        assert!(distinct_delays.len() > 1);
+    }
+
+    #[test]
+    fn claude_project_memory_is_selected_from_resolved_transport() {
+        let mut transport = test_command_transport();
+        assert!(!transport_uses_claude_project_memory(&transport));
+
+        transport.provider = Some(InteractiveProviderSpec {
+            kind: "ClAuDe".into(),
+            settings: None,
+        });
+        assert!(transport_uses_claude_project_memory(&transport));
+
+        transport.provider = None;
+        transport.output_format = Some(CommandOutputFormat::ClaudeStreamJson);
+        transport.decoder = Some(ProviderDecoderSpec {
+            format: "builtin".into(),
+            name: Some("claude_stream_json".into()),
+            ..Default::default()
+        });
+        assert!(transport_uses_claude_project_memory(&transport));
+
+        transport.decoder.as_mut().expect("decoder").name = Some("qoder_stream_json".into());
+        assert!(!transport_uses_claude_project_memory(&transport));
+    }
 
     fn sample_spec(bundle: Option<AgentBundleSpec>) -> AgentSpec {
         AgentSpec {
@@ -9488,6 +10331,75 @@ mod tests {
             relations: Vec::new(),
             _meta: None,
         }
+    }
+
+    #[tokio::test]
+    async fn thread_message_target_uses_exact_thread_get_rpc() {
+        let rpc_root = tempfile::tempdir().expect("file rpc root");
+        let client = Client::connect(&format!("file-rpc://{}", rpc_root.path().display()))
+            .await
+            .expect("connect file rpc client");
+        client.set_rpc_timeout_ms(2_000);
+
+        let client_dir = std::fs::read_dir(rpc_root.path().join("clients"))
+            .expect("read clients")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .next()
+            .expect("client directory");
+        let in_dir = client_dir.join("in");
+        let out_dir = client_dir.join("out");
+        let responder = tokio::spawn(async move {
+            for _ in 0..100 {
+                let request_file = std::fs::read_dir(&in_dir)
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(std::result::Result::ok)
+                    .map(|entry| entry.path())
+                    .find(|path| path.extension().and_then(OsStr::to_str) == Some("json"));
+                if let Some(request_file) = request_file {
+                    let request: proto::Request = serde_json::from_str(
+                        &std::fs::read_to_string(request_file).expect("read request"),
+                    )
+                    .expect("parse request");
+                    let response = proto::Response::ok(
+                        request.id.clone(),
+                        json!({
+                            "thread": {
+                                "id": "thread_demo",
+                                "channelId": "chan_demo",
+                                "title": "Demo",
+                                "rootMessageId": "msg_root"
+                            }
+                        }),
+                    );
+                    std::fs::write(
+                        out_dir.join("00000000000000000001.json"),
+                        serde_json::to_vec(&response).expect("serialize response"),
+                    )
+                    .expect("write response");
+                    return request;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+            panic!("file rpc request was not written");
+        });
+
+        let target = message_target_for_scope(
+            &client,
+            &ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_demo".into(),
+            },
+        )
+        .await
+        .expect("resolve message target");
+        let request = responder.await.expect("responder task");
+
+        assert_eq!(request.method, method::THREAD_GET);
+        assert_eq!(request.params, Some(json!({ "threadId": "thread_demo" })));
+        assert_eq!(target, "#chan_demo:msg_root");
     }
 
     #[test]
@@ -9603,6 +10515,7 @@ mod tests {
             no_reply_file: None,
             no_reply_requested: false,
             cancel_requested: false,
+            provider_started: false,
         }
     }
 
@@ -9769,6 +10682,7 @@ mod tests {
                 &scope,
                 None,
                 &agents_md_context,
+                false,
                 RuntimeAwareness::Native,
             )
             .expect("ensure scope");
@@ -9795,6 +10709,8 @@ mod tests {
         let workspace = root.join("workspace");
         std::fs::create_dir_all(&workspace).expect("workspace");
         std::fs::write(workspace.join("AGENTS.md"), "# Project rules\n").expect("project rules");
+        std::fs::write(workspace.join("CLAUDE.md"), "# Project Claude rules\n")
+            .expect("project Claude rules");
         let context = agent_runtime::AgentsMdContext {
             actor_id: "actor_demo".into(),
             actor_display_name: "Demo".into(),
@@ -9808,12 +10724,17 @@ mod tests {
                 &scope,
                 Some(&workspace),
                 &context,
+                true,
                 RuntimeAwareness::Native,
             )
             .expect("native scope");
         assert!(std::fs::read_to_string(workspace.join("AGENTS.md"))
             .expect("native agents")
             .contains("# Loom runtime bootstrap"));
+        let claude =
+            std::fs::read_to_string(workspace.join("CLAUDE.md")).expect("native Claude bridge");
+        assert!(claude.contains("@AGENTS.md"));
+        assert!(claude.contains("# Project Claude rules"));
 
         paths
             .ensure_scope(
@@ -9822,6 +10743,7 @@ mod tests {
                 &scope,
                 Some(&workspace),
                 &context,
+                true,
                 RuntimeAwareness::Hidden,
             )
             .expect("hidden scope");
@@ -9829,6 +10751,10 @@ mod tests {
         let agents = std::fs::read_to_string(workspace.join("AGENTS.md")).expect("project agents");
         assert_eq!(agents, "# Project rules\n");
         assert!(!agents.contains("Loom"));
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("CLAUDE.md")).expect("project Claude rules"),
+            "# Project Claude rules\n"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -10230,6 +11156,7 @@ mod tests {
                 &scope,
                 Some(&custom_workspace),
                 &agents_md_context,
+                false,
                 RuntimeAwareness::Native,
             )
             .expect("ensure scope");
@@ -10498,7 +11425,7 @@ mod tests {
             trigger_batch: Vec::new(),
             ack_on_finish: true,
             trigger_is_message: true,
-            assignment_id: None,
+            assignment_id: Some("asgn_demo".into()),
             reply_target: Some("#chan_demo".into()),
             prompt_stats: empty_prompt_stats(),
             prompt_breakdown: empty_prompt_breakdown(),
@@ -10507,6 +11434,7 @@ mod tests {
             no_reply_file: Some(root.join("no-reply.json")),
             no_reply_requested: false,
             cancel_requested: false,
+            provider_started: false,
         };
         let env = paths.scope_env(
             "actor_demo",
@@ -10537,6 +11465,10 @@ mod tests {
             Some("chan_demo")
         );
         assert_eq!(env.get("LOOM_RUN_ID").map(String::as_str), Some("run_demo"));
+        assert_eq!(
+            env.get("LOOM_ASSIGNMENT_ID").map(String::as_str),
+            Some("asgn_demo")
+        );
         assert_eq!(
             env.get("LOOM_REPLY_TARGET").map(String::as_str),
             Some("#chan_demo")
@@ -11196,6 +12128,7 @@ mod tests {
             no_reply_file: None,
             no_reply_requested: false,
             cancel_requested: false,
+            provider_started: false,
         };
 
         assert_eq!(
@@ -11253,6 +12186,7 @@ mod tests {
             no_reply_file: Some(marker),
             no_reply_requested: false,
             cancel_requested: false,
+            provider_started: false,
         };
 
         assert_eq!(
@@ -11515,6 +12449,94 @@ mod tests {
         assert!(context.contains("latest handoff result"));
         assert!(!context.contains("old context"));
         assert!(context.contains("History gap"));
+    }
+
+    #[test]
+    fn minimal_turn_input_lists_messages_with_caps_and_summary() {
+        let mut actor_names = HashMap::new();
+        actor_names.insert("actor_human_x".into(), "canfuu".into());
+        let mut first = sample_message(
+            "msg_min_1",
+            ScopeRef {
+                kind: ScopeKind::Channel,
+                id: "chan_dev".into(),
+            },
+            "#chan_dev",
+            None,
+            None,
+        );
+        first.author_actor_id = "actor_human_x".into();
+        first.body = "帮我把登录页的样式改成深色主题".into();
+        let mut second = first.clone();
+        second.id = "msg_min_2".into();
+        second.body = "好".repeat(600);
+        let gap = TurnUnreadGap {
+            count: 3,
+            included: 0,
+            hint: Some("loom --json inbox list --state pending --no-ack".into()),
+        };
+
+        let prompt = render_minimal_turn_input(
+            "actor_agent_dev",
+            &[
+                AgentTrigger::Message(first),
+                AgentTrigger::Message(second.clone()),
+            ],
+            &actor_names,
+            ReminderRender::Full,
+            &gap,
+        );
+
+        assert!(prompt.starts_with("Pending message digest"));
+        assert!(
+            !prompt.contains("=== Loom turn input v1 ==="),
+            "no JSON header in minimal style"
+        );
+        assert!(prompt.contains("canfuu(Human)[id=actor_human_x][msgId=msg_min_1]"));
+        assert!(prompt.contains("帮我把登录页的样式改成深色主题"));
+        // 600-char body is capped at the 500-char context limit with a
+        // pointer to the full-text command.
+        assert!(prompt.contains(&format!("loom --json message get {}", second.id)));
+        assert!(prompt.contains("2 message(s) delivered this turn, 3 more pending"));
+        assert!(prompt.contains("run ignore"));
+    }
+
+    #[test]
+    fn minimal_turn_input_single_message_uses_new_message_header() {
+        let mut message = sample_message(
+            "msg_min_single",
+            ScopeRef {
+                kind: ScopeKind::Channel,
+                id: "chan_dev".into(),
+            },
+            "#chan_dev",
+            None,
+            None,
+        );
+        message.body = "just one".into();
+        let prompt = render_minimal_turn_input(
+            "actor_agent_dev",
+            &[AgentTrigger::Message(message)],
+            &HashMap::new(),
+            ReminderRender::Skip,
+            &TurnUnreadGap::empty(),
+        );
+        assert!(prompt.starts_with("New message:"));
+        assert!(
+            !prompt.contains("Rules:"),
+            "reminder off leaves no rule footer"
+        );
+    }
+
+    #[test]
+    fn turn_input_style_defaults_to_minimal_and_reads_spec() {
+        let mut spec = sample_spec(None);
+        assert_eq!(turn_input_style_for_spec(&spec), TurnInputStyle::Minimal);
+        spec.wake = Some(proto::methods::WakeSpec {
+            turn_input_style: Some(TurnInputStyle::Structured),
+            ..Default::default()
+        });
+        assert_eq!(turn_input_style_for_spec(&spec), TurnInputStyle::Structured);
     }
 
     #[test]
@@ -12060,6 +13082,41 @@ mod tests {
     }
 
     #[test]
+    fn default_prompt_outputs_do_not_duplicate_assignment_context() {
+        let assignment = "assignment payload";
+        let parts = vec![
+            PromptPart {
+                key: "runtime_context".into(),
+                title: "Runtime".into(),
+                content: "runtime".into(),
+                rendered_content: "runtime".into(),
+                role_hint: PromptRoleHint::User,
+            },
+            PromptPart {
+                key: "assignment_context".into(),
+                title: "Assignment".into(),
+                content: assignment.into(),
+                rendered_content: assignment.into(),
+                role_hint: PromptRoleHint::User,
+            },
+            PromptPart {
+                key: "user_message".into(),
+                title: "User".into(),
+                content: format!("latest\n\n{assignment}"),
+                rendered_content: format!("latest\n\n{assignment}"),
+                role_hint: PromptRoleHint::User,
+            },
+        ];
+
+        let legacy_full = format!("runtime\n\nlatest\n\n{assignment}");
+        let outputs =
+            render_agent_prompt_outputs(None, &parts, &legacy_full).expect("default outputs");
+
+        assert_eq!(outputs["user"].matches(assignment).count(), 1);
+        assert_eq!(outputs["full"].matches(assignment).count(), 1);
+    }
+
+    #[test]
     fn agent_prompt_templates_accept_empty_builtin_parts() {
         let assembly = AgentPromptAssemblySpec {
             outputs: BTreeMap::from([
@@ -12478,6 +13535,7 @@ mod tests {
             no_reply_file: None,
             no_reply_requested: false,
             cancel_requested: false,
+            provider_started: false,
         });
 
         assert!(state
@@ -12491,6 +13549,81 @@ mod tests {
         assert!(marked.cancel_requested);
         assert!(state.current_turn(&scope.id).unwrap().cancel_requested);
 
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn provider_started_is_confirmed_once_for_the_current_run() {
+        let root = temp_path("provider-started");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        let state = WorkerState::new(
+            "actor_demo".into(),
+            sample_spec(None),
+            paths.profile.clone(),
+            paths,
+            "ws://127.0.0.1:0".into(),
+        );
+        let active = sample_active_turn("actor_human");
+        let scope_id = active.scope.id.clone();
+        let run_id = active.run_id.clone();
+        state.set_turn(active.clone());
+
+        assert!(state
+            .confirm_provider_started("wrong_scope", &run_id)
+            .is_none());
+        assert!(state
+            .confirm_provider_started(&scope_id, "wrong_run")
+            .is_none());
+        let deferred = AdapterEvent::Text {
+            scope: Some(active.scope.clone()),
+            content: "ready".into(),
+            is_partial: false,
+        };
+        assert!(state.defer_prestart_event(&scope_id, &deferred));
+        state
+            .confirm_provider_started(&scope_id, &run_id)
+            .expect("current provider start should be confirmed");
+        assert!(state.confirm_provider_started(&scope_id, &run_id).is_none());
+        assert!(
+            state.defer_prestart_event(&scope_id, &deferred),
+            "events must stay gated until run.started is visible"
+        );
+        let queued = state
+            .drain_prestart_events_or_release(&scope_id, &run_id)
+            .expect("deferred events should drain before releasing the gate");
+        assert_eq!(queued.len(), 2);
+        assert!(
+            state
+                .drain_prestart_events_or_release(&scope_id, &run_id)
+                .is_none(),
+            "an empty queue should release the event gate"
+        );
+        assert!(
+            !state.defer_prestart_event(&scope_id, &deferred),
+            "events after release must flow directly to translation"
+        );
+
+        state.clear_turn(&scope_id);
+        state.set_turn(active);
+        assert!(
+            state.confirm_provider_started(&scope_id, &run_id).is_some(),
+            "finishing a run must clear its start de-duplication marker"
+        );
+
+        state.clear_turn(&scope_id);
+        let cancelled = sample_active_turn("actor_human");
+        let cancelled_id = cancelled.id.clone();
+        let cancelled_run = cancelled.run_id.clone();
+        state.set_turn(cancelled);
+        state
+            .mark_cancel_requested(&scope_id, &cancelled_id)
+            .expect("cancel current run");
+        assert!(
+            state
+                .confirm_provider_started(&scope_id, &cancelled_run)
+                .is_none(),
+            "cancelled run must never be confirmed as provider-started"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -12697,6 +13830,54 @@ mod tests {
     }
 
     #[test]
+    fn failed_provider_start_makes_remembered_delivery_retryable() {
+        let root = temp_path("provider-start-retry");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        let state = WorkerState::new(
+            "actor_demo".into(),
+            sample_spec(None),
+            paths.profile.clone(),
+            paths,
+            "ws://127.0.0.1:0".into(),
+        );
+        let source_id = "msg_provider_start_failed";
+        let scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: "chan_provider_start_failed".into(),
+        };
+        let turn_key = turn_key_for_scope(&scope);
+        assert!(state.remember_source(source_id));
+        assert!(state.begin_or_enqueue(
+            &turn_key,
+            AgentTrigger::Message(sample_message(
+                source_id,
+                scope.clone(),
+                "#chan_provider_start_failed",
+                None,
+                None,
+            ))
+        ));
+        let mut active = sample_active_turn("actor_agent_sender");
+        active.id = "run_provider_start_failed".into();
+        active.run_id = active.id.clone();
+        active.scope = scope.clone();
+        active.turn_key = turn_key;
+        active.trigger_source_id = source_id.into();
+        active.trigger_source_ids = vec![source_id.into()];
+        state.set_turn(active);
+
+        assert!(state.has_active_trigger(source_id));
+        assert!(state.finish_and_next_batch(&scope.id, true).is_empty());
+
+        // The durable inbox sees an already-remembered source again after the
+        // failed turn is gone and must retry it instead of suppressing it.
+        assert!(!state.remember_source(source_id));
+        assert!(!state.has_active_trigger(source_id));
+        assert!(!state.has_pending_source(source_id));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn missing_scope_error_matches_stale_thread_delivery() {
         let err = anyhow!("rpc `run.open` failed: thread thread_f247db3313b9 (code -32000)");
 
@@ -12775,6 +13956,7 @@ mod tests {
             no_reply_file: None,
             no_reply_requested: false,
             cancel_requested: false,
+            provider_started: false,
         });
         let queued_channel = Event {
             id: "evt_channel_route".into(),
@@ -12829,6 +14011,100 @@ mod tests {
     }
 
     #[test]
+    fn abandoning_unexecuted_dispatch_releases_slot_and_retry_markers() {
+        let root = temp_path("pre-provider-abort");
+        let paths = AgentPaths::new(&root, "actor_demo");
+        let state = WorkerState::new(
+            "actor_demo".into(),
+            sample_spec(None),
+            paths.profile.clone(),
+            paths,
+            "ws://127.0.0.1:0".into(),
+        );
+        let scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: "chan_retry".into(),
+        };
+        let turn_key = "scope:channel:chan_retry";
+        let current = AgentTrigger::Message(sample_message(
+            "msg_current",
+            scope.clone(),
+            "#chan_retry",
+            None,
+            None,
+        ));
+        let queued = AgentTrigger::Message(sample_message(
+            "msg_queued",
+            scope.clone(),
+            "#chan_retry",
+            None,
+            None,
+        ));
+        for source_id in ["msg_current", "msg_context", "msg_queued"] {
+            assert!(state.remember_source(source_id));
+        }
+        assert!(state.begin_or_enqueue(turn_key, current.clone()));
+        state.set_turn(ActiveTurn {
+            id: "run_pre_provider".into(),
+            run_id: "run_pre_provider".into(),
+            turn_key: turn_key.into(),
+            scope: scope.clone(),
+            opened_at: Utc::now(),
+            trigger_source_id: "msg_current".into(),
+            trigger_source_ids: vec!["msg_current".into(), "msg_context".into()],
+            trigger_batch: vec![current.clone()],
+            ack_on_finish: true,
+            trigger_is_message: true,
+            assignment_id: None,
+            reply_target: Some("#chan_retry".into()),
+            prompt_stats: empty_prompt_stats(),
+            prompt_breakdown: empty_prompt_breakdown(),
+            trigger_actor: "actor_human".into(),
+            trigger_private_to: Vec::new(),
+            no_reply_file: None,
+            no_reply_requested: false,
+            cancel_requested: false,
+            provider_started: false,
+        });
+        assert!(!state.begin_or_enqueue(turn_key, queued.clone()));
+        assert!(state.take_seed_slot(&scope.id));
+        state.push_text("run_pre_provider", "must be discarded");
+
+        let retry_ids = state.abandon_unexecuted_dispatch(
+            turn_key,
+            &scope.id,
+            &["msg_current".into(), "msg_context".into()],
+            true,
+        );
+
+        assert_eq!(
+            retry_ids.into_iter().collect::<HashSet<_>>(),
+            ["msg_current", "msg_context", "msg_queued"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        );
+        assert!(state.current_turn(&scope.id).is_none());
+        assert!(!state.has_pending_source("msg_queued"));
+        assert!(state.peek_text("run_pre_provider").is_none());
+        assert!(
+            state.take_seed_slot(&scope.id),
+            "failed prompt preparation must restore first-turn bootstrap"
+        );
+        for source_id in ["msg_current", "msg_context", "msg_queued"] {
+            assert!(
+                state.remember_source(source_id),
+                "{source_id} must be eligible for durable-inbox retry"
+            );
+        }
+        assert!(
+            state.begin_or_enqueue(turn_key, current),
+            "busy reservation must be released after pre-provider failure"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn worker_state_prioritizes_human_triggers_without_reversing_human_fifo() {
         let root = temp_path("scope-priority-queue");
         let paths = AgentPaths::new(&root, "actor_demo");
@@ -12863,6 +14139,7 @@ mod tests {
             no_reply_file: None,
             no_reply_requested: false,
             cancel_requested: false,
+            provider_started: false,
         });
 
         let service = Event {
@@ -12945,6 +14222,7 @@ mod tests {
             no_reply_file: None,
             no_reply_requested: false,
             cancel_requested: false,
+            provider_started: false,
         });
         assert_eq!(
             state
@@ -12972,6 +14250,7 @@ mod tests {
             no_reply_file: None,
             no_reply_requested: false,
             cancel_requested: false,
+            provider_started: false,
         });
         assert_eq!(
             state
@@ -12999,6 +14278,7 @@ mod tests {
             no_reply_file: None,
             no_reply_requested: false,
             cancel_requested: false,
+            provider_started: false,
         });
         assert!(state.clear_turn(&active_scope.id).is_none());
         std::fs::remove_dir_all(root).ok();
@@ -13055,6 +14335,7 @@ mod tests {
                 no_reply_file: None,
                 no_reply_requested: false,
                 cancel_requested: false,
+                provider_started: false,
             });
         };
 
@@ -13146,6 +14427,7 @@ mod tests {
             no_reply_file: None,
             no_reply_requested: false,
             cancel_requested: false,
+            provider_started: false,
         });
 
         assert!(!state.begin_or_enqueue(&turn_key, mk("msg_folded")));
@@ -13282,6 +14564,7 @@ mod tests {
             no_reply_file: None,
             no_reply_requested: false,
             cancel_requested: false,
+            provider_started: false,
         });
         assert!(!state.begin_or_enqueue(&turn_key, mk("msg_new")));
 
@@ -13348,6 +14631,7 @@ mod tests {
             no_reply_file: None,
             no_reply_requested: false,
             cancel_requested: false,
+            provider_started: false,
         });
         // A burst arrives while busy, followed by a non-coalescible event.
         assert!(!state.begin_or_enqueue(&turn_key, mk("msg_2")));
@@ -13385,6 +14669,7 @@ mod tests {
             no_reply_file: None,
             no_reply_requested: false,
             cancel_requested: false,
+            provider_started: false,
         });
         // Batched sources are visible for inbox dedupe.
         assert!(state.has_active_trigger("msg_3"));
@@ -13415,6 +14700,7 @@ mod tests {
             no_reply_file: None,
             no_reply_requested: false,
             cancel_requested: false,
+            provider_started: false,
         });
         assert!(state.finish_and_next_batch(&scope.id, true).is_empty());
         assert!(state.begin_or_enqueue(&turn_key, mk("msg_5")));

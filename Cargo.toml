@@ -7,7 +7,7 @@ members = ["crates/proto", "crates/agent-runtime", "crates/server", "crates/cli"
 default-members = ["crates/proto", "crates/agent-runtime", "crates/server", "crates/cli"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.8"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["The Loom Authors"]
@@ -21,7 +21,7 @@ dunce = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
-thiserror = "1"
+thiserror = "2"
 anyhow = "1"
 tokio = { version = "1", features = ["full"] }
 parking_lot = "0.12"
@@ -38,8 +38,8 @@ futures-util = "0.3"
 tokio-tungstenite = { version = "0.21", features = ["connect", "rustls-tls-native-roots"] }
 url = "2"
 dirs = "5"
-toml = "0.8"
-ratatui = { version = "0.28", default-features = false, features = ["crossterm"] }
+toml = "1.1"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures = "0.3"
 unicode-width = "0.1"

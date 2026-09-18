@@ -184,8 +184,10 @@ mod tests {
         assert!(!claude.args.contains(&"--append-system-prompt".into()));
         assert!(!claude.args.contains(&"{prompt.system}".into()));
         assert!(!claude.args.contains(&"{prompt.user}".into()));
-        assert!(claude.args.contains(&"{prompt.full}".into()));
+        assert!(!claude.args.contains(&"{prompt.full}".into()));
+        assert!(claude.args.contains(&"--print".into()));
         let claude_transport = claude.transport();
+        assert_eq!(claude_transport.stdin.as_deref(), Some("{prompt.full}"));
         assert_eq!(
             claude_transport.output_format,
             Some(CommandOutputFormat::ClaudeStreamJson)
@@ -205,7 +207,8 @@ mod tests {
         let resume_args = claude_session.resume_args.as_ref().expect("resume args");
         assert!(resume_args.contains(&"--resume".into()));
         assert!(resume_args.contains(&"{session_id}".into()));
-        assert!(resume_args.contains(&"{prompt.full}".into()));
+        assert!(!resume_args.contains(&"{prompt.full}".into()));
+        assert!(resume_args.contains(&"--print".into()));
         assert!(resume_args.contains(&"{agent.skillWorkspace}".into()));
         assert!(claude_session.resume_arg_specs.iter().any(|arg| matches!(
             arg,

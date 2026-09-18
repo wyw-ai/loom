@@ -89,7 +89,7 @@ export function ThreadsView({
           </label>
         </div>
       </div>
-      <div className="grid min-h-0 flex-1 grid-cols-[minmax(420px,1fr)_460px] bg-[#fbfbfd]">
+      <div className="threads-view-grid grid min-h-0 flex-1 grid-cols-1 bg-[#fbfbfd] lg:grid-cols-[minmax(420px,1fr)_460px]">
         <div className="min-h-0 overflow-y-auto border-r border-[#e2e6ef] p-4 soft-scrollbar">
           <div className="mb-4 flex items-center justify-between gap-2 text-xs font-semibold text-[#667085]">
             <span>{filteredThreads.length} threads</span>
@@ -211,5 +211,4 @@ export function ThreadListCard({
     </button>
   );
 }
-
 

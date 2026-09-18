@@ -7,14 +7,15 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use proto::methods::*;
 use proto::types::{
-    AudienceKind, AudienceRef, DeliveryPolicy, DeliveryState, Message, MessageIntent,
+    AudienceKind, AudienceRef, DeliveryPolicy, DeliveryState, Message, MessageIntent, Reminder,
+    ReminderStatus,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::client::Client;
 use crate::config;
-use crate::render;
+use crate::{cmd::run, render};
 
 const LONG_MESSAGE_BODY_CHAR_LIMIT: usize = 6_000;
 const ENV_LONG_MESSAGE_DIR: &str = "LOOM_LONG_MESSAGE_DIR";
@@ -33,7 +34,9 @@ pub async fn send(
     idempotency_key: Option<String>,
     attachment_ids: Vec<String>,
     allow_escaped_newlines: bool,
+    allow_after_no_reply: bool,
 ) -> Result<()> {
+    run::ensure_visible_output_allowed(allow_after_no_reply)?;
     let private_to = normalize_actor_ids(private_to)?;
     if to.is_some() && !private_to.is_empty() {
         bail!("use either --to for global DM or --private-to for same-scope private delivery, not both");
@@ -54,7 +57,26 @@ pub async fn send(
         allow_escaped_newlines,
         agent_turn_is_active(),
     )?;
+    check_artifact_attachment_claim(&body, &attachment_ids, agent_turn_is_active())?;
     let is_private = !private_to.is_empty();
+    check_public_sensitive_payload_claim(
+        &body,
+        agent_turn_is_active(),
+        !is_private && target.starts_with('#'),
+    )?;
+    check_clock_fallback_has_reminder(
+        client.as_ref(),
+        &actor_id,
+        &target,
+        &body,
+        agent_turn_is_active(),
+    )
+    .await?;
+    check_collection_followup_has_latest_guard(
+        &body,
+        if_latest.as_deref(),
+        agent_turn_is_active(),
+    )?;
     let mut intent = parse_message_intent(intent)?;
     let mut delivery_policy = parse_delivery_policy(delivery_policy)?;
     let explicit_notify_intent = matches!(intent, Some(MessageIntent::Notify));
@@ -105,6 +127,21 @@ pub async fn send(
         delivery_policy = Some(DeliveryPolicy::WakeAgent);
         params["deliveryPolicy"] = serde_json::to_value(DeliveryPolicy::WakeAgent)?;
     }
+    if let Some(inferred_actor) = inferred_reply.as_deref() {
+        if should_reject_inferred_single_recipient_collective_call(
+            agent_turn_is_active(),
+            explicit_notify_intent,
+            explicit_silent_policy,
+            &body,
+        ) {
+            bail!(
+                "this public call for multiple actors to act would infer only `@{inferred_actor}` \
+                 from the current trigger. This is blocked inside an agent run. Publish any \
+                 no-action context separately with `message send --intent notify`, then use \
+                 `loom message ask` with the exact actor(s) or group that must act."
+            );
+        }
+    }
     if let Some(if_latest) = if_latest.filter(|value| !value.trim().is_empty()) {
         params["ifLatestMessageId"] = json!(if_latest);
     }
@@ -113,18 +150,22 @@ pub async fn send(
     }
     let will_wake = !private_to.is_empty() || delivery_policy == Some(DeliveryPolicy::WakeAgent);
     let has_targeted_audience = !private_to.is_empty() || inferred_reply.is_some();
-    if !will_wake && !has_targeted_audience && looks_like_call_for_action(&body) {
+    if !will_wake
+        && !has_targeted_audience
+        && (looks_like_call_for_action(&body) || looks_like_directed_operational_call(&body))
+    {
         let warning = notify_only_call_for_action_warning();
         if should_reject_notify_only_call_for_action(
             agent_turn_is_active(),
             explicit_notify_intent,
             explicit_silent_policy,
+            &body,
         ) {
             bail!(
                 "{warning} This is blocked inside an agent run. Use `loom message ask @actor_id ...` \
                  or `loom message send --private-to @actor_id --target \"$LOOM_REPLY_TARGET\" ...` \
-                 for hidden same-scope work. If this is intentionally a no-action notification, \
-                 rerun with `--intent notify`."
+                 for hidden same-scope work. If this is intentionally no-action context, remove \
+                 the directed action request and send that context separately with `--intent notify`."
             );
         }
         eprintln!("{warning}");
@@ -143,7 +184,7 @@ pub async fn send(
 
 pub async fn ask(
     client: Arc<Client>,
-    _actor_id: String,
+    actor_id: String,
     target: Option<String>,
     thread: Option<String>,
     recipients: Vec<String>,
@@ -152,7 +193,9 @@ pub async fn ask(
     idempotency_key: Option<String>,
     attachment_ids: Vec<String>,
     allow_escaped_newlines: bool,
+    allow_after_no_reply: bool,
 ) -> Result<()> {
+    run::ensure_visible_output_allowed(allow_after_no_reply)?;
     let target = resolve_send_target(client.as_ref(), target, thread, None, false).await?;
     let text_contains_escaped_newline = text
         .as_deref()
@@ -166,6 +209,21 @@ pub async fn ask(
         &body,
         text_contains_escaped_newline,
         allow_escaped_newlines,
+        agent_turn_is_active(),
+    )?;
+    check_artifact_attachment_claim(&body, &attachment_ids, agent_turn_is_active())?;
+    check_public_sensitive_payload_claim(&body, agent_turn_is_active(), target.starts_with('#'))?;
+    check_clock_fallback_has_reminder(
+        client.as_ref(),
+        &actor_id,
+        &target,
+        &body,
+        agent_turn_is_active(),
+    )
+    .await?;
+    check_collection_followup_has_latest_guard(
+        &body,
+        if_latest.as_deref(),
         agent_turn_is_active(),
     )?;
     let params = build_ask_params(
@@ -188,6 +246,214 @@ pub async fn ask(
     Ok(())
 }
 
+fn check_public_sensitive_payload_claim(
+    body: &str,
+    agent_turn_active: bool,
+    public_scope: bool,
+) -> Result<()> {
+    if !agent_turn_active || !public_scope || !looks_like_sensitive_payload(body) {
+        return Ok(());
+    }
+    bail!(
+        "this public message appears to contain a secret, hidden allocation, or actor-specific private instruction. An `audience` controls delivery, not visibility. This is blocked inside an agent run; use same-scope `message send --private-to @actor_id ...` addressed once to the complete intended private group."
+    )
+}
+
+fn check_collection_followup_has_latest_guard(
+    body: &str,
+    if_latest: Option<&str>,
+    agent_turn_active: bool,
+) -> Result<()> {
+    if !agent_turn_active
+        || !looks_like_collection_followup(body)
+        || if_latest.is_some_and(|value| !value.trim().is_empty())
+    {
+        return Ok(());
+    }
+    bail!(
+        "this message says a response, submission, decision, or participant is still missing, \
+         or re-asks/calls out a non-responder. That conclusion can become stale while this \
+         agent turn is running. Re-read the current scope, rebuild the latest-effective \
+         response ledger, then send with `--if-latest <latest_message_id>`. If a new message \
+         arrives first, the server will reject the stale follow-up; read and reconcile again."
+    )
+}
+
+fn looks_like_collection_followup(body: &str) -> bool {
+    let lower = body.to_lowercase();
+    const MISSING_CUES: &[&str] = &[
+        "still missing",
+        "still waiting for",
+        "has not responded",
+        "have not responded",
+        "hasn't responded",
+        "haven't responded",
+        "has not replied",
+        "have not replied",
+        "hasn't replied",
+        "haven't replied",
+        "has not submitted",
+        "have not submitted",
+        "hasn't submitted",
+        "haven't submitted",
+        "no response from",
+        "no reply from",
+        "missing response",
+        "missing submission",
+        "missing decision",
+        "awaiting response from",
+        "waiting on",
+        "尚未回复",
+        "尚未回应",
+        "尚未提交",
+        "仍未回复",
+        "仍未回应",
+        "仍未提交",
+        "还没回复",
+        "还没回应",
+        "还没提交",
+        "未回复者",
+        "未回应者",
+        "未提交者",
+        "缺少回复",
+        "缺少回应",
+        "缺少提交",
+        "等待回复",
+        "等待回应",
+        "等待提交",
+    ];
+    const REASK_CUES: &[&str] = &[
+        "remind the remaining",
+        "reminding the remaining",
+        "follow up with the remaining",
+        "please respond again",
+        "please reply again",
+        "please submit again",
+        "再次回复",
+        "重新回复",
+        "再次提交",
+        "重新提交",
+        "催办",
+        "催促",
+        "补充回复",
+        "请补回复",
+        "请尽快回复",
+    ];
+    MISSING_CUES.iter().any(|cue| lower.contains(cue))
+        || REASK_CUES.iter().any(|cue| lower.contains(cue))
+}
+
+fn looks_like_sensitive_payload(body: &str) -> bool {
+    let lower = body.to_lowercase();
+    const STRONG_CUES: &[&str] = &[
+        "this is secret",
+        "keep this secret",
+        "keep this private",
+        "confidential assignment",
+        "hidden assignment",
+        "secret assignment",
+        "这是秘密",
+        "请保密",
+        "务必保密",
+        "私密分配",
+        "秘密分配",
+        "隐藏分配",
+        "仅你可见",
+    ];
+    if STRONG_CUES.iter().any(|cue| lower.contains(cue)) {
+        return true;
+    }
+
+    const PRIVATE_ROUTE_CUES: &[&str] = &[
+        "privately",
+        "private message",
+        "direct message",
+        " dm ",
+        "私信",
+        "私聊",
+    ];
+    const DIRECT_ASSIGNMENT_CUES: &[&str] = &[
+        "you are the ",
+        "you are assigned",
+        "your role is",
+        "your identity is",
+        "assigned to you",
+        "你是",
+        "你的角色是",
+        "你的身份是",
+        "你被分配",
+        "分配给你",
+    ];
+    PRIVATE_ROUTE_CUES.iter().any(|cue| lower.contains(cue))
+        && DIRECT_ASSIGNMENT_CUES.iter().any(|cue| lower.contains(cue))
+}
+
+async fn check_clock_fallback_has_reminder(
+    client: &Client,
+    actor_id: &str,
+    target: &str,
+    body: &str,
+    agent_turn_active: bool,
+) -> Result<()> {
+    if !agent_turn_active || !looks_like_clock_fallback_promise(body) {
+        return Ok(());
+    }
+    let res: ReminderListResult = client
+        .call(
+            method::REMINDER_LIST,
+            json!({
+                "actorId": actor_id,
+                "statuses": ["scheduled"],
+                "all": false,
+            }),
+        )
+        .await
+        .context("verify scheduled reminder before publishing a clock fallback")?;
+    if has_scheduled_reminder_for_target(&res.reminders, target) {
+        return Ok(());
+    }
+    bail!(
+        "this message promises a clock-based deadline or timeout fallback, but actor `{actor_id}` has no scheduled reminder bound to `{target}`. This is blocked inside an agent run. Schedule the same-scope reminder first (so it records this reply target), then publish the time-bound contract; otherwise replace the clock fallback with an observable completion condition."
+    )
+}
+
+fn has_scheduled_reminder_for_target(reminders: &[Reminder], target: &str) -> bool {
+    reminders.iter().any(|reminder| {
+        reminder.status == ReminderStatus::Scheduled
+            && reminder
+                ._meta
+                .as_ref()
+                .and_then(|meta| meta.get("loomReplyTarget"))
+                .and_then(Value::as_str)
+                .is_some_and(|reply_target| reply_target == target)
+    })
+}
+
+fn looks_like_clock_fallback_promise(body: &str) -> bool {
+    let lower = body.to_lowercase();
+    const TIME_UNITS: &[&str] = &[
+        "second", "seconds", "minute", "minutes", "hour", "hours", "秒", "分钟", "小时",
+    ];
+    const CLOCK_CUES: &[&str] = &[
+        "timeout",
+        "time out",
+        "deadline",
+        "when time expires",
+        "once time expires",
+        "if time expires",
+        "or time expires",
+        "by then",
+        "超时",
+        "截止",
+        "到时",
+        "届时",
+        "时间到",
+    ];
+    let has_duration = lower.chars().any(|ch| ch.is_ascii_digit())
+        && TIME_UNITS.iter().any(|unit| lower.contains(unit));
+    has_duration && CLOCK_CUES.iter().any(|cue| lower.contains(cue))
+}
+
 /// Best-effort, non-blocking heuristic: does this body read like a request for
 /// other actors to act (discuss, vote, answer, take a turn)? Used only to print
 /// a stderr nudge when such a message is sent notify_only (wakes nobody).
@@ -199,20 +465,38 @@ fn looks_like_call_for_action(body: &str) -> bool {
         "please respond",
         "please answer",
         "please reply",
+        "please submit",
+        "please provide",
+        "please state",
         "please choose",
         "please decide",
         "please share",
         "your turn",
         "take a turn",
         "cast your vote",
+        "cast a vote",
         "start the discussion",
         "open the floor",
+        "please ask",
+        "please continue",
+        "please begin",
+        "please start",
+        "begin now",
+        "start now",
+        "who wants to",
         "请发言",
         "开始发言",
         "请讨论",
         "请投票",
         "请回复",
         "请回答",
+        "请给出",
+        "请说出",
+        "请写出",
+        "请投出",
+        "请表态",
+        "请发表",
+        "请提供",
         "请选择",
         "请决定",
         "轮到",
@@ -221,6 +505,210 @@ fn looks_like_call_for_action(body: &str) -> bool {
         "各位发言",
         "投票开始",
         "开始投票",
+        "请提问",
+        "开始提问",
+        "请继续",
+        "请开始",
+        "谁先",
+    ];
+    CUES.iter().any(|cue| lower.contains(cue))
+}
+
+/// Detect collective operational text whose natural-language audience is
+/// broader than the single actor inferred from the current trigger. This is
+/// intentionally conservative: informational collective progress must opt in
+/// to `notify`, while collective action must use explicit `ask` recipients.
+fn looks_like_collective_call_for_action(body: &str) -> bool {
+    let lower = body.to_lowercase();
+    const COLLECTIVE_CUES: &[&str] = &[
+        "everyone",
+        "everybody",
+        "all of you",
+        "all reviewers",
+        "all actors",
+        "all agents",
+        "all contributors",
+        "all participants",
+        "all members",
+        "anyone",
+        "whoever",
+        "each of you",
+        "next person",
+        "next participant",
+        "大家",
+        "各位",
+        "所有人",
+        "所有参与者",
+        "每个人",
+        "每位",
+        "任意一位",
+        "下一位",
+        "谁有",
+        "谁先",
+    ];
+    const OPERATION_CUES: &[&str] = &[
+        "please act",
+        "must act",
+        "to act",
+        "take action",
+        "action",
+        "execute",
+        "proceed",
+        "participate",
+        "respond",
+        "reply",
+        "answer",
+        "submit",
+        "provide",
+        "state your",
+        "give your",
+        "cast",
+        "review",
+        "discuss",
+        "vote",
+        "choose",
+        "decide",
+        "continue",
+        "start",
+        "begin",
+        "行动",
+        "执行",
+        "推进",
+        "处理",
+        "参与",
+        "查收",
+        "回复",
+        "回答",
+        "提交",
+        "给出",
+        "说出",
+        "写出",
+        "投出",
+        "表态",
+        "发表",
+        "提供",
+        "评审",
+        "讨论",
+        "投票",
+        "选择",
+        "决定",
+        "发言",
+        "提问",
+        "继续",
+        "开始",
+    ];
+    let has_collective_addressee = COLLECTIVE_CUES.iter().any(|cue| lower.contains(cue));
+    let has_operation =
+        looks_like_call_for_action(body) || OPERATION_CUES.iter().any(|cue| lower.contains(cue));
+    has_collective_addressee && has_operation
+}
+
+/// Detect an instruction addressed to somebody else, independently of whether
+/// the text happens to use one of the compact phrase cues above. This closes a
+/// dangerous escape hatch where an agent could mark "please ... act" as an
+/// explicit notification: notifications intentionally wake nobody, so an
+/// imperative in one cannot be the operational handoff.
+fn looks_like_directed_operational_call(body: &str) -> bool {
+    let lower = body.to_lowercase();
+    const DIRECTIVE_CUES: &[&str] = &[
+        "please",
+        "you must",
+        "you should",
+        "your turn",
+        "each of you",
+        "请",
+        "你们要",
+        "你需要",
+        "你们需要",
+        "必须",
+        "轮到",
+    ];
+    const OPERATION_CUES: &[&str] = &[
+        "act",
+        "execute",
+        "proceed",
+        "participate",
+        "respond",
+        "reply",
+        "answer",
+        "submit",
+        "provide",
+        "state your",
+        "give your",
+        "cast your",
+        "cast a",
+        "review",
+        "discuss",
+        "vote",
+        "choose",
+        "decide",
+        "continue",
+        "begin",
+        "start",
+        "行动",
+        "执行",
+        "推进",
+        "处理",
+        "参与",
+        "回复",
+        "回答",
+        "提交",
+        "给出",
+        "说出",
+        "写出",
+        "投出",
+        "表态",
+        "发表",
+        "提供",
+        "评审",
+        "讨论",
+        "投票",
+        "选择",
+        "决定",
+        "发言",
+        "提问",
+        "继续",
+        "开始",
+    ];
+    lower
+        .split(['\n', '.', '!', '?', '。', '！', '？', ';', '；'])
+        .any(|segment| {
+            DIRECTIVE_CUES.iter().any(|cue| segment.contains(cue))
+                && OPERATION_CUES.iter().any(|cue| segment.contains(cue))
+        })
+}
+
+/// Recognize messages that explicitly keep work with the sender or merely
+/// report progress. Default reply inference is a convenience for returning an
+/// answer to the triggering agent; it must not turn an obvious wait/status
+/// update into a new handoff. An explicit wake policy still wins.
+fn looks_like_no_action_update(body: &str) -> bool {
+    if looks_like_directed_operational_call(body) {
+        return false;
+    }
+    let lower = body.to_lowercase();
+    const CUES: &[&str] = &[
+        "please wait",
+        "please stand by",
+        "no reply needed",
+        "no response needed",
+        "for your information",
+        "currently waiting",
+        "still waiting",
+        "waiting for the remaining",
+        "more to follow",
+        "请稍候",
+        "请稍等",
+        "无需回复",
+        "不用回复",
+        "不必回复",
+        "目前进度",
+        "确认进度",
+        "还在等待",
+        "等待其余",
+        "等待剩余",
+        "稍后我会",
+        "完成后我会",
     ];
     CUES.iter().any(|cue| lower.contains(cue))
 }
@@ -261,6 +749,86 @@ fn escaped_newline_warning(body: &str) -> Option<&'static str> {
     )
 }
 
+fn check_artifact_attachment_claim(
+    body: &str,
+    attachment_ids: &[String],
+    agent_turn_active: bool,
+) -> Result<()> {
+    let Some(warning) = unattached_artifact_claim_warning(body, attachment_ids) else {
+        return Ok(());
+    };
+    if agent_turn_active {
+        bail!(
+            "{warning} This is blocked inside an agent run: uploading an artifact or writing its URI in message text does not attach it to chat. Send the message again with the returned id as `--attachment-id art_...`."
+        );
+    }
+    eprintln!("loom: warning: {warning}");
+    Ok(())
+}
+
+fn unattached_artifact_claim_warning(body: &str, attachment_ids: &[String]) -> Option<String> {
+    let lower = body.to_lowercase();
+    let claims_attachment = [
+        "uploaded file",
+        "uploaded attachment",
+        "uploaded image",
+        "attached file",
+        "attached image",
+        "attachment id",
+        "artifact id",
+        "artifact uri",
+        "已上传",
+        "已经上传",
+        "已附加",
+        "已发送文件",
+        "附件 id",
+        "附件id",
+    ]
+    .iter()
+    .any(|cue| lower.contains(cue));
+    if !claims_attachment {
+        return None;
+    }
+
+    let attached_ids = attachment_ids
+        .iter()
+        .flat_map(|value| artifact_ids_in_text(value))
+        .collect::<BTreeSet<_>>();
+    let missing_ids = artifact_ids_in_text(body)
+        .into_iter()
+        .filter(|id| !attached_ids.contains(id))
+        .collect::<BTreeSet<_>>();
+    if !attachment_ids.is_empty() && missing_ids.is_empty() {
+        return None;
+    }
+
+    if missing_ids.is_empty() {
+        Some(
+            "message text claims a file or image was uploaded, but the message has no attachment"
+                .into(),
+        )
+    } else {
+        Some(format!(
+            "message text claims an uploaded artifact, but {} is not attached",
+            missing_ids.into_iter().collect::<Vec<_>>().join(", ")
+        ))
+    }
+}
+
+fn artifact_ids_in_text(text: &str) -> Vec<String> {
+    let mut ids = BTreeSet::new();
+    for (start, _) in text.match_indices("art_") {
+        let id = text[start..]
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+            .collect::<String>();
+        if id.len() > "art_".len() {
+            ids.insert(id);
+        }
+    }
+    ids.into_iter().collect()
+}
+
 fn agent_turn_is_active() -> bool {
     std::env::var("LOOM_RUN_ID")
         .map(|value| !value.trim().is_empty())
@@ -271,8 +839,23 @@ fn should_reject_notify_only_call_for_action(
     agent_turn_active: bool,
     explicit_notify_intent: bool,
     explicit_silent_policy: bool,
+    body: &str,
 ) -> bool {
-    agent_turn_active && !explicit_notify_intent && !explicit_silent_policy
+    agent_turn_active
+        && (looks_like_directed_operational_call(body)
+            || (!explicit_notify_intent && !explicit_silent_policy))
+}
+
+fn should_reject_inferred_single_recipient_collective_call(
+    agent_turn_active: bool,
+    explicit_notify_intent: bool,
+    explicit_silent_policy: bool,
+    body: &str,
+) -> bool {
+    agent_turn_active
+        && !explicit_notify_intent
+        && !explicit_silent_policy
+        && looks_like_collective_call_for_action(body)
 }
 
 /// Best-effort, non-blocking nudge: warn when a non-private message is being
@@ -565,6 +1148,7 @@ fn inferred_reply_audience<'a>(
     let should_wake = delivery_policy == Some(DeliveryPolicy::WakeAgent)
         || (delivery_policy.is_none()
             && infer_default_agent_reply
+            && !looks_like_no_action_update(body)
             && trigger_actor.starts_with("actor_agent_"));
     if !should_wake {
         return None;
@@ -613,18 +1197,226 @@ mod tests {
     }
 
     #[test]
-    fn agent_turn_rejects_notify_only_call_for_action_unless_explicitly_notify() {
+    fn collective_call_heuristic_requires_action_and_multiple_addressees() {
+        assert!(looks_like_collective_call_for_action(
+            "All reviewers, please submit feedback now."
+        ));
+        assert!(looks_like_collective_call_for_action("下一位请继续处理。"));
+        assert!(looks_like_collective_call_for_action(
+            "阶段开始，谁有想法谁先发言。"
+        ));
+        assert!(looks_like_collective_call_for_action(
+            "请各位根据各自收到的说明行动。"
+        ));
+        assert!(looks_like_collective_call_for_action(
+            "所有参与者现在开始执行各自的步骤。"
+        ));
+        assert!(looks_like_collective_call_for_action(
+            "现在进入评审阶段，请每位参与者投出各自的选择。"
+        ));
+        assert!(!looks_like_collective_call_for_action(
+            "Reviewer A, please continue."
+        ));
+        assert!(looks_like_collective_call_for_action(
+            "Everyone has submitted feedback."
+        ));
+    }
+
+    #[test]
+    fn directed_operation_heuristic_distinguishes_requests_from_status() {
+        assert!(looks_like_directed_operational_call(
+            "所有参与者请公开讨论，然后提交各自的选择。"
+        ));
+        assert!(looks_like_directed_operational_call(
+            "Please review the context and respond."
+        ));
+        assert!(looks_like_directed_operational_call(
+            "现在进入评审阶段，请每位参与者投出各自的选择。"
+        ));
+        assert!(!looks_like_directed_operational_call(
+            "All reviewers have submitted feedback."
+        ));
+        assert!(!looks_like_directed_operational_call(
+            "The next phase will include discussion and review."
+        ));
+        assert!(!looks_like_directed_operational_call(
+            "请阅读上方状态。下一阶段开始后会进行讨论。"
+        ));
+    }
+
+    #[test]
+    fn collection_followup_requires_send_time_rebase_in_agent_turn() {
+        let stale = "已收到 6 位参与者回复，灰太狼尚未回复，请尽快回复。";
+        assert!(looks_like_collection_followup(stale));
+        let error = check_collection_followup_has_latest_guard(stale, None, true)
+            .expect_err("missing-response claims require optimistic concurrency");
+        assert!(error.to_string().contains("--if-latest"));
+        check_collection_followup_has_latest_guard(stale, Some("msg_latest"), true)
+            .expect("a fresh-read CAS base makes the follow-up safe");
+        check_collection_followup_has_latest_guard(stale, None, false)
+            .expect("manual operator messages are not forced through agent CAS");
+
+        assert!(!looks_like_collection_followup(
+            "请所有参与者首次提交各自的方案。"
+        ));
+        assert!(!looks_like_collection_followup(
+            "所有参与者已经提交，下面公布汇总结果。"
+        ));
+    }
+
+    #[test]
+    fn agent_turn_rejects_collective_call_with_inferred_single_recipient() {
+        assert!(should_reject_inferred_single_recipient_collective_call(
+            true,
+            false,
+            false,
+            "Everyone, please continue."
+        ));
+        assert!(!should_reject_inferred_single_recipient_collective_call(
+            false,
+            false,
+            false,
+            "Everyone, please continue."
+        ));
+        assert!(!should_reject_inferred_single_recipient_collective_call(
+            true,
+            true,
+            false,
+            "Everyone, please continue."
+        ));
+    }
+
+    #[test]
+    fn agent_turn_requires_explicit_notify_only_for_non_directive_context() {
         assert!(should_reject_notify_only_call_for_action(
-            true, false, false
+            true,
+            false,
+            false,
+            "Open the floor for discussion."
         ));
         assert!(!should_reject_notify_only_call_for_action(
-            false, false, false
+            false,
+            false,
+            false,
+            "Open the floor for discussion."
         ));
         assert!(!should_reject_notify_only_call_for_action(
-            true, true, false
+            true,
+            true,
+            false,
+            "The next phase will include discussion and review."
         ));
         assert!(!should_reject_notify_only_call_for_action(
-            true, false, true
+            true,
+            false,
+            true,
+            "The next phase will include discussion and review."
+        ));
+    }
+
+    #[test]
+    fn agent_turn_rejects_directed_action_even_when_marked_notify_or_silent() {
+        let body = "所有参与者请公开讨论，然后提交各自的选择。";
+        assert!(should_reject_notify_only_call_for_action(
+            true, true, false, body
+        ));
+        assert!(should_reject_notify_only_call_for_action(
+            true,
+            true,
+            false,
+            "现在进入评审阶段，请每位参与者投出各自的选择。"
+        ));
+        assert!(should_reject_notify_only_call_for_action(
+            true, false, true, body
+        ));
+    }
+
+    #[test]
+    fn agent_turn_blocks_sensitive_payloads_on_public_messages() {
+        let leaked = "请保密：你的身份是审阅者，请私信提交选择。";
+        let error = check_public_sensitive_payload_claim(leaked, true, true)
+            .expect_err("public sensitive payload must be rejected in an agent turn");
+        assert!(error.to_string().contains("audience"));
+        assert!(error.to_string().contains("--private-to"));
+
+        check_public_sensitive_payload_claim(leaked, true, false)
+            .expect("same-scope private delivery is allowed");
+        check_public_sensitive_payload_claim(leaked, false, true)
+            .expect("manual CLI usage is not heuristically blocked");
+        check_public_sensitive_payload_claim(
+            "The public workflow has one reviewer and two contributors.",
+            true,
+            true,
+        )
+        .expect("public role descriptions without private allocation are allowed");
+    }
+
+    #[test]
+    fn sensitive_payload_heuristic_requires_privacy_or_private_assignment() {
+        assert!(looks_like_sensitive_payload(
+            "私信通知：你的角色是最终审阅者，请保密。"
+        ));
+        assert!(looks_like_sensitive_payload(
+            "Keep this private: you are assigned the hidden work item."
+        ));
+        assert!(!looks_like_sensitive_payload(
+            "You are the next public speaker; please continue."
+        ));
+        assert!(!looks_like_sensitive_payload(
+            "Publicly assigned roles are listed below."
+        ));
+    }
+
+    #[test]
+    fn clock_fallback_heuristic_requires_duration_and_fallback_language() {
+        assert!(looks_like_clock_fallback_promise(
+            "请在 3 分钟内回复；集齐结果或超时后继续。"
+        ));
+        assert!(looks_like_clock_fallback_promise(
+            "The deadline is 5 minutes; on timeout the owner will continue."
+        ));
+        assert!(!looks_like_clock_fallback_promise(
+            "Please reply when ready; the owner continues after every required response."
+        ));
+        assert!(!looks_like_clock_fallback_promise(
+            "The report took 5 minutes to prepare."
+        ));
+    }
+
+    #[test]
+    fn only_scheduled_reminder_for_exact_target_satisfies_clock_fallback() {
+        fn reminder(status: ReminderStatus, target: &str) -> Reminder {
+            Reminder {
+                id: "rem_demo".into(),
+                actor_id: "actor_agent_owner".into(),
+                title: "recheck".into(),
+                scope: None,
+                msg_id: None,
+                fire_at: chrono::Utc::now(),
+                repeat: None,
+                status,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                last_fired_at: None,
+                _meta: Some(proto::types::Meta::from([(
+                    "loomReplyTarget".into(),
+                    json!(target),
+                )])),
+            }
+        }
+
+        let target = "#chan_demo:msg_root";
+        assert!(has_scheduled_reminder_for_target(
+            &[reminder(ReminderStatus::Scheduled, target)],
+            target,
+        ));
+        assert!(!has_scheduled_reminder_for_target(
+            &[reminder(ReminderStatus::Fired, target)],
+            target,
+        ));
+        assert!(!has_scheduled_reminder_for_target(
+            &[reminder(ReminderStatus::Scheduled, "#chan_demo:msg_other")],
+            target,
         ));
     }
 
@@ -652,6 +1444,29 @@ mod tests {
             .expect("real newline should pass");
         check_escaped_newlines("line one\\nline two", false, false, true)
             .expect("stdin body with literal sequence should only warn");
+    }
+
+    #[test]
+    fn agent_turn_rejects_claiming_an_upload_without_attaching_it() {
+        let body =
+            "已上传文件：hello.txt Artifact ID: art_demo123 URI: artifact://art_demo123/hello.txt";
+        let error = check_artifact_attachment_claim(body, &[], true)
+            .expect_err("agent must attach the uploaded artifact");
+        assert!(error.to_string().contains("art_demo123 is not attached"));
+        assert!(error.to_string().contains("--attachment-id"));
+
+        check_artifact_attachment_claim(body, &["art_demo123".into()], true)
+            .expect("the matching attachment id should pass");
+    }
+
+    #[test]
+    fn informational_artifact_references_are_not_forced_into_attachments() {
+        check_artifact_attachment_claim(
+            "The task output is recorded in artifact://art_demo123/result.json.",
+            &[],
+            true,
+        )
+        .expect("a plain durable-artifact reference is not an upload claim");
     }
 
     #[test]
@@ -812,6 +1627,41 @@ mod tests {
                 false,
             ),
             None
+        );
+    }
+
+    #[test]
+    fn default_reply_inference_does_not_turn_wait_or_status_into_handoffs() {
+        for body in [
+            "目前进度：已收到三份结果，还在等待其余结果。",
+            "我现在处理汇总，完成后我会公布。请稍候。",
+            "Please stand by; more to follow.",
+        ] {
+            assert_eq!(
+                inferred_reply_audience(
+                    "#chan:msg_root",
+                    "actor_agent_owner",
+                    body,
+                    None,
+                    Some("actor_agent_contributor"),
+                    true,
+                ),
+                None,
+                "obvious no-action status must not infer a reply audience: {body}"
+            );
+        }
+
+        assert_eq!(
+            inferred_reply_audience(
+                "#chan:msg_root",
+                "actor_agent_owner",
+                "请继续处理下一步。",
+                Some(DeliveryPolicy::WakeAgent),
+                Some("actor_agent_contributor"),
+                true,
+            ),
+            Some("actor_agent_contributor"),
+            "an explicit wake policy must override the no-action heuristic"
         );
     }
 
@@ -1238,6 +2088,31 @@ fn parse_delivery_state_filter(raw: &str) -> Result<Option<DeliveryState>> {
         "all" => Ok(None),
         other => bail!("invalid --state `{other}`; expected pending, delivered, failed, or all"),
     }
+}
+
+/// Fetch one message by id (via `message.context` with a zero window) and
+/// print it with the full body, spilling oversized bodies to a file like
+/// `read` does. This is the command that prompt truncation notes point to.
+pub async fn get(client: Arc<Client>, _actor_id: String, message_id: String) -> Result<()> {
+    let res: MessageContextResult = client
+        .call(
+            method::MESSAGE_CONTEXT,
+            json!({
+                "messageId": message_id,
+                "before": 0,
+                "after": 0,
+            }),
+        )
+        .await?;
+    let mut messages = vec![res.anchor];
+    spill_long_message_bodies(&mut messages)?;
+    let message = &messages[0];
+    if render::is_json() {
+        render::print_json(message);
+    } else {
+        render::render_message(message);
+    }
+    Ok(())
 }
 
 pub async fn search(

@@ -44,6 +44,14 @@ pub enum StoreEvent {
     DeliveryUpdated(Delivery),
     MachineCommandUpdated(MachineCommand),
     ChannelUpdated(Channel),
+    /// A visibility transition needs global discovery fanout rather than the
+    /// normal scope-only `ChannelUpdated` route.  The previous value lets the
+    /// websocket layer distinguish newly-public discovery from removal of
+    /// implicit public access without exposing private channel data.
+    ChannelVisibilityChanged {
+        channel: Channel,
+        previous_visibility: ChannelVisibility,
+    },
     ChannelDeleted {
         channel_id: String,
         visibility: ChannelVisibility,
@@ -86,6 +94,9 @@ impl StoreEvent {
                 kind: ScopeKind::Channel,
                 id: c.id.clone(),
             }),
+            // Routed specially by ws::fanout: visibility transitions must
+            // reach clients that are not subscribed to the channel scope.
+            StoreEvent::ChannelVisibilityChanged { .. } => None,
             StoreEvent::ChannelDeleted { .. } => None,
             StoreEvent::TaskAssignmentChanged { task, .. } => Some(ScopeRef {
                 kind: ScopeKind::Channel,
@@ -109,7 +120,11 @@ impl StoreEvent {
 struct Inner {
     actors: HashMap<String, Actor>,
     channels: HashMap<String, Channel>,
+    channels_by_title: HashMap<String, HashSet<String>>,
     channel_member_configs: HashMap<(String, String), ChannelMemberConfig>,
+    /// Per-actor navigation preferences. A Store belongs to exactly one
+    /// server, so the actor key also provides the required server isolation.
+    channel_layouts: HashMap<String, ChannelLayout>,
     actor_groups: HashMap<String, ActorGroup>,
     actor_presences: HashMap<(String, String), ActorPresence>,
     threads: HashMap<String, Thread>,
@@ -138,12 +153,24 @@ struct Inner {
     runs: HashMap<String, Run>,
     run_frames: HashMap<String, Vec<RunFrame>>,
     run_seq: HashMap<String, u64>,
+    /// Durable per-(actor, scope) cumulative token usage, folded from the
+    /// `token_usage.increment` values that closed runs carry in their
+    /// metadata. Rebuilt from RunUpsert records on replay, so it survives
+    /// both server and worker restarts.
+    run_usage_totals: HashMap<(String, String), proto::types::TokenUsageSummary>,
     agent_config_versions: HashMap<String, AgentConfigVersion>,
     agent_config_activations: HashMap<String, AgentConfigActivation>,
     coordination_sessions: HashMap<String, CoordinationSession>,
     coordination_steps: HashMap<String, CoordinationStep>,
     memberships: HashMap<(String, ScopeRef), Membership>,
     deliveries: HashMap<(String, String), Delivery>,
+    /// actor_id -> source_ids with a delivery row for that actor. Secondary
+    /// index for `list_deliveries` (agent inbox polling is a hot path).
+    deliveries_by_actor: HashMap<String, HashSet<String>>,
+    /// source_id -> actor_ids with a delivery row for that source. Secondary
+    /// index for `delivery_recipients_for_source` (called on every message /
+    /// event broadcast fanout).
+    deliveries_by_source: HashMap<String, HashSet<String>>,
     machine_commands: HashMap<String, MachineCommand>,
     reminders: HashMap<String, Reminder>,
     artifacts: HashMap<String, Artifact>,
@@ -156,8 +183,78 @@ struct Inner {
 pub struct Store {
     journal: Arc<Journal>,
     inner: RwLock<Inner>,
+    actor_upsert_lock: Mutex<()>,
     structure_lock: Mutex<()>,
     broadcaster: broadcast::Sender<StoreEvent>,
+}
+
+impl Inner {
+    /// Insert (or update) a delivery row and keep the by-actor / by-source
+    /// secondary indexes in sync. Every write to `deliveries` must go
+    /// through here.
+    fn insert_delivery(&mut self, delivery: Delivery) {
+        self.deliveries_by_actor
+            .entry(delivery.actor_id.clone())
+            .or_default()
+            .insert(delivery.source_id.clone());
+        self.deliveries_by_source
+            .entry(delivery.source_id.clone())
+            .or_default()
+            .insert(delivery.actor_id.clone());
+        self.deliveries.insert(
+            (delivery.source_id.clone(), delivery.actor_id.clone()),
+            delivery,
+        );
+    }
+
+    /// Drop every delivery row addressed to `actor_id`, updating both
+    /// secondary indexes.
+    fn remove_actor_deliveries(&mut self, actor_id: &str) {
+        let Some(sources) = self.deliveries_by_actor.remove(actor_id) else {
+            return;
+        };
+        for source_id in sources {
+            self.deliveries
+                .remove(&(source_id.clone(), actor_id.to_string()));
+            if let Some(set) = self.deliveries_by_source.get_mut(&source_id) {
+                set.remove(actor_id);
+                if set.is_empty() {
+                    self.deliveries_by_source.remove(&source_id);
+                }
+            }
+        }
+    }
+}
+
+fn actors_equivalent_for_upsert(existing: &Actor, incoming: &Actor) -> bool {
+    if existing == incoming {
+        return true;
+    }
+    if existing.kind != ActorKind::Service || incoming.kind != ActorKind::Service {
+        return false;
+    }
+
+    let is_machine = |actor: &Actor| {
+        actor
+            ._meta
+            .as_ref()
+            .and_then(|meta| meta.get("role"))
+            .and_then(serde_json::Value::as_str)
+            == Some("machine")
+    };
+    if !is_machine(existing) || !is_machine(incoming) {
+        return false;
+    }
+
+    let mut existing = existing.clone();
+    let mut incoming = incoming.clone();
+    if let Some(meta) = existing._meta.as_mut() {
+        meta.remove("observedAt");
+    }
+    if let Some(meta) = incoming._meta.as_mut() {
+        meta.remove("observedAt");
+    }
+    existing == incoming
 }
 
 impl Store {
@@ -166,10 +263,14 @@ impl Store {
         let store = Arc::new(Self {
             journal: journal.clone(),
             inner: RwLock::new(Inner::default()),
+            actor_upsert_lock: Mutex::new(()),
             structure_lock: Mutex::new(()),
             broadcaster: tx,
         });
-        store.replay()?;
+        let mut stats = store.replay()?;
+        let repaired_finishes = store.reconcile_terminal_run_delivery_acks()?;
+        stats.tail_records = stats.tail_records.saturating_add(repaired_finishes);
+        store.compact_journal_if_needed(&stats);
         Ok(store)
     }
 
@@ -181,11 +282,281 @@ impl Store {
         let _ = self.broadcaster.send(event);
     }
 
-    fn replay(&self) -> StoreResult<()> {
-        self.journal.replay(|m| {
+    fn replay(&self) -> StoreResult<crate::journal::ReplayStats> {
+        let stats = self.journal.replay(|m| {
             self.apply_replay(m);
         })?;
-        Ok(())
+        Ok(stats)
+    }
+
+    /// Upgrade repair for journals written by workers that closed a run and
+    /// acknowledged its trigger in two RPCs. If the close made it to disk but
+    /// the ack did not, the terminal run is durable proof that a completed or
+    /// failed turn already consumed the delivery. Canceled runs are excluded:
+    /// cancel-and-requeue intentionally leaves those sources pending.
+    ///
+    /// Legacy workers did not persist the ids of extra pending-context rows
+    /// folded into a prompt, so those cannot be reconstructed safely. We only
+    /// repair ids explicitly tied to the run and never guess by scope: a
+    /// same-scope sweep could consume newer work the provider never saw.
+    fn reconcile_terminal_run_delivery_acks(&self) -> StoreResult<usize> {
+        let stranded = {
+            let inner = self.inner.read();
+            inner
+                .runs
+                .values()
+                .filter(|run| matches!(run.status, RunStatus::Completed | RunStatus::Failed))
+                .filter(|run| {
+                    run_ack_source_ids(run, &[], true)
+                        .into_iter()
+                        .any(|source_id| {
+                            inner
+                                .deliveries
+                                .get(&(source_id, run.actor_id.clone()))
+                                .is_some_and(|delivery| delivery.state == DeliveryState::Pending)
+                        })
+                })
+                .map(|run| (run.id.clone(), run.status))
+                .collect::<Vec<_>>()
+        };
+        let mut repaired_finishes = 0usize;
+        let mut repaired_deliveries = 0usize;
+        for (run_id, status) in stranded {
+            let (_, acknowledged) =
+                self.close_run_with_delivery_acks(&run_id, status, None, &[])?;
+            let repaired = acknowledged
+                .iter()
+                .filter(|delivery| delivery.state == DeliveryState::Delivered)
+                .count();
+            if repaired > 0 {
+                repaired_finishes += 1;
+                repaired_deliveries += repaired;
+            }
+        }
+        if repaired_deliveries > 0 {
+            tracing::warn!(
+                repaired_deliveries,
+                repaired_finishes,
+                "reconciled terminal runs with stranded pending inbox deliveries"
+            );
+        }
+        Ok(repaired_finishes)
+    }
+
+    /// Startup compaction: when the journal tail replayed after the last
+    /// snapshot exceeds the threshold, persist a fresh snapshot so the next
+    /// start replays a bounded record count instead of the full history.
+    /// Runs before the server begins serving, so no concurrent appends can
+    /// race the snapshot. Disable with `LOOM_JOURNAL_SNAPSHOT=off`.
+    fn compact_journal_if_needed(&self, stats: &crate::journal::ReplayStats) {
+        if std::env::var("LOOM_JOURNAL_SNAPSHOT")
+            .map(|v| matches!(v.as_str(), "off" | "0" | "false"))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let threshold = std::env::var("LOOM_SNAPSHOT_TAIL_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(SNAPSHOT_TAIL_THRESHOLD);
+        if stats.tail_records < threshold {
+            return;
+        }
+        let mutations = self.snapshot_mutations();
+        if let Err(err) = self.journal.write_snapshot(&mutations) {
+            tracing::warn!(%err, "journal compaction failed; full tail will be replayed next start");
+        }
+    }
+
+    /// Serialize the current in-memory state as the minimal mutation
+    /// sequence that reconstructs it through `apply`. Every `Inner` field
+    /// must be covered here (or be derivable from covered records, like the
+    /// `*_seq` counters and the idempotency/usage indexes).
+    fn snapshot_mutations(&self) -> Vec<Mutation> {
+        let inner = self.inner.read();
+        let mut out: Vec<Mutation> = Vec::new();
+        out.extend(inner.actors.values().cloned().map(Mutation::ActorUpsert));
+        out.extend(
+            inner
+                .channels
+                .values()
+                .cloned()
+                .map(Mutation::ChannelCreate),
+        );
+        out.extend(
+            inner
+                .channel_member_configs
+                .values()
+                .cloned()
+                .map(Mutation::ChannelMemberConfigUpsert),
+        );
+        out.extend(
+            inner
+                .channel_layouts
+                .values()
+                .cloned()
+                .map(Mutation::ChannelLayoutUpsert),
+        );
+        out.extend(
+            inner
+                .actor_groups
+                .values()
+                .cloned()
+                .map(Mutation::ActorGroupUpsert),
+        );
+        out.extend(
+            inner
+                .actor_presences
+                .values()
+                .cloned()
+                .map(Mutation::ActorPresenceUpsert),
+        );
+        out.extend(inner.threads.values().cloned().map(Mutation::ThreadCreate));
+        out.extend(
+            inner
+                .memberships
+                .values()
+                .cloned()
+                .map(Mutation::MembershipUpsert),
+        );
+        // Messages must be appended in their per-scope order so the
+        // `messages_by_scope` vectors are rebuilt identically.
+        for ids in inner.messages_by_scope.values() {
+            for id in ids {
+                if let Some(m) = inner.messages.get(id) {
+                    out.push(Mutation::MessageAppend(m.clone()));
+                }
+            }
+        }
+        for ids in inner.events_by_scope.values() {
+            for id in ids {
+                if let Some(e) = inner.events.get(id) {
+                    out.push(Mutation::EventAppend(e.clone()));
+                }
+            }
+        }
+        out.extend(inner.tasks.values().cloned().map(Mutation::TaskUpsert));
+        out.extend(
+            inner
+                .assignments
+                .values()
+                .cloned()
+                .map(Mutation::TaskAssignmentUpsert),
+        );
+        out.extend(
+            inner
+                .task_refs
+                .values()
+                .cloned()
+                .map(Mutation::TaskRefUpsert),
+        );
+        out.extend(
+            inner
+                .task_artifact_links
+                .values()
+                .cloned()
+                .map(Mutation::TaskArtifactLinkUpsert),
+        );
+        out.extend(
+            inner
+                .task_facts
+                .values()
+                .cloned()
+                .map(Mutation::TaskFactUpsert),
+        );
+        out.extend(
+            inner
+                .task_projections
+                .values()
+                .cloned()
+                .map(Mutation::TaskProjectionUpsert),
+        );
+        out.extend(
+            inner
+                .workspace_leases
+                .values()
+                .cloned()
+                .map(Mutation::WorkspaceLeaseUpsert),
+        );
+        out.extend(
+            inner
+                .task_changes
+                .values()
+                .cloned()
+                .map(Mutation::TaskChangeUpsert),
+        );
+        out.extend(
+            inner
+                .task_change_deliveries
+                .values()
+                .cloned()
+                .map(Mutation::TaskChangeDeliveryUpsert),
+        );
+        out.extend(inner.turns.values().cloned().map(Mutation::TurnOpen));
+        out.extend(inner.runs.values().cloned().map(Mutation::RunUpsert));
+        for frames in inner.run_frames.values() {
+            out.extend(frames.iter().cloned().map(Mutation::RunFrameAppend));
+        }
+        out.extend(
+            inner
+                .agent_config_versions
+                .values()
+                .cloned()
+                .map(Mutation::AgentConfigVersionPublish),
+        );
+        out.extend(
+            inner
+                .agent_config_activations
+                .values()
+                .cloned()
+                .map(Mutation::AgentConfigActivationUpsert),
+        );
+        out.extend(
+            inner
+                .coordination_sessions
+                .values()
+                .cloned()
+                .map(Mutation::CoordinationSessionUpsert),
+        );
+        out.extend(
+            inner
+                .coordination_steps
+                .values()
+                .cloned()
+                .map(Mutation::CoordinationStepAppend),
+        );
+        out.extend(
+            inner
+                .deliveries
+                .values()
+                .cloned()
+                .map(Mutation::DeliveryUpsert),
+        );
+        out.extend(
+            inner
+                .machine_commands
+                .values()
+                .cloned()
+                .map(Mutation::MachineCommandUpsert),
+        );
+        out.extend(
+            inner
+                .reminders
+                .values()
+                .cloned()
+                .map(Mutation::ReminderUpsert),
+        );
+        out.extend(
+            inner
+                .artifacts
+                .values()
+                .cloned()
+                .map(Mutation::ArtifactCreate),
+        );
+        for frames in inner.trace_by_turn.values() {
+            out.extend(frames.iter().cloned().map(Mutation::TraceAppend));
+        }
+        out
     }
 
     fn apply_replay(&self, m: Mutation) {
@@ -196,9 +567,40 @@ impl Store {
     // -------- Actors --------
 
     pub fn upsert_actor(&self, actor: Actor) -> StoreResult<Actor> {
+        if let Some(existing) = self.inner.read().actors.get(&actor.id) {
+            if actors_equivalent_for_upsert(existing, &actor) {
+                return Ok(existing.clone());
+            }
+        }
+
+        let _guard = self.actor_upsert_lock.lock();
+        if let Some(existing) = self.inner.read().actors.get(&actor.id) {
+            if actors_equivalent_for_upsert(existing, &actor) {
+                return Ok(existing.clone());
+            }
+        }
+
+        let started = std::time::Instant::now();
+        let append_started = std::time::Instant::now();
         self.journal.append(&Mutation::ActorUpsert(actor.clone()))?;
+        let journal_append_ms = append_started.elapsed().as_millis();
+        let lock_started = std::time::Instant::now();
         let mut inner = self.inner.write();
+        let lock_wait_ms = lock_started.elapsed().as_millis();
+        let mutate_started = std::time::Instant::now();
         inner.actors.insert(actor.id.clone(), actor.clone());
+        let mutate_elapsed_ms = mutate_started.elapsed().as_millis();
+        let total_elapsed_ms = started.elapsed().as_millis();
+        if journal_append_ms > 50 || lock_wait_ms > 50 || total_elapsed_ms > 100 {
+            tracing::warn!(
+                actor_id = %actor.id,
+                journal_append_ms,
+                lock_wait_ms,
+                mutate_elapsed_ms,
+                total_elapsed_ms,
+                "slow actor upsert store operation"
+            );
+        }
         Ok(actor)
     }
 
@@ -218,7 +620,24 @@ impl Store {
     }
 
     pub fn list_actors(&self) -> Vec<Actor> {
-        self.inner.read().actors.values().cloned().collect()
+        let started = std::time::Instant::now();
+        let lock_started = std::time::Instant::now();
+        let inner = self.inner.read();
+        let lock_wait_ms = lock_started.elapsed().as_millis();
+        let collect_started = std::time::Instant::now();
+        let actors = inner.actors.values().cloned().collect::<Vec<_>>();
+        let collect_elapsed_ms = collect_started.elapsed().as_millis();
+        let total_elapsed_ms = started.elapsed().as_millis();
+        if lock_wait_ms > 50 || total_elapsed_ms > 100 {
+            tracing::warn!(
+                actors = actors.len(),
+                lock_wait_ms,
+                collect_elapsed_ms,
+                total_elapsed_ms,
+                "slow actor list store operation"
+            );
+        }
+        actors
     }
 
     // -------- Channels --------
@@ -242,10 +661,27 @@ impl Store {
         topic: String,
         creator_actor_id: Option<String>,
     ) -> StoreResult<Channel> {
-        let (visibility, members) = match creator_actor_id {
-            Some(id) => (ChannelVisibility::Private, vec![id]),
-            None => (ChannelVisibility::Public, Vec::new()),
+        let visibility = if creator_actor_id.is_some() {
+            ChannelVisibility::Private
+        } else {
+            ChannelVisibility::Public
         };
+        self.create_channel_with_visibility(title, topic, creator_actor_id, visibility)
+    }
+
+    /// Create a channel with an explicit visibility while retaining the
+    /// creator as its first explicit member.  This is used by modern RPC
+    /// callers that deliberately create a public channel: public access stays
+    /// implicit for everyone else, but the creator identity is not discarded,
+    /// so the channel can still be administered later.
+    pub fn create_channel_with_visibility(
+        &self,
+        title: String,
+        topic: String,
+        creator_actor_id: Option<String>,
+        visibility: ChannelVisibility,
+    ) -> StoreResult<Channel> {
+        let members = creator_actor_id.into_iter().collect();
         let channel = Channel {
             id: format!("chan_{}", short_id()),
             title,
@@ -259,12 +695,40 @@ impl Store {
         };
         self.journal
             .append(&Mutation::ChannelCreate(channel.clone()))?;
-        self.inner
-            .write()
-            .channels
-            .insert(channel.id.clone(), channel.clone());
+        self.inner.write().insert_channel(channel.clone());
         self.emit(StoreEvent::ChannelCreated(channel.clone()));
         Ok(channel)
+    }
+
+    /// Return the existing public channel with this exact title, or create it.
+    ///
+    /// The structure lock keeps the lookup and append+apply pair atomic for
+    /// callers using this API. If historical duplicates exist, the lowest id
+    /// wins deterministically so every caller converges on the same channel.
+    pub fn ensure_public_channel(
+        &self,
+        title: String,
+        topic: String,
+    ) -> StoreResult<(Channel, bool)> {
+        let _guard = self.structure_lock.lock();
+        let existing = {
+            let inner = self.inner.read();
+            inner
+                .channels_by_title
+                .get(&title)
+                .into_iter()
+                .flat_map(|ids| ids.iter())
+                .filter_map(|id| inner.channels.get(id))
+                .filter(|channel| channel.visibility == ChannelVisibility::Public)
+                .min_by(|left, right| left.id.cmp(&right.id))
+                .cloned()
+        };
+        if let Some(channel) = existing {
+            return Ok((channel, false));
+        }
+
+        self.create_channel_with_topic(title, topic, None)
+            .map(|channel| (channel, true))
     }
 
     /// `true` when `actor_id` is allowed to read/write `channel_id`.
@@ -374,11 +838,94 @@ impl Store {
     }
 
     pub fn list_channels(&self) -> Vec<Channel> {
-        self.inner.read().channels.values().cloned().collect()
+        let started = std::time::Instant::now();
+        let lock_started = std::time::Instant::now();
+        let inner = self.inner.read();
+        let lock_wait_ms = lock_started.elapsed().as_millis();
+        let collect_started = std::time::Instant::now();
+        let channels = inner.channels.values().cloned().collect::<Vec<_>>();
+        let collect_elapsed_ms = collect_started.elapsed().as_millis();
+        let total_elapsed_ms = started.elapsed().as_millis();
+        if lock_wait_ms > 50 || total_elapsed_ms > 100 {
+            tracing::warn!(
+                channels = channels.len(),
+                lock_wait_ms,
+                collect_elapsed_ms,
+                total_elapsed_ms,
+                "slow channel list store operation"
+            );
+        }
+        channels
+    }
+
+    pub fn find_channels_by_title(&self, title: &str) -> Vec<Channel> {
+        let inner = self.inner.read();
+        let mut channels = inner
+            .channels_by_title
+            .get(title)
+            .into_iter()
+            .flat_map(|ids| ids.iter())
+            .filter_map(|id| inner.channels.get(id).cloned())
+            .collect::<Vec<_>>();
+        drop(inner);
+        channels.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+        channels
     }
 
     pub fn get_channel(&self, id: &str) -> Option<Channel> {
         self.inner.read().channels.get(id).cloned()
+    }
+
+    pub fn get_channel_layout(&self, actor_id: &str) -> ChannelLayout {
+        self.inner
+            .read()
+            .channel_layouts
+            .get(actor_id)
+            .cloned()
+            .unwrap_or_else(|| ChannelLayout {
+                actor_id: actor_id.to_string(),
+                sections: Vec::new(),
+                revision: 0,
+                // A stable sentinel keeps repeated reads of a never-written
+                // layout deterministic while preserving the required field.
+                updated_at: chrono::DateTime::<Utc>::from_timestamp(0, 0)
+                    .expect("unix epoch is a valid UTC timestamp"),
+            })
+    }
+
+    /// Persist a complete, already-normalized layout and allocate its next
+    /// revision atomically. Validation/merge semantics live in the RPC layer,
+    /// while this store primitive guarantees monotonic revisions across
+    /// concurrent GUI/mobile writes and journal replay.
+    pub fn set_channel_layout(
+        &self,
+        actor_id: &str,
+        sections: Vec<ChannelLayoutSection>,
+    ) -> StoreResult<ChannelLayout> {
+        let _guard = self.structure_lock.lock();
+        let revision = self
+            .inner
+            .read()
+            .channel_layouts
+            .get(actor_id)
+            .map(|layout| layout.revision)
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| {
+                StoreError::InvalidState(format!(
+                    "channel layout revision exhausted for actor {actor_id}"
+                ))
+            })?;
+        let layout = ChannelLayout {
+            actor_id: actor_id.to_string(),
+            sections,
+            revision,
+            updated_at: Utc::now(),
+        };
+        let mutation = Mutation::ChannelLayoutUpsert(layout.clone());
+        self.journal.append(&mutation)?;
+        apply(&mut self.inner.write(), mutation);
+        Ok(layout)
     }
 
     pub fn get_channel_member_config(
@@ -411,34 +958,93 @@ impl Store {
         Ok(configs)
     }
 
-    pub fn set_channel_member_workspace_dir(
+    pub fn set_channel_member_config(
         &self,
         channel_id: &str,
         actor_id: &str,
-        workspace_dir: String,
+        workspace_dir: Option<String>,
+        mention_ids: Option<Vec<String>>,
     ) -> StoreResult<ChannelMemberConfig> {
-        let workspace_dir = workspace_dir.trim().to_string();
-        if workspace_dir.is_empty() {
+        let _guard = self.structure_lock.lock();
+        let workspace_dir = match workspace_dir {
+            Some(value) => {
+                let value = value.trim().to_string();
+                if value.is_empty() {
+                    return Err(StoreError::InvalidState(
+                        "workspaceDir cannot be empty".into(),
+                    ));
+                }
+                if value.contains('\0') {
+                    return Err(StoreError::InvalidState(
+                        "workspaceDir cannot contain NUL bytes".into(),
+                    ));
+                }
+                Some(value)
+            }
+            None => None,
+        };
+        let mention_ids = mention_ids
+            .map(normalize_channel_member_mention_ids)
+            .transpose()?;
+        if workspace_dir.is_none() && mention_ids.is_none() {
             return Err(StoreError::InvalidState(
-                "workspaceDir cannot be empty".into(),
+                "workspaceDir or mentionIds is required".into(),
             ));
         }
-        if workspace_dir.contains('\0') {
-            return Err(StoreError::InvalidState(
-                "workspaceDir cannot contain NUL bytes".into(),
-            ));
-        }
-        {
+        let existing = {
             let inner = self.inner.read();
             if !inner.channels.contains_key(channel_id) {
                 return Err(StoreError::NotFound(format!("channel {channel_id}")));
             }
-            validate_channel_member_workspace_actor_inner(&inner, channel_id, actor_id)?;
+            if workspace_dir.is_some() {
+                validate_channel_member_workspace_actor_inner(&inner, channel_id, actor_id)?;
+            } else {
+                validate_channel_member_agent_inner(&inner, channel_id, actor_id)?;
+            }
+            if let Some(ref requested_ids) = mention_ids {
+                for config in inner.channel_member_configs.values() {
+                    if config.channel_id == channel_id
+                        && config.actor_id != actor_id
+                        && config
+                            .mention_ids
+                            .iter()
+                            .any(|id| requested_ids.iter().any(|requested| requested == id))
+                    {
+                        return Err(StoreError::Conflict(format!(
+                            "mentionId is already owned by actor {} in channel {}",
+                            config.actor_id, channel_id
+                        )));
+                    }
+                }
+            }
+            inner
+                .channel_member_configs
+                .get(&(channel_id.to_string(), actor_id.to_string()))
+                .cloned()
+        };
+        let effective_workspace_dir = workspace_dir.or_else(|| {
+            existing
+                .as_ref()
+                .and_then(|config| config.workspace_dir.clone())
+        });
+        let effective_mention_ids = mention_ids.unwrap_or_else(|| {
+            existing
+                .as_ref()
+                .map(|config| config.mention_ids.clone())
+                .unwrap_or_default()
+        });
+        if let Some(existing) = existing {
+            if existing.workspace_dir == effective_workspace_dir
+                && existing.mention_ids == effective_mention_ids
+            {
+                return Ok(existing);
+            }
         }
         let config = ChannelMemberConfig {
             channel_id: channel_id.to_string(),
             actor_id: actor_id.to_string(),
-            workspace_dir: Some(workspace_dir),
+            workspace_dir: effective_workspace_dir,
+            mention_ids: effective_mention_ids,
             updated_at: Utc::now(),
             _meta: None,
         };
@@ -451,6 +1057,34 @@ impl Store {
         Ok(config)
     }
 
+    pub fn resolve_channel_member_mentions(
+        &self,
+        channel_id: &str,
+        mention_ids: &[String],
+    ) -> StoreResult<Vec<(String, Vec<String>)>> {
+        let requested = normalize_channel_member_mention_ids(mention_ids.to_vec())?;
+        let inner = self.inner.read();
+        if !inner.channels.contains_key(channel_id) {
+            return Err(StoreError::NotFound(format!("channel {channel_id}")));
+        }
+        let mut matches = inner
+            .channel_member_configs
+            .values()
+            .filter(|config| config.channel_id == channel_id)
+            .filter_map(|config| {
+                let matched = config
+                    .mention_ids
+                    .iter()
+                    .filter(|id| requested.iter().any(|requested_id| requested_id == *id))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (!matched.is_empty()).then(|| (config.actor_id.clone(), matched))
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(matches)
+    }
+
     pub fn clear_channel_member_config(
         &self,
         channel_id: &str,
@@ -461,7 +1095,14 @@ impl Store {
             if !inner.channels.contains_key(channel_id) {
                 return Err(StoreError::NotFound(format!("channel {channel_id}")));
             }
-            validate_channel_member_workspace_actor_inner(&inner, channel_id, actor_id)?;
+            let existing = inner
+                .channel_member_configs
+                .get(&(channel_id.to_string(), actor_id.to_string()));
+            if existing.is_some_and(|config| config.workspace_dir.is_some()) {
+                validate_channel_member_workspace_actor_inner(&inner, channel_id, actor_id)?;
+            } else {
+                validate_channel_member_agent_inner(&inner, channel_id, actor_id)?;
+            }
         }
         let mutation = Mutation::ChannelMemberConfigDelete {
             channel_id: channel_id.to_string(),
@@ -706,22 +1347,23 @@ impl Store {
             visibility,
         })?;
         let mut inner = self.inner.write();
-        let ch = inner
+        let previous_visibility = inner
             .channels
-            .get_mut(id)
+            .get(id)
+            .map(|channel| channel.visibility)
             .ok_or_else(|| StoreError::NotFound(format!("channel {id}")))?;
-        if let Some(title) = title {
-            ch.title = title;
-        }
-        if let Some(topic) = topic {
-            ch.topic = topic;
-        }
-        if let Some(visibility) = visibility {
-            ch.visibility = visibility;
-        }
-        let updated = ch.clone();
+        let updated = inner
+            .update_channel(id, title, topic, visibility)
+            .ok_or_else(|| StoreError::NotFound(format!("channel {id}")))?;
         drop(inner);
-        self.emit(StoreEvent::ChannelUpdated(updated.clone()));
+        if updated.visibility != previous_visibility {
+            self.emit(StoreEvent::ChannelVisibilityChanged {
+                channel: updated.clone(),
+                previous_visibility,
+            });
+        } else {
+            self.emit(StoreEvent::ChannelUpdated(updated.clone()));
+        }
         Ok(updated)
     }
 
@@ -816,8 +1458,14 @@ impl Store {
         })?;
         let removed = {
             let mut inner = self.inner.write();
-            let removed = inner.channels.remove(id).is_some();
+            let removed = inner.remove_channel(id).is_some();
+            inner
+                .channel_member_configs
+                .retain(|(config_channel_id, _), _| config_channel_id != id);
             inner.actor_groups.retain(|_, group| group.channel_id != id);
+            inner
+                .actor_presences
+                .retain(|_, presence| presence.channel_id != id);
             let task_ids: std::collections::HashSet<String> = inner
                 .tasks
                 .values()
@@ -3032,24 +3680,157 @@ impl Store {
         Ok((run, frame))
     }
 
-    pub fn close_run(&self, run_id: &str, status: RunStatus) -> StoreResult<Run> {
+    pub fn close_run(
+        &self,
+        run_id: &str,
+        status: RunStatus,
+        usage: Option<proto::types::TokenUsageSummary>,
+    ) -> StoreResult<Run> {
+        self.close_run_with_delivery_acks(run_id, status, usage, &[])
+            .map(|(run, _)| run)
+    }
+
+    /// Close a run and durably consume every inbox source handled by it in a
+    /// single journal mutation. The old worker flow called `run.close` and
+    /// then `delivery.ack` one source at a time; a disconnect between those
+    /// calls left a terminal run beside pending deliveries, so daemon startup
+    /// replayed mentions the agent had already answered.
+    pub fn close_run_with_delivery_acks(
+        &self,
+        run_id: &str,
+        status: RunStatus,
+        usage: Option<proto::types::TokenUsageSummary>,
+        ack_source_ids: &[String],
+    ) -> StoreResult<(Run, Vec<Delivery>)> {
         if !is_terminal_run_status(status) {
             return Err(StoreError::InvalidState(
                 "run.close requires completed, failed, or canceled".into(),
             ));
         }
+        let _guard = self.structure_lock.lock();
         let mut run = self
             .get_run(run_id)
             .ok_or_else(|| StoreError::NotFound(format!("run {run_id}")))?;
-        if is_terminal_run_status(run.status) {
-            return Ok(run);
+        let was_terminal = is_terminal_run_status(run.status);
+        let now = Utc::now();
+        if !was_terminal {
+            run.status = status;
+            run.closed_at = Some(now);
         }
-        run.status = status;
-        run.closed_at = Some(Utc::now());
-        self.journal.append(&Mutation::RunUpsert(run.clone()))?;
-        self.inner.write().runs.insert(run.id.clone(), run.clone());
-        self.emit(StoreEvent::RunUpdated(run.clone()));
-        Ok(run)
+        if !was_terminal {
+            if let Some(increment) = usage {
+                // Fold the per-turn increment into the durable per-(actor, scope)
+                // counter and stamp both onto the run so clients get increment +
+                // authoritative cumulative from the same broadcast. Do not mutate
+                // the counter yet: applying the atomic RunFinish mutation is the
+                // single live/replay path that commits it.
+                let cumulative = {
+                    let inner = self.inner.read();
+                    let mut total = inner
+                        .run_usage_totals
+                        .get(&(run.actor_id.clone(), run.scope.id.clone()))
+                        .cloned()
+                        .unwrap_or_default();
+                    total.add(&increment);
+                    total
+                };
+                run.metadata.insert(
+                    "token_usage".into(),
+                    serde_json::json!({
+                        "increment": increment,
+                        "cumulative": cumulative,
+                    }),
+                );
+            }
+        }
+
+        let infer_legacy_sources = matches!(run.status, RunStatus::Completed | RunStatus::Failed);
+        let source_ids = run_ack_source_ids(&run, ack_source_ids, infer_legacy_sources);
+        let mut acknowledged = Vec::new();
+        let mut delivery_updates = Vec::new();
+        {
+            let inner = self.inner.read();
+            for source_id in &source_ids {
+                let key = (source_id.clone(), run.actor_id.clone());
+                let Some(existing) = inner.deliveries.get(&key) else {
+                    continue;
+                };
+                match existing.state {
+                    DeliveryState::Pending => {
+                        let mut delivered = existing.clone();
+                        delivered.state = DeliveryState::Delivered;
+                        delivered.updated_at = run.closed_at.unwrap_or(now);
+                        acknowledged.push(delivered.clone());
+                        delivery_updates.push(delivered);
+                    }
+                    DeliveryState::Delivered => acknowledged.push(existing.clone()),
+                    DeliveryState::Failed | DeliveryState::Cancelled => {}
+                }
+            }
+        }
+        let acknowledged_ids = acknowledged
+            .iter()
+            .map(|delivery| delivery.source_id.clone())
+            .collect::<Vec<_>>();
+        let previous_ack_ids = run
+            .metadata
+            .get("ackSourceIds")
+            .and_then(serde_json::Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let persisted_ack_ids = unique_nonempty(
+            previous_ack_ids
+                .iter()
+                .cloned()
+                .chain(acknowledged_ids)
+                .collect(),
+        );
+        let ack_metadata_changed = persisted_ack_ids != previous_ack_ids;
+        if !persisted_ack_ids.is_empty() {
+            run.metadata
+                .insert("ackSourceIds".into(), serde_json::json!(persisted_ack_ids));
+        }
+
+        let run_changed = !was_terminal || ack_metadata_changed;
+        if !run_changed && delivery_updates.is_empty() {
+            return Ok((run, acknowledged));
+        }
+        let mutation = Mutation::RunFinish {
+            run: run.clone(),
+            deliveries: delivery_updates.clone(),
+        };
+        self.journal.append(&mutation)?;
+        {
+            let mut inner = self.inner.write();
+            apply(&mut inner, mutation);
+        }
+        if run_changed {
+            self.emit(StoreEvent::RunUpdated(run.clone()));
+        }
+        for delivery in delivery_updates {
+            self.emit(StoreEvent::DeliveryUpdated(delivery));
+        }
+        Ok((run, acknowledged))
+    }
+
+    /// Durable cumulative token usage for `(actor, scope)`, if any closed run
+    /// has reported usage there.
+    pub fn run_usage_total(
+        &self,
+        actor_id: &str,
+        scope_id: &str,
+    ) -> Option<proto::types::TokenUsageSummary> {
+        self.inner
+            .read()
+            .run_usage_totals
+            .get(&(actor_id.to_string(), scope_id.to_string()))
+            .cloned()
     }
 
     pub fn get_run(&self, run_id: &str) -> Option<Run> {
@@ -3088,11 +3869,66 @@ impl Store {
             })
             .filter(|run| statuses.is_none_or(|set| set.contains(&run.status)))
             .filter(|run| run_actor_id.is_none_or(|id| run.actor_id == id))
-            .cloned()
+            .filter_map(|run| Self::project_run_for_actor_inner(&inner, run, actor_id))
             .collect();
         runs.sort_by(|a, b| b.opened_at.cmp(&a.opened_at).then_with(|| b.id.cmp(&a.id)));
         runs.truncate(limit);
         Ok(runs)
+    }
+
+    fn run_private_actor_ids_inner(inner: &Inner, run: &Run) -> Option<HashSet<String>> {
+        let source_id = run.delivery_id.as_deref()?;
+        match inner.messages.get(source_id) {
+            Some(message) => Self::message_private_actor_ids(message).map(|mut allowed| {
+                allowed.insert(run.actor_id.clone());
+                allowed
+            }),
+            // A retained run may outlive its triggering message under a
+            // bounded retention policy. Fail closed instead of widening a
+            // formerly-private run to every member of the scope.
+            None => Some(HashSet::from([run.actor_id.clone()])),
+        }
+    }
+
+    /// Return the actor ids that may learn a run triggered by a same-scope
+    /// private message. `None` means the trigger was not private. The run
+    /// actor is always included defensively.
+    pub fn run_private_actor_ids(&self, run: &Run) -> Option<HashSet<String>> {
+        Self::run_private_actor_ids_inner(&self.inner.read(), run)
+    }
+
+    /// Project a run for a caller without letting worker-controlled execution
+    /// metadata become a side channel. The worker gets its canonical run. Any
+    /// other actor that may see the run gets lifecycle data only; for a run
+    /// triggered by a private message, unrelated scope members do not learn
+    /// that the run exists at all.
+    fn project_run_for_actor_inner(inner: &Inner, run: &Run, actor_id: &str) -> Option<Run> {
+        if actor_id == run.actor_id {
+            return Some(run.clone());
+        }
+
+        if let Some(allowed) = Self::run_private_actor_ids_inner(inner, run) {
+            if !allowed.contains(actor_id) {
+                return None;
+            }
+        }
+
+        Some(Self::redact_run_for_observer(run))
+    }
+
+    pub fn project_run_for_actor(&self, run: &Run, actor_id: &str) -> Option<Run> {
+        Self::project_run_for_actor_inner(&self.inner.read(), run, actor_id)
+    }
+
+    /// Strip every worker-controlled diagnostic field from a run shown to a
+    /// different actor. In particular, `startReason` and metadata such as
+    /// `noReplyReason` may contain prompt-derived text, private conversation
+    /// state, or model reasoning even when the triggering message was public.
+    pub fn redact_run_for_observer(run: &Run) -> Run {
+        let mut projected = run.clone();
+        projected.start_reason = None;
+        projected.metadata.clear();
+        projected
     }
 
     pub fn message_target_for_scope(&self, scope: &ScopeRef) -> StoreResult<String> {
@@ -3694,6 +4530,13 @@ impl Store {
         idempotency_key: Option<String>,
         merge_mention_audience: bool,
     ) -> StoreResult<Message> {
+        if body.len() > MESSAGE_BODY_MAX_BYTES {
+            return Err(StoreError::InvalidState(format!(
+                "message body is {} bytes; the maximum is {} bytes — publish large content as an artifact and reference it instead",
+                body.len(),
+                MESSAGE_BODY_MAX_BYTES
+            )));
+        }
         let resolved = self.resolve_message_target_for_append(&target, &author_actor_id)?;
         self.check_scope_access(&resolved.scope, &author_actor_id)?;
         let idempotency_key = normalize_message_idempotency_key(idempotency_key)?;
@@ -3737,6 +4580,7 @@ impl Store {
                 )));
             }
         }
+        validate_explicit_mention_spans(&body, &explicit_mentions)?;
         self.validate_message_mentions(&resolved.scope, &explicit_mentions)?;
         self.validate_message_audience(&resolved.scope, &explicit_audience)?;
         if let Some(parent_id) = parent_message_id.as_deref() {
@@ -3840,10 +4684,7 @@ impl Store {
             };
             self.journal
                 .append(&Mutation::DeliveryUpsert(delivery.clone()))?;
-            self.inner.write().deliveries.insert(
-                (delivery.source_id.clone(), delivery.actor_id.clone()),
-                delivery.clone(),
-            );
+            self.inner.write().insert_delivery(delivery.clone());
             self.emit(StoreEvent::DeliveryUpdated(delivery));
         }
 
@@ -4756,10 +5597,7 @@ impl Store {
                 };
                 self.journal
                     .append(&Mutation::DeliveryUpsert(delivery.clone()))?;
-                self.inner.write().deliveries.insert(
-                    (delivery.source_id.clone(), delivery.actor_id.clone()),
-                    delivery.clone(),
-                );
+                self.inner.write().insert_delivery(delivery.clone());
                 self.emit(StoreEvent::DeliveryUpdated(delivery));
             }
         }
@@ -4812,10 +5650,7 @@ impl Store {
             };
             self.journal
                 .append(&Mutation::DeliveryUpsert(delivery.clone()))?;
-            self.inner.write().deliveries.insert(
-                (delivery.source_id.clone(), delivery.actor_id.clone()),
-                delivery.clone(),
-            );
+            self.inner.write().insert_delivery(delivery.clone());
             self.emit(StoreEvent::DeliveryUpdated(delivery));
         }
 
@@ -4931,10 +5766,18 @@ impl Store {
         after: Option<(Timestamp, String)>,
     ) -> Vec<Delivery> {
         let inner = self.inner.read();
-        let mut rows: Vec<Delivery> = inner
-            .deliveries
-            .values()
-            .filter(|d| d.actor_id == actor_id)
+        // Indexed lookup: agents poll their inbox continuously, so this must
+        // not scan the full delivery table.
+        let Some(source_ids) = inner.deliveries_by_actor.get(actor_id) else {
+            return Vec::new();
+        };
+        let mut rows: Vec<Delivery> = source_ids
+            .iter()
+            .filter_map(|source_id| {
+                inner
+                    .deliveries
+                    .get(&(source_id.clone(), actor_id.to_string()))
+            })
             .filter(|d| state_filter.is_none_or(|s| d.state == s))
             .filter(|d| match &after {
                 None => true,
@@ -4959,32 +5802,152 @@ impl Store {
 
     pub fn delivery_recipients_for_source(&self, source_id: &str) -> Vec<String> {
         let inner = self.inner.read();
+        // Indexed lookup: called on every message/event broadcast fanout.
         let mut recipients: Vec<String> = inner
-            .deliveries
-            .values()
-            .filter(|delivery| delivery.source_id == source_id)
-            .map(|delivery| delivery.actor_id.clone())
-            .collect();
+            .deliveries_by_source
+            .get(source_id)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default();
         recipients.sort();
-        recipients.dedup();
         recipients
     }
 
     pub fn ack_delivery(&self, actor_id: &str, source_id: &str) -> StoreResult<Delivery> {
+        let _guard = self.structure_lock.lock();
         let now = Utc::now();
-        let mut inner = self.inner.write();
         let key = (source_id.to_string(), actor_id.to_string());
-        let Some(delivery) = inner.deliveries.get_mut(&key) else {
+        let Some(mut delivery) = self.inner.read().deliveries.get(&key).cloned() else {
             return Err(StoreError::NotFound(format!(
                 "delivery source={source_id} actor={actor_id}"
             )));
         };
+        // Delivery states are monotonic. A duplicate ack is idempotent, and a
+        // late worker completion must never revive a delivery that a human
+        // cancelled (or that already failed) into Delivered.
+        if delivery.state != DeliveryState::Pending {
+            return Ok(delivery);
+        }
         delivery.state = DeliveryState::Delivered;
         delivery.updated_at = now;
-        let delivery = delivery.clone();
-        drop(inner);
         self.journal
             .append(&Mutation::DeliveryUpsert(delivery.clone()))?;
+        self.inner.write().insert_delivery(delivery.clone());
+        self.emit(StoreEvent::DeliveryUpdated(delivery.clone()));
+        Ok(delivery)
+    }
+
+    /// Aggregate pending-delivery status for `actor_id` (agent-activity
+    /// banner). Uses the by-actor index; never exposes message bodies.
+    pub fn inbox_status_for_actor(
+        &self,
+        actor_id: &str,
+        include_entries: bool,
+        entry_limit: usize,
+    ) -> proto::methods::InboxActorStatus {
+        let inner = self.inner.read();
+        let mut pending: Vec<(&String, Timestamp)> = inner
+            .deliveries_by_actor
+            .get(actor_id)
+            .map(|sources| {
+                sources
+                    .iter()
+                    .filter_map(|source_id| {
+                        inner
+                            .deliveries
+                            .get(&(source_id.clone(), actor_id.to_string()))
+                            .filter(|d| d.state == DeliveryState::Pending)
+                            .map(|d| (source_id, d.updated_at))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        pending.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(b.0)));
+        let entries = if include_entries {
+            pending
+                .iter()
+                .take(entry_limit)
+                .map(|(source_id, updated_at)| proto::methods::InboxStatusEntry {
+                    source_id: (*source_id).clone(),
+                    updated_at: *updated_at,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        proto::methods::InboxActorStatus {
+            actor_id: actor_id.to_string(),
+            pending: pending.len() as u32,
+            oldest_pending_at: pending.first().map(|(_, at)| *at),
+            entries,
+        }
+    }
+
+    /// Withdraw pending deliveries for `actor_id` before the worker consumes
+    /// them. `source_ids = None` cancels every pending delivery. Returns the
+    /// cancelled rows (each also broadcast as `delivery.updated` so the
+    /// worker can drop its queued triggers).
+    pub fn cancel_pending_deliveries(
+        &self,
+        actor_id: &str,
+        source_ids: Option<&[String]>,
+    ) -> StoreResult<Vec<Delivery>> {
+        let _guard = self.structure_lock.lock();
+        let now = Utc::now();
+        let candidates: Vec<String> = match source_ids {
+            Some(ids) => ids.to_vec(),
+            None => self
+                .inner
+                .read()
+                .deliveries_by_actor
+                .get(actor_id)
+                .map(|set| set.iter().cloned().collect())
+                .unwrap_or_default(),
+        };
+        let mut cancelled = Vec::new();
+        for source_id in candidates {
+            let key = (source_id, actor_id.to_string());
+            let Some(mut delivery) = self.inner.read().deliveries.get(&key).cloned() else {
+                continue;
+            };
+            if delivery.state != DeliveryState::Pending {
+                continue;
+            }
+            delivery.state = DeliveryState::Cancelled;
+            delivery.updated_at = now;
+            self.journal
+                .append(&Mutation::DeliveryUpsert(delivery.clone()))?;
+            self.inner.write().insert_delivery(delivery.clone());
+            cancelled.push(delivery);
+        }
+        for delivery in &cancelled {
+            self.emit(StoreEvent::DeliveryUpdated(delivery.clone()));
+        }
+        Ok(cancelled)
+    }
+
+    /// Flag a pending delivery so the target worker promotes it to the front
+    /// of its queue. The state stays `pending`; only `_meta.expedite` is set
+    /// and the row is re-broadcast.
+    pub fn expedite_delivery(&self, actor_id: &str, source_id: &str) -> StoreResult<Delivery> {
+        let _guard = self.structure_lock.lock();
+        let now = Utc::now();
+        let key = (source_id.to_string(), actor_id.to_string());
+        let Some(mut delivery) = self.inner.read().deliveries.get(&key).cloned() else {
+            return Err(StoreError::NotFound(format!(
+                "delivery source={source_id} actor={actor_id}"
+            )));
+        };
+        if delivery.state != DeliveryState::Pending {
+            return Err(StoreError::InvalidState(format!(
+                "delivery source={source_id} actor={actor_id} is not pending"
+            )));
+        }
+        delivery.updated_at = now;
+        let meta = delivery._meta.get_or_insert_with(Default::default);
+        meta.insert("expedite".into(), serde_json::json!(true));
+        self.journal
+            .append(&Mutation::DeliveryUpsert(delivery.clone()))?;
+        self.inner.write().insert_delivery(delivery.clone());
         self.emit(StoreEvent::DeliveryUpdated(delivery.clone()));
         Ok(delivery)
     }
@@ -4992,12 +5955,33 @@ impl Store {
     // -------- Machine commands --------
 
     pub fn upsert_machine_command(&self, command: MachineCommand) -> StoreResult<MachineCommand> {
+        let started = std::time::Instant::now();
+        let append_started = std::time::Instant::now();
         self.journal
             .append(&Mutation::MachineCommandUpsert(command.clone()))?;
+        let journal_append_ms = append_started.elapsed().as_millis();
+        let lock_started = std::time::Instant::now();
         let mut inner = self.inner.write();
+        let lock_wait_ms = lock_started.elapsed().as_millis();
+        let mutate_started = std::time::Instant::now();
         apply(&mut inner, Mutation::MachineCommandUpsert(command.clone()));
+        let mutate_elapsed_ms = mutate_started.elapsed().as_millis();
         drop(inner);
+        let emit_started = std::time::Instant::now();
         self.emit(StoreEvent::MachineCommandUpdated(command.clone()));
+        let emit_elapsed_ms = emit_started.elapsed().as_millis();
+        let total_elapsed_ms = started.elapsed().as_millis();
+        if journal_append_ms > 50 || lock_wait_ms > 50 || total_elapsed_ms > 100 {
+            tracing::warn!(
+                command_id = %command.command_id,
+                journal_append_ms,
+                lock_wait_ms,
+                mutate_elapsed_ms,
+                emit_elapsed_ms,
+                total_elapsed_ms,
+                "slow machine command upsert store operation"
+            );
+        }
         Ok(command)
     }
 
@@ -5013,9 +5997,12 @@ impl Store {
         requested_by: Option<&str>,
         limit: usize,
     ) -> Vec<MachineCommand> {
-        let mut rows: Vec<MachineCommand> = self
-            .inner
-            .read()
+        let started = std::time::Instant::now();
+        let lock_started = std::time::Instant::now();
+        let inner = self.inner.read();
+        let lock_wait_ms = lock_started.elapsed().as_millis();
+        let filter_started = std::time::Instant::now();
+        let mut rows: Vec<MachineCommand> = inner
             .machine_commands
             .values()
             .filter(|command| machine_id.is_none_or(|id| command.machine_id == id))
@@ -5024,12 +6011,31 @@ impl Store {
             .filter(|command| statuses.is_empty() || statuses.contains(&command.status))
             .cloned()
             .collect();
+        let filter_elapsed_ms = filter_started.elapsed().as_millis();
+        let sort_started = std::time::Instant::now();
         rows.sort_by(|a, b| {
             a.created_at
                 .cmp(&b.created_at)
                 .then_with(|| a.command_id.cmp(&b.command_id))
         });
         rows.truncate(limit);
+        let sort_elapsed_ms = sort_started.elapsed().as_millis();
+        let total_elapsed_ms = started.elapsed().as_millis();
+        if lock_wait_ms > 50 || total_elapsed_ms > 100 {
+            tracing::warn!(
+                machine_id = machine_id.unwrap_or("<any>"),
+                machine_actor_id = machine_actor_id.unwrap_or("<any>"),
+                requested_by = requested_by.unwrap_or("<any>"),
+                statuses = statuses.len(),
+                limit,
+                returned_commands = rows.len(),
+                lock_wait_ms,
+                filter_elapsed_ms,
+                sort_elapsed_ms,
+                total_elapsed_ms,
+                "slow machine command list store operation"
+            );
+        }
         rows
     }
 
@@ -5324,6 +6330,69 @@ fn normalize_instructions(instructions: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+impl Inner {
+    fn index_channel_title(&mut self, title: &str, channel_id: &str) {
+        self.channels_by_title
+            .entry(title.to_string())
+            .or_default()
+            .insert(channel_id.to_string());
+    }
+
+    fn deindex_channel_title(&mut self, title: &str, channel_id: &str) {
+        let should_remove = if let Some(ids) = self.channels_by_title.get_mut(title) {
+            ids.remove(channel_id);
+            ids.is_empty()
+        } else {
+            false
+        };
+        if should_remove {
+            self.channels_by_title.remove(title);
+        }
+    }
+
+    fn insert_channel(&mut self, channel: Channel) {
+        if let Some(previous) = self.channels.remove(&channel.id) {
+            self.deindex_channel_title(&previous.title, &previous.id);
+        }
+        self.index_channel_title(&channel.title, &channel.id);
+        self.channels.insert(channel.id.clone(), channel);
+    }
+
+    fn update_channel(
+        &mut self,
+        id: &str,
+        title: Option<String>,
+        topic: Option<String>,
+        visibility: Option<ChannelVisibility>,
+    ) -> Option<Channel> {
+        let old_title = self.channels.get(id)?.title.clone();
+        let updated = {
+            let channel = self.channels.get_mut(id)?;
+            if let Some(title) = title {
+                channel.title = title;
+            }
+            if let Some(topic) = topic {
+                channel.topic = topic;
+            }
+            if let Some(visibility) = visibility {
+                channel.visibility = visibility;
+            }
+            channel.clone()
+        };
+        if updated.title != old_title {
+            self.deindex_channel_title(&old_title, id);
+            self.index_channel_title(&updated.title, id);
+        }
+        Some(updated)
+    }
+
+    fn remove_channel(&mut self, id: &str) -> Option<Channel> {
+        let removed = self.channels.remove(id)?;
+        self.deindex_channel_title(&removed.title, &removed.id);
+        Some(removed)
+    }
+}
+
 fn apply(inner: &mut Inner, m: Mutation) {
     match m {
         Mutation::ActorUpsert(a) => {
@@ -5334,6 +6403,7 @@ fn apply(inner: &mut Inner, m: Mutation) {
         }
         Mutation::ActorDelete { actor_id } => {
             inner.actors.remove(&actor_id);
+            inner.channel_layouts.remove(&actor_id);
             for channel in inner.channels.values_mut() {
                 channel.members.retain(|member| member != &actor_id);
             }
@@ -5354,15 +6424,13 @@ fn apply(inner: &mut Inner, m: Mutation) {
             inner
                 .actor_presences
                 .retain(|(presence_actor_id, _), _| presence_actor_id != &actor_id);
-            inner
-                .deliveries
-                .retain(|(_, target_actor_id), _| target_actor_id != &actor_id);
+            inner.remove_actor_deliveries(&actor_id);
             inner.assignments.retain(|_, assignment| {
                 assignment.from_actor_id != actor_id && assignment.to_actor_id != actor_id
             });
         }
         Mutation::ChannelCreate(c) => {
-            inner.channels.insert(c.id.clone(), c);
+            inner.insert_channel(c);
         }
         Mutation::ChannelMemberConfigUpsert(config) => {
             inner
@@ -5374,6 +6442,11 @@ fn apply(inner: &mut Inner, m: Mutation) {
             actor_id,
         } => {
             inner.channel_member_configs.remove(&(channel_id, actor_id));
+        }
+        Mutation::ChannelLayoutUpsert(layout) => {
+            inner
+                .channel_layouts
+                .insert(layout.actor_id.clone(), layout);
         }
         Mutation::ActorGroupUpsert(group) => {
             inner.actor_groups.insert(group.id.clone(), group);
@@ -5435,7 +6508,50 @@ fn apply(inner: &mut Inner, m: Mutation) {
             }
         }
         Mutation::RunUpsert(run) => {
+            if let Some(increment) = run_usage_increment_from_meta(&run.metadata) {
+                inner
+                    .run_usage_totals
+                    .entry((run.actor_id.clone(), run.scope.id.clone()))
+                    .or_default()
+                    .add(&increment);
+            }
             inner.runs.insert(run.id.clone(), run);
+        }
+        Mutation::RunFinish { run, deliveries } => {
+            // A terminal retry may carry late ack ids after the original
+            // close. Account usage only on the first mutation that gives this
+            // run its per-turn increment; delivery application is naturally
+            // idempotent by (source, actor) key.
+            let usage_already_accounted = inner.runs.get(&run.id).is_some_and(|previous| {
+                run_usage_increment_from_meta(&previous.metadata).is_some()
+            });
+            if !usage_already_accounted {
+                if let Some(increment) = run_usage_increment_from_meta(&run.metadata) {
+                    inner
+                        .run_usage_totals
+                        .entry((run.actor_id.clone(), run.scope.id.clone()))
+                        .or_default()
+                        .add(&increment);
+                }
+            }
+            inner.runs.insert(run.id.clone(), run);
+            for delivery in deliveries {
+                // `RunFinish` is allowed to consume only a pending row. This
+                // guard is deliberately repeated in the replay path: an old
+                // or concurrently produced stale finish record must never
+                // revive an already Cancelled/Failed delivery. New live
+                // mutators share `structure_lock`, while this makes journal
+                // replay converge to the same monotonic state.
+                let key = (delivery.source_id.clone(), delivery.actor_id.clone());
+                let can_apply = delivery.state != DeliveryState::Delivered
+                    || inner
+                        .deliveries
+                        .get(&key)
+                        .is_none_or(|current| current.state == DeliveryState::Pending);
+                if can_apply {
+                    inner.insert_delivery(delivery);
+                }
+            }
         }
         Mutation::RunFrameAppend(frame) => {
             let entry = inner.run_seq.entry(frame.run_id.clone()).or_insert(0);
@@ -5505,9 +6621,7 @@ fn apply(inner: &mut Inner, m: Mutation) {
                 .insert((m.actor_id.clone(), m.scope.clone()), m);
         }
         Mutation::DeliveryUpsert(d) => {
-            inner
-                .deliveries
-                .insert((d.source_id.clone(), d.actor_id.clone()), d);
+            inner.insert_delivery(d);
         }
         Mutation::MachineCommandUpsert(command) => {
             inner
@@ -5537,17 +6651,7 @@ fn apply(inner: &mut Inner, m: Mutation) {
             topic,
             visibility,
         } => {
-            if let Some(c) = inner.channels.get_mut(&channel_id) {
-                if let Some(title) = title {
-                    c.title = title;
-                }
-                if let Some(topic) = topic {
-                    c.topic = topic;
-                }
-                if let Some(visibility) = visibility {
-                    c.visibility = visibility;
-                }
-            }
+            inner.update_channel(&channel_id, title, topic, visibility);
         }
         Mutation::ChannelInstructionSet {
             channel_id,
@@ -5562,7 +6666,7 @@ fn apply(inner: &mut Inner, m: Mutation) {
             }
         }
         Mutation::ChannelDelete { channel_id } => {
-            inner.channels.remove(&channel_id);
+            inner.remove_channel(&channel_id);
             inner
                 .channel_member_configs
                 .retain(|(config_channel_id, _), _| config_channel_id != &channel_id);
@@ -5747,17 +6851,54 @@ fn is_mention_body_char(ch: char) -> bool {
         ))
 }
 
-fn merge_mentions(into: &mut Vec<MessageMention>, incoming: Vec<MessageMention>) {
-    for mention in incoming {
-        if !into.iter().any(|existing| {
-            existing.kind == mention.kind
-                && existing.actor_or_group_id == mention.actor_or_group_id
-                && existing.byte_start == mention.byte_start
-                && existing.byte_end == mention.byte_end
-        }) {
-            into.push(mention);
+fn validate_explicit_mention_spans(body: &str, mentions: &[MessageMention]) -> StoreResult<()> {
+    for mention in mentions {
+        if mention.byte_start >= mention.byte_end || mention.byte_end > body.len() {
+            return Err(StoreError::InvalidState(format!(
+                "mention span {}..{} is outside message body ({} bytes)",
+                mention.byte_start,
+                mention.byte_end,
+                body.len()
+            )));
+        }
+        if !body.is_char_boundary(mention.byte_start) || !body.is_char_boundary(mention.byte_end) {
+            return Err(StoreError::InvalidState(format!(
+                "mention span {}..{} is not on UTF-8 character boundaries",
+                mention.byte_start, mention.byte_end
+            )));
         }
     }
+    for (index, mention) in mentions.iter().enumerate() {
+        if mentions[index + 1..]
+            .iter()
+            .any(|other| mention.byte_start < other.byte_end && other.byte_start < mention.byte_end)
+        {
+            return Err(StoreError::InvalidState(format!(
+                "explicit mention spans overlap at {}..{}",
+                mention.byte_start, mention.byte_end
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Structured mentions come from the editor's selected actor/group and are
+/// authoritative for their source span. The server parser is only a fallback
+/// for plain-text clients; keeping its different actor for the same `@name`
+/// would widen the audience when two actors share a display alias.
+fn merge_mentions(parsed: &mut Vec<MessageMention>, explicit: Vec<MessageMention>) {
+    parsed.retain(|candidate| {
+        !explicit.iter().any(|authoritative| {
+            candidate.byte_start < authoritative.byte_end
+                && authoritative.byte_start < candidate.byte_end
+        })
+    });
+    parsed.extend(explicit);
+    parsed.sort_by(|left, right| {
+        left.byte_start
+            .cmp(&right.byte_start)
+            .then_with(|| left.byte_end.cmp(&right.byte_end))
+    });
 }
 
 fn merge_audience_from_mentions(audience: &mut Vec<AudienceRef>, mentions: &[MessageMention]) {
@@ -5867,6 +7008,60 @@ fn validate_channel_member_workspace_actor_inner(
     Ok(())
 }
 
+fn validate_channel_member_agent_inner(
+    inner: &Inner,
+    channel_id: &str,
+    actor_id: &str,
+) -> StoreResult<()> {
+    if !is_channel_member_inner(inner, channel_id, actor_id) {
+        return Err(StoreError::InvalidState(format!(
+            "actor {actor_id} is not a member of channel {channel_id}"
+        )));
+    }
+    let actor = inner
+        .actors
+        .get(actor_id)
+        .ok_or_else(|| StoreError::NotFound(format!("actor {actor_id}")))?;
+    if actor.kind != ActorKind::Agent {
+        return Err(StoreError::InvalidState(format!(
+            "actor {actor_id} is not an agent"
+        )));
+    }
+    Ok(())
+}
+
+fn normalize_channel_member_mention_ids(values: Vec<String>) -> StoreResult<Vec<String>> {
+    const MAX_MENTION_IDS: usize = 32;
+    const MAX_MENTION_ID_BYTES: usize = 512;
+
+    let mut normalized = Vec::new();
+    for value in values {
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        if value.contains('\0') {
+            return Err(StoreError::InvalidState(
+                "mentionIds cannot contain NUL bytes".into(),
+            ));
+        }
+        if value.len() > MAX_MENTION_ID_BYTES {
+            return Err(StoreError::InvalidState(format!(
+                "mentionId exceeds {MAX_MENTION_ID_BYTES} bytes"
+            )));
+        }
+        if !normalized.iter().any(|existing| existing == value) {
+            normalized.push(value.to_string());
+        }
+    }
+    if normalized.len() > MAX_MENTION_IDS {
+        return Err(StoreError::InvalidState(format!(
+            "mentionIds cannot contain more than {MAX_MENTION_IDS} values"
+        )));
+    }
+    Ok(normalized)
+}
+
 fn scope_channel_id_inner<'a>(inner: &'a Inner, scope: &'a ScopeRef) -> Option<&'a str> {
     match scope.kind {
         ScopeKind::Channel => inner
@@ -5902,6 +7097,76 @@ fn is_terminal_run_status(status: RunStatus) -> bool {
         status,
         RunStatus::Completed | RunStatus::Failed | RunStatus::Canceled
     )
+}
+
+/// Resolve every delivery source a terminal run is allowed to consume.
+/// Explicit close-time ids are authoritative (and are required for canceled
+/// runs); completed/failed runs additionally understand metadata written by
+/// older workers so an upgraded server can close their historical ack gap.
+fn run_ack_source_ids(
+    run: &Run,
+    explicit_source_ids: &[String],
+    infer_legacy_sources: bool,
+) -> Vec<String> {
+    let mut ids = explicit_source_ids.to_vec();
+    if let Some(values) = run
+        .metadata
+        .get("ackSourceIds")
+        .and_then(serde_json::Value::as_array)
+    {
+        ids.extend(
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned),
+        );
+    }
+    if infer_legacy_sources {
+        if let Some(delivery_id) = run.delivery_id.as_deref() {
+            ids.push(delivery_id.to_string());
+        }
+        if let Some(source_id) = run
+            .metadata
+            .get("triggerSourceId")
+            .and_then(serde_json::Value::as_str)
+        {
+            ids.push(source_id.to_string());
+        }
+        if let Some(values) = run
+            .metadata
+            .get("coalescedSourceIds")
+            .and_then(serde_json::Value::as_array)
+        {
+            ids.extend(
+                values
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned),
+            );
+        }
+    }
+    unique_nonempty(ids)
+}
+
+/// Server-side hard cap on `message.send` body size. Oversized content should
+/// be published as an artifact and referenced from the message instead of
+/// inlining it, which keeps the journal, broadcast fanout, and agent turn
+/// inputs bounded.
+pub const MESSAGE_BODY_MAX_BYTES: usize = 64 * 1024;
+
+/// When the journal tail replayed after the last snapshot exceeds this many
+/// records, `Store::open` writes a fresh snapshot so the next start is fast.
+/// Override with `LOOM_SNAPSHOT_TAIL_THRESHOLD`.
+const SNAPSHOT_TAIL_THRESHOLD: usize = 20_000;
+
+/// Extract the per-turn usage increment a closed run carries in
+/// `metadata.token_usage.increment` (written by `close_run`). Used on replay
+/// to rebuild the durable per-(actor, scope) cumulative counters.
+fn run_usage_increment_from_meta(
+    meta: &proto::types::Meta,
+) -> Option<proto::types::TokenUsageSummary> {
+    let value = meta.get("token_usage")?.get("increment")?;
+    serde_json::from_value(value.clone()).ok()
 }
 
 fn agent_config_activation_key(actor_id: &str, scope: Option<&ScopeRef>) -> String {
@@ -6548,6 +7813,336 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_round_trip_reconstructs_state() {
+        // Build a store exercising most Inner maps, snapshot it into a fresh
+        // SQLite journal, and verify a store opened from the snapshot alone
+        // answers the same queries.
+        let dir = std::env::temp_dir().join(format!(
+            "loom-store-snapshot-test-{}",
+            Uuid::new_v4().simple()
+        ));
+        let journal = Journal::open_sqlite(dir.join("loom.sqlite3")).expect("open sqlite");
+        let store = Store::open(journal.clone()).expect("open store");
+
+        store
+            .upsert_actor(test_actor("actor_h", ActorKind::Human, "H"))
+            .unwrap();
+        store
+            .upsert_actor(test_actor("actor_a", ActorKind::Agent, "A"))
+            .unwrap();
+        let channel = store
+            .create_channel("snap".into(), Some("actor_h".into()))
+            .unwrap();
+        store.grant_channel(&channel.id, "actor_a").unwrap();
+        let channel_layout = store
+            .set_channel_layout(
+                "actor_h",
+                vec![ChannelLayoutSection {
+                    id: "local-work".into(),
+                    title: "Work".into(),
+                    channel_ids: vec![channel.id.clone()],
+                    collapsed: true,
+                }],
+            )
+            .expect("set channel layout");
+        let root = send_test_message(&store, "actor_h", &format!("#{}", channel.id), "root msg");
+        store
+            .append_message(
+                "actor_h".into(),
+                format!("#{}", channel.id),
+                MessageKind::Human,
+                "@actor_a do things".into(),
+                Vec::new(),
+                vec![AudienceRef {
+                    kind: AudienceKind::Actor,
+                    id: "actor_a".into(),
+                    display: None,
+                }],
+                MessageIntent::RequestAction,
+                DeliveryPolicy::WakeAgent,
+                None,
+                None,
+                Vec::new(),
+                Meta::default(),
+                None,
+            )
+            .expect("wake message");
+
+        // Snapshot current state into the journal.
+        journal
+            .write_snapshot(&store.snapshot_mutations())
+            .expect("write snapshot");
+
+        // Reopen: replay must come from the snapshot (tail = 0).
+        let reopened = Store::open(journal.clone()).expect("reopen store");
+        let (messages, _) = reopened
+            .read_messages_for_target("actor_h", &format!("#{}", channel.id), 10, None)
+            .expect("read messages");
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().any(|m| m.id == root.id));
+        let deliveries =
+            reopened.list_deliveries("actor_a", Some(DeliveryState::Pending), 10, None);
+        assert_eq!(deliveries.len(), 1, "delivery index must survive snapshot");
+        let recipients = reopened.delivery_recipients_for_source(&deliveries[0].source_id);
+        assert_eq!(recipients, vec!["actor_a".to_string()]);
+        assert!(reopened.get_channel(&channel.id).is_some());
+        assert_eq!(reopened.get_channel_layout("actor_h"), channel_layout);
+    }
+
+    #[test]
+    fn channel_layout_revision_and_json_journal_replay_are_monotonic() {
+        let store = fresh_store();
+        let empty = store.get_channel_layout("actor_alice");
+        assert_eq!(empty.actor_id, "actor_alice");
+        assert_eq!(empty.revision, 0);
+        assert!(empty.sections.is_empty());
+
+        let first = store
+            .set_channel_layout(
+                "actor_alice",
+                vec![ChannelLayoutSection {
+                    id: "one".into(),
+                    title: "One".into(),
+                    channel_ids: vec!["chan_a".into()],
+                    collapsed: false,
+                }],
+            )
+            .expect("first layout");
+        let second = store
+            .set_channel_layout(
+                "actor_alice",
+                vec![ChannelLayoutSection {
+                    id: "two".into(),
+                    title: "Two".into(),
+                    channel_ids: vec!["chan_b".into()],
+                    collapsed: true,
+                }],
+            )
+            .expect("second layout");
+        assert_eq!(first.revision, 1);
+        assert_eq!(second.revision, 2);
+        assert!(second.updated_at >= first.updated_at);
+
+        let journal =
+            Journal::open(store.journal.path().to_path_buf()).expect("open replay journal");
+        let replayed = Store::open(journal).expect("replay store");
+        assert_eq!(replayed.get_channel_layout("actor_alice"), second);
+        let third = replayed
+            .set_channel_layout("actor_alice", Vec::new())
+            .expect("revision continues after replay");
+        assert_eq!(third.revision, 3);
+    }
+
+    #[test]
+    fn identical_actor_upsert_does_not_append_duplicate_journal_record() {
+        let store = fresh_store();
+        let actor = Actor {
+            id: "actor_agent_stable".into(),
+            kind: ActorKind::Agent,
+            display_name: "Stable Agent".into(),
+            capabilities: None,
+            _meta: None,
+        };
+
+        store.upsert_actor(actor.clone()).expect("first upsert");
+        let first_journal = std::fs::read_to_string(store.journal.path()).expect("read journal");
+        assert_eq!(first_journal.lines().count(), 1);
+
+        store.upsert_actor(actor.clone()).expect("identical upsert");
+        let unchanged_journal =
+            std::fs::read_to_string(store.journal.path()).expect("read unchanged journal");
+        assert_eq!(unchanged_journal.lines().count(), 1);
+
+        let mut changed = actor;
+        changed.display_name = "Renamed Agent".into();
+        store.upsert_actor(changed).expect("changed upsert");
+        let changed_journal =
+            std::fs::read_to_string(store.journal.path()).expect("read changed journal");
+        assert_eq!(changed_journal.lines().count(), 2);
+        assert_eq!(
+            store
+                .get_actor("actor_agent_stable")
+                .expect("stored actor")
+                .display_name,
+            "Renamed Agent"
+        );
+    }
+
+    #[test]
+    fn machine_actor_observed_at_change_does_not_append_journal_record() {
+        let store = fresh_store();
+        let actor = Actor {
+            id: "actor_machine_stable".into(),
+            kind: ActorKind::Service,
+            display_name: "Stable Machine".into(),
+            capabilities: None,
+            _meta: Some(BTreeMap::from([
+                ("role".into(), serde_json::json!("machine")),
+                ("revision".into(), serde_json::json!(1)),
+                (
+                    "observedAt".into(),
+                    serde_json::json!("2026-07-28T00:00:00Z"),
+                ),
+            ])),
+        };
+
+        store.upsert_actor(actor.clone()).expect("first upsert");
+
+        let mut heartbeat = actor.clone();
+        heartbeat._meta.as_mut().expect("machine metadata").insert(
+            "observedAt".into(),
+            serde_json::json!("2026-07-28T00:00:15Z"),
+        );
+        let unchanged = store.upsert_actor(heartbeat).expect("heartbeat upsert");
+        assert_eq!(unchanged, actor);
+        let heartbeat_journal =
+            std::fs::read_to_string(store.journal.path()).expect("read heartbeat journal");
+        assert_eq!(heartbeat_journal.lines().count(), 1);
+
+        let mut changed = actor;
+        changed
+            ._meta
+            .as_mut()
+            .expect("machine metadata")
+            .insert("revision".into(), serde_json::json!(2));
+        store
+            .upsert_actor(changed)
+            .expect("changed inventory upsert");
+        let changed_journal =
+            std::fs::read_to_string(store.journal.path()).expect("read changed journal");
+        assert_eq!(changed_journal.lines().count(), 2);
+    }
+
+    #[test]
+    fn concurrent_identical_actor_upserts_append_once() {
+        let store = fresh_store();
+        let actor = Actor {
+            id: "actor_agent_concurrent".into(),
+            kind: ActorKind::Agent,
+            display_name: "Concurrent Agent".into(),
+            capabilities: None,
+            _meta: None,
+        };
+        let worker_count = 16;
+        let barrier = Arc::new(Barrier::new(worker_count));
+        let mut workers = Vec::new();
+        for _ in 0..worker_count {
+            let store = store.clone();
+            let actor = actor.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                store.upsert_actor(actor).expect("concurrent upsert");
+            }));
+        }
+        for worker in workers {
+            worker.join().expect("join concurrent upsert");
+        }
+
+        let journal = std::fs::read_to_string(store.journal.path()).expect("read journal");
+        assert_eq!(journal.lines().count(), 1);
+    }
+
+    #[test]
+    fn concurrent_public_channel_ensure_creates_once() {
+        let store = fresh_store();
+        let worker_count = 16;
+        let barrier = Arc::new(Barrier::new(worker_count));
+        let mut workers = Vec::new();
+        for _ in 0..worker_count {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                store
+                    .ensure_public_channel("shared group".into(), String::new())
+                    .expect("ensure public channel")
+            }));
+        }
+
+        let mut channel_ids = Vec::new();
+        let mut created_count = 0;
+        for worker in workers {
+            let (channel, created) = worker.join().expect("join channel ensure");
+            channel_ids.push(channel.id);
+            created_count += usize::from(created);
+        }
+
+        channel_ids.sort();
+        channel_ids.dedup();
+        assert_eq!(channel_ids.len(), 1);
+        assert_eq!(created_count, 1);
+        assert_eq!(store.find_channels_by_title("shared group").len(), 1);
+        let journal = std::fs::read_to_string(store.journal.path()).expect("read journal");
+        assert_eq!(journal.lines().count(), 1);
+    }
+
+    #[test]
+    fn public_channel_ensure_ignores_same_title_private_channel() {
+        let store = fresh_store();
+        let private = store
+            .create_channel("shared group".into(), Some("actor_owner".into()))
+            .expect("create private channel");
+
+        let (public, created) = store
+            .ensure_public_channel("shared group".into(), String::new())
+            .expect("ensure public channel");
+        let (same_public, created_again) = store
+            .ensure_public_channel("shared group".into(), "ignored topic".into())
+            .expect("ensure existing public channel");
+
+        assert!(created);
+        assert!(!created_again);
+        assert_ne!(public.id, private.id);
+        assert_eq!(same_public.id, public.id);
+        assert_eq!(public.visibility, ChannelVisibility::Public);
+    }
+
+    #[test]
+    fn channel_title_index_updates_and_replays() {
+        let store = fresh_store();
+        let first = store
+            .create_channel("same".into(), None)
+            .expect("create first");
+        let second = store
+            .create_channel("same".into(), None)
+            .expect("create second");
+
+        let ids = store
+            .find_channels_by_title("same")
+            .into_iter()
+            .map(|channel| channel.id)
+            .collect::<Vec<_>>();
+        let mut expected = vec![first.id.clone(), second.id.clone()];
+        expected.sort();
+        assert_eq!(ids, expected);
+        assert_eq!(
+            store
+                .find_channels_by_title("same")
+                .into_iter()
+                .map(|channel| channel.id)
+                .collect::<Vec<_>>(),
+            expected
+        );
+
+        store
+            .update_channel(&first.id, Some("renamed".into()), None, None)
+            .expect("rename channel");
+        assert_eq!(store.find_channels_by_title("same").len(), 1);
+        assert_eq!(store.find_channels_by_title("renamed").len(), 1);
+
+        let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
+        let replayed = Store::open(journal).unwrap();
+        assert_eq!(replayed.find_channels_by_title("same").len(), 1);
+        assert_eq!(replayed.find_channels_by_title("renamed")[0].id, first.id);
+
+        replayed
+            .delete_channel(&second.id, false)
+            .expect("delete second");
+        assert!(replayed.find_channels_by_title("same").is_empty());
+    }
+
+    #[test]
     fn delete_actor_removes_actor_and_channel_membership_on_replay() {
         let store = fresh_store();
         let actor = Actor {
@@ -6561,15 +8156,20 @@ mod tests {
         let channel = store
             .create_channel("private".into(), Some("actor_agent_qa".into()))
             .expect("create channel");
+        store
+            .set_channel_layout("actor_agent_qa", Vec::new())
+            .expect("set layout");
 
         assert!(store.delete_actor("actor_agent_qa").expect("delete actor"));
         assert!(store.get_actor("actor_agent_qa").is_none());
         assert!(!store.is_channel_member(&channel.id, "actor_agent_qa"));
+        assert_eq!(store.get_channel_layout("actor_agent_qa").revision, 0);
 
         let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
         let replayed = Store::open(journal).unwrap();
         assert!(replayed.get_actor("actor_agent_qa").is_none());
         assert!(!replayed.is_channel_member(&channel.id, "actor_agent_qa"));
+        assert_eq!(replayed.get_channel_layout("actor_agent_qa").revision, 0);
     }
 
     #[test]
@@ -6601,9 +8201,15 @@ mod tests {
             .expect("grant agent");
 
         let config = store
-            .set_channel_member_workspace_dir(&channel.id, "actor_agent", "F:/work/demo".into())
+            .set_channel_member_config(
+                &channel.id,
+                "actor_agent",
+                Some("F:/work/demo".into()),
+                Some(vec!["external-agent".into()]),
+            )
             .expect("set config");
         assert_eq!(config.workspace_dir.as_deref(), Some("F:/work/demo"));
+        assert_eq!(config.mention_ids, vec!["external-agent"]);
 
         let journal = Journal::open(store.journal.path().to_path_buf()).unwrap();
         let replayed = Store::open(journal).unwrap();
@@ -6612,6 +8218,12 @@ mod tests {
                 .get_channel_member_config(&channel.id, "actor_agent")
                 .and_then(|config| config.workspace_dir),
             Some("F:/work/demo".into())
+        );
+        assert_eq!(
+            replayed
+                .get_channel_member_config(&channel.id, "actor_agent")
+                .map(|config| config.mention_ids),
+            Some(vec!["external-agent".into()])
         );
 
         replayed
@@ -6996,6 +8608,107 @@ mod tests {
         );
         assert_eq!(deliveries.len(), 1);
         assert_eq!(deliveries[0].source_id, message.id);
+    }
+
+    #[test]
+    fn explicit_mention_span_overrides_ambiguous_server_alias() {
+        let store = fresh_store();
+        store
+            .upsert_actor(test_actor("actor_alice", ActorKind::Human, "Alice"))
+            .unwrap();
+        for actor_id in ["actor_agent_twin_a", "actor_agent_twin_b"] {
+            store
+                .upsert_actor(test_actor(actor_id, ActorKind::Agent, "Twin"))
+                .unwrap();
+        }
+        let channel = store
+            .create_channel("structured mentions".into(), Some("actor_alice".into()))
+            .unwrap();
+        for actor_id in ["actor_agent_twin_a", "actor_agent_twin_b"] {
+            store.grant_channel(&channel.id, actor_id).unwrap();
+        }
+
+        // HashMap iteration makes the plain-text alias intentionally
+        // ambiguous. Select the other actor explicitly so this test proves
+        // the parser candidate at the exact same span is replaced, not
+        // merely deduplicated by actor id.
+        let parser_choice = store.resolve_actor_alias("Twin").expect("parser choice");
+        let explicit_actor = if parser_choice == "actor_agent_twin_a" {
+            "actor_agent_twin_b"
+        } else {
+            "actor_agent_twin_a"
+        };
+        let body = "你好，@Twin 请处理".to_string();
+        let byte_start = body.find("@Twin").expect("mention start");
+        let byte_end = byte_start + "@Twin".len();
+        let message = store
+            .append_message(
+                "actor_alice".into(),
+                format!("#{}", channel.id),
+                MessageKind::Human,
+                body,
+                vec![MessageMention {
+                    actor_or_group_id: explicit_actor.into(),
+                    kind: MessageMentionKind::Actor,
+                    source: "mobile_composer".into(),
+                    byte_start,
+                    byte_end,
+                    display: "@Twin".into(),
+                }],
+                Vec::new(),
+                MessageIntent::RequestAction,
+                DeliveryPolicy::WakeAgent,
+                None,
+                None,
+                Vec::new(),
+                Meta::default(),
+                None,
+            )
+            .expect("append structured mention");
+
+        assert_eq!(message.mentions.len(), 1);
+        assert_eq!(message.mentions[0].actor_or_group_id, explicit_actor);
+        assert_eq!(message.mentions[0].source, "mobile_composer");
+        assert_eq!(
+            &message.body[message.mentions[0].byte_start..message.mentions[0].byte_end],
+            "@Twin"
+        );
+        assert_eq!(
+            store
+                .list_deliveries(explicit_actor, Some(DeliveryState::Pending), 10, None)
+                .len(),
+            1,
+        );
+        assert!(store
+            .list_deliveries(&parser_choice, Some(DeliveryState::Pending), 10, None)
+            .is_empty());
+    }
+
+    #[test]
+    fn explicit_mention_spans_require_valid_utf8_bounds() {
+        let body = "你 @Twin";
+        let mention = |byte_start, byte_end| MessageMention {
+            actor_or_group_id: "actor_agent_twin".into(),
+            kind: MessageMentionKind::Actor,
+            source: "mobile_composer".into(),
+            byte_start,
+            byte_end,
+            display: "@Twin".into(),
+        };
+
+        let split_codepoint = validate_explicit_mention_spans(body, &[mention(1, body.len())])
+            .expect_err("span inside a Chinese codepoint must be rejected");
+        assert!(matches!(
+            split_codepoint,
+            StoreError::InvalidState(message) if message.contains("UTF-8 character boundaries")
+        ));
+
+        let outside = validate_explicit_mention_spans(body, &[mention(4, body.len() + 1)])
+            .expect_err("out-of-bounds span must be rejected");
+        assert!(matches!(
+            outside,
+            StoreError::InvalidState(message) if message.contains("outside message body")
+        ));
     }
 
     #[test]
@@ -7519,7 +9232,7 @@ mod tests {
         assert_eq!(frame.seq, 1);
 
         let closed = store
-            .close_run(&run.id, RunStatus::Completed)
+            .close_run(&run.id, RunStatus::Completed, None)
             .expect("close run");
         assert_eq!(closed.status, RunStatus::Completed);
         assert!(closed.closed_at.is_some());
@@ -7530,6 +9243,423 @@ mod tests {
             replayed.get_run(&run.id).expect("replayed run").status,
             RunStatus::Completed
         );
+    }
+
+    #[test]
+    fn closing_run_consumes_its_trigger_delivery_across_restart() {
+        let store = fresh_store();
+        store
+            .upsert_actor(test_actor("actor_human", ActorKind::Human, "Human"))
+            .unwrap();
+        store
+            .upsert_actor(test_actor("actor_agent_bot", ActorKind::Agent, "Bot"))
+            .unwrap();
+        let channel = store
+            .create_channel("run delivery ack".into(), Some("actor_human".into()))
+            .unwrap();
+        store.grant_channel(&channel.id, "actor_agent_bot").unwrap();
+        let message = send_test_message(
+            &store,
+            "actor_human",
+            &format!("#{}", channel.id),
+            "@Bot handle this once",
+        );
+        assert_eq!(
+            store
+                .list_deliveries("actor_agent_bot", Some(DeliveryState::Pending), 10, None,)
+                .len(),
+            1,
+        );
+
+        let config = store
+            .publish_agent_config_version(
+                "actor_agent_bot".into(),
+                Some("v1".into()),
+                String::new(),
+                "test-model".into(),
+                "test-adapter".into(),
+                serde_json::Value::Null,
+                Vec::new(),
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                "actor_agent_bot".into(),
+                Meta::default(),
+            )
+            .expect("publish config");
+        let run = store
+            .open_run(
+                "actor_agent_bot".into(),
+                message.scope.clone(),
+                None,
+                Some(message.id.clone()),
+                config.id,
+                serde_json::from_value(serde_json::json!({
+                    "triggerSourceId": message.id,
+                }))
+                .expect("run metadata"),
+            )
+            .expect("open run");
+
+        store
+            .close_run(&run.id, RunStatus::Completed, None)
+            .expect("close run");
+        assert!(
+            store
+                .list_deliveries("actor_agent_bot", Some(DeliveryState::Pending), 10, None,)
+                .is_empty(),
+            "a terminal run must not leave its trigger pending for daemon restart",
+        );
+
+        let replayed = Store::open(Journal::open(store.journal.path().to_path_buf()).unwrap())
+            .expect("replay");
+        assert!(
+            replayed
+                .list_deliveries("actor_agent_bot", Some(DeliveryState::Pending), 10, None,)
+                .is_empty(),
+            "the consumed trigger must stay delivered after server restart",
+        );
+    }
+
+    #[test]
+    fn startup_repairs_legacy_terminal_ack_gap_but_preserves_canceled_requeue() {
+        let store = fresh_store();
+        store
+            .upsert_actor(test_actor("actor_human", ActorKind::Human, "Human"))
+            .unwrap();
+        store
+            .upsert_actor(test_actor("actor_agent_bot", ActorKind::Agent, "Bot"))
+            .unwrap();
+        let channel = store
+            .create_channel("legacy run ack".into(), Some("actor_human".into()))
+            .unwrap();
+        store.grant_channel(&channel.id, "actor_agent_bot").unwrap();
+        let completed_message = send_test_message(
+            &store,
+            "actor_human",
+            &format!("#{}", channel.id),
+            "@Bot completed before disconnect",
+        );
+        let canceled_message = send_test_message(
+            &store,
+            "actor_human",
+            &format!("#{}", channel.id),
+            "@Bot canceled and requeued",
+        );
+        let config = store
+            .publish_agent_config_version(
+                "actor_agent_bot".into(),
+                Some("v1".into()),
+                String::new(),
+                "test-model".into(),
+                "test-adapter".into(),
+                serde_json::Value::Null,
+                Vec::new(),
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                "actor_agent_bot".into(),
+                Meta::default(),
+            )
+            .expect("publish config");
+        let open = |message: &Message| {
+            store
+                .open_run(
+                    "actor_agent_bot".into(),
+                    message.scope.clone(),
+                    None,
+                    Some(message.id.clone()),
+                    config.id.clone(),
+                    serde_json::from_value(serde_json::json!({
+                        "triggerSourceId": message.id,
+                    }))
+                    .expect("run metadata"),
+                )
+                .expect("open run")
+        };
+        let mut completed = open(&completed_message);
+        completed.status = RunStatus::Completed;
+        completed.closed_at = Some(Utc::now());
+        let mut canceled = open(&canceled_message);
+        canceled.status = RunStatus::Canceled;
+        canceled.closed_at = Some(Utc::now());
+
+        // Reproduce the legacy two-RPC crash window exactly: terminal run
+        // records made it to disk, but no DeliveryUpsert followed them.
+        for run in [completed, canceled] {
+            let mutation = Mutation::RunUpsert(run);
+            store
+                .journal
+                .append(&mutation)
+                .expect("append legacy close");
+            apply(&mut store.inner.write(), mutation);
+        }
+        assert_eq!(
+            store
+                .list_deliveries("actor_agent_bot", Some(DeliveryState::Pending), 10, None,)
+                .len(),
+            2,
+        );
+
+        let reopened = Store::open(Journal::open(store.journal.path().to_path_buf()).unwrap())
+            .expect("reopen and repair");
+        let pending =
+            reopened.list_deliveries("actor_agent_bot", Some(DeliveryState::Pending), 10, None);
+        assert_eq!(
+            pending
+                .iter()
+                .map(|delivery| delivery.source_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![canceled_message.id.as_str()],
+            "completed work is repaired, while cancel-and-requeue remains pending",
+        );
+    }
+
+    #[test]
+    fn terminal_close_retry_adds_late_acks_without_reviving_cancelled_delivery() {
+        let store = fresh_store();
+        store
+            .upsert_actor(test_actor("actor_human", ActorKind::Human, "Human"))
+            .unwrap();
+        store
+            .upsert_actor(test_actor("actor_agent_bot", ActorKind::Agent, "Bot"))
+            .unwrap();
+        let channel = store
+            .create_channel("late acks".into(), Some("actor_human".into()))
+            .unwrap();
+        store.grant_channel(&channel.id, "actor_agent_bot").unwrap();
+        let pending_message = send_test_message(
+            &store,
+            "actor_human",
+            &format!("#{}", channel.id),
+            "@Bot pending retry",
+        );
+        let withdrawn_message = send_test_message(
+            &store,
+            "actor_human",
+            &format!("#{}", channel.id),
+            "@Bot withdrawn wake",
+        );
+        store
+            .cancel_pending_deliveries(
+                "actor_agent_bot",
+                Some(std::slice::from_ref(&withdrawn_message.id)),
+            )
+            .expect("cancel delivery");
+        let config = store
+            .publish_agent_config_version(
+                "actor_agent_bot".into(),
+                Some("v1".into()),
+                String::new(),
+                "test-model".into(),
+                "test-adapter".into(),
+                serde_json::Value::Null,
+                Vec::new(),
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                "actor_agent_bot".into(),
+                Meta::default(),
+            )
+            .expect("publish config");
+        let run = store
+            .open_run(
+                "actor_agent_bot".into(),
+                pending_message.scope.clone(),
+                None,
+                Some("cancel-and-requeue".into()),
+                config.id,
+                Meta::default(),
+            )
+            .expect("open run");
+        store
+            .close_run(&run.id, RunStatus::Canceled, None)
+            .expect("legacy canceled close leaves pending");
+
+        let requested = vec![pending_message.id.clone(), withdrawn_message.id.clone()];
+        let (_, acknowledged) = store
+            .close_run_with_delivery_acks(&run.id, RunStatus::Canceled, None, &requested)
+            .expect("terminal retry with late acks");
+        assert_eq!(
+            acknowledged
+                .iter()
+                .map(|delivery| delivery.source_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![pending_message.id.as_str()],
+        );
+        assert_eq!(
+            store
+                .ack_delivery("actor_agent_bot", &withdrawn_message.id)
+                .expect("late legacy ack remains idempotent")
+                .state,
+            DeliveryState::Cancelled,
+        );
+        assert_eq!(
+            store
+                .list_deliveries("actor_agent_bot", Some(DeliveryState::Cancelled), 10, None,)
+                .into_iter()
+                .map(|delivery| delivery.source_id)
+                .collect::<Vec<_>>(),
+            vec![withdrawn_message.id.clone()],
+            "a withdrawn wake must stay cancelled rather than becoming delivered",
+        );
+
+        // Deterministically reproduce the worst concurrent ordering on disk:
+        // cancellation is already durable, then a stale close snapshot tries
+        // to apply Delivered for the same row. Both the live apply path and a
+        // fresh replay must keep the absorbing Cancelled state.
+        let mut stale_delivery = store
+            .inner
+            .read()
+            .deliveries
+            .get(&(withdrawn_message.id.clone(), "actor_agent_bot".to_string()))
+            .cloned()
+            .expect("cancelled delivery exists");
+        stale_delivery.state = DeliveryState::Delivered;
+        stale_delivery.updated_at = Utc::now();
+        let stale_finish = Mutation::RunFinish {
+            run: store.get_run(&run.id).expect("terminal run exists"),
+            deliveries: vec![stale_delivery],
+        };
+        store
+            .journal
+            .append(&stale_finish)
+            .expect("append stale finish after cancellation");
+        apply(&mut store.inner.write(), stale_finish);
+        assert_eq!(
+            store
+                .ack_delivery("actor_agent_bot", &withdrawn_message.id)
+                .expect("live state remains terminal")
+                .state,
+            DeliveryState::Cancelled,
+        );
+
+        let replayed = Store::open(Journal::open(store.journal.path().to_path_buf()).unwrap())
+            .expect("replay cancellation followed by stale finish");
+        assert_eq!(
+            replayed
+                .list_deliveries("actor_agent_bot", Some(DeliveryState::Cancelled), 10, None,)
+                .into_iter()
+                .map(|delivery| delivery.source_id)
+                .collect::<Vec<_>>(),
+            vec![withdrawn_message.id],
+            "journal replay must not revive a cancelled delivery",
+        );
+    }
+
+    #[test]
+    fn close_run_with_usage_accumulates_and_survives_replay() {
+        use proto::types::TokenUsageSummary;
+
+        let store = fresh_store();
+        store
+            .upsert_actor(test_actor("actor_agent_bot", ActorKind::Agent, "Bot"))
+            .unwrap();
+        let channel = store
+            .create_channel("usage".into(), Some("actor_agent_bot".into()))
+            .unwrap();
+        let config = store
+            .publish_agent_config_version(
+                "actor_agent_bot".into(),
+                Some("v1".into()),
+                String::new(),
+                "test-model".into(),
+                "test-adapter".into(),
+                serde_json::Value::Null,
+                Vec::new(),
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                "actor_agent_bot".into(),
+                Meta::default(),
+            )
+            .expect("publish config");
+        let scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: channel.id.clone(),
+        };
+        let usage = |input: u64, output: u64| TokenUsageSummary {
+            input_tokens: Some(input),
+            output_tokens: Some(output),
+            total_tokens: Some(input + output),
+            ..TokenUsageSummary::default()
+        };
+
+        let open = |reason: &str| {
+            store
+                .open_run(
+                    "actor_agent_bot".into(),
+                    scope.clone(),
+                    None,
+                    Some(reason.into()),
+                    config.id.clone(),
+                    Meta::default(),
+                )
+                .expect("open run")
+        };
+
+        let first = open("turn-1");
+        let first = store
+            .close_run(&first.id, RunStatus::Completed, Some(usage(100, 40)))
+            .expect("close first run");
+        let meta = first
+            .metadata
+            .get("token_usage")
+            .expect("first run has token_usage metadata");
+        assert_eq!(meta["increment"]["total_tokens"], 140);
+        assert_eq!(meta["cumulative"]["total_tokens"], 140);
+        store
+            .close_run_with_delivery_acks(
+                &first.id,
+                RunStatus::Completed,
+                Some(usage(999, 999)),
+                &[],
+            )
+            .expect("terminal retry is idempotent");
+        assert_eq!(
+            store
+                .run_usage_total("actor_agent_bot", &channel.id)
+                .and_then(|total| total.total_tokens),
+            Some(140),
+            "a terminal run retry must not account usage twice",
+        );
+
+        let second = open("turn-2");
+        let second = store
+            .close_run(&second.id, RunStatus::Completed, Some(usage(50, 10)))
+            .expect("close second run");
+        let meta = second
+            .metadata
+            .get("token_usage")
+            .expect("second run has token_usage metadata");
+        assert_eq!(meta["increment"]["total_tokens"], 60);
+        assert_eq!(
+            meta["cumulative"]["total_tokens"], 200,
+            "cumulative must fold successive increments"
+        );
+
+        // Closing without usage leaves no token_usage metadata and does not
+        // disturb the running totals.
+        let third = open("turn-3");
+        let third = store
+            .close_run(&third.id, RunStatus::Failed, None)
+            .expect("close third run");
+        assert!(third.metadata.get("token_usage").is_none());
+
+        let total = store
+            .run_usage_total("actor_agent_bot", &channel.id)
+            .expect("usage total present");
+        assert_eq!(total.total_tokens, Some(200));
+
+        // Replay rebuilds the durable counters from run metadata alone.
+        let replayed = Store::open(Journal::open(store.journal.path().to_path_buf()).unwrap())
+            .expect("replay");
+        let total = replayed
+            .run_usage_total("actor_agent_bot", &channel.id)
+            .expect("usage total survives replay");
+        assert_eq!(total.total_tokens, Some(200));
+        assert_eq!(total.input_tokens, Some(150));
+        assert_eq!(total.output_tokens, Some(50));
     }
 
     #[test]
@@ -8166,6 +10296,181 @@ mod tests {
     }
 
     #[test]
+    fn public_runs_hide_worker_metadata_from_other_scope_members() {
+        let store = fresh_store();
+        store
+            .upsert_actor(test_actor("actor_agent_bot", ActorKind::Agent, "Bot"))
+            .unwrap();
+        store
+            .upsert_actor(test_actor("actor_observer", ActorKind::Human, "Observer"))
+            .unwrap();
+        let channel = store.create_channel("public".into(), None).unwrap();
+        let config = store
+            .publish_agent_config_version(
+                "actor_agent_bot".into(),
+                Some("v1".into()),
+                String::new(),
+                "test-model".into(),
+                "test-adapter".into(),
+                serde_json::Value::Null,
+                Vec::new(),
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                "actor_agent_bot".into(),
+                Meta::default(),
+            )
+            .expect("publish config");
+        let mut metadata = Meta::default();
+        metadata.insert(
+            "noReplyReason".into(),
+            serde_json::json!("prompt-derived secret state"),
+        );
+        let run = store
+            .open_run(
+                "actor_agent_bot".into(),
+                ScopeRef {
+                    kind: ScopeKind::Channel,
+                    id: channel.id,
+                },
+                None,
+                Some("worker-provided diagnostic".into()),
+                config.id,
+                metadata,
+            )
+            .expect("open run");
+
+        let worker = store
+            .project_run_for_actor(&run, "actor_agent_bot")
+            .expect("worker projection");
+        assert_eq!(
+            worker
+                .metadata
+                .get("noReplyReason")
+                .and_then(serde_json::Value::as_str),
+            Some("prompt-derived secret state")
+        );
+        assert_eq!(
+            worker.start_reason.as_deref(),
+            Some("worker-provided diagnostic")
+        );
+
+        let observer = store
+            .project_run_for_actor(&run, "actor_observer")
+            .expect("public lifecycle projection");
+        assert_eq!(observer.id, run.id);
+        assert_eq!(observer.status, run.status);
+        assert!(observer.metadata.is_empty());
+        assert!(observer.start_reason.is_none());
+
+        let listed = store
+            .list_runs("actor_observer", None, None, None, 50)
+            .expect("observer list");
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].metadata.is_empty());
+        assert!(listed[0].start_reason.is_none());
+    }
+
+    #[test]
+    fn private_triggered_runs_do_not_leak_execution_metadata() {
+        let store = fresh_store();
+        for (id, kind, name) in [
+            ("actor_player", ActorKind::Human, "Player"),
+            ("actor_agent_host", ActorKind::Agent, "Host"),
+            ("actor_observer", ActorKind::Human, "Observer"),
+        ] {
+            store.upsert_actor(test_actor(id, kind, name)).unwrap();
+        }
+        let channel = store.create_channel("public".into(), None).unwrap();
+        for actor_id in ["actor_player", "actor_agent_host", "actor_observer"] {
+            store.grant_channel(&channel.id, actor_id).unwrap();
+        }
+
+        let mut message_metadata = Meta::default();
+        message_metadata.insert("privateTo".into(), serde_json::json!(["actor_agent_host"]));
+        let private_message = store
+            .append_message(
+                "actor_player".into(),
+                format!("#{}", channel.id),
+                MessageKind::Human,
+                "my secret role is seer".into(),
+                Vec::new(),
+                vec![AudienceRef {
+                    kind: AudienceKind::Actor,
+                    id: "actor_agent_host".into(),
+                    display: None,
+                }],
+                MessageIntent::RequestAction,
+                DeliveryPolicy::WakeAgent,
+                None,
+                None,
+                Vec::new(),
+                message_metadata,
+                None,
+            )
+            .expect("append private trigger");
+        let config = store
+            .publish_agent_config_version(
+                "actor_agent_host".into(),
+                Some("v1".into()),
+                String::new(),
+                "test-model".into(),
+                "test-adapter".into(),
+                serde_json::Value::Null,
+                Vec::new(),
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                "actor_agent_host".into(),
+                Meta::default(),
+            )
+            .expect("publish config");
+        let mut run_metadata = Meta::default();
+        run_metadata.insert(
+            "noReplyReason".into(),
+            serde_json::json!("all secret roles and night actions"),
+        );
+        let run = store
+            .open_run(
+                "actor_agent_host".into(),
+                private_message.scope.clone(),
+                Some(private_message.id.clone()),
+                Some(private_message.id.clone()),
+                config.id,
+                run_metadata,
+            )
+            .expect("open private-triggered run");
+
+        let worker_runs = store
+            .list_runs("actor_agent_host", None, None, None, 50)
+            .unwrap();
+        assert_eq!(worker_runs.len(), 1);
+        assert_eq!(
+            worker_runs[0]
+                .metadata
+                .get("noReplyReason")
+                .and_then(serde_json::Value::as_str),
+            Some("all secret roles and night actions")
+        );
+
+        let sender_runs = store
+            .list_runs("actor_player", None, None, None, 50)
+            .unwrap();
+        assert_eq!(sender_runs.len(), 1);
+        assert_eq!(sender_runs[0].id, run.id);
+        assert!(sender_runs[0].metadata.is_empty());
+        assert!(sender_runs[0].start_reason.is_none());
+
+        assert!(store
+            .list_runs("actor_observer", None, None, None, 50)
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .project_run_for_actor(&run, "actor_observer")
+            .is_none());
+    }
+
+    #[test]
     fn list_runs_filters_sorts_and_respects_acl() {
         let store = fresh_store();
         store
@@ -8253,7 +10558,7 @@ mod tests {
 
         // Status filter.
         store
-            .close_run(&run_public.id, RunStatus::Failed)
+            .close_run(&run_public.id, RunStatus::Failed, None)
             .expect("close run");
         let runs = store
             .list_runs(

@@ -103,7 +103,7 @@ impl Subscriptions {
         actor_id: String,
         actor_kind: ActorKind,
         claim_inbox: bool,
-    ) {
+    ) -> bool {
         let mut inner = self.inner.write();
         if let Some(c) = inner.connections.get_mut(connection_id) {
             c.actor_id = Some(actor_id.clone());
@@ -128,8 +128,12 @@ impl Subscriptions {
                 kind = ?actor_kind,
                 "actor connection bound as observer; inbox owner unchanged",
             );
-            return;
+            return false;
         }
+        let previously_owned = matches!(
+            inner.actor_conn.get(&actor_id),
+            Some(prev) if inner.connections.contains_key(prev)
+        );
         let take_inbox = match inner.actor_conn.get(&actor_id) {
             None => true,
             Some(prev) if prev == connection_id => true,
@@ -167,14 +171,22 @@ impl Subscriptions {
         if take_inbox {
             inner.actor_conn.insert(actor_id, connection_id.into());
         }
+        // "Came online" = took the inbox slot while no live connection held
+        // it before. Used for presence.changed broadcasts.
+        take_inbox && !previously_owned
     }
 
-    pub fn remove_connection(&self, connection_id: &str) {
+    /// Remove a connection; returns the actor id whose canonical inbox
+    /// binding was dropped (if any), so the caller can broadcast a
+    /// presence change.
+    pub fn remove_connection(&self, connection_id: &str) -> Option<String> {
         let mut inner = self.inner.write();
+        let mut went_offline = None;
         if let Some(c) = inner.connections.remove(connection_id) {
             if let Some(actor) = &c.actor_id {
                 if inner.actor_conn.get(actor).map(|s| s.as_str()) == Some(connection_id) {
                     inner.actor_conn.remove(actor);
+                    went_offline = Some(actor.clone());
                 }
             }
         }
@@ -185,6 +197,12 @@ impl Subscriptions {
                 }
             }
         }
+        went_offline
+    }
+
+    /// Stable actor kind learned at `bind_actor`, if any.
+    pub fn actor_kind(&self, actor_id: &str) -> Option<ActorKind> {
+        self.inner.read().actor_kind.get(actor_id).copied()
     }
 
     pub fn subscribe(&self, connection_id: &str, scope: ScopeRef) -> bool {
@@ -226,6 +244,19 @@ impl Subscriptions {
             .connections
             .get(connection_id)
             .and_then(|c| c.actor_id.clone())
+    }
+
+    /// Snapshot every live connection and its bound actor identity.  Global
+    /// channel visibility transitions need per-connection routing: explicit
+    /// members receive the updated private channel, while everyone else gets
+    /// only a removal notification (and therefore no private metadata).
+    pub(crate) fn connection_actors(&self) -> Vec<(String, Option<String>)> {
+        self.inner
+            .read()
+            .connections
+            .values()
+            .map(|connection| (connection.id.clone(), connection.actor_id.clone()))
+            .collect()
     }
 
     /// True when `connection_id` is a stale/duplicate agent worker connection
@@ -306,10 +337,15 @@ impl Subscriptions {
         }
     }
 
-    /// Send a JSON-RPC notification to every connected client, regardless
-    /// of scope subscriptions. Used for global announcements like
-    /// `channel.created` for public channels.
-    pub fn broadcast_to_all(&self, method: &str, payload: Value) {
+    /// Send a JSON-RPC notification to every authenticated client, regardless
+    /// of scope subscriptions. When server authentication is disabled, every
+    /// connection remains eligible for backwards-compatible discovery events.
+    pub fn broadcast_to_authenticated(
+        &self,
+        auth: &crate::auth::ServerAuth,
+        method: &str,
+        payload: Value,
+    ) {
         let frame = match serde_json::to_string(&proto::Notification::new(method, Some(payload))) {
             Ok(s) => s,
             Err(e) => {
@@ -319,7 +355,9 @@ impl Subscriptions {
         };
         let inner = self.inner.read();
         for c in inner.connections.values() {
-            let _ = c.tx.send(frame.clone());
+            if auth.is_authenticated(&c.id) {
+                let _ = c.tx.send(frame.clone());
+            }
         }
     }
 
@@ -426,6 +464,30 @@ impl Subscriptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protected_global_broadcast_reaches_only_authenticated_connections() {
+        let subs = Subscriptions::new();
+        let (allowed_tx, mut allowed_rx) = mpsc::unbounded_channel();
+        let (blocked_tx, mut blocked_rx) = mpsc::unbounded_channel();
+        subs.add_connection(Connection {
+            id: "conn_allowed".into(),
+            actor_id: None,
+            tx: allowed_tx,
+        });
+        subs.add_connection(Connection {
+            id: "conn_blocked".into(),
+            actor_id: None,
+            tx: blocked_tx,
+        });
+        let auth = crate::auth::ServerAuth::with_password("secret").expect("password auth");
+        assert!(auth.authenticate("conn_allowed", "secret"));
+
+        subs.broadcast_to_authenticated(&auth, "stream/update", serde_json::json!({ "ok": true }));
+
+        assert!(allowed_rx.try_recv().is_ok());
+        assert!(blocked_rx.try_recv().is_err());
+    }
 
     fn make_conn(id: &str) -> Connection {
         let (tx, _rx) = mpsc::unbounded_channel();

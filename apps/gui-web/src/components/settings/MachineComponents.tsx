@@ -6,6 +6,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { capitalize, statusDotClass } from "@/lib/format-utils";
+import { useI18n } from "@/lib/i18n";
 import { cn, formatTime } from "@/lib/utils";
 import type { MachineInfo } from "@/ipc/types";
 import { Check, HardDrive, Loader2, Plus, Server, Trash2, X } from "lucide-react";
@@ -30,6 +31,7 @@ export function HostListItem({
   selected: boolean;
   onSelect: () => void;
 }) {
+  const { t } = useI18n();
   return (
     <button
       type="button"
@@ -50,7 +52,11 @@ export function HostListItem({
           <span className={cn("h-2 w-2 shrink-0 rounded-full", statusDotClass(machine.connectionStatus))} />
         </span>
         <span className="mt-1 block truncate text-xs text-[#667085]">
-          {machine.providers.length} runtimes · {machine.onlineAgentCount}/{machine.agentCount} agents online
+          {t("{{providers}} runtimes · {{online}}/{{agents}} agents online", {
+            providers: machine.providers.length,
+            online: machine.onlineAgentCount,
+            agents: machine.agentCount,
+          })}
         </span>
       </span>
     </button>
@@ -64,15 +70,16 @@ export function RegisteredHostsEmpty({
   busy: string | null;
   onOpenRegisterHost: () => void;
 }) {
+  const { t } = useI18n();
   return (
     <div className="flex min-h-full items-center justify-center bg-white px-6 py-10">
       <div className="w-full max-w-xl rounded-xl border border-dashed border-[#dfe3ec] bg-[#fbfbfd] p-6 text-center">
         <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-xl bg-[#f1efff] text-[#503ed4]">
           <Server size={22} />
         </div>
-        <h2 className="mt-4 text-lg font-bold text-[#111827]">Register a Host</h2>
+        <h2 className="mt-4 text-lg font-bold text-[#111827]">{t("Register a Host")}</h2>
         <p className="mt-2 text-sm leading-6 text-[#667085]">
-          Prepare a daemon registration for this space, then start the generated command so the host can publish its runtime inventory.
+          {t("Prepare a daemon registration for this space, then start the generated command so the host can publish its runtime inventory.")}
         </p>
         <Button
           className="mt-5 rounded-lg"
@@ -84,7 +91,7 @@ export function RegisteredHostsEmpty({
           ) : (
             <Plus size={15} />
           )}
-          Register Host
+          {t("Register Host")}
         </Button>
       </div>
     </div>
@@ -105,7 +112,8 @@ export function HostRegisterDialog({
   onCreated: (machine: MachineInfo) => void;
   onClose: () => void;
 }) {
-  const [name, setName] = useState("Local Host");
+  const { t } = useI18n();
+  const [name, setName] = useState(() => t("Local Host"));
   const [dataRoot, setDataRoot] = useState("");
   const creating = busy === "machine:create";
   const canSubmit = Boolean(name.trim()) && !creating;
@@ -153,16 +161,16 @@ export function HostRegisterDialog({
               <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-[#f1efff] text-[#503ed4]">
                 <Server size={15} />
               </span>
-              Register Host
+              {t("Register Host")}
             </div>
             <div className="mt-2 text-sm text-[#667085]">
-              Create a daemon launch profile for the active space.
+              {t("Create a daemon launch profile for the active space.")}
             </div>
           </div>
           <button
             type="button"
             className="composer-icon h-8 min-w-8"
-            title="Close"
+            title={t("Close")}
             onClick={onClose}
             disabled={creating}
           >
@@ -173,28 +181,28 @@ export function HostRegisterDialog({
         <div className="space-y-4 p-5">
           <label className="block">
             <span className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
-              Display Name
+              {t("Display Name")}
             </span>
             <Input
               value={name}
               onChange={(event) => setName(event.target.value)}
               className="mt-2"
-              placeholder="Local Host"
+              placeholder={t("Local Host")}
               autoFocus
             />
           </label>
           <label className="block">
             <span className="text-xs font-semibold uppercase tracking-wide text-[#596174]">
-              Data Root
+              {t("Data Root")}
             </span>
             <Input
               value={dataRoot}
               onChange={(event) => setDataRoot(event.target.value)}
               className="mt-2 font-mono text-xs"
-              placeholder="Use Loom default"
+              placeholder={t("Use Loom default")}
             />
             <span className="mt-2 block text-xs leading-5 text-[#667085]">
-              Leave empty unless this host should store agent profiles under a specific path.
+              {t("Leave empty unless this host should store agent profiles under a specific path.")}
             </span>
           </label>
         </div>
@@ -207,11 +215,11 @@ export function HostRegisterDialog({
             disabled={creating}
             className="rounded-lg border-[#dfe3ec] bg-white"
           >
-            Cancel
+            {t("Cancel")}
           </Button>
           <Button type="submit" disabled={!canSubmit} className="rounded-lg">
             {creating ? <Loader2 className="animate-spin" size={15} /> : <Check size={15} />}
-            Prepare Host
+            {t("Prepare Host")}
           </Button>
         </div>
       </form>
@@ -231,6 +239,7 @@ export function MachineCard({
   onRemove: (machineId: string) => void;
   onOpenLocalPath: (path: string) => void;
 }) {
+  const { t } = useI18n();
   const canRemoveMachine = machine.capabilities.includes("machine.remove");
   const isLocalRegistration = machine.source === "local_registration";
 
@@ -253,63 +262,63 @@ export function MachineCard({
                     statusDotClass(machine.connectionStatus),
                   )}
                 />
-                <span>{capitalize(machine.connectionStatus)}</span>
+                <span>{t(capitalize(machine.connectionStatus))}</span>
                 <span className="text-[#a0a6b3]">/</span>
                 <span className="font-mono text-xs">{machine.id}</span>
               </div>
               <div className="mt-3 flex flex-wrap gap-2">
-                <Badge variant="secondary">{machine.setupStatus}</Badge>
-                <Badge variant="outline">{machine.kind}</Badge>
-                {machine.readOnly && <Badge variant="warning">read only</Badge>}
+                <Badge variant="secondary">{t(machine.setupStatus)}</Badge>
+                <Badge variant="outline">{t(machine.kind)}</Badge>
+                {machine.readOnly && <Badge variant="warning">{t("read only")}</Badge>}
               </div>
             </div>
           </div>
 
           <div className="flex flex-wrap items-start gap-6">
-            <HostMetric label="Runtimes" value={machine.providers.length} />
-            <HostMetric label="Agents" value={machine.agentCount} />
-            <HostMetric label="Online" value={machine.onlineAgentCount} />
+            <HostMetric label={t("Runtimes")} value={machine.providers.length} />
+            <HostMetric label={t("Agents")} value={machine.agentCount} />
+            <HostMetric label={t("Online")} value={machine.onlineAgentCount} />
             {machine.canOpenLocalPath && (
               <Button
                 variant="outline"
                 size="sm"
-                title="Open data root"
+                title={t("Open data root")}
                 onClick={() => onOpenLocalPath(machine.dataRoot)}
                 className="rounded-lg border-[#dfe3ec] bg-white"
               >
                 <HardDrive size={15} />
-                Open Data
+                {t("Open Data")}
               </Button>
             )}
           </div>
         </div>
       </section>
 
-      <HostDetailSection title="Name">
+      <HostDetailSection title={t("Name")}>
         <div className="text-sm font-semibold text-[#111827]">{machine.name}</div>
       </HostDetailSection>
 
-      <HostDetailSection title="Info">
+      <HostDetailSection title={t("Info")}>
         <div className="divide-y divide-[#edf0f5]">
-          <HostInfoRow label="Source">
-            {machine.source || "Not set"}
+          <HostInfoRow label={t("Source")}>
+            {machine.source ? t(machine.source) : t("Not set")}
           </HostInfoRow>
-          <HostInfoRow label="Data Root" mono>
-            {machine.dataRoot || "Not set"}
+          <HostInfoRow label={t("Data Root")} mono>
+            {machine.dataRoot || t("Not set")}
           </HostInfoRow>
-          <HostInfoRow label="Config Dir" mono>
-            {machine.configDir || "Not set"}
+          <HostInfoRow label={t("Config Dir")} mono>
+            {machine.configDir || t("Not set")}
           </HostInfoRow>
-          <HostInfoRow label="Connection Actor" mono>
-            {machine.connectionActorId || "Not set"}
+          <HostInfoRow label={t("Connection Actor")} mono>
+            {machine.connectionActorId || t("Not set")}
           </HostInfoRow>
-          <HostInfoRow label="Serve Command" mono>
-            {machine.serveCommand || "Not set"}
+          <HostInfoRow label={t("Serve Command")} mono>
+            {machine.serveCommand || t("Not set")}
           </HostInfoRow>
-          <HostInfoRow label="Detected Runtimes">
+          <HostInfoRow label={t("Detected Runtimes")}>
             <div className="flex flex-wrap gap-2">
               {machine.providers.length === 0 ? (
-                <Badge variant="warning">no runtimes detected</Badge>
+                <Badge variant="warning">{t("no runtimes detected")}</Badge>
               ) : (
                 machine.providers.map((provider) => (
                   <ProviderBadge key={provider.id} provider={provider} />
@@ -317,8 +326,8 @@ export function MachineCard({
               )}
             </div>
           </HostInfoRow>
-          <HostInfoRow label="Inventory">
-            Revision {machine.inventoryRevision}
+          <HostInfoRow label={t("Inventory")}>
+            {t("Revision {{revision}}", { revision: machine.inventoryRevision })}
             {machine.inventoryObservedAt
               ? ` · ${formatTime(machine.inventoryObservedAt)}`
               : ""}
@@ -326,60 +335,60 @@ export function MachineCard({
         </div>
       </HostDetailSection>
 
-      <HostDetailSection title="Actions">
+      <HostDetailSection title={t("Actions")}>
         {isLocalRegistration ? (
           <div className="flex flex-col gap-3">
             <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-[#dfe3ec] bg-[#fbfbfd] px-4 py-3">
               <div className="min-w-0">
-                <div className="text-sm font-bold text-[#111827]">Start Host</div>
+                <div className="text-sm font-bold text-[#111827]">{t("Start Host")}</div>
                 <div className="mt-1 text-sm text-[#667085]">
-                  Run the serve command above, then refresh hosts after the daemon connects.
+                  {t("Run the serve command above, then refresh hosts after the daemon connects.")}
                 </div>
               </div>
-              <Badge variant="warning">pending daemon</Badge>
+              <Badge variant="warning">{t("pending daemon")}</Badge>
             </div>
             <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3">
               <div className="min-w-0">
-                <div className="text-sm font-bold text-[#991b1b]">Discard Registration</div>
+                <div className="text-sm font-bold text-[#991b1b]">{t("Discard Registration")}</div>
                 <div className="mt-1 text-sm text-[#b91c1c]">
-                  Remove this pending host registration. This will delete the local config and data directories.
+                  {t("Remove this pending host registration. This will delete the local config and data directories.")}
                 </div>
               </div>
               <Button
                 variant="destructive"
                 size="sm"
-                title="Discard pending registration"
+                title={t("Discard pending registration")}
                 onClick={() => onRemove(machine.id)}
                 disabled={busy === `machine:remove:${machine.id}`}
                 className="rounded-lg"
               >
                 <Trash2 size={15} />
-                Discard
+                {t("Discard")}
               </Button>
             </div>
           </div>
         ) : (
           <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-[#dfe3ec] bg-[#fbfbfd] px-4 py-3">
             <div className="min-w-0">
-              <div className="text-sm font-bold text-[#111827]">Delete Host</div>
+              <div className="text-sm font-bold text-[#111827]">{t("Delete Host")}</div>
               <div className="mt-1 text-sm text-[#667085]">
-                Permanently remove this host after its agents are deleted.
+                {t("Permanently remove this host after its agents are deleted.")}
               </div>
             </div>
             {canRemoveMachine ? (
               <Button
                 variant="destructive"
                 size="sm"
-                title="Remove host"
+                title={t("Remove host")}
                 onClick={() => onRemove(machine.id)}
                 disabled={busy === `machine:remove:${machine.id}`}
                 className="rounded-lg"
               >
                 <Trash2 size={15} />
-                Delete Host
+                {t("Delete Host")}
               </Button>
             ) : (
-              <Badge variant="warning">managed by server</Badge>
+              <Badge variant="warning">{t("managed by server")}</Badge>
             )}
           </div>
         )}

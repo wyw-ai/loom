@@ -6,6 +6,7 @@ import { AvatarStack } from "@/components/agent/AvatarStack";
 import { ChannelDeleteConfirm } from "@/components/channel/ChannelDeleteConfirm";
 import { EmptyState } from "@/components/shared/EmptyState";
 import { channelGroupSections, channelTopic } from "@/lib/channel-utils";
+import { ungroupedChannelGroupId } from "@/lib/constants";
 import { capitalize, fallbackActor } from "@/lib/format-utils";
 import { cn } from "@/lib/utils";
 import { Clock, Hash, Loader2, Lock, Search, Trash2 } from "lucide-react";
@@ -38,6 +39,9 @@ export function ChannelsView({
     return text.includes(query.trim().toLowerCase());
   });
   const sections = channelGroupSections(channelGroups, filteredChannels);
+  const hasUserChannelGroups = channelGroups.some(
+    (group) => group.id !== ungroupedChannelGroupId,
+  );
   const closeDeleteConfirm = () => {
     setDeleteChannelId(null);
   };
@@ -74,7 +78,7 @@ export function ChannelsView({
           </div>
           {sections.map((section) => (
             <div key={section.id}>
-              {(section.local || channelGroups.length > 0) && (
+              {(section.local || hasUserChannelGroups) && (
                 <div className="channel-table-group">
                   {section.title}
                   <span>({section.channels.length} channels)</span>

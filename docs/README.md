@@ -40,4 +40,5 @@ runtime/provider behavior, GUI product flows, or local verification steps.
 ## Contracts And Runbooks
 
 - [artifact-contracts.md](./artifact-contracts.md) - artifact shape conventions, generic contract structures, and versioning rules.
+- [release-preview-workflow.md](./release-preview-workflow.md) - versioned `preview-X.Y.Z` release candidates, automatic 0.x minor rollover, recovery, and release-bot setup.
 - [e2e-runbook-local.md](./e2e-runbook-local.md) - local end-to-end prerequisites, build commands, core checks, harness entry points, troubleshooting, and release gate.

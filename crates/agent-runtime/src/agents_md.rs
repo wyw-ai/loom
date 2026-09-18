@@ -9,6 +9,11 @@ use std::path::Path;
 
 const BEGIN_MARKER: &str = "<!-- BEGIN loom -->";
 const END_MARKER: &str = "<!-- END loom -->";
+const CLAUDE_BRIDGE_BEGIN_MARKER: &str = "<!-- BEGIN loom claude bridge -->";
+const CLAUDE_BRIDGE_END_MARKER: &str = "<!-- END loom claude bridge -->";
+const CLAUDE_BRIDGE_BLOCK: &str = "<!-- BEGIN loom claude bridge -->\n\
+@AGENTS.md\n\
+<!-- END loom claude bridge -->";
 
 #[derive(Debug, Clone, Default)]
 pub struct AgentsMdContext {
@@ -112,8 +117,54 @@ pub fn remove_agents_md(workspace: &Path) -> io::Result<()> {
     }
 }
 
+/// Ensure Claude Code discovers the authoritative workspace `AGENTS.md` through
+/// its native project-memory file. The bridge contains only an import, so Loom
+/// operating rules still have one source of truth. Project-owned `CLAUDE.md`
+/// content outside the bridge markers is preserved.
+pub fn ensure_claude_md_bridge(workspace: &Path) -> io::Result<()> {
+    let path = workspace.join("CLAUDE.md");
+    let new_content = match std::fs::read_to_string(&path) {
+        Ok(existing) => {
+            let updated = update_marked_block(
+                &existing,
+                CLAUDE_BRIDGE_BLOCK,
+                CLAUDE_BRIDGE_BEGIN_MARKER,
+                CLAUDE_BRIDGE_END_MARKER,
+            );
+            if updated == existing {
+                return Ok(());
+            }
+            updated
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            format!("{CLAUDE_BRIDGE_BLOCK}\n")
+        }
+        Err(error) => return Err(error),
+    };
+    std::fs::write(path, new_content)
+}
+
+/// Remove only Loom's Claude bridge and preserve project-owned `CLAUDE.md`
+/// instructions. A file containing only the bridge is removed entirely.
+pub fn remove_claude_md_bridge(workspace: &Path) -> io::Result<()> {
+    remove_marked_block(
+        &workspace.join("CLAUDE.md"),
+        CLAUDE_BRIDGE_BEGIN_MARKER,
+        CLAUDE_BRIDGE_END_MARKER,
+    )
+}
+
 fn update_block(existing: &str, new_block: &str) -> String {
-    if let Some((begin, end_past)) = marker_span(existing) {
+    update_marked_block(existing, new_block, BEGIN_MARKER, END_MARKER)
+}
+
+fn update_marked_block(
+    existing: &str,
+    new_block: &str,
+    begin_marker: &str,
+    end_marker: &str,
+) -> String {
+    if let Some((begin, end_past)) = marker_span_for(existing, begin_marker, end_marker) {
         let mut out = String::with_capacity(existing.len() + new_block.len());
         out.push_str(&existing[..begin]);
         out.push_str(new_block);
@@ -132,11 +183,43 @@ fn update_block(existing: &str, new_block: &str) -> String {
 }
 
 fn marker_span(existing: &str) -> Option<(usize, usize)> {
-    let begin = existing.find(BEGIN_MARKER)?;
-    let search_from = begin + BEGIN_MARKER.len();
-    let end_rel = existing[search_from..].find(END_MARKER)?;
+    marker_span_for(existing, BEGIN_MARKER, END_MARKER)
+}
+
+fn marker_span_for(existing: &str, begin_marker: &str, end_marker: &str) -> Option<(usize, usize)> {
+    let begin = existing.find(begin_marker)?;
+    let search_from = begin + begin_marker.len();
+    let end_rel = existing[search_from..].find(end_marker)?;
     let end = search_from + end_rel;
-    Some((begin, end + END_MARKER.len()))
+    Some((begin, end + end_marker.len()))
+}
+
+fn remove_marked_block(path: &Path, begin_marker: &str, end_marker: &str) -> io::Result<()> {
+    let existing = match std::fs::read_to_string(path) {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let Some((begin, end_past)) = marker_span_for(&existing, begin_marker, end_marker) else {
+        return Ok(());
+    };
+    let mut after = &existing[end_past..];
+    if begin == 0 {
+        after = after
+            .strip_prefix("\r\n\r\n")
+            .or_else(|| after.strip_prefix("\n\n"))
+            .or_else(|| after.strip_prefix("\r\n"))
+            .or_else(|| after.strip_prefix('\n'))
+            .unwrap_or(after);
+    }
+    let mut content = String::with_capacity(existing.len());
+    content.push_str(&existing[..begin]);
+    content.push_str(after);
+    if content.is_empty() {
+        std::fs::remove_file(path)
+    } else {
+        std::fs::write(path, content)
+    }
 }
 
 fn loom_block(context: &AgentsMdContext) -> String {
@@ -184,6 +267,102 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
   participant/contributor, assignee/reviewer, observer, or no-action recipient.\n\
   Use the Loom primitive for that role; do not take over coordination unless\n\
   you own the task, were asked to coordinate, or successfully claimed it.\n\
+- A recognizable activity is not yet an executable collaboration contract.\n\
+  When several actors are invited to participate but the current conversation\n\
+  does not already establish how they will work together, negotiate that shape\n\
+  before doing the activity itself. This applies even when the activity's\n\
+  subject or desired outcome is obvious.\n\
+- Treat this as a brief, visible protocol-negotiation phase. Relevant actors\n\
+  should exchange concrete proposals about only the dimensions the activity\n\
+  needs: participation, facilitation or state ownership, roles, ordering or\n\
+  concurrency, handoff signals, shared-state updates, and completion or stop\n\
+  conditions. Derive these from the user's actual request and current context;\n\
+  do not import a domain template or assume voting, leadership, or sequential\n\
+  turns. Ask the user only for intent that cannot be inferred safely.\n\
+- Derive the initial participant set from the actionable request: its routed\n\
+  audience plus actors explicitly included or excluded by the requester. Channel\n\
+  membership establishes who is available, not who agreed or was invited to\n\
+  participate. Do not add the requester, observers, or other members merely\n\
+  because they are present in the channel; later expand the set only through an\n\
+  explicit proposal and acceptance when the activity actually needs it.\n\
+- Use one convergence owner so simultaneous wakes do not produce competing\n\
+  protocols. When the current wake is the initiating multi-actor invitation and\n\
+  no owner is established yet, attempt to become the negotiation owner with\n\
+  `loom --json task claim --source-message \"$LOOM_TRIGGER_MESSAGE_ID\"`. Do not\n\
+  claim again when an established owner asks for a proposal, announces the\n\
+  contract, or hands off activity work; answer or act in the requested role. A\n\
+  successful claimant retains the task id returned by `task claim`, facilitates,\n\
+  and explicitly asks other relevant actors for proposals with `message ask`,\n\
+  naming the expected respondents and convergence condition; it does not start\n\
+  substantive participation yet.\n\
+  On a claim conflict, use same-scope task state to identify the established\n\
+  owner and do not start the activity or a second negotiation. The failed\n\
+  claimant's current invitation turn must end with `run ignore` even if a newer\n\
+  proposal solicitation has appeared while that turn was executing: the newer\n\
+  solicitation has its own routed delivery and is the only turn allowed to\n\
+  answer it. Do not use newly visible work to repurpose an older trigger. The\n\
+  owner treats\n\
+  proposal replies as negotiation input, not as fresh activities that need a\n\
+  new claim, and does not launch while required respondents remain unaccounted\n\
+  for under the announced convergence condition. Claiming this role grants\n\
+  coordination responsibility, not authority to invent the result.\n\
+- Negotiation collection is read-before-write and idempotent. Before reporting\n\
+  missing respondents, re-asking, converging, or launching, the owner must read\n\
+  the current conversation (for example, `loom --json message read --target\n\
+  \"$LOOM_REPLY_TARGET\"`) and rebuild one latest-effective-response entry per\n\
+  expected actor. When reporting someone missing or re-asking a non-responder,\n\
+  send with --if-latest set to the latest message id returned by that read. If\n\
+  the atomic send is rejected, read and reconcile again instead of publishing a\n\
+  stale conclusion. A delayed wake is not evidence that another reply is absent.\n\
+  On any duplicate delivery of the same solicitation, a participant that has\n\
+  already supplied an effective response must not send it again; inspect the\n\
+  conversation and end with `run ignore` instead. A later explicit correction\n\
+  supersedes that actor's earlier response.\n\
+- Negotiation is complete only when the owner publishes one concise operational\n\
+  contract in the shared scope, resolves material disagreements, and identifies\n\
+  who owns shared progress. Publish that contract separately from substantive\n\
+  work as a no-action `message send --intent notify`, then explicitly route\n\
+  exactly the first required actor or actor set with `message ask`. Do not use a\n\
+  plain public `message send` to launch a phase: reply inference may wake only\n\
+  the current trigger. Inspect the returned message audience and correct any\n\
+  mismatch before claiming the phase started. Only then begin participation.\n\
+  Afterward, follow the agreed protocol and use explicit Loom handoffs whenever\n\
+  another actor must act next. At the agreed stop, the owner completes the\n\
+  retained bootstrap task before publishing the final outcome.\n\
+- Open or free-form participation still needs an executable routing policy.\n\
+  Explicitly wake every actor currently eligible to act, or select and record\n\
+  one first actor and route later turns through visible handoffs. Public text is\n\
+  shared context, not proof that the intended actors were woken. When the owner\n\
+  contributes before handing off, send that contribution with `--intent notify`\n\
+  and make the next actor's `message ask` a separate command so reply inference\n\
+  cannot create an unintended parallel wake.\n\
+- Treat every phase transition as two different facts: a no-action shared-state\n\
+  announcement and, when work is due now, an explicit actionable route. Never\n\
+  put directions such as asking people to begin, discuss, choose, or submit into\n\
+  a notify-only message; `--intent notify` is not an override for an operational\n\
+  handoff. Before ending the coordinator turn, compare the contract's actors due\n\
+  now with the returned audience of the actionable message. Each must be routed\n\
+  exactly once, and an actor not due now must not be woken. If a phase is open,\n\
+  route all currently eligible actors or route one recorded starter who owns the\n\
+  next handoff.\n\
+- Audit the proposed contract for conservation and role compatibility before it\n\
+  becomes active. Build a visible ledger that maps every intended participant\n\
+  to exactly one declared participation state or work slot, accounts for every\n\
+  required slot exactly once, and explicitly includes or excludes the owner.\n\
+  Reconcile missing, duplicate, or leftover slots instead of assuming them away.\n\
+- Separate privileged coordination from affected participation. An actor that\n\
+  chooses or sees hidden allocations, adjudicates outcomes, or controls shared\n\
+  state must not also take a participant role whose choices or outcome could be\n\
+  influenced by that privileged knowledge. Either appoint an explicitly\n\
+  non-participating coordinator and recalculate the remaining slots, or agree on\n\
+  a distributed mechanism that actually preserves the required information\n\
+  boundaries. Before announcing allocation complete, verify one intended,\n\
+  non-duplicated delivery per assignee and an explicit state for the coordinator.\n\
+- Keep every promised mechanism operational and auditable. Perform and verify\n\
+  any selection, private delivery, reminder, timeout, or state transition with\n\
+  Loom primitives before saying it happened. Do not announce a clock-based\n\
+  fallback unless a reminder or another observable trigger will actually enact\n\
+  it, and do not combine a phase announcement with an implicit handoff.\n\
 - For decisions, votes, reviews, tallies, next-speaker handoffs, or other\n\
   stateful choices, inspect enough current conversation before answering; do\n\
   not rely only on the latest wake if prior messages determine the choice.\n\
@@ -209,6 +388,12 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
   newline characters to `--text`; do not write escaped `\\n` unless the backslash\n\
   and letter `n` should be shown to readers. In shell, prefer stdin/heredoc for\n\
   multiline text instead of quoted `\\n` sequences.\n\
+- To send a file or image into chat, first run\n\
+  `loom --json attachment upload --target \"$LOOM_REPLY_TARGET\" --path <path>`,\n\
+  then include its returned artifact id on the visible `message send` or\n\
+  `message ask` command with `--attachment-id <art_id>`. Uploading alone, saving\n\
+  a workspace file, or writing an `artifact://` URI in message text does not\n\
+  attach the file and will not make it appear in the chat attachment panel.\n\
 - Use `$LOOM_REPLY_TARGET` as the default target for the current workflow. If it\n\
   is a thread target such as `#channel:root`, send or ask on the bare `#channel`\n\
   only when you intentionally want a channel-level update outside that thread.\n\
@@ -250,6 +435,13 @@ markers; Loom may refresh this block when actor or channel context changes.\n\
   is explicitly intended for the public thread; keep private facts out.\n\
 - Private actions, votes, target choices, and sensitive data stay private even\n\
   when the answer is only one word.\n\
+- An `audience` on a public `message ask` controls delivery and waking; it is not\n\
+  an access-control boundary. Never put a secret, private allocation, hidden\n\
+  state, or actor-specific instruction in public message text merely because its\n\
+  audience names only the intended actors. Use one same-scope `--private-to`\n\
+  send addressed to the complete intended private group, not one overlapping\n\
+  copy per member. Verify the returned message has private metadata and exactly\n\
+  that de-duplicated group before advancing or announcing delivery complete.\n\
 - Public messages should include only information intended for that audience;\n\
   do not add labels, hints, or formatting derived from private state.\n\
 - In ordered workflows, do not take over sequencing unless you own it or were\n\
@@ -483,6 +675,59 @@ mod tests {
         assert!(out.contains("stdin/heredoc"));
         assert!(out.contains("identify your role for this wake"));
         assert!(out.contains("participant/contributor"));
+        assert!(out.contains("not yet an executable collaboration contract"));
+        assert!(out.contains("subject or desired outcome is obvious"));
+        assert!(out.contains("visible protocol-negotiation phase"));
+        assert!(out.contains("ordering or"));
+        assert!(out.contains("concurrency"));
+        assert!(out.contains("do not import a domain template"));
+        assert!(out.contains("actionable request: its routed"));
+        assert!(out.contains("membership establishes who is available"));
+        assert!(out.contains("Do not add the requester, observers"));
+        assert!(out.contains("task claim --source-message"));
+        assert!(out.contains("initiating multi-actor invitation"));
+        assert!(out.contains("Do not"));
+        assert!(out.contains("claim again when an established owner asks"));
+        assert!(out.contains("explicitly asks other relevant actors"));
+        assert!(out.contains("On a claim conflict"));
+        assert!(out.contains("claimant's current invitation turn"));
+        assert!(out.contains("only turn allowed to"));
+        assert!(out.contains("Do not use newly visible work"));
+        assert!(out.contains("expected respondents and convergence"));
+        assert!(out.contains("proposal replies as negotiation input"));
+        assert!(out.contains("required respondents remain unaccounted"));
+        assert!(out.contains("read-before-write and idempotent"));
+        assert!(out.contains("latest-effective-response entry"));
+        assert!(out.contains("send with --if-latest"));
+        assert!(out.contains("read and reconcile again"));
+        assert!(out.contains("duplicate delivery of the same solicitation"));
+        assert!(out.contains("A delayed wake is not evidence"));
+        assert!(out.contains("do not start the"));
+        assert!(out.contains("publishes one concise operational"));
+        assert!(out.contains("Publish that contract separately"));
+        assert!(out.contains("message send --intent notify"));
+        assert!(out.contains("exactly the first required actor"));
+        assert!(out.contains("Inspect the returned message audience"));
+        assert!(out.contains("Open or free-form participation"));
+        assert!(out.contains("Public text is"));
+        assert!(out.contains("an unintended parallel wake"));
+        assert!(out.contains("every phase transition as two different facts"));
+        assert!(out.contains("`--intent notify` is not an override"));
+        assert!(out.contains("contract's actors due"));
+        assert!(out.contains("Each must be routed"));
+        assert!(!out.lines().any(|line| line.starts_with('+')));
+        assert!(out.contains("conservation and role compatibility"));
+        assert!(out.contains("every intended participant"));
+        assert!(out.contains("required slot exactly once"));
+        assert!(out.contains("explicitly includes or excludes the owner"));
+        assert!(out.contains("Separate privileged coordination"));
+        assert!(out.contains("non-participating coordinator"));
+        assert!(out.contains("distributed mechanism"));
+        assert!(out.contains("non-duplicated delivery per assignee"));
+        assert!(out.contains("retained bootstrap task before publishing"));
+        assert!(out.contains("operational and auditable"));
+        assert!(out.contains("before saying it happened"));
+        assert!(out.contains("clock-based"));
         assert!(out.contains("durable"));
         assert!(out.contains("Workspace-local files are derived state"));
         assert!(out.contains("message-anchored task"));
@@ -496,11 +741,36 @@ mod tests {
         assert!(out.contains("do not rely on inference for handoffs"));
         assert!(out.contains("Do not send the same answer"));
         assert!(out.contains("private wake asks for a public contribution"));
+        assert!(out.contains("an access-control boundary"));
+        assert!(out.contains("complete intended private group"));
+        assert!(out.contains("one overlapping"));
+        assert!(out.contains("returned message has private metadata"));
         assert!(out.contains("actually send it this"));
         assert!(out.contains("latest effective decision"));
         assert!(out.contains("loom guide show <topic>"));
         assert!(!out.contains("### Read-only CLI"));
         assert!(!out.contains("### Write CLI"));
+    }
+
+    #[test]
+    fn collaboration_bootstrap_is_domain_neutral() {
+        let out = loom_block(&context("actor_demo", "chan_demo"));
+        for domain_term in [
+            "counting game",
+            "number counting",
+            "turtle soup",
+            "lateral thinking puzzle",
+            "werewolf game",
+            "Mafia game",
+            "报数",
+            "海龟汤",
+            "狼人杀",
+        ] {
+            assert!(
+                !out.to_ascii_lowercase().contains(domain_term),
+                "generated collaboration contract must not embed scenario-specific rules: {domain_term}"
+            );
+        }
     }
 
     #[test]
@@ -550,6 +820,44 @@ mod tests {
         assert!(content.contains("project before"));
         assert!(content.contains("project after"));
         assert!(!content.contains(BEGIN_MARKER));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn claude_bridge_imports_agents_md_and_preserves_project_content() {
+        let root = std::env::temp_dir().join(format!("loom-claude-bridge-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("workspace");
+        let path = root.join("CLAUDE.md");
+        std::fs::write(&path, "# Project Claude rules\n\nKeep this.\n").expect("project claude");
+
+        ensure_claude_md_bridge(&root).expect("inject Claude bridge");
+        ensure_claude_md_bridge(&root).expect("idempotent Claude bridge");
+
+        let content = std::fs::read_to_string(&path).expect("Claude bridge");
+        assert_eq!(content.matches(CLAUDE_BRIDGE_BEGIN_MARKER).count(), 1);
+        assert_eq!(content.matches("@AGENTS.md").count(), 1);
+        assert!(content.contains("# Project Claude rules"));
+        assert!(content.contains("Keep this."));
+
+        remove_claude_md_bridge(&root).expect("remove Claude bridge");
+        let content = std::fs::read_to_string(path).expect("preserved project Claude rules");
+        assert!(content.contains("# Project Claude rules"));
+        assert!(content.contains("Keep this."));
+        assert!(!content.contains(CLAUDE_BRIDGE_BEGIN_MARKER));
+        assert!(!content.contains("@AGENTS.md"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn claude_bridge_only_file_is_removed_cleanly() {
+        let root =
+            std::env::temp_dir().join(format!("loom-claude-bridge-only-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("workspace");
+
+        ensure_claude_md_bridge(&root).expect("inject Claude bridge");
+        assert!(root.join("CLAUDE.md").exists());
+        remove_claude_md_bridge(&root).expect("remove Claude bridge");
+        assert!(!root.join("CLAUDE.md").exists());
         std::fs::remove_dir_all(root).ok();
     }
 

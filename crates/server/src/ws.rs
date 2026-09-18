@@ -182,7 +182,15 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
         handle_text_frame(&state, &connection_id, &tx, text).await;
     }
 
-    cleanup_connection(state.subscriptions.as_ref(), &connection_id, tx, writer).await;
+    state.auth.forget(&connection_id);
+    cleanup_connection(
+        state.subscriptions.as_ref(),
+        state.auth.as_ref(),
+        &connection_id,
+        tx,
+        writer,
+    )
+    .await;
 }
 
 pub async fn handle_local_socket(state: AppState, socket: loom_platform::ipc::LocalStream) {
@@ -222,16 +230,39 @@ pub async fn handle_local_socket(state: AppState, socket: loom_platform::ipc::Lo
         }
     }
 
-    cleanup_connection(state.subscriptions.as_ref(), &connection_id, tx, writer).await;
+    state.auth.forget(&connection_id);
+    cleanup_connection(
+        state.subscriptions.as_ref(),
+        state.auth.as_ref(),
+        &connection_id,
+        tx,
+        writer,
+    )
+    .await;
 }
 
 async fn cleanup_connection(
     subscriptions: &crate::subscribe::Subscriptions,
+    auth: &crate::auth::ServerAuth,
     connection_id: &str,
     tx: mpsc::UnboundedSender<String>,
     writer: JoinHandle<()>,
 ) {
-    subscriptions.remove_connection(connection_id);
+    if let Some(actor_id) = subscriptions.remove_connection(connection_id) {
+        if matches!(
+            subscriptions.actor_kind(&actor_id),
+            Some(proto::types::ActorKind::Agent | proto::types::ActorKind::Service)
+        ) {
+            subscriptions.broadcast_to_authenticated(
+                auth,
+                method::STREAM_UPDATE,
+                json!({
+                    "kind": proto::methods::stream_kind::PRESENCE_CHANGED,
+                    "data": { "actorId": actor_id, "online": false },
+                }),
+            );
+        }
+    }
     drop(tx);
     let _ = writer.await;
 }
@@ -359,9 +390,11 @@ fn fanout(state: &AppState, ev: StoreEvent) {
         });
         match channel.visibility {
             ChannelVisibility::Public => {
-                state
-                    .subscriptions
-                    .broadcast_to_all(method::STREAM_UPDATE, payload);
+                state.subscriptions.broadcast_to_authenticated(
+                    state.auth.as_ref(),
+                    method::STREAM_UPDATE,
+                    payload,
+                );
                 tracing::debug!(
                     channel = %channel.id,
                     "channel.created broadcast to all",
@@ -383,6 +416,106 @@ fn fanout(state: &AppState, ev: StoreEvent) {
         return;
     }
 
+    // A visibility transition changes global discovery, so scope fanout is
+    // insufficient: clients that do not subscribe to a private channel must
+    // discover it when it becomes public, and clients that only had implicit
+    // public access must remove it immediately when it becomes private.
+    if let StoreEvent::ChannelVisibilityChanged {
+        channel,
+        previous_visibility,
+    } = &ev
+    {
+        let scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: channel.id.clone(),
+        };
+        match (previous_visibility, channel.visibility) {
+            (ChannelVisibility::Private, ChannelVisibility::Public) => {
+                let payload = json!({
+                    "kind": sk::CHANNEL_UPDATED,
+                    "scope": scope,
+                    "data": { "channel": channel },
+                });
+                state.subscriptions.broadcast_to_authenticated(
+                    state.auth.as_ref(),
+                    method::STREAM_UPDATE,
+                    payload,
+                );
+                tracing::debug!(
+                    channel = %channel.id,
+                    "channel became public; channel.updated broadcast to all",
+                );
+            }
+            (ChannelVisibility::Public, ChannelVisibility::Private) => {
+                let explicit_members = channel
+                    .members
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<std::collections::HashSet<_>>();
+                let member_payload = json!({
+                    "kind": sk::CHANNEL_UPDATED,
+                    "scope": scope,
+                    "data": { "channel": channel },
+                });
+                let member_frame = serde_json::to_string(&proto::Notification::new(
+                    method::STREAM_UPDATE,
+                    Some(member_payload),
+                ))
+                .ok();
+
+                for (connection_id, actor_id) in state.subscriptions.connection_actors() {
+                    if !state.auth.is_authenticated(&connection_id) {
+                        continue;
+                    }
+                    if actor_id
+                        .as_deref()
+                        .is_some_and(|actor| explicit_members.contains(actor))
+                    {
+                        if let Some(frame) = member_frame.as_ref() {
+                            state
+                                .subscriptions
+                                .send_to_connection(&connection_id, frame.clone());
+                        }
+                        continue;
+                    }
+
+                    // Do not include the private Channel object in this frame:
+                    // non-members only need the id they already learned while
+                    // it was public so they can evict it from local caches.
+                    let payload = json!({
+                        "kind": sk::CHANNEL_REVOKED,
+                        "scope": scope,
+                        "data": {
+                            "channelId": channel.id,
+                            "actorId": actor_id.unwrap_or_default(),
+                        },
+                    });
+                    if let Ok(frame) = serde_json::to_string(&proto::Notification::new(
+                        method::STREAM_UPDATE,
+                        Some(payload),
+                    )) {
+                        state
+                            .subscriptions
+                            .send_to_connection(&connection_id, frame);
+                    }
+                    // The per-frame ACL still protects any child thread
+                    // subscriptions, but dropping this channel subscription
+                    // also avoids retaining obviously stale navigation state.
+                    state.subscriptions.unsubscribe(&connection_id, &scope);
+                }
+                tracing::debug!(
+                    channel = %channel.id,
+                    "channel became private; members updated and non-members revoked",
+                );
+            }
+            // The store only emits this event for an actual transition.  Keep
+            // this arm defensive in case a future visibility enum or replay
+            // path constructs it manually.
+            _ => {}
+        }
+        return;
+    }
+
     if let StoreEvent::ChannelDeleted {
         channel_id,
         visibility,
@@ -400,9 +533,11 @@ fn fanout(state: &AppState, ev: StoreEvent) {
         });
         match visibility {
             ChannelVisibility::Public => {
-                state
-                    .subscriptions
-                    .broadcast_to_all(method::STREAM_UPDATE, payload);
+                state.subscriptions.broadcast_to_authenticated(
+                    state.auth.as_ref(),
+                    method::STREAM_UPDATE,
+                    payload,
+                );
                 tracing::debug!(
                     channel = %channel_id,
                     "channel.deleted broadcast to all",
@@ -472,6 +607,59 @@ fn fanout(state: &AppState, ev: StoreEvent) {
         return;
     }
 
+    // Run metadata is worker-controlled and may contain prompt-derived text or
+    // private state even when the trigger itself was public. Send the canonical
+    // run only to its worker. Other eligible scope participants receive a
+    // lifecycle-only projection; for private triggers, unrelated members do
+    // not learn that the run exists at all.
+    if let StoreEvent::RunUpdated(run) = &ev {
+        let scope = run.scope.clone();
+        let full_allowed = std::collections::HashSet::from([run.actor_id.clone()]);
+        let full_payload = json!({
+            "kind": sk::RUN_UPDATED,
+            "scope": scope,
+            "data": { "run": run },
+        });
+        broadcast_filtered(
+            state,
+            &scope,
+            method::STREAM_UPDATE,
+            &full_payload,
+            &full_allowed,
+        );
+
+        let mut observer_allowed = match state.store.run_private_actor_ids(run) {
+            Some(private_allowed) => private_allowed,
+            None => scope_acl_filter(state, &scope).unwrap_or_else(|| {
+                state
+                    .subscriptions
+                    .scope_subscribers(&scope)
+                    .into_iter()
+                    .filter_map(|connection_id| {
+                        state.subscriptions.actor_for_connection(&connection_id)
+                    })
+                    .collect()
+            }),
+        };
+        observer_allowed.remove(&run.actor_id);
+        if !observer_allowed.is_empty() {
+            let projected = Store::redact_run_for_observer(run);
+            let observer_payload = json!({
+                "kind": sk::RUN_UPDATED,
+                "scope": scope,
+                "data": { "run": projected },
+            });
+            broadcast_filtered(
+                state,
+                &scope,
+                method::STREAM_UPDATE,
+                &observer_payload,
+                &observer_allowed,
+            );
+        }
+        return;
+    }
+
     let scope = ev.scope();
     let (kind, data) = match &ev {
         StoreEvent::MessageCreated(m) => (sk::MESSAGE_CREATED, json!({ "message": m })),
@@ -482,6 +670,9 @@ fn fanout(state: &AppState, ev: StoreEvent) {
         StoreEvent::ThreadUpdated(t) => (sk::THREAD_UPDATED, json!({ "thread": t })),
         StoreEvent::TaskChanged(t) => (sk::TASK_CHANGED, json!({ "task": t })),
         StoreEvent::ChannelUpdated(c) => (sk::CHANNEL_UPDATED, json!({ "channel": c })),
+        StoreEvent::ChannelVisibilityChanged { .. } => {
+            unreachable!("channel visibility transitions handled above")
+        }
         StoreEvent::TaskAssignmentChanged { assignment, task } => (
             sk::TASK_ASSIGNMENT_CHANGED,
             json!({ "assignment": assignment, "task": task }),
@@ -692,11 +883,13 @@ mod tests {
     use std::time::Duration;
 
     use proto::types::{
-        Actor, AudienceKind, AudienceRef, DeliveryPolicy, MessageIntent, MessageKind, Meta,
+        Actor, AudienceKind, AudienceRef, DeliveryPolicy, MessageIntent, MessageKind, Meta, Run,
+        RunStatus,
     };
     use tokio::sync::oneshot;
 
     use crate::artifacts::ArtifactStore;
+    use crate::auth::ServerAuth;
     use crate::journal::Journal;
     use crate::machine_commands::MachineCommandWaiters;
     use crate::scope_skills::ScopeSkills;
@@ -731,6 +924,7 @@ mod tests {
             ScopeSkills::new(root.join("workspaces"), root.join("agents")).expect("scope skills"),
         );
         AppState {
+            auth: Arc::new(ServerAuth::disabled()),
             store,
             subscriptions,
             artifacts,
@@ -755,7 +949,8 @@ mod tests {
             let _ = closed_tx.send(());
         });
 
-        cleanup_connection(subscriptions.as_ref(), "conn_test", tx, writer).await;
+        let auth = ServerAuth::disabled();
+        cleanup_connection(subscriptions.as_ref(), &auth, "conn_test", tx, writer).await;
 
         tokio::time::timeout(Duration::from_secs(1), closed_rx)
             .await
@@ -916,6 +1111,321 @@ mod tests {
             rx_carol.try_recv().is_err(),
             "non-recipient subscriber must not receive private message frames"
         );
+    }
+
+    #[test]
+    fn fanout_public_run_redacts_worker_metadata_from_observers() {
+        let state = fresh_state("public-run-fanout");
+        for (id, kind, name) in [
+            ("actor_agent_bot", ActorKind::Agent, "Bot"),
+            ("actor_observer", ActorKind::Human, "Observer"),
+        ] {
+            state
+                .store
+                .upsert_actor(Actor {
+                    id: id.into(),
+                    display_name: name.into(),
+                    kind,
+                    capabilities: None,
+                    _meta: None,
+                })
+                .expect("actor");
+        }
+        let channel = state
+            .store
+            .create_channel("public run".into(), None)
+            .expect("channel");
+        let scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: channel.id,
+        };
+
+        let (worker_tx, mut worker_rx) = mpsc::unbounded_channel::<String>();
+        let (observer_tx, mut observer_rx) = mpsc::unbounded_channel::<String>();
+        for (connection_id, actor_id, tx) in [
+            ("conn_worker", "actor_agent_bot", worker_tx),
+            ("conn_observer", "actor_observer", observer_tx),
+        ] {
+            state.subscriptions.add_connection(Connection {
+                id: connection_id.into(),
+                actor_id: Some(actor_id.into()),
+                tx,
+            });
+            assert!(state.subscriptions.subscribe(connection_id, scope.clone()));
+        }
+
+        let mut metadata = Meta::default();
+        metadata.insert(
+            "noReplyReason".into(),
+            json!("private state inferred while handling a public message"),
+        );
+        let run = Run {
+            id: "run_public".into(),
+            actor_id: "actor_agent_bot".into(),
+            scope,
+            delivery_id: None,
+            start_reason: Some("worker diagnostic".into()),
+            agent_config_version_id: "config_public".into(),
+            status: RunStatus::Running,
+            opened_at: chrono::Utc::now(),
+            closed_at: None,
+            metadata,
+        };
+
+        fanout(&state, StoreEvent::RunUpdated(run));
+
+        let worker: Value =
+            serde_json::from_str(&worker_rx.try_recv().expect("worker gets canonical run"))
+                .expect("worker frame");
+        assert_eq!(
+            worker["params"]["data"]["run"]["metadata"]["noReplyReason"],
+            "private state inferred while handling a public message"
+        );
+
+        let observer: Value =
+            serde_json::from_str(&observer_rx.try_recv().expect("observer gets lifecycle run"))
+                .expect("observer frame");
+        assert_eq!(observer["params"]["data"]["run"]["metadata"], json!({}));
+        assert!(observer["params"]["data"]["run"]
+            .get("startReason")
+            .is_none());
+    }
+
+    #[test]
+    fn fanout_private_triggered_run_redacts_sender_and_hides_observer() {
+        let state = fresh_state("private-run-fanout");
+        for (id, kind, name) in [
+            ("actor_player", ActorKind::Human, "Player"),
+            ("actor_agent_host", ActorKind::Agent, "Host"),
+            ("actor_observer", ActorKind::Human, "Observer"),
+        ] {
+            state
+                .store
+                .upsert_actor(Actor {
+                    id: id.into(),
+                    display_name: name.into(),
+                    kind,
+                    capabilities: None,
+                    _meta: None,
+                })
+                .expect("actor");
+        }
+        let channel = state
+            .store
+            .create_channel("private run".into(), None)
+            .expect("channel");
+        for actor_id in ["actor_player", "actor_agent_host", "actor_observer"] {
+            state.store.grant_channel(&channel.id, actor_id).unwrap();
+        }
+        let scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: channel.id.clone(),
+        };
+
+        let mut receivers = Vec::new();
+        for (connection_id, actor_id) in [
+            ("conn_player", "actor_player"),
+            ("conn_host", "actor_agent_host"),
+            ("conn_observer", "actor_observer"),
+        ] {
+            let (tx, rx) = mpsc::unbounded_channel::<String>();
+            state.subscriptions.add_connection(Connection {
+                id: connection_id.into(),
+                actor_id: Some(actor_id.into()),
+                tx,
+            });
+            assert!(state.subscriptions.subscribe(connection_id, scope.clone()));
+            receivers.push((actor_id, rx));
+        }
+
+        let mut message_metadata = Meta::default();
+        message_metadata.insert("privateTo".into(), json!(["actor_agent_host"]));
+        let private_message = state
+            .store
+            .append_message(
+                "actor_player".into(),
+                format!("#{}", channel.id),
+                MessageKind::Human,
+                "secret role".into(),
+                Vec::new(),
+                vec![AudienceRef {
+                    kind: AudienceKind::Actor,
+                    id: "actor_agent_host".into(),
+                    display: None,
+                }],
+                MessageIntent::RequestAction,
+                DeliveryPolicy::WakeAgent,
+                None,
+                None,
+                Vec::new(),
+                message_metadata,
+                None,
+            )
+            .expect("private trigger");
+        let mut run_metadata = Meta::default();
+        run_metadata.insert(
+            "noReplyReason".into(),
+            json!("player is the seer and inspected the wolf"),
+        );
+        let run = Run {
+            id: "run_private".into(),
+            actor_id: "actor_agent_host".into(),
+            scope,
+            delivery_id: Some(private_message.id.clone()),
+            start_reason: Some(private_message.id),
+            agent_config_version_id: "config_private".into(),
+            status: RunStatus::Running,
+            opened_at: chrono::Utc::now(),
+            closed_at: None,
+            metadata: run_metadata,
+        };
+
+        fanout(&state, StoreEvent::RunUpdated(run));
+
+        let (_, mut player_rx) = receivers.remove(0);
+        let (_, mut host_rx) = receivers.remove(0);
+        let (_, mut observer_rx) = receivers.remove(0);
+        let player: Value =
+            serde_json::from_str(&player_rx.try_recv().expect("private sender gets lifecycle"))
+                .expect("player frame");
+        assert_eq!(player["params"]["data"]["run"]["metadata"], json!({}));
+        assert!(player["params"]["data"]["run"].get("startReason").is_none());
+
+        let host: Value = serde_json::from_str(&host_rx.try_recv().expect("worker gets full run"))
+            .expect("host frame");
+        assert_eq!(
+            host["params"]["data"]["run"]["metadata"]["noReplyReason"],
+            "player is the seer and inspected the wolf"
+        );
+        assert!(
+            observer_rx.try_recv().is_err(),
+            "unrelated observer must not learn that a private run exists"
+        );
+    }
+
+    #[test]
+    fn visibility_transition_fanout_updates_global_discovery_without_leaking_private_data() {
+        let state = fresh_state("channel-visibility-fanout");
+        let channel = state
+            .store
+            .create_channel("visibility".into(), Some("actor_owner".into()))
+            .expect("private channel");
+        let scope = ScopeRef {
+            kind: ScopeKind::Channel,
+            id: channel.id.clone(),
+        };
+        let (tx_owner, mut rx_owner) = mpsc::unbounded_channel::<String>();
+        let (tx_guest, mut rx_guest) = mpsc::unbounded_channel::<String>();
+        let (tx_unbound, mut rx_unbound) = mpsc::unbounded_channel::<String>();
+        state.subscriptions.add_connection(Connection {
+            id: "conn_owner".into(),
+            actor_id: Some("actor_owner".into()),
+            tx: tx_owner,
+        });
+        state.subscriptions.add_connection(Connection {
+            id: "conn_guest".into(),
+            actor_id: Some("actor_guest".into()),
+            tx: tx_guest,
+        });
+        state.subscriptions.add_connection(Connection {
+            id: "conn_unbound".into(),
+            actor_id: None,
+            tx: tx_unbound,
+        });
+
+        // None of these clients subscribes to the private scope.  Making it
+        // public must still patch every global channel list immediately.
+        let mut events = state.store.subscribe();
+        let public = state
+            .store
+            .update_channel(&channel.id, None, None, Some(ChannelVisibility::Public))
+            .expect("make public");
+        let event = events.try_recv().expect("visibility changed event");
+        assert!(matches!(
+            &event,
+            StoreEvent::ChannelVisibilityChanged {
+                previous_visibility: ChannelVisibility::Private,
+                channel,
+            } if channel.visibility == ChannelVisibility::Public
+        ));
+        fanout(&state, event);
+
+        for frame in [
+            rx_owner.try_recv().expect("owner public update"),
+            rx_guest.try_recv().expect("guest public update"),
+            rx_unbound.try_recv().expect("unbound public update"),
+        ] {
+            let value: Value = serde_json::from_str(&frame).expect("public update json");
+            assert_eq!(
+                value["params"]["kind"],
+                proto::methods::stream_kind::CHANNEL_UPDATED
+            );
+            assert_eq!(value["params"]["data"]["channel"]["id"], public.id);
+            assert_eq!(value["params"]["data"]["channel"]["visibility"], "public");
+        }
+
+        // Public clients may have acquired a live subscription.  On the
+        // reverse transition, only explicit members receive the full private
+        // object; all other connections receive an id-only removal frame.
+        assert!(state.subscriptions.subscribe("conn_guest", scope.clone()));
+        assert!(state.subscriptions.subscribe("conn_unbound", scope.clone()));
+        let private = state
+            .store
+            .update_channel(&channel.id, None, None, Some(ChannelVisibility::Private))
+            .expect("make private");
+        let event = events.try_recv().expect("reverse visibility event");
+        assert!(matches!(
+            &event,
+            StoreEvent::ChannelVisibilityChanged {
+                previous_visibility: ChannelVisibility::Public,
+                channel,
+            } if channel.visibility == ChannelVisibility::Private
+        ));
+        fanout(&state, event);
+
+        let owner: Value = serde_json::from_str(
+            &rx_owner
+                .try_recv()
+                .expect("explicit member receives private update"),
+        )
+        .expect("owner update json");
+        assert_eq!(
+            owner["params"]["kind"],
+            proto::methods::stream_kind::CHANNEL_UPDATED
+        );
+        assert_eq!(owner["params"]["data"]["channel"]["id"], private.id);
+        assert_eq!(owner["params"]["data"]["channel"]["visibility"], "private");
+
+        let guest: Value = serde_json::from_str(
+            &rx_guest
+                .try_recv()
+                .expect("implicit public reader receives removal"),
+        )
+        .expect("guest removal json");
+        assert_eq!(
+            guest["params"]["kind"],
+            proto::methods::stream_kind::CHANNEL_REVOKED
+        );
+        assert_eq!(guest["params"]["data"]["channelId"], private.id);
+        assert_eq!(guest["params"]["data"]["actorId"], "actor_guest");
+        assert!(
+            guest["params"]["data"].get("channel").is_none(),
+            "a non-member removal must not include private channel metadata",
+        );
+
+        let unbound: Value = serde_json::from_str(
+            &rx_unbound
+                .try_recv()
+                .expect("unbound public reader receives removal"),
+        )
+        .expect("unbound removal json");
+        assert_eq!(
+            unbound["params"]["kind"],
+            proto::methods::stream_kind::CHANNEL_REVOKED
+        );
+        assert_eq!(unbound["params"]["data"]["channelId"], private.id);
+        assert_eq!(unbound["params"]["data"]["actorId"], "");
+        assert!(state.subscriptions.scope_subscribers(&scope).is_empty());
     }
 
     #[test]

@@ -1,8 +1,16 @@
 import { useCallback, useRef, type PointerEvent } from "react";
 import type { CSSProperties } from "react";
 import type { PanelResizeDrag, PanelResizeKind } from "@/lib/types";
-import { detailPanelBreakpoint, mainMinWidth } from "@/lib/constants";
-import { fitPanelSizes, initialViewportWidth } from "@/lib/format-utils";
+import {
+  detailPanelBreakpoint,
+  mainMinWidth,
+  threadPanelDragMainMinWidth,
+} from "@/lib/constants";
+import {
+  fitPanelSizes,
+  initialViewportWidth,
+  shouldSnapThreadPanel,
+} from "@/lib/format-utils";
 
 interface UsePanelResizeParams {
   panelSizes: { sidebar: number; detail: number };
@@ -10,6 +18,8 @@ interface UsePanelResizeParams {
   viewportWidth: number;
   detailVisibleInGrid: boolean;
   showChatDetail: boolean;
+  allowDetailExpansion: boolean;
+  onDetailSnap: () => void;
   setResizingPanel: (kind: PanelResizeKind | null) => void;
 }
 
@@ -19,6 +29,8 @@ export function usePanelResize({
   viewportWidth,
   detailVisibleInGrid,
   showChatDetail,
+  allowDetailExpansion,
+  onDetailSnap,
   setResizingPanel,
 }: UsePanelResizeParams) {
   const panelResizeDragRef = useRef<PanelResizeDrag | null>(null);
@@ -28,12 +40,15 @@ export function usePanelResize({
     panelSizes,
     viewportWidth,
     detailVisibleInGrid,
+    { allowWideDetail: allowDetailExpansion },
   );
 
   const shellStyle = {
     "--sidebar-width": `${fittedPanelSizes.sidebar}px`,
     "--detail-width": `${fittedPanelSizes.detail}px`,
-    "--main-min-width": `${mainMinWidth}px`,
+    "--main-min-width": `${
+      allowDetailExpansion ? threadPanelDragMainMinWidth : mainMinWidth
+    }px`,
   } as CSSProperties;
 
   const cleanupPanelResize = useCallback(() => {
@@ -46,16 +61,29 @@ export function usePanelResize({
 
   const applyPanelResize = useCallback(
     (drag: PanelResizeDrag, clientX: number, width = initialViewportWidth()) => {
+      const detailVisible = width >= detailPanelBreakpoint && showChatDetail;
+      if (
+        drag.kind === "detail" &&
+        allowDetailExpansion &&
+        detailVisible &&
+        shouldSnapThreadPanel(clientX, drag.sidebar)
+      ) {
+        onDetailSnap();
+        return true;
+      }
       const delta = clientX - drag.startX;
       const next =
         drag.kind === "sidebar"
           ? { sidebar: drag.sidebar + delta, detail: drag.detail }
           : { sidebar: drag.sidebar, detail: drag.detail - delta };
       setPanelSizes(
-        fitPanelSizes(next, width, width >= detailPanelBreakpoint && showChatDetail),
+        fitPanelSizes(next, width, detailVisible, {
+          allowWideDetail: allowDetailExpansion,
+        }),
       );
+      return false;
     },
-    [setPanelSizes, showChatDetail],
+    [allowDetailExpansion, onDetailSnap, setPanelSizes, showChatDetail],
   );
 
   const startPanelResize = useCallback(
@@ -66,8 +94,8 @@ export function usePanelResize({
       const drag: PanelResizeDrag = {
         kind,
         startX: event.clientX,
-        sidebar: panelSizes.sidebar,
-        detail: panelSizes.detail,
+        sidebar: fittedPanelSizes.sidebar,
+        detail: fittedPanelSizes.detail,
       };
       panelResizeDragRef.current = drag;
       setResizingPanel(kind);
@@ -76,7 +104,7 @@ export function usePanelResize({
         const current = panelResizeDragRef.current;
         if (!current) return;
         moveEvent.preventDefault();
-        applyPanelResize(current, moveEvent.clientX);
+        if (applyPanelResize(current, moveEvent.clientX)) cleanupPanelResize();
       };
       const handlePointerUp = (upEvent: globalThis.PointerEvent) => {
         const current = panelResizeDragRef.current;
@@ -92,18 +120,28 @@ export function usePanelResize({
         window.removeEventListener("pointercancel", cleanupPanelResize);
       };
     },
-    [applyPanelResize, cleanupPanelResize, panelSizes.detail, panelSizes.sidebar, setResizingPanel],
+    [applyPanelResize, cleanupPanelResize, fittedPanelSizes, setResizingPanel],
   );
 
   const resizePanelByKeyboard = useCallback(
     (kind: PanelResizeKind, delta: number) => {
       const next =
         kind === "sidebar"
-          ? { ...panelSizes, sidebar: panelSizes.sidebar + delta }
-          : { ...panelSizes, detail: panelSizes.detail - delta };
-      setPanelSizes(fitPanelSizes(next, viewportWidth, detailVisibleInGrid));
+          ? { ...fittedPanelSizes, sidebar: fittedPanelSizes.sidebar + delta }
+          : { ...fittedPanelSizes, detail: fittedPanelSizes.detail - delta };
+      setPanelSizes(
+        fitPanelSizes(next, viewportWidth, detailVisibleInGrid, {
+          allowWideDetail: allowDetailExpansion,
+        }),
+      );
     },
-    [setPanelSizes, viewportWidth, detailVisibleInGrid, panelSizes],
+    [
+      allowDetailExpansion,
+      detailVisibleInGrid,
+      fittedPanelSizes,
+      setPanelSizes,
+      viewportWidth,
+    ],
   );
 
   return {

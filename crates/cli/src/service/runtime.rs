@@ -22,10 +22,12 @@ use anyhow::{Context, Result};
 use proto::methods::{
     method, ActorUpsertParams, ActorUpsertResult, ArtifactIngress, ArtifactPublishParams,
     ArtifactPublishResult, InboxListParams, InboxListResult, InlineTextIngress, MessageSendResult,
-    TaskFactAppendResult, ThreadCreateParams, ThreadCreateResult, ThreadListParams,
-    ThreadListResult,
+    TaskFactAppendResult, TaskFactListResult, ThreadCreateParams, ThreadCreateResult,
+    ThreadListParams, ThreadListResult,
 };
-use proto::types::{Actor, DeliveryState, Message, Meta, Relation, ScopeKind, ScopeRef, Thread};
+use proto::types::{
+    Actor, DeliveryState, Message, Meta, Relation, ScopeKind, ScopeRef, TaskFactStatus, Thread,
+};
 use serde_json::json;
 
 use crate::client::Client;
@@ -298,25 +300,54 @@ impl ServiceRuntime {
         artifact_id: Option<&str>,
         summary: impl Into<String>,
         source_cursor: Option<&str>,
+        target_key: Option<&str>,
+        replace_active: bool,
     ) -> Result<String> {
+        let target_key = target_key.map(ToString::to_string).unwrap_or_else(|| {
+            payload
+                .get("mrId")
+                .or_else(|| payload.get("workitemId"))
+                .and_then(|v| {
+                    v.as_str()
+                        .map(ToString::to_string)
+                        .or_else(|| v.as_i64().map(|n| n.to_string()))
+                        .or_else(|| v.as_u64().map(|n| n.to_string()))
+                })
+                .unwrap_or_default()
+        });
+        let replaces = if replace_active && !target_key.is_empty() {
+            let active: TaskFactListResult = self
+                .client
+                .call(
+                    method::TASK_FACT_LIST,
+                    json!({
+                        "taskId": task_id,
+                        "kind": kind,
+                        "status": TaskFactStatus::Active,
+                        "targetKey": &target_key,
+                    }),
+                )
+                .await
+                .context("task/fact.list active replacements")?;
+            active
+                .facts
+                .into_iter()
+                .map(|fact| fact.id)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let res: TaskFactAppendResult = self
             .client
             .call(
                 method::TASK_FACT_APPEND,
                 json!({
                     "taskId": task_id,
-                    "targetKey": payload.get("mrId")
-                        .or_else(|| payload.get("workitemId"))
-                        .and_then(|v| {
-                            v.as_str()
-                                .map(ToString::to_string)
-                                .or_else(|| v.as_i64().map(|n| n.to_string()))
-                                .or_else(|| v.as_u64().map(|n| n.to_string()))
-                        })
-                        .unwrap_or_default(),
+                    "targetKey": target_key,
                     "kind": kind,
                     "factType": "status",
                     "status": "active",
+                    "replaces": replaces,
                     "producerId": &self.actor_id,
                     "summary": summary.into(),
                     "artifactId": artifact_id,

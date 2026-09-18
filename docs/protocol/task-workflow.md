@@ -203,6 +203,23 @@ Rules:
 - Completing an assignment does not automatically complete the parent task.
 - The parent owner remains responsible for final task status.
 
+### Terminal Assignment Handoff
+
+Updating an assignment to `completed`, `failed`, or `canceled` is the
+authoritative handoff back to the assigning actor. The server records that
+transition and wakes the assigning actor automatically.
+
+An assignee should therefore attach artifacts and send any required progress
+or result details before the terminal update. During an assignment-triggered
+agent run, the CLI marks a successful terminal update as a no-reply outcome and
+rejects later `loom message send` or `loom message ask` calls from the same run.
+This prevents a second visible handoff and duplicate wake after the server has
+already returned the assignment.
+
+For exceptional diagnostics, callers may explicitly pass
+`--allow-after-no-reply` to the message command. Normal workflows should not
+use this override.
+
 ## Preflight And Workspace Lease
 
 Assignments that perform external side effects can request a preflight check:

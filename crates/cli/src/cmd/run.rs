@@ -1,5 +1,6 @@
 use std::future::Future;
 use std::io::{self, BufRead, IsTerminal, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,7 +13,7 @@ use serde_json::{json, Value};
 use crate::client::Client;
 use crate::render;
 
-const LOOM_NO_REPLY_FILE_ENV: &str = "LOOM_NO_REPLY_FILE";
+pub(crate) const LOOM_NO_REPLY_FILE_ENV: &str = "LOOM_NO_REPLY_FILE";
 const WATCH_RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(1);
 const WATCH_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(5);
 
@@ -408,7 +409,7 @@ pub async fn ignore(
     Ok(())
 }
 
-fn mark_local_no_reply(run_id: &str, payload: &Value) -> std::io::Result<bool> {
+pub(crate) fn mark_local_no_reply(run_id: &str, payload: &Value) -> std::io::Result<bool> {
     let Some(path) = std::env::var_os(LOOM_NO_REPLY_FILE_ENV) else {
         return Ok(false);
     };
@@ -424,6 +425,47 @@ fn mark_local_no_reply(run_id: &str, payload: &Value) -> std::io::Result<bool> {
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
     std::fs::write(path, bytes)?;
     Ok(true)
+}
+
+pub(crate) fn ensure_visible_output_allowed(allow_after_no_reply: bool) -> Result<()> {
+    let Some(path) = std::env::var_os(LOOM_NO_REPLY_FILE_ENV) else {
+        return Ok(());
+    };
+    ensure_visible_output_allowed_for_path(PathBuf::from(path).as_path(), allow_after_no_reply)
+}
+
+fn ensure_visible_output_allowed_for_path(
+    path: &std::path::Path,
+    allow_after_no_reply: bool,
+) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let reason = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|marker| {
+            marker
+                .pointer("/payload/reason")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    if reason.as_deref() == Some("task_claim_conflict_for_current_trigger") {
+        anyhow::bail!(
+            "this initiating agent run lost the atomic task claim for its trigger and is sealed \
+             no-reply. A newer routed delivery must run independently; \
+             --allow-after-no-reply cannot bypass this convergence guard"
+        );
+    }
+    if allow_after_no_reply {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "this agent run is already marked no-reply or has completed its assignment handoff; \
+         sending another message now can duplicate an outcome or wake. Send any visible result \
+         before the terminal assignment update, or pass --allow-after-no-reply when a deliberate \
+         post-handoff message is required"
+    );
 }
 
 pub async fn close(client: Arc<Client>, run_id: String, status: String) -> Result<()> {
@@ -477,6 +519,52 @@ fn parse_run_status(raw: &str) -> Result<RunStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_marker(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "loom-{name}-{}-{}.json",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ))
+    }
+
+    #[test]
+    fn visible_output_guard_allows_missing_marker() {
+        let marker = temp_marker("missing-no-reply");
+        assert!(ensure_visible_output_allowed_for_path(&marker, false).is_ok());
+    }
+
+    #[test]
+    fn visible_output_guard_rejects_existing_marker() {
+        let marker = temp_marker("existing-no-reply");
+        std::fs::write(&marker, "{}").expect("write marker");
+
+        let err = ensure_visible_output_allowed_for_path(&marker, false)
+            .expect_err("guard should reject");
+
+        assert!(err.to_string().contains("--allow-after-no-reply"));
+        assert!(ensure_visible_output_allowed_for_path(&marker, true).is_ok());
+        std::fs::remove_file(marker).ok();
+    }
+
+    #[test]
+    fn lost_trigger_claim_marker_cannot_be_bypassed() {
+        let marker = temp_marker("lost-trigger-claim");
+        std::fs::write(
+            &marker,
+            serde_json::to_vec(&json!({
+                "payload": { "reason": "task_claim_conflict_for_current_trigger" }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let err = ensure_visible_output_allowed_for_path(&marker, true)
+            .expect_err("convergence guard must be terminal for this run");
+
+        assert!(err.to_string().contains("cannot bypass"));
+        std::fs::remove_file(marker).ok();
+    }
 
     #[test]
     fn human_status_names_match_canonical_wire_values() {

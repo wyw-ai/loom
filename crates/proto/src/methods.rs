@@ -7,14 +7,19 @@ use crate::types::*;
 
 pub mod method {
     pub const INITIALIZE: &str = "initialize";
+    pub const AUTH_LOGIN: &str = "auth/login";
     pub const CONNECTION_OPEN: &str = "connection/open";
     pub const CONNECTION_CLOSE: &str = "connection/close";
     pub const CONNECTION_LIST: &str = "connection/list";
     pub const SCOPE_SUBSCRIBE: &str = "scope/subscribe";
     pub const SCOPE_UNSUBSCRIBE: &str = "scope/unsubscribe";
     pub const CHANNEL_CREATE: &str = "channel/create";
+    pub const CHANNEL_ENSURE_PUBLIC: &str = "channel/ensure_public";
     pub const CHANNEL_LIST: &str = "channel/list";
+    pub const CHANNEL_LOOKUP: &str = "channel/lookup";
     pub const CHANNEL_UPDATE: &str = "channel/update";
+    pub const CHANNEL_LAYOUT_GET: &str = "channel.layout.get";
+    pub const CHANNEL_LAYOUT_SET: &str = "channel.layout.set";
     pub const CHANNEL_DELETE: &str = "channel/delete";
     pub const CHANNEL_INVITE: &str = "channel/invite";
     pub const CHANNEL_REVOKE: &str = "channel/revoke";
@@ -23,10 +28,12 @@ pub mod method {
     pub const CHANNEL_MEMBER_CONFIG_LIST: &str = "channel/member_config.list";
     pub const CHANNEL_MEMBER_CONFIG_SET: &str = "channel/member_config.set";
     pub const CHANNEL_MEMBER_CONFIG_CLEAR: &str = "channel/member_config.clear";
+    pub const CHANNEL_MEMBER_RESOLVE: &str = "channel/member.resolve";
     pub const CHANNEL_SET_INSTRUCTION: &str = "channel/set_instruction";
     pub const CHANNEL_GET_INSTRUCTION: &str = "channel/get_instruction";
     pub const CHANNEL_CLEAR_INSTRUCTION: &str = "channel/clear_instruction";
     pub const THREAD_CREATE: &str = "thread/create";
+    pub const THREAD_GET: &str = "thread/get";
     pub const THREAD_LIST: &str = "thread/list";
     pub const THREAD_UPDATE: &str = "thread/update";
     pub const THREAD_ARCHIVE: &str = "thread/archive";
@@ -98,6 +105,17 @@ pub mod method {
     /// host can resume after restart without losing directed events.
     pub const INBOX_LIST: &str = "inbox.list";
     pub const DELIVERY_ACK: &str = "delivery.ack";
+    /// Aggregate pending-delivery status for a set of actors (counts +
+    /// optional source-id entries, never message bodies). Powers the GUI
+    /// actor-activity banner. Every caller may query itself; human callers may
+    /// also manage agent/service actors, while other human inboxes stay private.
+    pub const INBOX_STATUS: &str = "inbox.status";
+    /// Withdraw pending deliveries before an agent consumes them. The worker
+    /// drops matching queued triggers when it sees the state change.
+    pub const DELIVERY_CANCEL: &str = "delivery.cancel";
+    /// Ask the target actor's worker to move a pending delivery to the front
+    /// of its queue (and dispatch immediately if the scope is idle).
+    pub const DELIVERY_EXPEDITE: &str = "delivery.expedite";
     /// Compatibility create-and-wait wrapper around the durable command API.
     pub const MACHINE_COMMAND: &str = "machine/command";
     pub const MACHINE_COMMAND_CREATE: &str = "machine/command.create";
@@ -106,6 +124,10 @@ pub mod method {
     pub const MACHINE_COMMAND_ACK: &str = "machine/command.ack";
     pub const MACHINE_COMMAND_RESULT: &str = "machine/command.result";
     pub const MACHINE_COMMAND_CANCEL: &str = "machine/command.cancel";
+    /// Scope-filtered, read-only projection of active daemon-hosted service
+    /// runtimes. Unlike `actor/list`, this method never exposes machine
+    /// inventory internals.
+    pub const SERVICE_RUNTIME_LIST: &str = "service.runtime.list";
     pub const ACTOR_LIST: &str = "actor/list";
     pub const ACTOR_UPSERT: &str = "actor/upsert";
     pub const ACTOR_DELETE: &str = "actor/delete";
@@ -156,6 +178,30 @@ pub struct InitializeResult {
     pub protocol_version: String,
     pub server_info: ServerInfo,
     pub server_capabilities: Value,
+}
+
+impl InitializeResult {
+    pub fn password_auth_required(&self) -> bool {
+        self.server_capabilities
+            .get("auth")
+            .and_then(|auth| auth.get("required"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+}
+
+// ---- auth/login ----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthLoginParams {
+    pub password: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthLoginResult {
+    pub authenticated: bool,
 }
 
 // ---- connection/open ----
@@ -249,13 +295,15 @@ pub struct ChannelCreateParams {
     #[serde(default)]
     pub topic: String,
     /// Force a public channel even when the connection is bound to an actor.
-    /// This is useful for product-level shared spaces where membership is
-    /// tracked for discovery but should not gate visibility.
+    /// The creator remains the first explicit member (and therefore channel
+    /// administrator), while every server actor gets implicit read/write
+    /// access through the public visibility rule.
     #[serde(default)]
     pub public: bool,
-    /// When provided, the new channel is created `Private` and the creator
-    /// is its sole initial member. When omitted, the channel is created
-    /// `Public`.
+    /// Optional creator override. When omitted, the server uses the actor
+    /// bound by `connection/open`. New channels default to `Private`; only an
+    /// explicit `public: true` creates `Public`. Calls with neither identity
+    /// are rejected so no unowned channel can be created.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor_id: Option<String>,
 }
@@ -266,7 +314,32 @@ pub struct ChannelCreateResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelEnsurePublicParams {
+    pub title: String,
+    #[serde(default)]
+    pub topic: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelEnsurePublicResult {
+    pub channel: Channel,
+    pub created: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelListResult {
+    pub channels: Vec<Channel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelLookupParams {
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelLookupResult {
     pub channels: Vec<Channel>,
 }
 
@@ -340,7 +413,10 @@ pub struct ChannelMemberConfigListResult {
 pub struct ChannelMemberConfigSetParams {
     pub channel_id: String,
     pub actor_id: String,
-    pub workspace_dir: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mention_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -360,6 +436,27 @@ pub struct ChannelMemberConfigClearResult {
     pub cleared: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelMemberResolveParams {
+    pub channel_id: String,
+    pub mention_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedChannelMember {
+    pub actor: Actor,
+    pub mention_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelMemberResolveResult {
+    pub members: Vec<ResolvedChannelMember>,
+    pub unresolved_mention_ids: Vec<String>,
+}
+
 // ---- channel/update / delete ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -377,6 +474,32 @@ pub struct ChannelUpdateParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelUpdateResult {
     pub channel: Channel,
+}
+
+// ---- channel.layout.get / channel.layout.set ----
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChannelLayoutGetParams {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelLayoutGetResult {
+    pub layout: ChannelLayout,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChannelLayoutSetParams {
+    pub sections: Vec<ChannelLayoutSection>,
+    /// One-time local-cache migration mode. Existing server sections win;
+    /// incoming sections/channels are appended without displacing them.
+    #[serde(default)]
+    pub merge: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelLayoutSetResult {
+    pub layout: ChannelLayout,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -450,6 +573,17 @@ pub struct ThreadCreateParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadCreateResult {
     pub thread: Thread,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadGetParams {
+    pub thread_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadGetResult {
+    pub thread: Option<Thread>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1280,6 +1414,18 @@ pub struct RunCloseParams {
     pub run_id: String,
     #[serde(default = "default_run_close_status")]
     pub status: RunStatus,
+    /// Optional per-turn token usage reported by the worker (additive field;
+    /// older servers ignore it, older workers never send it). The server
+    /// merges it into `run.metadata.token_usage` together with the durable
+    /// per-(actor, scope) cumulative counter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<crate::types::TokenUsageSummary>,
+    /// Delivery rows consumed by this completed turn. Supplying these on the
+    /// same RPC lets the server persist the terminal run and inbox acks as one
+    /// journal mutation, so a worker/server disconnect cannot replay already
+    /// handled mentions on the next daemon start.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ack_source_ids: Vec<String>,
 }
 
 fn default_run_close_status() -> RunStatus {
@@ -1287,8 +1433,55 @@ fn default_run_close_status() -> RunStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RunCloseResult {
     pub run: Run,
+    /// Source ids the server found in this actor's inbox and left in the
+    /// delivered state. Empty when talking to an older server, allowing new
+    /// workers to fall back to individual `delivery.ack` calls.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acked_source_ids: Vec<String>,
+}
+
+#[cfg(test)]
+mod run_close_compat_tests {
+    use super::*;
+
+    #[test]
+    fn ack_sources_are_additive_and_use_camel_case_on_the_wire() {
+        let legacy: RunCloseParams =
+            serde_json::from_value(serde_json::json!({ "runId": "run_legacy" }))
+                .expect("legacy run.close params");
+        assert!(legacy.ack_source_ids.is_empty());
+
+        let run = Run {
+            id: "run_1".into(),
+            actor_id: "actor_agent".into(),
+            scope: ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_1".into(),
+            },
+            delivery_id: Some("msg_1".into()),
+            start_reason: Some("msg_1".into()),
+            agent_config_version_id: "agent_config_1".into(),
+            status: RunStatus::Completed,
+            opened_at: chrono::Utc::now(),
+            closed_at: Some(chrono::Utc::now()),
+            metadata: Meta::default(),
+        };
+        let value = serde_json::to_value(RunCloseResult {
+            run: run.clone(),
+            acked_source_ids: vec!["msg_1".into()],
+        })
+        .expect("serialize run.close result");
+        assert_eq!(value["ackedSourceIds"], serde_json::json!(["msg_1"]));
+        assert!(value.get("acked_source_ids").is_none());
+
+        let legacy_result: RunCloseResult =
+            serde_json::from_value(serde_json::json!({ "run": run }))
+                .expect("legacy run.close result");
+        assert!(legacy_result.acked_source_ids.is_empty());
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1867,6 +2060,80 @@ pub struct DeliveryAckResult {
     pub delivery: Delivery,
 }
 
+// ---- inbox.status / delivery.cancel / delivery.expedite (agent-activity banner) ----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InboxStatusParams {
+    /// Actors to report on. Callers may name themselves and agent/service
+    /// actors; entries for other humans are silently omitted.
+    pub actor_ids: Vec<String>,
+    /// Include per-delivery source-id entries (capped). Off by default so the
+    /// collapsed banner can poll counts cheaply.
+    #[serde(default)]
+    pub include_entries: bool,
+    /// Cap for `entries` per actor (default 50, hard cap 200).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InboxStatusEntry {
+    pub source_id: String,
+    pub updated_at: Timestamp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InboxActorStatus {
+    pub actor_id: String,
+    /// Pending (unconsumed) delivery count.
+    pub pending: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_pending_at: Option<Timestamp>,
+    /// Pending deliveries oldest-first (only when `include_entries`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<InboxStatusEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct InboxStatusResult {
+    pub actors: Vec<InboxActorStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliveryCancelParams {
+    /// Target actor whose pending deliveries are withdrawn.
+    pub actor_id: String,
+    /// Specific deliveries to cancel. Ignored when `all_pending` is set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_ids: Vec<String>,
+    /// Cancel every pending delivery for `actor_id`.
+    #[serde(default)]
+    pub all_pending: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliveryCancelResult {
+    pub cancelled: Vec<Delivery>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliveryExpediteParams {
+    pub actor_id: String,
+    pub source_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeliveryExpediteResult {
+    pub delivery: Delivery,
+}
+
 // ---- machine command durable lifecycle ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2005,6 +2272,47 @@ pub struct MachineCommandCancelParams {
 #[serde(rename_all = "camelCase")]
 pub struct MachineCommandCancelResult {
     pub command: MachineCommand,
+}
+
+// ---- service.runtime.list ----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceRuntimeListParams {
+    pub scope: ScopeRef,
+}
+
+/// Minimal public projection used by an Actor activity banner.
+///
+/// The requested scope is deliberately not repeated on each row: every item
+/// in a response is guaranteed to match `ServiceRuntimeListParams::scope`
+/// exactly.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceRuntimeListItem {
+    pub runtime_id: String,
+    pub machine_id: String,
+    pub machine_actor_id: String,
+    pub machine_name: String,
+    pub service_id: String,
+    pub actor_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_display_name: Option<String>,
+    pub plugin_kind: String,
+    pub lifecycle: ServiceLifecycle,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+    pub phase: ServiceRuntimePhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ServiceRuntimeListResult {
+    pub runtimes: Vec<ServiceRuntimeListItem>,
 }
 
 // ---- actor/list + actor/upsert ----
@@ -3081,6 +3389,25 @@ pub struct WakeSpec {
     /// injected outside the structured wake body. Default is runtime-defined.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_token_budget: Option<u64>,
+    /// How the per-turn user message is rendered. `minimal` (default) is a
+    /// compact plain-text list of the delivered messages plus a one-line
+    /// queue summary; `structured` keeps the turn-input-contract v1 JSON
+    /// header + fenced bodies for strong/programmatic agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_input_style: Option<TurnInputStyle>,
+}
+
+/// Turn-input rendering style. See `WakeSpec.turn_input_style`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum TurnInputStyle {
+    /// Compact plain-text digest: numbered pending-message list (each body
+    /// capped and pointing at `loom message get` for the full text) plus a
+    /// one-line scope/queue summary. Default.
+    #[default]
+    Minimal,
+    /// Turn-input-contract v1: fenced JSON wake header + fenced raw bodies.
+    Structured,
 }
 
 /// Reply-reminder frequency. See `WakeSpec.reply_reminder`.
@@ -3469,6 +3796,43 @@ pub enum ServiceLifecycle {
     ThreadBound,
 }
 
+/// Observable state for one concrete service runtime owned by a daemon host.
+///
+/// A channel-singleton has no `instance_id`; a thread-bound runtime uses the
+/// bound thread id as its instance id.  Consumers must key rows by
+/// `(machine_id, service_id, instance_id)` rather than `actor_id`, because
+/// multiple thread-bound instances intentionally share one service actor.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceRuntimeState {
+    pub runtime_id: String,
+    pub machine_id: String,
+    pub service_id: String,
+    pub actor_id: String,
+    pub plugin_kind: String,
+    pub lifecycle: ServiceLifecycle,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+    /// Effective scopes known by the host. Empty means "not known" and must
+    /// not be interpreted as a workspace-global binding.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<ScopeRef>,
+    pub phase: ServiceRuntimePhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceRuntimePhase {
+    Starting,
+    Running,
+    Failed,
+}
+
 /// Binding info for a [`ServiceLifecycle::ThreadBound`] service.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -3595,7 +3959,8 @@ pub struct AgentMarketplaceListResult {
 #[serde(rename_all = "camelCase")]
 pub struct StreamUpdate {
     pub kind: String,
-    pub scope: ScopeRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<ScopeRef>,
     pub data: Value,
 }
 
@@ -3608,6 +3973,9 @@ pub mod stream_kind {
     /// all connections; private channels go to the creator only.
     pub const CHANNEL_CREATED: &str = "channel.created";
     pub const CHANNEL_UPDATED: &str = "channel.updated";
+    /// Actor-global navigation update. Carries `{ layout }` and intentionally
+    /// has no scope because the layout spans multiple channels.
+    pub const CHANNEL_LAYOUT_UPDATED: &str = "channel.layout.updated";
     pub const CHANNEL_DELETED: &str = "channel.deleted";
     pub const RUN_UPDATED: &str = "run.updated";
     pub const MESSAGE_CREATED: &str = "message.created";
@@ -3623,6 +3991,81 @@ pub mod stream_kind {
     /// Mirror of `CHANNEL_INVITED`: the recipient was removed from a
     /// channel. Carries `{ channelId, actorId }`.
     pub const CHANNEL_REVOKED: &str = "channel.revoked";
+    /// Broadcast when an agent/service actor's canonical worker connection
+    /// comes online or goes away. Carries `{ actorId, online }`. Human
+    /// connections never emit this.
+    pub const PRESENCE_CHANGED: &str = "presence.changed";
+}
+
+#[cfg(test)]
+mod channel_layout_wire_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn example_layout() -> ChannelLayout {
+        ChannelLayout {
+            actor_id: "actor_alice".into(),
+            sections: vec![ChannelLayoutSection {
+                id: "local-work".into(),
+                title: "Work".into(),
+                channel_ids: vec!["chan_a".into(), "chan_b".into()],
+                collapsed: true,
+            }],
+            revision: 7,
+            updated_at: "2026-08-10T01:02:03Z".parse().expect("timestamp"),
+        }
+    }
+
+    #[test]
+    fn channel_layout_uses_fixed_camel_case_wire_shape() {
+        let value = serde_json::to_value(ChannelLayoutSetResult {
+            layout: example_layout(),
+        })
+        .expect("serialize layout result");
+        assert_eq!(value["layout"]["actorId"], "actor_alice");
+        assert_eq!(value["layout"]["revision"], 7);
+        assert_eq!(value["layout"]["updatedAt"], "2026-08-10T01:02:03Z");
+        assert_eq!(
+            value["layout"]["sections"][0]["channelIds"],
+            json!(["chan_a", "chan_b"]),
+        );
+        assert!(value["layout"].get("actor_id").is_none());
+
+        let params: ChannelLayoutSetParams = serde_json::from_value(json!({
+            "sections": [{
+                "id": "local-work",
+                "title": "Work",
+                "channelIds": ["chan_a"],
+                "collapsed": false,
+            }],
+        }))
+        .expect("set params");
+        assert!(!params.merge);
+        assert_eq!(params.sections[0].channel_ids, vec!["chan_a"]);
+    }
+
+    #[test]
+    fn channel_layout_identity_is_not_a_client_parameter_and_stream_has_no_scope() {
+        assert!(serde_json::from_value::<ChannelLayoutGetParams>(json!({
+            "actorId": "actor_other"
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<ChannelLayoutSetParams>(json!({
+            "actorId": "actor_other",
+            "sections": []
+        }))
+        .is_err());
+
+        let update = StreamUpdate {
+            kind: stream_kind::CHANNEL_LAYOUT_UPDATED.into(),
+            scope: None,
+            data: json!({ "layout": example_layout() }),
+        };
+        let value = serde_json::to_value(update).expect("serialize stream update");
+        assert_eq!(value["kind"], "channel.layout.updated");
+        assert!(value.get("scope").is_none());
+        assert_eq!(value["data"]["layout"]["actorId"], "actor_alice");
+    }
 }
 
 #[cfg(test)]
@@ -3658,6 +4101,67 @@ mod service_spec_tests {
     #[test]
     fn validate_passes_for_service_actor() {
         assert!(base_spec().validate().is_ok());
+    }
+
+    #[test]
+    fn service_runtime_state_uses_camel_case_inventory_shape() {
+        let state = ServiceRuntimeState {
+            runtime_id: "machine_a:daily:thread_1".into(),
+            machine_id: "machine_a".into(),
+            service_id: "daily".into(),
+            actor_id: "actor_service_daily".into(),
+            plugin_kind: "scheduler".into(),
+            lifecycle: ServiceLifecycle::ThreadBound,
+            instance_id: Some("thread_1".into()),
+            scopes: vec![ScopeRef {
+                kind: ScopeKind::Thread,
+                id: "thread_1".into(),
+            }],
+            phase: ServiceRuntimePhase::Running,
+            started_at: Some("2026-08-09T10:00:00Z".into()),
+            updated_at: "2026-08-09T10:00:01Z".into(),
+            last_error: None,
+        };
+
+        let value = serde_json::to_value(&state).expect("serialize runtime state");
+        assert_eq!(value["runtimeId"], "machine_a:daily:thread_1");
+        assert_eq!(value["pluginKind"], "scheduler");
+        assert_eq!(value["lifecycle"], "thread_bound");
+        assert_eq!(value["phase"], "running");
+        assert!(value.get("lastError").is_none());
+
+        let round_trip: ServiceRuntimeState =
+            serde_json::from_value(value).expect("deserialize runtime state");
+        assert_eq!(round_trip, state);
+    }
+
+    #[test]
+    fn service_runtime_list_item_uses_narrow_camel_case_shape() {
+        let item = ServiceRuntimeListItem {
+            runtime_id: "machine_a:daily:thread_1".into(),
+            machine_id: "machine_a".into(),
+            machine_actor_id: "actor_service_machine_a".into(),
+            machine_name: "Build host".into(),
+            service_id: "daily".into(),
+            actor_id: "actor_service_daily".into(),
+            actor_display_name: Some("Daily scheduler".into()),
+            plugin_kind: "scheduler".into(),
+            lifecycle: ServiceLifecycle::ThreadBound,
+            instance_id: Some("thread_1".into()),
+            phase: ServiceRuntimePhase::Running,
+            started_at: Some("2026-08-09T10:00:00Z".into()),
+            updated_at: "2026-08-09T10:00:01Z".into(),
+            last_error: None,
+        };
+
+        let value = serde_json::to_value(&item).expect("serialize runtime list item");
+        assert_eq!(value["runtimeId"], "machine_a:daily:thread_1");
+        assert_eq!(value["machineActorId"], "actor_service_machine_a");
+        assert_eq!(value["actorDisplayName"], "Daily scheduler");
+        assert_eq!(value["pluginKind"], "scheduler");
+        assert_eq!(value["instanceId"], "thread_1");
+        assert!(value.get("runtime_id").is_none());
+        assert!(value.get("lastError").is_none());
     }
 
     #[test]

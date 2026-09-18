@@ -161,7 +161,7 @@ export function RunsView({ runs, actors, channels, connection, busy, loading = f
                         >
                           <span
                             className={cn("h-2 w-2 rounded-full", dotClass)}
-                            style={animation ? { animationName: animation, animationDuration: "1.5s", animationIterationCount: "infinite", animationTimingFunction: "ease-in-out" } : undefined}
+                            style={animation ? { animationName: animation, animationDuration: "2.2s", animationIterationCount: "infinite", animationTimingFunction: "ease-in-out" } : undefined}
                           />
                           {runStatusLabel[run.status] ?? run.status}
                         </Badge>

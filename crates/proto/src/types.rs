@@ -48,7 +48,7 @@ pub enum ActorKind {
     Service,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Actor {
     pub id: String,
@@ -113,6 +113,33 @@ pub struct Channel {
     pub _meta: Option<Meta>,
 }
 
+/// One user-defined section in the per-actor channel navigation layout.
+/// Channel ids are ordered and globally unique across a normalized layout.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelLayoutSection {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub channel_ids: Vec<String>,
+    #[serde(default)]
+    pub collapsed: bool,
+}
+
+/// Server-backed channel navigation preferences for one actor. The server
+/// identity is deliberately part of the value, while the RPC never accepts an
+/// actor id from the caller; this prevents one actor from reading or replacing
+/// another actor's layout.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelLayout {
+    pub actor_id: String,
+    #[serde(default)]
+    pub sections: Vec<ChannelLayoutSection>,
+    pub revision: u64,
+    pub updated_at: Timestamp,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ChannelMemberConfig {
@@ -120,6 +147,10 @@ pub struct ChannelMemberConfig {
     pub actor_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_dir: Option<String>,
+    /// External mention identifiers that route a platform-native mention to
+    /// this actor within the channel.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mention_ids: Vec<String>,
     pub updated_at: Timestamp,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "_meta")]
     pub _meta: Option<Meta>,
@@ -245,6 +276,63 @@ pub struct Run {
     pub closed_at: Option<Timestamp>,
     #[serde(default, rename = "metadata")]
     pub metadata: Meta,
+}
+
+/// Per-turn token-usage summary reported by an agent worker when it closes a
+/// run. Field names intentionally mirror
+/// `agent-runtime::adapter::TokenUsage` (snake_case) so the worker can
+/// round-trip its adapter value through serde without a manual mapping.
+///
+/// Additive protocol surface: servers that predate this type ignore the
+/// extra `usage` field on `run.close`, and workers talking to such servers
+/// lose nothing but the durable copy.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TokenUsageSummary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_cost_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub estimated: bool,
+}
+
+impl TokenUsageSummary {
+    /// Field-wise saturating accumulation used by the server to maintain the
+    /// durable per-(actor, scope) cumulative counter.
+    pub fn add(&mut self, increment: &TokenUsageSummary) {
+        fn add_opt(left: &mut Option<u64>, right: Option<u64>) {
+            if let Some(right) = right {
+                *left = Some(left.unwrap_or(0).saturating_add(right));
+            }
+        }
+        add_opt(&mut self.input_tokens, increment.input_tokens);
+        add_opt(&mut self.output_tokens, increment.output_tokens);
+        add_opt(&mut self.total_tokens, increment.total_tokens);
+        add_opt(
+            &mut self.cache_creation_input_tokens,
+            increment.cache_creation_input_tokens,
+        );
+        add_opt(
+            &mut self.cache_read_input_tokens,
+            increment.cache_read_input_tokens,
+        );
+        add_opt(&mut self.reasoning_tokens, increment.reasoning_tokens);
+        if let Some(cost) = increment.total_cost_usd {
+            self.total_cost_usd = Some(self.total_cost_usd.unwrap_or(0.0) + cost);
+        }
+        self.estimated = self.estimated || increment.estimated;
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1038,6 +1126,11 @@ pub enum DeliveryState {
     Pending,
     Delivered,
     Failed,
+    /// Withdrawn before consumption (e.g. a human revoked a queued wake from
+    /// the GUI). Terminal; workers drop matching queued triggers. Additive
+    /// variant: servers only emit it for clients that requested cancellation
+    /// flows, and state-filtered queries never leak it to legacy pollers.
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

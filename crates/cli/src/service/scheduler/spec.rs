@@ -88,6 +88,16 @@ pub struct EmitConfig {
     /// Event kind to emit for each artifact. Defaults to `status.update`.
     #[serde(default = "default_status_event_type")]
     pub status_event_type: String,
+    /// Optional template for task-fact `targetKey`. Placeholders read
+    /// top-level JSON fields. When absent, the runtime keeps its legacy
+    /// `mrId` / `workitemId` fallback.
+    #[serde(default)]
+    pub task_fact_target_key_template: Option<String>,
+    /// Supersede all active facts with the same task, kind, and rendered
+    /// target key before appending a changed observation. Identical payloads
+    /// remain idempotent and reuse the existing fact.
+    #[serde(default)]
+    pub replace_active_task_fact: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -403,6 +413,23 @@ mod tests {
             _ => panic!("wrong source kind"),
         }
         assert!(matches!(job.cursor_by, CursorBy::BodyHash));
+    }
+
+    #[test]
+    fn emit_task_fact_replacement_options_deserialize() {
+        let emit: EmitConfig = serde_json::from_value(json!({
+            "mode": "artifact_per_json_line",
+            "taskFactTargetKeyTemplate": "{repo}:{mrId}",
+            "replaceActiveTaskFact": true
+        }))
+        .expect("parse emit config");
+
+        assert_eq!(
+            emit.task_fact_target_key_template.as_deref(),
+            Some("{repo}:{mrId}")
+        );
+        assert!(emit.replace_active_task_fact);
+        assert_eq!(emit.status_event_type, "status.update");
     }
 
     #[test]

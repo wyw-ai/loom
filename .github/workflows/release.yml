@@ -166,7 +166,7 @@ jobs:
         run: tar -czf linux-dist.tar.gz -C dist release
 
       - name: Upload Linux dist
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: linux-dist
           path: linux-dist.tar.gz
@@ -221,7 +221,7 @@ jobs:
         run: tar -czf macos-dist.tar.gz -C dist release
 
       - name: Upload macOS dist
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: macos-dist
           path: macos-dist.tar.gz
@@ -307,7 +307,7 @@ jobs:
           7z a -tzip ../../../windows-dist.zip .
 
       - name: Upload Windows dist
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: windows-dist
           path: windows-dist.zip
@@ -403,7 +403,7 @@ jobs:
             --group "${{ needs.version.outputs.tag }}"
 
       - name: Upload package artifact
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: release-packages
           path: dist/packages
@@ -414,7 +414,7 @@ jobs:
         run: bash pages/build.sh
 
       - name: Upload Pages build artifact
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: pages-build
           path: pages/build

@@ -117,7 +117,7 @@ jobs:
 
       - name: Upload loom-shell artifact
         if: github.event_name == 'push'
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: loom-shell-windows
           path: target/debug/loom-shell.exe
@@ -158,7 +158,7 @@ jobs:
 
       - name: Upload frontend dist (for bundle jobs)
         if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: frontend-dist
           path: apps/gui-web/dist
@@ -215,7 +215,7 @@ jobs:
         run: cd crates/gui && cargo tauri build --ci --bundles deb,appimage
 
       - name: Upload bundle artifact
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: gui-bundle-linux
           path: |
@@ -262,7 +262,7 @@ jobs:
         run: cd crates/gui && cargo tauri build --ci --bundles dmg
 
       - name: Upload bundle artifact
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: gui-bundle-macos
           path: target/release/bundle/dmg/*.dmg
@@ -310,7 +310,7 @@ jobs:
         run: cargo build -p loom-shell --release
 
       - name: Upload bundle artifact
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: gui-bundle-windows
           path: |

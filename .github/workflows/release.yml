@@ -360,19 +360,19 @@ jobs:
         run: cargo install tauri-cli --version "^2" --locked
 
       - name: Download Linux dist
-        uses: actions/download-artifact@v8.0.1
+        uses: actions/download-artifact@v8.0.2
         with:
           name: linux-dist
           path: artifacts/linux
 
       - name: Download macOS dist
-        uses: actions/download-artifact@v8.0.1
+        uses: actions/download-artifact@v8.0.2
         with:
           name: macos-dist
           path: artifacts/macos
 
       - name: Download Windows dist
-        uses: actions/download-artifact@v8.0.1
+        uses: actions/download-artifact@v8.0.2
         with:
           name: windows-dist
           path: artifacts/windows
@@ -462,7 +462,7 @@ jobs:
       pages: write
     steps:
       - name: Download Pages build artifact
-        uses: actions/download-artifact@v8.0.1
+        uses: actions/download-artifact@v8.0.2
         with:
           name: pages-build
           path: pages/build
